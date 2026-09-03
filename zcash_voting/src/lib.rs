@@ -30,6 +30,7 @@ pub mod config;
 pub(crate) mod confirmation;
 pub mod delegate;
 pub mod delegation_capability;
+pub mod delegation_pipeline;
 mod delegation_proof_coordination;
 pub mod error;
 pub mod governance;
@@ -80,6 +81,10 @@ pub use chain_submission::{
     ChainSubmissionTarget, ChainTransport, ChainTransportError, ChainTransportFailureKind,
     ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
+pub use delegation_pipeline::{
+    start_proving_cache_warmup, DelegationPipeline, DelegationSigner, KeystoneSignatureSource,
+    SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport, WalletDbOpener,
+};
 pub use error::{DelegationSetupField, VotingErrorKind, VotingErrorKindView, VotingErrorView};
 pub use helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
@@ -94,6 +99,7 @@ pub use pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, ImtProofData, NegotiatedPirLayout,
     PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
+pub use pir::{PirFleet, PirProofSource, PirSession};
 pub use transport::{
     DirectRoute, PirHttpFailure, PirHttpFailurePhase, RouteError, RouteFuture, RouteHttp,
     RoutePhase, RouteRequest, RouteResponse,

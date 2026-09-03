@@ -223,7 +223,7 @@ pub fn delegation_pir(
     round_id: &str,
     bundle_index: u32,
     notes: &[NoteInfo],
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<PirPrecomputeReport, VotingError> {
     let result =
@@ -258,7 +258,7 @@ pub fn precompute_pir_proofs(
     notes: &[NoteInfo],
     bundle_policy: crate::note_bundling::BundlePolicy,
     network: Network,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
 ) -> Result<PirCachePrecomputeResult, VotingError> {
     db.precompute_pir_proof_cache(notes, bundle_policy, network, pir_client)
 }
@@ -310,7 +310,7 @@ pub fn precompute_snapshot_bundles(
     round_id: &str,
     notes: &[NoteInfo],
     bundle_policy: BundlePolicy,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<SnapshotBundlePrecomputeReport, VotingError> {
     db.require_round_network(round_id, network, "snapshot bundle precompute")?;
@@ -368,7 +368,7 @@ pub(crate) fn warm_delegation_pir(
     bundle_index: u32,
     notes: &[NoteInfo],
     layout: BundleLayout,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<PreparedDelegationReport, VotingError> {
     db.ensure_padded_secrets(round_id, bundle_index, notes)?;

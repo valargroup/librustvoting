@@ -7,8 +7,9 @@
 //! hardcodes depth, tier-split, or YPIR degree constants, and neither checks
 //! whether the URL appears in a resolved config's advertised endpoint list.
 
-use std::sync::Arc;
+use std::{sync::mpsc, sync::Arc, thread};
 
+use crate::backend::pasta_curves::pallas::Base as Fp;
 use crate::config::{validate_and_convert_pir_layout, PirLayout};
 use crate::http_transport::PirHttpFailure;
 use crate::types::VotingError;
@@ -131,6 +132,354 @@ pub(crate) fn map_pir_fetch_error(
         http_status: typed.and_then(|failure| failure.http_status),
         retryable: typed.is_some_and(PirHttpFailure::retryable),
         message: format!("{context}: {err:#}"),
+    }
+}
+
+/// Source of PIR non-membership proofs used by delegation and cache warm-up.
+///
+/// [`PirClientBlocking`] implements this directly. [`PirSession`] implements it
+/// without owning a Tokio runtime on the caller's thread, so proving code can
+/// run inside `spawn_blocking` workers or any other thread that must not build
+/// or block on a nested runtime.
+pub trait PirProofSource: Send + Sync {
+    /// The circuit root (PIR root padded to circuit depth) the server serves.
+    fn circuit_root(&self) -> Fp;
+    /// Fetches proofs for `nullifiers`, all against the same served root.
+    fn fetch_proofs(&self, nullifiers: &[Fp]) -> anyhow::Result<Vec<ImtProofData>>;
+}
+
+impl PirProofSource for PirClientBlocking {
+    fn circuit_root(&self) -> Fp {
+        PirClientBlocking::circuit_root(self)
+    }
+
+    fn fetch_proofs(&self, nullifiers: &[Fp]) -> anyhow::Result<Vec<ImtProofData>> {
+        PirClientBlocking::fetch_proofs(self, nullifiers)
+    }
+}
+
+impl<T: PirProofSource + ?Sized> PirProofSource for Arc<T> {
+    fn circuit_root(&self) -> Fp {
+        (**self).circuit_root()
+    }
+
+    fn fetch_proofs(&self, nullifiers: &[Fp]) -> anyhow::Result<Vec<ImtProofData>> {
+        (**self).fetch_proofs(nullifiers)
+    }
+}
+
+enum PirSessionRequest {
+    Fetch {
+        nullifiers: Vec<Fp>,
+        reply: mpsc::Sender<anyhow::Result<Vec<ImtProofData>>>,
+    },
+}
+
+/// A connected PIR client serviced by its own OS thread.
+///
+/// The thread owns a single-threaded Tokio runtime and the async
+/// [`PirClient`]; callers block on a channel for each fetch. That keeps the
+/// runtime off the caller's thread, so a session can be used from a
+/// `spawn_blocking` worker of another runtime, where [`PirClientBlocking`]
+/// would panic or deadlock. Dropping the session ends the thread once any
+/// in-flight fetch completes.
+pub struct PirSession {
+    requests: mpsc::Sender<PirSessionRequest>,
+    circuit_root: Fp,
+    endpoint: String,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl PirSession {
+    /// Connects to `endpoint_url` and performs the layout handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] for an empty URL or an unusable
+    /// layout, and [`VotingError::PirUnavailable`] when the endpoint cannot be
+    /// reached or fails the handshake.
+    pub fn connect(
+        endpoint_url: &str,
+        pir_layout: PirLayout,
+        transport: Arc<dyn Transport>,
+    ) -> Result<Self, VotingError> {
+        let endpoint = normalize_endpoint_url(endpoint_url);
+        if endpoint.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "PIR endpoint URL must not be empty".to_string(),
+            });
+        }
+        let expected_layout = negotiated_pir_layout(pir_layout)?;
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<Fp, VotingError>>();
+        let (request_tx, request_rx) = mpsc::channel::<PirSessionRequest>();
+        let thread_endpoint = endpoint.clone();
+        let worker = thread::Builder::new()
+            .name("voting-pir-session".to_string())
+            .spawn(move || {
+                // The blocking client builds its own runtime; on this plain
+                // OS thread that is safe, which is the whole point of the
+                // session: callers never host that runtime themselves.
+                let client = match PirClientBlocking::with_transport(
+                    &thread_endpoint,
+                    expected_layout,
+                    transport,
+                ) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(map_pir_connect_error(&thread_endpoint, error)));
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(client.circuit_root())).is_err() {
+                    return;
+                }
+                while let Ok(PirSessionRequest::Fetch { nullifiers, reply }) = request_rx.recv() {
+                    let _ = reply.send(client.fetch_proofs(&nullifiers));
+                }
+            })
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to spawn PIR session thread: {error}"),
+            })?;
+        let circuit_root = match ready_rx.recv() {
+            Ok(ready) => ready?,
+            Err(_) => {
+                let _ = worker.join();
+                return Err(VotingError::Internal {
+                    message: "PIR session thread exited before connecting".to_string(),
+                });
+            }
+        };
+        Ok(Self {
+            requests: request_tx,
+            circuit_root,
+            endpoint,
+            worker: Some(worker),
+        })
+    }
+
+    /// Endpoint this session is connected to.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl PirProofSource for PirSession {
+    fn circuit_root(&self) -> Fp {
+        self.circuit_root
+    }
+
+    fn fetch_proofs(&self, nullifiers: &[Fp]) -> anyhow::Result<Vec<ImtProofData>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let ended = || PirHttpFailure {
+            phase: crate::http_transport::PirHttpFailurePhase::Send,
+            http_status: None,
+        };
+        self.requests
+            .send(PirSessionRequest::Fetch {
+                nullifiers: nullifiers.to_vec(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::Error::new(ended()).context("PIR session ended"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| anyhow::Error::new(ended()).context("PIR session ended mid-fetch"))?
+    }
+}
+
+impl Drop for PirSession {
+    fn drop(&mut self) {
+        let (detached, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.requests, detached));
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Ordered PIR endpoints for one snapshot, with failover on retryable failures.
+///
+/// Endpoints are tried in order. A connect or fetch failure that is
+/// [`VotingError::retryable`] moves to the next endpoint; any other failure,
+/// or exhausting the list, is returned to the caller.
+#[derive(Clone)]
+pub struct PirFleet {
+    endpoints: Vec<String>,
+    layout: PirLayout,
+    transport: Arc<dyn Transport>,
+}
+
+impl PirFleet {
+    /// Builds a fleet from ordered endpoint URLs, dropping duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] for an empty list, an empty URL,
+    /// or an unusable layout.
+    pub fn new(
+        endpoints: &[String],
+        layout: PirLayout,
+        transport: Arc<dyn Transport>,
+    ) -> Result<Self, VotingError> {
+        let mut normalized: Vec<String> = Vec::with_capacity(endpoints.len());
+        for raw in endpoints {
+            let url = normalize_endpoint_url(raw);
+            if url.is_empty() {
+                return Err(VotingError::InvalidInput {
+                    message: "PIR server URLs must not contain an empty URL".to_string(),
+                });
+            }
+            if !normalized.iter().any(|existing| *existing == url) {
+                normalized.push(url);
+            }
+        }
+        if normalized.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "at least one PIR server URL is required".to_string(),
+            });
+        }
+        negotiated_pir_layout(layout)?;
+        Ok(Self {
+            endpoints: normalized,
+            layout,
+            transport,
+        })
+    }
+
+    /// Ordered, deduplicated endpoint URLs.
+    pub fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+
+    /// Layout every endpoint is expected to serve.
+    pub fn layout(&self) -> PirLayout {
+        self.layout
+    }
+
+    /// Connects to the first endpoint that completes the handshake.
+    pub fn connect(&self) -> Result<PirSession, VotingError> {
+        failover_over(
+            &self.endpoints,
+            |endpoint| PirSession::connect(endpoint, self.layout, Arc::clone(&self.transport)),
+            |_| Ok(()),
+        )
+        .map(|(session, ())| session)
+    }
+
+    /// Runs `operation` against connected endpoints in order until it
+    /// succeeds or fails with a non-retryable error.
+    ///
+    /// The operation must be safe to repeat against another endpoint; proof
+    /// fetches and cache warm-ups are, because every persisted proof is
+    /// validated against the served root before it is stored.
+    pub fn with_failover<T>(
+        &self,
+        operation: impl FnMut(&PirSession) -> Result<T, VotingError>,
+    ) -> Result<T, VotingError> {
+        failover_over(
+            &self.endpoints,
+            |endpoint| PirSession::connect(endpoint, self.layout, Arc::clone(&self.transport)),
+            operation,
+        )
+        .map(|(_, value)| value)
+    }
+}
+
+/// Shared failover policy over an ordered endpoint list.
+fn failover_over<S, T>(
+    endpoints: &[String],
+    mut connect: impl FnMut(&str) -> Result<S, VotingError>,
+    mut operation: impl FnMut(&S) -> Result<T, VotingError>,
+) -> Result<(S, T), VotingError> {
+    let last = endpoints.len().saturating_sub(1);
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        let has_next = index < last;
+        let session = match connect(endpoint) {
+            Ok(session) => session,
+            Err(error) if error.retryable() && has_next => continue,
+            Err(error) => return Err(error),
+        };
+        match operation(&session) {
+            Ok(value) => return Ok((session, value)),
+            Err(error) if error.retryable() && has_next => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(VotingError::InvalidInput {
+        message: "at least one PIR server URL is required".to_string(),
+    })
+}
+
+#[cfg(test)]
+mod fleet_tests {
+    use super::failover_over;
+    use crate::VotingError;
+
+    fn retryable(endpoint: &str) -> VotingError {
+        VotingError::PirUnavailable {
+            endpoint: Some(endpoint.to_string()),
+            http_status: Some(503),
+            retryable: true,
+            message: "unavailable".to_string(),
+        }
+    }
+
+    fn fatal() -> VotingError {
+        VotingError::InvalidInput {
+            message: "layout mismatch".to_string(),
+        }
+    }
+
+    #[test]
+    fn failover_skips_retryable_connect_and_operation_failures_in_order() {
+        let endpoints: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let mut connects = Vec::new();
+        let mut operations = Vec::new();
+        let (session, value) = failover_over(
+            &endpoints,
+            |endpoint| {
+                connects.push(endpoint.to_string());
+                if endpoint == "a" {
+                    Err(retryable(endpoint))
+                } else {
+                    Ok(endpoint.to_string())
+                }
+            },
+            |session| {
+                operations.push(session.clone());
+                if session == "b" {
+                    Err(retryable(session))
+                } else {
+                    Ok(42)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!((session.as_str(), value), ("c", 42));
+        assert_eq!(connects, ["a", "b", "c"]);
+        assert_eq!(operations, ["b", "c"]);
+    }
+
+    #[test]
+    fn failover_stops_on_non_retryable_failure_and_on_exhaustion() {
+        let endpoints: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let error = failover_over(
+            &endpoints,
+            |endpoint| Ok(endpoint.to_string()),
+            |_| Err::<(), _>(fatal()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::VotingErrorKind::InvalidInput);
+
+        let error = failover_over(
+            &endpoints,
+            |endpoint| Err::<String, _>(retryable(endpoint)),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            VotingError::PirUnavailable { endpoint: Some(ref endpoint), .. } if endpoint == "b"
+        ));
     }
 }
 

@@ -39,6 +39,10 @@ pub use crate::delegation_capability::{
     ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
+pub use crate::delegation_pipeline::{
+    start_proving_cache_warmup, DelegationPipeline, DelegationSigner, KeystoneSignatureSource,
+    SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport, WalletDbOpener,
+};
 pub use crate::error::{
     DelegationSetupField, VotingError, VotingErrorKind, VotingErrorKindView, VotingErrorView,
 };
@@ -67,6 +71,7 @@ pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
 pub use crate::pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, select_pir_endpoint, PirEndpoint,
 };
+pub use crate::pir::{PirFleet, PirProofSource, PirSession};
 pub use crate::precompute::{
     note_witnesses, precompute_pir_proofs, precompute_snapshot_bundles, stored_note_witnesses,
     validate_cached_pir_proofs, verify_witness, PirPrecomputeReport,

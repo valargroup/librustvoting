@@ -1053,7 +1053,7 @@ impl VotingDb {
         round_id: &str,
         bundle_index: u32,
         notes: &[NoteInfo],
-        pir_client: &pir_client::PirClientBlocking,
+        pir_client: &dyn crate::pir::PirProofSource,
         network: Network,
     ) -> Result<DelegationPirPrecomputeResult, VotingError> {
         let wallet_id = self.wallet_id();
@@ -1074,7 +1074,7 @@ impl VotingDb {
         round_id: &str,
         bundle_index: u32,
         notes: &[NoteInfo],
-        pir_client: &pir_client::PirClientBlocking,
+        pir_client: &dyn crate::pir::PirProofSource,
         network: Network,
     ) -> Result<DelegationPirPrecomputeResult, VotingError> {
         let (params, padded_nullifiers) = {
@@ -1146,7 +1146,7 @@ impl VotingDb {
         notes: &[NoteInfo],
         bundle_policy: BundlePolicy,
         network: Network,
-        pir_client: &pir_client::PirClientBlocking,
+        pir_client: &dyn crate::pir::PirProofSource,
     ) -> Result<PirCachePrecomputeResult, VotingError> {
         let wallet_id = self.wallet_id();
         let notes = crate::note_bundling::notes_for_pir_proof_cache(notes, bundle_policy)?;
@@ -1409,7 +1409,7 @@ impl VotingDb {
         identity: &DelegationProofIdentity,
         notes: &[NoteInfo],
         keys: &DelegationKeys,
-        pir_client: &pir_client::PirClientBlocking,
+        pir_client: &dyn crate::pir::PirProofSource,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationProofResult, VotingError> {
         let wallet_id = identity.wallet_id();
