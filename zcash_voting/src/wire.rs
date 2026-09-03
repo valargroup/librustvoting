@@ -271,10 +271,67 @@ pub struct SubmissionDiagnosticView {
     pub message: String,
 }
 
+/// Discriminator of a [`NextStepView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NextStepKind {
+    Delegate,
+    AdvanceDelegation,
+    AdvanceImportedDelegation,
+    CastVote,
+    AdvanceVote,
+    AdvanceVoteBatch,
+    SubmitShares,
+    ConfirmShare,
+}
+
+/// High-level work area a wallet should show or resume for a round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundPlanActionKind {
+    Idle,
+    Delegate,
+    Vote,
+    SubmitShares,
+    Done,
+}
+
+/// Kind of grouped delegation recovery work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationRecoveryWorkKindView {
+    Delegate,
+    AdvanceDelegation,
+    AdvanceImportedDelegation,
+}
+
+/// Kind of grouped vote recovery work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoteRecoveryWorkKindView {
+    AdvanceVote,
+    AdvanceVoteBatch,
+    SubmitShares,
+}
+
+/// Cross-stage workflow phase of a delegation, vote, or share record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPhaseView {
+    Prepared,
+    Signed,
+    SubmittedDelegation,
+    SubmittedVote,
+    SubmittedShare,
+    SubmissionManaged,
+    SubmissionRejected,
+    Confirmed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationRecoveryView {
     pub bundle_index: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub tx_hash: Option<String>,
     /// Confirmed VAN leaf position, if delegation has been projected.
     pub van_leaf_position: Option<u64>,
@@ -287,7 +344,7 @@ pub struct VoteRecoveryView {
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub choice: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub tx_hash: Option<String>,
     pub vc_tree_position: Option<u64>,
     pub has_commitment_bundle: bool,
@@ -315,7 +372,7 @@ pub struct ShareDelegationRecordView {
     #[serde(default)]
     pub target_count: u32,
     pub nullifier: Vec<u8>,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub confirmed: bool,
     pub submit_at: u64,
     pub created_at: u64,
@@ -326,11 +383,11 @@ pub struct ShareWorkflowRecoveryView {
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub share_index: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NextStepView {
-    pub kind: String,
+    pub kind: NextStepKind,
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub choice: u32,
@@ -352,7 +409,7 @@ pub struct RoundRecoveryStateView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationStatusView {
     pub bundle_index: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub tx_hash: Option<String>,
     #[serde(default)]
     pub submission_diagnostic: Option<SubmissionDiagnosticView>,
@@ -360,15 +417,15 @@ pub struct DelegationStatusView {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationRecoveryWorkView {
-    pub kind: String,
+    pub kind: DelegationRecoveryWorkKindView,
     pub bundle_index: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub tx_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteRecoveryWorkView {
-    pub kind: String,
+    pub kind: VoteRecoveryWorkKindView,
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub tx_hash: Option<String>,
@@ -416,7 +473,7 @@ pub struct RoundPlanView {
     /// True when any vote or share work remains, counting share confirmation
     /// unconditionally.
     pub has_recoverable_vote_or_share_work: bool,
-    pub primary_action: String,
+    pub primary_action: RoundPlanActionKind,
     pub next_steps: Vec<NextStepView>,
     pub delegation_statuses: Vec<DelegationStatusView>,
     pub recovered_delegation_work: Vec<DelegationRecoveryWorkView>,

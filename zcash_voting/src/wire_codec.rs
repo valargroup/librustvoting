@@ -582,7 +582,7 @@ impl From<recovery::DelegationRecovery> for DelegationRecoveryView {
     fn from(record: recovery::DelegationRecovery) -> Self {
         Self {
             bundle_index: record.bundle_index,
-            phase: record.workflow_phase().as_str().to_string(),
+            phase: record.workflow_phase().into(),
             tx_hash: record.tx_hash,
             van_leaf_position: record.van_leaf_position,
             submission_diagnostic: record.submission_diagnostic.map(Into::into),
@@ -596,7 +596,7 @@ impl From<recovery::VoteRecovery> for VoteRecoveryView {
             bundle_index: record.bundle_index,
             proposal_id: record.proposal_id,
             choice: record.choice,
-            phase: record.workflow_phase().as_str().to_string(),
+            phase: record.workflow_phase().into(),
             tx_hash: record.tx_hash,
             vc_tree_position: record.vc_tree_position,
             has_commitment_bundle: record.has_commitment_bundle,
@@ -622,9 +622,9 @@ impl From<crate::types::ShareDelegationRecord> for ShareDelegationRecordView {
             target_count: record.target_count,
             nullifier: record.nullifier,
             phase: if record.confirmed {
-                WorkflowPhase::Confirmed.as_str().to_string()
+                WorkflowPhase::Confirmed.into()
             } else {
-                WorkflowPhase::SubmittedShare.as_str().to_string()
+                WorkflowPhase::SubmittedShare.into()
             },
             confirmed: record.confirmed,
             submit_at: record.submit_at,
@@ -639,7 +639,7 @@ impl From<recovery::ShareWorkflow> for ShareWorkflowRecoveryView {
             bundle_index: record.bundle_index,
             proposal_id: record.proposal_id,
             share_index: record.share_index,
-            phase: record.workflow_phase().as_str().to_string(),
+            phase: record.workflow_phase().into(),
         }
     }
 }
@@ -671,7 +671,7 @@ impl TryFrom<session::NextStep> for NextStepView {
     type Error = VotingError;
 
     fn try_from(step: session::NextStep) -> Result<Self, Self::Error> {
-        let kind = step.kind().to_string();
+        let kind = step.kind_view();
         match step {
             session::NextStep::Delegate { bundle_index }
             | session::NextStep::AdvanceDelegation { bundle_index }
@@ -731,9 +731,7 @@ impl From<session::DelegationStatus> for DelegationStatusView {
     fn from(status: session::DelegationStatus) -> Self {
         Self {
             bundle_index: status.bundle_index,
-            phase: WorkflowPhase::for_delegation(status.phase)
-                .as_str()
-                .to_string(),
+            phase: WorkflowPhase::for_delegation(status.phase).into(),
             tx_hash: status.tx_hash,
             submission_diagnostic: status.submission_diagnostic.map(Into::into),
         }
@@ -743,11 +741,9 @@ impl From<session::DelegationStatus> for DelegationStatusView {
 impl From<session::DelegationRecoveryWork> for DelegationRecoveryWorkView {
     fn from(work: session::DelegationRecoveryWork) -> Self {
         Self {
-            kind: work.kind.as_str().to_string(),
+            kind: work.kind.into(),
             bundle_index: work.bundle_index,
-            phase: WorkflowPhase::for_delegation(work.phase)
-                .as_str()
-                .to_string(),
+            phase: WorkflowPhase::for_delegation(work.phase).into(),
             tx_hash: work.tx_hash,
         }
     }
@@ -756,7 +752,7 @@ impl From<session::DelegationRecoveryWork> for DelegationRecoveryWorkView {
 impl From<session::VoteRecoveryWork> for VoteRecoveryWorkView {
     fn from(work: session::VoteRecoveryWork) -> Self {
         Self {
-            kind: work.kind.as_str().to_string(),
+            kind: work.kind.into(),
             bundle_index: work.bundle_index,
             proposal_id: work.proposal_id,
             tx_hash: work.tx_hash,
@@ -803,7 +799,7 @@ impl TryFrom<session::RoundPlan> for RoundPlanView {
             needs_vote_polling: plan.needs_vote_polling,
             has_remaining_vote_or_share_work: plan.has_remaining_vote_or_share_work,
             has_recoverable_vote_or_share_work: plan.has_recoverable_vote_or_share_work,
-            primary_action: plan.primary_action.as_str().to_string(),
+            primary_action: plan.primary_action.into(),
             next_steps: plan
                 .next_steps
                 .into_iter()
@@ -2017,7 +2013,7 @@ mod tests {
             Some(123)
         );
         assert!(!view.needs_draft_setup);
-        assert_eq!(view.primary_action, "vote");
+        assert_eq!(view.primary_action, crate::wire::RoundPlanActionKind::Vote);
         assert_eq!(view.open_proposals, vec![11, 12]);
         assert_eq!(
             view.immediate_share_key,
@@ -2032,7 +2028,13 @@ mod tests {
         let kinds = view
             .next_steps
             .iter()
-            .map(|step| step.kind.as_str())
+            .map(|step| {
+                serde_json::to_value(step.kind)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
@@ -2053,19 +2055,34 @@ mod tests {
         assert_eq!(view.next_steps[2].proposal_id, 11);
         assert_eq!(view.next_steps[2].choice, 1);
         assert_eq!(view.next_steps[8].share_index, 1);
-        assert_eq!(view.delegation_statuses[0].phase, "submitted_delegation");
-        assert_eq!(view.recovered_delegation_work[0].kind, "advance_delegation");
+        assert_eq!(
+            view.delegation_statuses[0].phase,
+            crate::wire::WorkflowPhaseView::SubmittedDelegation
+        );
+        assert_eq!(
+            view.recovered_delegation_work[0].kind,
+            crate::wire::DelegationRecoveryWorkKindView::AdvanceDelegation
+        );
         assert_eq!(
             view.recovered_delegation_work[1].kind,
-            "advance_imported_delegation"
+            crate::wire::DelegationRecoveryWorkKindView::AdvanceImportedDelegation
         );
-        assert_eq!(view.recovered_vote_work[0].kind, "advance_vote_batch");
-        assert_eq!(view.recovered_vote_work[1].kind, "advance_vote_batch");
+        assert_eq!(
+            view.recovered_vote_work[0].kind,
+            crate::wire::VoteRecoveryWorkKindView::AdvanceVoteBatch
+        );
+        assert_eq!(
+            view.recovered_vote_work[1].kind,
+            crate::wire::VoteRecoveryWorkKindView::AdvanceVoteBatch
+        );
         assert_eq!(
             view.recovered_vote_work[1].tx_hash.as_deref(),
             Some("batch-tx")
         );
-        assert_eq!(view.recovered_vote_work[2].kind, "submit_shares");
+        assert_eq!(
+            view.recovered_vote_work[2].kind,
+            crate::wire::VoteRecoveryWorkKindView::SubmitShares
+        );
         assert_eq!(view.recovered_vote_work[2].vc_tree_position, Some(99));
         assert_eq!(view.recovered_vote_work[2].share_indexes, vec![0, 1]);
     }

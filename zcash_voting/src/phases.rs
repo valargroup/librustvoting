@@ -181,21 +181,22 @@ impl DelegationPhase {
     }
 }
 
-impl WorkflowPhase {
-    /// Returns the stable string used by FFI layers and UI state machines.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Prepared => "prepared",
-            Self::Signed => "signed",
-            Self::SubmittedDelegation => "submitted_delegation",
-            Self::SubmittedVote => "submitted_vote",
-            Self::SubmittedShare => "submitted_share",
-            Self::SubmissionManaged => "submission_managed",
-            Self::SubmissionRejected => "submission_rejected",
-            Self::Confirmed => "confirmed",
+impl From<WorkflowPhase> for crate::wire::WorkflowPhaseView {
+    fn from(phase: WorkflowPhase) -> Self {
+        match phase {
+            WorkflowPhase::Prepared => Self::Prepared,
+            WorkflowPhase::Signed => Self::Signed,
+            WorkflowPhase::SubmittedDelegation => Self::SubmittedDelegation,
+            WorkflowPhase::SubmittedVote => Self::SubmittedVote,
+            WorkflowPhase::SubmittedShare => Self::SubmittedShare,
+            WorkflowPhase::SubmissionManaged => Self::SubmissionManaged,
+            WorkflowPhase::SubmissionRejected => Self::SubmissionRejected,
+            WorkflowPhase::Confirmed => Self::Confirmed,
         }
     }
+}
 
+impl WorkflowPhase {
     /// Converts a canonical delegation phase into the merged workflow phase.
     pub fn for_delegation(phase: DelegationPhase) -> Self {
         match phase {
@@ -662,6 +663,15 @@ fn authoritative_submission_phase(state: Option<&str>) -> Option<VotePhase> {
 
 #[cfg(test)]
 mod tests {
+    /// Serde label of the wire view, so the tests keep asserting the stable
+    /// strings hosts saw before the view became an enum.
+    fn label(phase: super::WorkflowPhase) -> String {
+        serde_json::to_value(crate::wire::WorkflowPhaseView::from(phase))
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
     use super::*;
     use crate::{round::RoundParams, storage::VotingDb, types::NoteInfo};
 
@@ -841,65 +851,69 @@ mod tests {
     #[test]
     fn workflow_phase_mapping_and_strings_are_stable() {
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::Prepared).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::Prepared)),
             "prepared"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::PcztBuilt).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::PcztBuilt)),
             "signed"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::Proved).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::Proved)),
             "signed"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::SubmissionManaged).as_str(),
+            label(WorkflowPhase::for_delegation(
+                DelegationPhase::SubmissionManaged
+            )),
             "submission_managed"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::SubmissionRejected).as_str(),
+            label(WorkflowPhase::for_delegation(
+                DelegationPhase::SubmissionRejected
+            )),
             "submission_rejected"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::Submitted).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::Submitted)),
             "submitted_delegation"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::Confirmed).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::Confirmed)),
             "confirmed"
         );
 
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::Prepared).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::Prepared)),
             "prepared"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::Committed).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::Committed)),
             "signed"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::Submitted).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::Submitted)),
             "submitted_vote"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::SubmissionManaged).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::SubmissionManaged)),
             "submission_managed"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::SubmissionRejected).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::SubmissionRejected)),
             "submission_rejected"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::Confirmed).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::Confirmed)),
             "confirmed"
         );
 
         assert_eq!(
-            WorkflowPhase::for_share(SharePhase::Submitted).as_str(),
+            label(WorkflowPhase::for_share(SharePhase::Submitted)),
             "submitted_share"
         );
         assert_eq!(
-            WorkflowPhase::for_share(SharePhase::Confirmed).as_str(),
+            label(WorkflowPhase::for_share(SharePhase::Confirmed)),
             "confirmed"
         );
     }

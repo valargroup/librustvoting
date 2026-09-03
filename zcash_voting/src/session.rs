@@ -326,17 +326,26 @@ pub enum NextStep {
 }
 
 impl NextStep {
-    /// Returns the stable string discriminator used by FFI layers.
-    pub fn kind(&self) -> &'static str {
+    /// Typed discriminator exposed to hosts through [`crate::wire::NextStepView`].
+    ///
+    /// Hosts match on the enum rather than a string, so a new step kind is a
+    /// compile-time event for them instead of a silently unmatched label:
+    ///
+    /// ```compile_fail
+    /// let step = zcash_voting::session::NextStep::Delegate { bundle_index: 0 };
+    /// let _: &str = step.kind();
+    /// ```
+    pub fn kind_view(&self) -> crate::wire::NextStepKind {
+        use crate::wire::NextStepKind as Kind;
         match self {
-            Self::Delegate { .. } => "delegate",
-            Self::AdvanceDelegation { .. } => "advance_delegation",
-            Self::AdvanceImportedDelegation { .. } => "advance_imported_delegation",
-            Self::CastVote { .. } => "cast_vote",
-            Self::AdvanceVote { .. } => "advance_vote",
-            Self::AdvanceVoteBatch { .. } => "advance_vote_batch",
-            Self::SubmitShares { .. } => "submit_shares",
-            Self::ConfirmShare { .. } => "confirm_share",
+            Self::Delegate { .. } => Kind::Delegate,
+            Self::AdvanceDelegation { .. } => Kind::AdvanceDelegation,
+            Self::AdvanceImportedDelegation { .. } => Kind::AdvanceImportedDelegation,
+            Self::CastVote { .. } => Kind::CastVote,
+            Self::AdvanceVote { .. } => Kind::AdvanceVote,
+            Self::AdvanceVoteBatch { .. } => Kind::AdvanceVoteBatch,
+            Self::SubmitShares { .. } => Kind::SubmitShares,
+            Self::ConfirmShare { .. } => Kind::ConfirmShare,
         }
     }
 }
@@ -357,15 +366,14 @@ pub enum RoundPlanAction {
     Done,
 }
 
-impl RoundPlanAction {
-    /// Returns the stable string discriminator used by FFI layers.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Delegate => "delegate",
-            Self::Vote => "vote",
-            Self::SubmitShares => "submit_shares",
-            Self::Done => "done",
+impl From<RoundPlanAction> for crate::wire::RoundPlanActionKind {
+    fn from(action: RoundPlanAction) -> Self {
+        match action {
+            RoundPlanAction::Idle => Self::Idle,
+            RoundPlanAction::Delegate => Self::Delegate,
+            RoundPlanAction::Vote => Self::Vote,
+            RoundPlanAction::SubmitShares => Self::SubmitShares,
+            RoundPlanAction::Done => Self::Done,
         }
     }
 }
@@ -382,13 +390,14 @@ pub enum DelegationRecoveryWorkKind {
     AdvanceImportedDelegation,
 }
 
-impl DelegationRecoveryWorkKind {
-    /// Returns the stable string discriminator used by FFI layers.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Delegate => "delegate",
-            Self::AdvanceDelegation => "advance_delegation",
-            Self::AdvanceImportedDelegation => "advance_imported_delegation",
+impl From<DelegationRecoveryWorkKind> for crate::wire::DelegationRecoveryWorkKindView {
+    fn from(kind: DelegationRecoveryWorkKind) -> Self {
+        match kind {
+            DelegationRecoveryWorkKind::Delegate => Self::Delegate,
+            DelegationRecoveryWorkKind::AdvanceDelegation => Self::AdvanceDelegation,
+            DelegationRecoveryWorkKind::AdvanceImportedDelegation => {
+                Self::AdvanceImportedDelegation
+            }
         }
     }
 }
@@ -431,13 +440,12 @@ pub enum VoteRecoveryWorkKind {
     SubmitShares,
 }
 
-impl VoteRecoveryWorkKind {
-    /// Returns the stable string discriminator used by FFI layers.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::AdvanceVote => "advance_vote",
-            Self::AdvanceVoteBatch => "advance_vote_batch",
-            Self::SubmitShares => "submit_shares",
+impl From<VoteRecoveryWorkKind> for crate::wire::VoteRecoveryWorkKindView {
+    fn from(kind: VoteRecoveryWorkKind) -> Self {
+        match kind {
+            VoteRecoveryWorkKind::AdvanceVote => Self::AdvanceVote,
+            VoteRecoveryWorkKind::AdvanceVoteBatch => Self::AdvanceVoteBatch,
+            VoteRecoveryWorkKind::SubmitShares => Self::SubmitShares,
         }
     }
 }
@@ -2340,12 +2348,12 @@ mod tests {
                 share_index: 0,
             },
         ] {
-            let kind = step.kind();
+            let kind = step.kind_view();
             let summary = summarize_plan_work(&[step], false);
-            assert!(summary.needs_vote_polling, "{kind}");
-            assert!(summary.has_remaining_vote_or_share_work, "{kind}");
-            assert!(summary.has_recoverable_vote_or_share_work, "{kind}");
-            assert!(!summary.needs_delegation_signing, "{kind}");
+            assert!(summary.needs_vote_polling, "{kind:?}");
+            assert!(summary.has_remaining_vote_or_share_work, "{kind:?}");
+            assert!(summary.has_recoverable_vote_or_share_work, "{kind:?}");
+            assert!(!summary.needs_delegation_signing, "{kind:?}");
         }
 
         // Share confirmation is always recoverable work, but only counts as
