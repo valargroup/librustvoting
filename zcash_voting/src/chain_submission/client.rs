@@ -65,6 +65,50 @@ pub struct ChainSubmissionClientConfig {
     pub retry_backoffs: Vec<Duration>,
 }
 
+/// Default time to track a candidate hash before entering recovery.
+pub const DEFAULT_CHAIN_TRACKING_WINDOW: Duration = Duration::from_secs(90);
+/// Default POST attempts per advancement call.
+pub const DEFAULT_CHAIN_MAXIMUM_POST_ATTEMPTS: usize = 3;
+/// Default delays between the default POST attempts.
+pub const DEFAULT_CHAIN_RETRY_BACKOFFS: [Duration; 2] =
+    [Duration::from_secs(2), Duration::from_secs(4)];
+
+impl ChainSubmissionClientConfig {
+    /// Configuration for `network` with the conventional chain id and the
+    /// SDK's default tracking and retry policy.
+    ///
+    /// `endpoints` are validated when the client is constructed.
+    pub fn for_network(network: Network, endpoints: Vec<String>) -> Self {
+        Self {
+            network,
+            vote_chain_id: network.default_vote_chain_id().to_string(),
+            endpoints,
+            tracking_window: DEFAULT_CHAIN_TRACKING_WINDOW,
+            maximum_post_attempts: DEFAULT_CHAIN_MAXIMUM_POST_ATTEMPTS,
+            retry_backoffs: DEFAULT_CHAIN_RETRY_BACKOFFS.to_vec(),
+        }
+    }
+
+    /// Overrides the chain id, for deployments that publish it in configuration.
+    pub fn with_vote_chain_id(mut self, vote_chain_id: impl Into<String>) -> Self {
+        self.vote_chain_id = vote_chain_id.into();
+        self
+    }
+
+    /// Overrides the tracking window.
+    pub fn with_tracking_window(mut self, tracking_window: Duration) -> Self {
+        self.tracking_window = tracking_window;
+        self
+    }
+
+    /// Overrides the POST budget; `retry_backoffs` must hold `attempts - 1` delays.
+    pub fn with_post_attempts(mut self, attempts: usize, retry_backoffs: Vec<Duration>) -> Self {
+        self.maximum_post_attempts = attempts;
+        self.retry_backoffs = retry_backoffs;
+        self
+    }
+}
+
 /// Host-owned cancellation and session-epoch authority for bounded calls.
 ///
 /// Clones share both values. Cancellation and epoch changes are observed at

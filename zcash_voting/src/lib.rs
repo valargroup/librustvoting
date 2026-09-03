@@ -94,7 +94,10 @@ pub use pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, ImtProofData, NegotiatedPirLayout,
     PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
-pub use transport::{PirHttpFailure, PirHttpFailurePhase};
+pub use transport::{
+    DirectRoute, PirHttpFailure, PirHttpFailurePhase, RouteError, RouteFuture, RouteHttp,
+    RoutePhase, RouteRequest, RouteResponse,
+};
 pub use vote_work::{
     NoopVoteRecoveryProgressReporter, VoteRecoveryAdvance, VoteRecoveryDisposition,
     VoteRecoveryExecutor, VoteRecoveryFailure, VoteRecoveryFailureKind, VoteRecoveryKey,

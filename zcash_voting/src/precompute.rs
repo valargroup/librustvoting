@@ -121,7 +121,22 @@ pub fn verify_witness(witness: &WitnessData) -> Result<(), VotingError> {
 /// For each confirmed bundle that has not yet submitted a vote, this also
 /// verifies that the confirmed event position contains its delegation VAN.
 pub fn sync_vote_tree(db: &VotingDb, round_id: &str, node_url: &str) -> Result<u32, VotingError> {
-    vote_tree_sync_for(db)?.sync(db, round_id, node_url)
+    vote_tree_sync_for(db, None)?.sync(db, round_id, node_url)
+}
+
+/// Same as [`sync_vote_tree`], but the wallet's tree client is created over
+/// `transport` when it does not exist yet.
+///
+/// The process keeps one tree client per wallet; once created, it keeps its
+/// transport until [`reset_vote_tree`] with an empty round id or process
+/// exit. Pass the same transport on every call for a wallet.
+pub fn sync_vote_tree_with(
+    db: &VotingDb,
+    round_id: &str,
+    node_url: &str,
+    transport: Arc<dyn vote_commitment_tree_client::transport::Transport>,
+) -> Result<u32, VotingError> {
+    vote_tree_sync_for(db, Some(transport))?.sync(db, round_id, node_url)
 }
 
 /// Generates the VAN witness needed by `vote::commit`.
@@ -131,12 +146,27 @@ pub fn van_witness(
     bundle_index: u32,
     anchor_height: u32,
 ) -> Result<VanWitness, VotingError> {
-    vote_tree_sync_for(db)?.generate_van_witness(db, round_id, bundle_index, anchor_height)
+    vote_tree_sync_for(db, None)?.generate_van_witness(db, round_id, bundle_index, anchor_height)
 }
 
 /// Drops cached vote tree state for one round, or all rounds when `round_id` is empty.
 pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError> {
-    vote_tree_sync_for(db)?.reset(round_id)
+    if round_id.is_empty() {
+        // An account-wide reset also forgets the transport the client was
+        // created with, so the next sync can bind a different one.
+        let wallet_id = db.wallet_id();
+        let mut guard = VOTE_TREE_SYNCS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|e| VotingError::Internal {
+                message: format!("vote tree sync registry lock poisoned: {e}"),
+            })?;
+        if let Some(sync) = guard.remove(&wallet_id) {
+            sync.reset("")?;
+        }
+        return Ok(());
+    }
+    vote_tree_sync_for(db, None)?.reset(round_id)
 }
 
 /// Drops cached vote tree state and, for round-scoped resets, clears locally
@@ -163,7 +193,10 @@ pub fn reset_voting_session_state(db: &VotingDb, round_id: &str) -> Result<(), V
     Ok(())
 }
 
-fn vote_tree_sync_for(db: &VotingDb) -> Result<Arc<crate::tree_sync::VoteTreeSync>, VotingError> {
+fn vote_tree_sync_for(
+    db: &VotingDb,
+    transport: Option<Arc<dyn vote_commitment_tree_client::transport::Transport>>,
+) -> Result<Arc<crate::tree_sync::VoteTreeSync>, VotingError> {
     let wallet_id = db.wallet_id();
     let mut guard = VOTE_TREE_SYNCS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -173,7 +206,12 @@ fn vote_tree_sync_for(db: &VotingDb) -> Result<Arc<crate::tree_sync::VoteTreeSyn
         })?;
     Ok(guard
         .entry(wallet_id)
-        .or_insert_with(|| Arc::new(crate::tree_sync::VoteTreeSync::new()))
+        .or_insert_with(|| {
+            Arc::new(match transport {
+                Some(transport) => crate::tree_sync::VoteTreeSync::with_transport(transport),
+                None => crate::tree_sync::VoteTreeSync::new(),
+            })
+        })
         .clone())
 }
 

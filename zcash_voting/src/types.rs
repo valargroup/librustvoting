@@ -252,6 +252,22 @@ pub enum Network {
     Regtest,
 }
 
+impl Network {
+    /// Vote-chain deployment identifier conventionally paired with this
+    /// network: `zvote-1` for mainnet and `svote-1` for the shared
+    /// staging chain used by testnet and regtest wallets.
+    ///
+    /// This is a convention, not an authenticated value; a deployment that
+    /// rotates chain ids must supply the id from configuration through
+    /// [`crate::ChainSubmissionClientConfig::with_vote_chain_id`].
+    pub fn default_vote_chain_id(self) -> &'static str {
+        match self {
+            Self::Mainnet => "zvote-1",
+            Self::Testnet | Self::Regtest => "svote-1",
+        }
+    }
+}
+
 impl Parameters for Network {
     fn network_type(&self) -> NetworkType {
         match self {

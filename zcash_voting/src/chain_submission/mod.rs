@@ -155,6 +155,8 @@ mod tests;
 pub use client::{
     AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch, ChainRecoveryMode,
     ChainSubmissionClient, ChainSubmissionClientConfig, ChainSubmissionControl,
+    DEFAULT_CHAIN_MAXIMUM_POST_ATTEMPTS, DEFAULT_CHAIN_RETRY_BACKOFFS,
+    DEFAULT_CHAIN_TRACKING_WINDOW,
 };
 #[cfg(test)]
 pub(crate) use generation::generation_for_vote;

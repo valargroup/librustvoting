@@ -347,14 +347,22 @@ impl RoundTreeClient {
 /// lock, so a remote sync cannot block unrelated rounds for the same wallet.
 pub struct VoteTreeSync {
     clients: Mutex<HashMap<String, Arc<Mutex<RoundTreeClient>>>>,
-    transport: Arc<HyperTransport>,
+    transport: Arc<dyn vote_commitment_tree_client::transport::Transport>,
 }
 
 impl VoteTreeSync {
+    /// Creates a tree sync over the SDK's direct HTTP transport.
     pub fn new() -> Self {
+        Self::with_transport(Arc::new(HyperTransport::new()))
+    }
+
+    /// Creates a tree sync over a host-supplied transport.
+    pub fn with_transport(
+        transport: Arc<dyn vote_commitment_tree_client::transport::Transport>,
+    ) -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
-            transport: Arc::new(HyperTransport::new()),
+            transport,
         }
     }
 

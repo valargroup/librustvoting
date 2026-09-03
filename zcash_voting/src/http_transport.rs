@@ -1,6 +1,14 @@
-use std::{future::Future, pin::Pin, sync::OnceLock, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+    time::Duration,
+};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use http::{Method, Request};
 use http_body_util::{BodyExt, Full, Limited};
@@ -56,11 +64,6 @@ const TREE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 // The helper body ceiling is a protocol property, so it comes from the
 // transport contract rather than being chosen here. The deadline stays
 // caller-supplied, because helper retry cadence is a policy decision.
-
-struct HyperResponse {
-    status: u16,
-    body: Vec<u8>,
-}
 
 /// Where a PIR HTTP request failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,38 +128,135 @@ impl PirHttpFailure {
     }
 }
 
-/// Hyper HTTP transport for client-side network requests.
-///
-/// `zcash_voting` keeps PIR, tree-sync, helper, and vote-chain traffic behind
-/// small transport traits, and includes this adapter for consumers that want
-/// pooled HTTP traffic without implementing those protocol transports.
-/// [`Self::new`] uses direct HTTP/HTTPS; hosts can instead inject a connector
-/// for proxies, custom DNS, or route-lifecycle enforcement.
-pub struct HyperTransport {
-    client: Box<dyn HyperRequestClient>,
-    runtime: BlockingRuntime,
+/// One HTTP request handed to a [`RouteHttp`] executor.
+pub struct RouteRequest<'a> {
+    pub method: Method,
+    pub url: &'a str,
+    /// Protocol headers the SDK requires for this request.
+    pub headers: &'a [(String, String)],
+    pub body: Vec<u8>,
+    /// Deadline for the complete request: connection setup, dispatch, and
+    /// body read. The SDK enforces the same deadline as a backstop.
+    pub timeout: Duration,
+    /// Response body ceiling. Executors stop reading at this size and fail
+    /// with [`RoutePhase::ResponseRead`].
+    pub max_response_bytes: usize,
 }
 
-impl HyperTransport {
-    /// Creates the default direct HTTP/HTTPS transport.
+/// Response produced by a [`RouteHttp`] executor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RouteResponse {
+    fn content_type(&self) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone())
+    }
+}
+
+/// Where a [`RouteHttp`] request failed relative to dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutePhase {
+    /// No request byte reached a network stack that could deliver it.
+    BeforeDispatch,
+    /// The request may have been delivered; no response headers arrived.
+    AfterDispatch,
+    /// Response headers arrived, but the body could not be read completely.
+    ResponseRead,
+}
+
+/// Failure reported by a [`RouteHttp`] executor.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct RouteError {
+    pub phase: RoutePhase,
+    pub message: String,
+}
+
+impl RouteError {
+    pub fn before_dispatch(message: impl Into<String>) -> Self {
+        Self {
+            phase: RoutePhase::BeforeDispatch,
+            message: message.into(),
+        }
+    }
+
+    pub fn after_dispatch(message: impl Into<String>) -> Self {
+        Self {
+            phase: RoutePhase::AfterDispatch,
+            message: message.into(),
+        }
+    }
+
+    pub fn response_read(message: impl Into<String>) -> Self {
+        Self {
+            phase: RoutePhase::ResponseRead,
+            message: message.into(),
+        }
+    }
+}
+
+/// Boxed future returned by [`RouteHttp::execute`].
+pub type RouteFuture<'a> =
+    Pin<Box<dyn Future<Output = std::result::Result<RouteResponse, RouteError>> + Send + 'a>>;
+
+/// Host-owned request executor behind [`HyperTransport`].
+///
+/// The SDK owns protocol headers, deadlines, response limits, and the
+/// definite-versus-ambiguous classification every transport trait needs. An
+/// executor owns only how one request reaches the network, so a wallet that
+/// routes voting traffic through Tor or a proxy implements this trait once and
+/// gets PIR, tree-sync, helper, and vote-chain transports from it.
+///
+/// Contract:
+///
+/// - Call `on_dispatch` immediately before the first request byte can reach
+///   a network stack able to deliver it. Every failure after that call is
+///   classified as possibly delivered, so calling it earlier than necessary
+///   only makes classification more conservative; never calling it before
+///   dispatch would misreport an ambiguous POST as safe to retry.
+/// - Fail closed. When the configured route is unavailable, return
+///   [`RoutePhase::BeforeDispatch`]; never fall back to a direct connection.
+/// - Honor `max_response_bytes`, and `timeout` where the executor can bound
+///   work the SDK cannot cancel. The SDK enforces `timeout` around the whole
+///   call and classifies its own deadline by whether the hook was called.
+/// - Report `phase` truthfully. It is consulted for failures the dispatch hook
+///   cannot classify, such as a body-read failure after headers arrived.
+pub trait RouteHttp: Send + Sync + 'static {
+    fn execute<'a>(
+        &'a self,
+        request: RouteRequest<'a>,
+        on_dispatch: &'a (dyn Fn() + Send + Sync),
+    ) -> RouteFuture<'a>;
+}
+
+/// SDK-owned direct HTTP/HTTPS executor with a pooled Hyper client.
+pub struct DirectRoute {
+    client: Box<dyn HyperRequestClient>,
+}
+
+impl DirectRoute {
+    /// Creates the default direct HTTP/HTTPS executor.
     pub fn new() -> Self {
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
         Self::with_http_connector(connector)
     }
 
-    /// Creates a transport by applying the SDK's standard Rustls configuration
-    /// to a caller-supplied raw HTTP connector.
+    /// Applies the SDK's standard Rustls configuration to a caller-supplied
+    /// raw HTTP connector.
     ///
     /// This preserves WebPKI roots, HTTP/1 and HTTP/2 support, and cleartext
     /// HTTP compatibility while letting the host control how sockets are
-    /// opened. In particular, a wallet can wrap returned I/O with its own
-    /// proxy or route-lifecycle guard without reimplementing request handling.
-    ///
-    /// Hyper pools connections. A host whose route can change must ensure that
-    /// already-open I/O is closed or made unusable when the old route is no
-    /// longer permitted; selecting a route only when this connector is called
-    /// is not sufficient for idle pooled connections.
+    /// opened. Hyper pools connections: a host whose route can change must
+    /// close or invalidate already-open I/O when the old route is no longer
+    /// permitted, or route every request through its own [`RouteHttp`].
     pub fn with_http_connector<C>(connector: C) -> Self
     where
         HttpsConnector<C>: Connect + Clone + Send + Sync + 'static,
@@ -171,13 +271,7 @@ impl HyperTransport {
         Self::with_connector(https)
     }
 
-    /// Creates a transport from a fully configured Hyper connector.
-    ///
-    /// Unlike [`Self::with_http_connector`], this does not add TLS or install a
-    /// Rustls crypto provider. The caller owns all scheme, TLS, trust-root, and
-    /// routing behavior supplied by the connector. Request deadlines,
-    /// response limits, response metadata, and ambiguous-outcome
-    /// classification remain enforced for helper and vote-chain traffic.
+    /// Uses a fully configured Hyper connector without adding TLS.
     pub fn with_connector<C>(connector: C) -> Self
     where
         C: Connect + Clone + Send + Sync + 'static,
@@ -185,48 +279,267 @@ impl HyperTransport {
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Self {
             client: Box::new(client),
+        }
+    }
+}
+
+impl Default for DirectRoute {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RouteHttp for DirectRoute {
+    fn execute<'a>(
+        &'a self,
+        request: RouteRequest<'a>,
+        on_dispatch: &'a (dyn Fn() + Send + Sync),
+    ) -> RouteFuture<'a> {
+        Box::pin(async move {
+            let mut builder = Request::builder().method(request.method).uri(request.url);
+            for (name, value) in request.headers {
+                builder = builder.header(name, value);
+            }
+            let hyper_request =
+                builder
+                    .body(Full::new(Bytes::from(request.body)))
+                    .map_err(|error| {
+                        RouteError::before_dispatch(format!("build HTTP request: {error}"))
+                    })?;
+            let max_response_bytes = request.max_response_bytes;
+            // The SDK enforces `request.timeout` around this future, and a
+            // deadline it observes is classified by the dispatch hook, so no
+            // second deadline is applied here.
+            async move {
+                // Hyper offers no hook between connection setup and the first
+                // request byte, so dispatch is marked before the request is
+                // handed over. A connect failure is reported distinctly and
+                // reclassified as pre-dispatch below.
+                on_dispatch();
+                let response = self.client.request(hyper_request).await.map_err(|error| {
+                    let message = format!("send HTTP request: {error}");
+                    if error.is_connect() {
+                        RouteError::before_dispatch(message)
+                    } else {
+                        RouteError::after_dispatch(message)
+                    }
+                })?;
+                let status = response.status().as_u16();
+                let headers = response
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), value.to_string()))
+                    })
+                    .collect();
+                let body = Limited::new(response.into_body(), max_response_bytes)
+                    .collect()
+                    .await
+                    .map_err(|error| {
+                        RouteError::response_read(format!(
+                            "read HTTP response body (limit {max_response_bytes} bytes): {error}"
+                        ))
+                    })?
+                    .to_bytes()
+                    .to_vec();
+                Ok(RouteResponse {
+                    status,
+                    headers,
+                    body,
+                })
+            }
+            .await
+        })
+    }
+}
+
+/// Failure of one routed request with the SDK's own dispatch observation.
+struct RoutedFailure {
+    /// Whether the executor called the dispatch hook before failing.
+    dispatched: bool,
+    /// Whether the SDK backstop deadline fired.
+    timed_out: bool,
+    error: RouteError,
+}
+
+/// HTTP transport for client-side network requests.
+///
+/// `zcash_voting` keeps PIR, tree-sync, helper, and vote-chain traffic behind
+/// small transport traits. This adapter implements all of them over one
+/// [`RouteHttp`] executor: [`Self::new`] uses the SDK's direct HTTP/HTTPS
+/// executor, and [`Self::with_route`] lets a host supply its own for Tor,
+/// proxies, or route-lifecycle enforcement. Deadlines, response limits,
+/// response metadata, and ambiguous-outcome classification are applied here,
+/// once, regardless of the executor.
+pub struct HyperTransport<R: RouteHttp = DirectRoute> {
+    route: Arc<R>,
+    runtime: BlockingRuntime,
+}
+
+impl HyperTransport<DirectRoute> {
+    /// Creates the default direct HTTP/HTTPS transport.
+    pub fn new() -> Self {
+        Self::with_route(DirectRoute::new())
+    }
+
+    /// Creates a direct transport over a caller-supplied raw HTTP connector.
+    ///
+    /// See [`DirectRoute::with_http_connector`].
+    pub fn with_http_connector<C>(connector: C) -> Self
+    where
+        HttpsConnector<C>: Connect + Clone + Send + Sync + 'static,
+    {
+        Self::with_route(DirectRoute::with_http_connector(connector))
+    }
+
+    /// Creates a direct transport from a fully configured Hyper connector.
+    ///
+    /// See [`DirectRoute::with_connector`].
+    pub fn with_connector<C>(connector: C) -> Self
+    where
+        C: Connect + Clone + Send + Sync + 'static,
+    {
+        Self::with_route(DirectRoute::with_connector(connector))
+    }
+}
+
+impl<R: RouteHttp> HyperTransport<R> {
+    /// Creates a transport over a host-owned request executor.
+    pub fn with_route(route: R) -> Self {
+        Self::with_shared_route(Arc::new(route))
+    }
+
+    /// Creates a transport over an executor shared with other transports.
+    pub fn with_shared_route(route: Arc<R>) -> Self {
+        Self {
+            route,
             runtime: BlockingRuntime::new(),
         }
     }
 
-    async fn request(
+    /// The executor this transport routes through.
+    pub fn route(&self) -> &Arc<R> {
+        &self.route
+    }
+
+    /// Runs one request through the executor under the SDK backstop
+    /// deadline, observing the dispatch hook so classification does not
+    /// depend on the executor's own reporting.
+    async fn execute(
+        &self,
+        request: RouteRequest<'_>,
+        external: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> std::result::Result<RouteResponse, RoutedFailure> {
+        let dispatched = AtomicBool::new(false);
+        let timeout = request.timeout;
+        let on_dispatch = || {
+            dispatched.store(true, Ordering::Release);
+            if let Some(external) = external {
+                external();
+            }
+        };
+        let outcome =
+            tokio::time::timeout(timeout, self.route.execute(request, &on_dispatch)).await;
+        let dispatched = dispatched.load(Ordering::Acquire);
+        match outcome {
+            Ok(Ok(response)) => Ok(response),
+            // The executor's phase is authoritative for its own failures: a
+            // connect refusal reported as pre-dispatch stays definite even if
+            // the executor had to call the hook early, as the direct route
+            // does. The hook decides only failures the executor never saw.
+            Ok(Err(error)) => Err(RoutedFailure {
+                dispatched: error.phase != RoutePhase::BeforeDispatch,
+                timed_out: false,
+                error,
+            }),
+            Err(_) => Err(RoutedFailure {
+                dispatched,
+                timed_out: true,
+                error: RouteError {
+                    phase: if dispatched {
+                        RoutePhase::AfterDispatch
+                    } else {
+                        RoutePhase::BeforeDispatch
+                    },
+                    message: "HTTP request timed out".to_string(),
+                },
+            }),
+        }
+    }
+
+    /// Performs one PIR request, attaching a [`PirHttpFailure`] to every
+    /// failure so callers can classify retryability without parsing text.
+    /// Non-success statuses are failures here rather than in the PIR client,
+    /// which lets the status reach the classifier.
+    async fn pir_request(
         &self,
         method: Method,
         url: &str,
         body: Vec<u8>,
-        max_response_bytes: usize,
-    ) -> Result<HyperResponse> {
-        let request = Request::builder()
-            .method(method)
-            .uri(url)
-            .body(Full::new(Bytes::from(body)))
-            .context("build HTTP request")?;
+    ) -> Result<pir_client::TransportResponse> {
+        use PirHttpFailurePhase as Phase;
         let response = self
-            .client
-            .request(request)
+            .execute(
+                RouteRequest {
+                    method,
+                    url,
+                    headers: &[],
+                    body,
+                    timeout: PIR_REQUEST_TIMEOUT,
+                    max_response_bytes: MAX_PIR_RESPONSE_BYTES,
+                },
+                None,
+            )
             .await
-            .context("send HTTP request")?;
-        let status = response.status().as_u16();
-        let body = Limited::new(response.into_body(), max_response_bytes)
-            .collect()
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "read HTTP response body (limit {max_response_bytes} bytes): {error}"
-                )
-            })?
-            .to_bytes()
-            .to_vec();
-
-        Ok(HyperResponse { status, body })
+            .map_err(|failure| {
+                let phase = if failure.timed_out {
+                    Phase::Timeout
+                } else {
+                    match failure.error.phase {
+                        RoutePhase::BeforeDispatch => Phase::Connect,
+                        RoutePhase::AfterDispatch => Phase::Send,
+                        RoutePhase::ResponseRead => Phase::Body,
+                    }
+                };
+                let message = if failure.timed_out {
+                    "PIR HTTP request timed out".to_string()
+                } else {
+                    failure.error.message
+                };
+                PirHttpFailure {
+                    phase,
+                    http_status: None,
+                }
+                .wrap(message)
+            })?;
+        let status = response.status;
+        if !(200..300).contains(&status) {
+            let preview: String = String::from_utf8_lossy(&response.body)
+                .chars()
+                .take(256)
+                .collect();
+            return Err(PirHttpFailure {
+                phase: Phase::Status,
+                http_status: Some(status),
+            }
+            .wrap(format!("PIR HTTP status {status} body={preview}")));
+        }
+        Ok(pir_client::TransportResponse {
+            status,
+            headers: response.headers,
+            body: response.body,
+        })
     }
 
     /// Performs one helper request under a caller-supplied deadline.
     ///
     /// A JSON content type is set for bodies because helper endpoints reject
-    /// anything else. Timeouts are reported distinctly from other failures so
-    /// higher-level clients can tell an ambiguous submission from a refused
-    /// one.
+    /// anything else. Failures before dispatch are definite; a deadline or
+    /// connection loss after dispatch is ambiguous; a body-read failure after
+    /// headers arrived is a response failure.
     async fn helper_request(
         &self,
         method: Method,
@@ -234,54 +547,97 @@ impl HyperTransport {
         body: Vec<u8>,
         timeout: Duration,
     ) -> std::result::Result<HelperResponse, HelperTransportError> {
-        let has_body = !body.is_empty();
-        let request = {
-            let builder = Request::builder().method(method).uri(url);
-            let builder = if has_body {
-                builder.header(http::header::CONTENT_TYPE, "application/json")
-            } else {
-                builder
-            };
-            builder
-                .body(Full::new(Bytes::from(body)))
-                .map_err(|error| {
-                    HelperTransportError::Transport(format!("build helper request: {error}"))
-                })?
+        let headers: Vec<(String, String)> = if body.is_empty() {
+            Vec::new()
+        } else {
+            vec![("content-type".to_string(), "application/json".to_string())]
         };
+        match self
+            .execute(
+                RouteRequest {
+                    method,
+                    url,
+                    headers: &headers,
+                    body,
+                    timeout,
+                    max_response_bytes: MAX_HELPER_RESPONSE_BYTES,
+                },
+                None,
+            )
+            .await
+        {
+            Ok(response) => {
+                let content_type = response.content_type();
+                Ok(HelperResponse::new(
+                    response.status,
+                    response.body,
+                    content_type,
+                ))
+            }
+            Err(failure) if !failure.dispatched => Err(HelperTransportError::Transport(format!(
+                "helper request failed before dispatch: {}",
+                failure.error.message
+            ))),
+            Err(failure) if failure.timed_out => Err(HelperTransportError::Timeout),
+            Err(failure) if failure.error.phase == RoutePhase::ResponseRead => {
+                Err(HelperTransportError::Response(format!(
+                    "read helper response: {}",
+                    failure.error.message
+                )))
+            }
+            Err(failure) => Err(HelperTransportError::Ambiguous(format!(
+                "send helper request: {}",
+                failure.error.message
+            ))),
+        }
+    }
 
-        tokio::time::timeout(timeout, async {
-            let response = self.client.request(request).await.map_err(|error| {
-                let message = format!("send helper request: {error}");
-                if error.is_connect() {
-                    HelperTransportError::Transport(message)
-                } else {
-                    // Once dispatch has progressed past connection setup,
-                    // Hyper cannot prove that a POST body was not received.
-                    HelperTransportError::Ambiguous(message)
-                }
-            })?;
-
-            let status = response.status().as_u16();
-            let content_type = response
-                .headers()
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let body = Limited::new(response.into_body(), MAX_HELPER_RESPONSE_BYTES)
-                .collect()
-                .await
-                .map_err(|error| {
-                    HelperTransportError::Response(format!(
-                        "read helper response body (limit {MAX_HELPER_RESPONSE_BYTES} bytes): {error}"
-                    ))
-                })?
-                .to_bytes()
-                .to_vec();
-
-            Ok(HelperResponse::new(status, body, content_type))
-        })
-        .await
-        .map_err(|_| HelperTransportError::Timeout)?
+    async fn chain_request(
+        &self,
+        method: Method,
+        metadata: ChainHttpRequest,
+        body: Vec<u8>,
+        dispatch: Option<ChainPostDispatch>,
+    ) -> std::result::Result<ChainHttpResponse, ChainTransportError> {
+        let mark_possible = || {
+            if let Some(dispatch) = dispatch.as_ref() {
+                dispatch.mark_possible();
+            }
+        };
+        match self
+            .execute(
+                RouteRequest {
+                    method,
+                    url: metadata.url(),
+                    headers: metadata.headers(),
+                    body,
+                    timeout: metadata.timeout(),
+                    max_response_bytes: metadata.max_response_bytes(),
+                },
+                Some(&mark_possible),
+            )
+            .await
+        {
+            Ok(response) => {
+                let content_type = response.content_type();
+                Ok(ChainHttpResponse::new(
+                    response.status,
+                    response.body,
+                    content_type,
+                    response.headers,
+                ))
+            }
+            Err(failure) if !failure.dispatched => {
+                Err(ChainTransportError::definitely_unsent(format!(
+                    "vote-chain request failed before dispatch: {}",
+                    failure.error.message
+                )))
+            }
+            Err(failure) => Err(ChainTransportError::possibly_dispatched(format!(
+                "vote-chain request failed: {}",
+                failure.error.message
+            ))),
+        }
     }
 }
 
@@ -292,7 +648,7 @@ fn ensure_rustls_provider() {
     });
 }
 
-impl Default for HyperTransport {
+impl Default for HyperTransport<DirectRoute> {
     fn default() -> Self {
         Self::new()
     }
@@ -330,93 +686,7 @@ impl Drop for BlockingRuntime {
     }
 }
 
-impl HyperTransport {
-    /// Performs one PIR request, attaching a [`PirHttpFailure`] to every
-    /// failure so callers can classify retryability without parsing text.
-    /// Non-success statuses are failures here rather than in the PIR client,
-    /// which lets the status reach the classifier.
-    async fn pir_request(
-        &self,
-        method: Method,
-        url: &str,
-        body: Vec<u8>,
-    ) -> Result<pir_client::TransportResponse> {
-        use PirHttpFailurePhase as Phase;
-        let request = Request::builder()
-            .method(method)
-            .uri(url)
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|error| {
-                PirHttpFailure {
-                    phase: Phase::Build,
-                    http_status: None,
-                }
-                .wrap(format!("build HTTP request: {error}"))
-            })?;
-        tokio::time::timeout(PIR_REQUEST_TIMEOUT, async {
-            let response = self.client.request(request).await.map_err(|error| {
-                let phase = if error.is_connect() {
-                    Phase::Connect
-                } else {
-                    Phase::Send
-                };
-                PirHttpFailure {
-                    phase,
-                    http_status: None,
-                }
-                .wrap(format!("send HTTP request: {error}"))
-            })?;
-            let status = response.status().as_u16();
-            let headers = response
-                .headers()
-                .iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name.as_str().to_string(), value.to_string()))
-                })
-                .collect();
-            let body = Limited::new(response.into_body(), MAX_PIR_RESPONSE_BYTES)
-                .collect()
-                .await
-                .map_err(|error| {
-                    PirHttpFailure {
-                        phase: Phase::Body,
-                        http_status: Some(status),
-                    }
-                    .wrap(format!(
-                        "read HTTP response body (limit {MAX_PIR_RESPONSE_BYTES} bytes): {error}"
-                    ))
-                })?
-                .to_bytes()
-                .to_vec();
-            if !(200..300).contains(&status) {
-                let preview: String = String::from_utf8_lossy(&body).chars().take(256).collect();
-                return Err(PirHttpFailure {
-                    phase: Phase::Status,
-                    http_status: Some(status),
-                }
-                .wrap(format!("PIR HTTP status {status} body={preview}")));
-            }
-            Ok(pir_client::TransportResponse {
-                status,
-                headers,
-                body,
-            })
-        })
-        .await
-        .map_err(|_| {
-            PirHttpFailure {
-                phase: Phase::Timeout,
-                http_status: None,
-            }
-            .wrap("PIR HTTP request timed out".to_string())
-        })?
-    }
-}
-
-impl pir_client::Transport for HyperTransport {
+impl<R: RouteHttp> pir_client::Transport for HyperTransport<R> {
     fn get<'a>(&'a self, url: &'a str) -> pir_client::TransportFuture<'a> {
         Box::pin(self.pir_request(Method::GET, url, Vec::new()))
     }
@@ -426,7 +696,7 @@ impl pir_client::Transport for HyperTransport {
     }
 }
 
-impl vote_commitment_tree_client::transport::Transport for HyperTransport {
+impl<R: RouteHttp> vote_commitment_tree_client::transport::Transport for HyperTransport<R> {
     fn get(
         &self,
         url: &str,
@@ -435,27 +705,35 @@ impl vote_commitment_tree_client::transport::Transport for HyperTransport {
         vote_commitment_tree_client::transport::TransportError,
     > {
         self.runtime
-            .block_on(async {
-                tokio::time::timeout(
-                    TREE_REQUEST_TIMEOUT,
-                    self.request(Method::GET, url, Vec::new(), MAX_TREE_RESPONSE_BYTES),
-                )
-                .await
-                .context("vote-tree HTTP request timed out")?
-            })
+            .block_on(self.execute(
+                RouteRequest {
+                    method: Method::GET,
+                    url,
+                    headers: &[],
+                    body: Vec::new(),
+                    timeout: TREE_REQUEST_TIMEOUT,
+                    max_response_bytes: MAX_TREE_RESPONSE_BYTES,
+                },
+                None,
+            ))
             .map(
                 |response| vote_commitment_tree_client::transport::TransportResponse {
                     status: response.status,
                     body: response.body,
                 },
             )
-            .map_err(|e| {
-                vote_commitment_tree_client::transport::TransportError::Request(e.to_string())
+            .map_err(|failure| {
+                let message = if failure.timed_out {
+                    "vote-tree HTTP request timed out".to_string()
+                } else {
+                    failure.error.message
+                };
+                vote_commitment_tree_client::transport::TransportError::Request(message)
             })
     }
 }
 
-impl HelperTransport for HyperTransport {
+impl<R: RouteHttp> HelperTransport for HyperTransport<R> {
     fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> HelperFuture<'a> {
         Box::pin(async move {
             self.helper_request(Method::GET, url, Vec::new(), timeout)
@@ -468,73 +746,7 @@ impl HelperTransport for HyperTransport {
     }
 }
 
-impl HyperTransport {
-    async fn chain_request(
-        &self,
-        method: Method,
-        metadata: ChainHttpRequest,
-        body: Vec<u8>,
-        dispatch: Option<ChainPostDispatch>,
-    ) -> std::result::Result<ChainHttpResponse, ChainTransportError> {
-        let mut builder = Request::builder().method(method).uri(metadata.url());
-        for (name, value) in metadata.headers() {
-            builder = builder.header(name, value);
-        }
-        let request = builder
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|error| {
-                ChainTransportError::definitely_unsent(format!(
-                    "build vote-chain request failed: {error}"
-                ))
-            })?;
-
-        tokio::time::timeout(metadata.timeout(), async {
-            if let Some(dispatch) = dispatch {
-                dispatch.mark_possible();
-            }
-            let response = self.client.request(request).await.map_err(|error| {
-                let message = format!("send vote-chain request failed: {error}");
-                if error.is_connect() {
-                    ChainTransportError::definitely_unsent(message)
-                } else {
-                    ChainTransportError::possibly_dispatched(message)
-                }
-            })?;
-            let status = response.status().as_u16();
-            let content_type = response
-                .headers()
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let headers = response
-                .headers()
-                .iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name.as_str().to_string(), value.to_string()))
-                })
-                .collect();
-            let body = Limited::new(response.into_body(), metadata.max_response_bytes())
-                .collect()
-                .await
-                .map_err(|error| {
-                    ChainTransportError::possibly_dispatched(format!(
-                        "read vote-chain response body (limit {} bytes) failed: {error}",
-                        metadata.max_response_bytes()
-                    ))
-                })?
-                .to_bytes()
-                .to_vec();
-            Ok(ChainHttpResponse::new(status, body, content_type, headers))
-        })
-        .await
-        .map_err(|_| ChainTransportError::possibly_dispatched("vote-chain request timed out"))?
-    }
-}
-
-impl ChainTransport for HyperTransport {
+impl<R: RouteHttp> ChainTransport for HyperTransport<R> {
     fn chain_get<'a>(&'a self, request: ChainHttpRequest) -> ChainTransportFuture<'a> {
         Box::pin(async move {
             self.chain_request(Method::GET, request, Vec::new(), None)
@@ -560,6 +772,237 @@ impl ChainTransport for HyperTransport {
             self.chain_request(Method::POST, request, json, Some(dispatch))
                 .await
         })
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use http::Method;
+
+    use crate::chain_submission::{
+        ChainHttpRequest, ChainPostDispatch, ChainTransport, ChainTransportFailureKind,
+    };
+    use crate::helper::transport::{HelperTransport, HelperTransportError};
+
+    use super::{
+        HyperTransport, PirHttpFailure, PirHttpFailurePhase, RouteError, RouteFuture, RouteHttp,
+        RouteRequest, RouteResponse,
+    };
+
+    /// Executor with a scripted outcome, so classification is tested without sockets.
+    struct ScriptedRoute {
+        dispatch: bool,
+        outcome: Result<u16, RouteError>,
+        hang: bool,
+    }
+
+    impl RouteHttp for ScriptedRoute {
+        fn execute<'a>(
+            &'a self,
+            _request: RouteRequest<'a>,
+            on_dispatch: &'a (dyn Fn() + Send + Sync),
+        ) -> RouteFuture<'a> {
+            Box::pin(async move {
+                if self.dispatch {
+                    on_dispatch();
+                }
+                if self.hang {
+                    std::future::pending::<()>().await;
+                }
+                match &self.outcome {
+                    Ok(status) => Ok(RouteResponse {
+                        status: *status,
+                        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                        body: b"{}".to_vec(),
+                    }),
+                    Err(error) => Err(error.clone()),
+                }
+            })
+        }
+    }
+
+    fn transport(
+        dispatch: bool,
+        outcome: Result<u16, RouteError>,
+    ) -> HyperTransport<ScriptedRoute> {
+        HyperTransport::with_route(ScriptedRoute {
+            dispatch,
+            outcome,
+            hang: false,
+        })
+    }
+
+    fn hanging(dispatch: bool) -> HyperTransport<ScriptedRoute> {
+        HyperTransport::with_route(ScriptedRoute {
+            dispatch,
+            outcome: Ok(200),
+            hang: true,
+        })
+    }
+
+    fn chain_request() -> ChainHttpRequest {
+        ChainHttpRequest::new(
+            "https://chain.example/tx".to_string(),
+            Vec::new(),
+            Duration::from_millis(50),
+            1024,
+        )
+    }
+
+    #[tokio::test]
+    async fn helper_failures_classify_by_dispatch_and_phase() {
+        let before = transport(
+            false,
+            Err(RouteError::before_dispatch("tor route unavailable")),
+        );
+        assert!(matches!(
+            before.post_json("https://h", b"{}".to_vec(), Duration::from_secs(1)).await,
+            Err(HelperTransportError::Transport(message)) if message.contains("tor route unavailable")
+        ));
+
+        let after = transport(true, Err(RouteError::after_dispatch("reset")));
+        assert!(matches!(
+            after
+                .post_json("https://h", b"{}".to_vec(), Duration::from_secs(1))
+                .await,
+            Err(HelperTransportError::Ambiguous(_))
+        ));
+
+        let body = transport(true, Err(RouteError::response_read("too large")));
+        assert!(matches!(
+            body.get("https://h", Duration::from_secs(1)).await,
+            Err(HelperTransportError::Response(_))
+        ));
+
+        // An executor that reports a post-dispatch phase without calling the
+        // hook is still treated as dispatched: the phase is the executor's
+        // own admission that bytes may have left.
+        let admitted = transport(false, Err(RouteError::after_dispatch("reset")));
+        assert!(matches!(
+            admitted
+                .post_json("https://h", b"{}".to_vec(), Duration::from_secs(1))
+                .await,
+            Err(HelperTransportError::Ambiguous(_))
+        ));
+
+        let ok = transport(true, Ok(200));
+        let response = ok.get("https://h", Duration::from_secs(1)).await.unwrap();
+        assert!(response.is_success());
+        assert_eq!(response.content_type(), Some("application/json"));
+    }
+
+    #[tokio::test]
+    async fn helper_deadline_before_dispatch_is_definite_and_after_is_a_timeout() {
+        let stalled_route = hanging(false);
+        assert!(matches!(
+            stalled_route
+                .post_json("https://h", b"{}".to_vec(), Duration::from_millis(30))
+                .await,
+            Err(HelperTransportError::Transport(_))
+        ));
+        let stalled_server = hanging(true);
+        assert!(matches!(
+            stalled_server
+                .post_json("https://h", b"{}".to_vec(), Duration::from_millis(30))
+                .await,
+            Err(HelperTransportError::Timeout)
+        ));
+    }
+
+    #[tokio::test]
+    async fn chain_failures_classify_by_dispatch_and_mark_the_dispatch_handle() {
+        let before = transport(false, Err(RouteError::before_dispatch("blocked")));
+        let error = before
+            .chain_post_json(chain_request(), b"{}".to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ChainTransportFailureKind::DefinitelyUnsent);
+
+        let after = transport(true, Err(RouteError::after_dispatch("reset")));
+        let dispatch = ChainPostDispatch::default();
+        let error = after
+            .chain_post_json_with_dispatch(chain_request(), b"{}".to_vec(), dispatch.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ChainTransportFailureKind::PossiblyDispatched);
+        assert!(dispatch.is_possible());
+
+        let stalled_route = hanging(false);
+        let dispatch = ChainPostDispatch::default();
+        let error = stalled_route
+            .chain_post_json_with_dispatch(chain_request(), b"{}".to_vec(), dispatch.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ChainTransportFailureKind::DefinitelyUnsent);
+        assert!(!dispatch.is_possible());
+
+        let ok = transport(true, Ok(200));
+        let response = ok.chain_get(chain_request()).await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn pir_failures_carry_typed_phase_and_status() {
+        use pir_client::Transport;
+
+        let before = transport(false, Err(RouteError::before_dispatch("blocked")));
+        let error = Transport::get(&before, "https://pir/root")
+            .await
+            .err()
+            .expect("PIR request should fail");
+        let typed = PirHttpFailure::from_error_chain(&error).unwrap();
+        assert_eq!(typed.phase, PirHttpFailurePhase::Connect);
+        assert!(typed.retryable());
+
+        let unavailable = transport(true, Ok(503));
+        let error = Transport::get(&unavailable, "https://pir/root")
+            .await
+            .err()
+            .expect("PIR request should fail");
+        let typed = PirHttpFailure::from_error_chain(&error).unwrap();
+        assert_eq!(typed.phase, PirHttpFailurePhase::Status);
+        assert_eq!(typed.http_status, Some(503));
+        assert!(typed.retryable());
+
+        let missing = transport(true, Ok(404));
+        let error = Transport::get(&missing, "https://pir/root")
+            .await
+            .err()
+            .expect("PIR request should fail");
+        assert!(!PirHttpFailure::from_error_chain(&error)
+            .unwrap()
+            .retryable());
+
+        let ok = transport(true, Ok(200));
+        assert_eq!(
+            Transport::post(&ok, "https://pir/query", vec![1])
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+    }
+
+    #[test]
+    fn tree_transport_reports_route_failures_as_request_errors() {
+        use vote_commitment_tree_client::transport::{Transport, TransportError};
+
+        let before = Arc::new(transport(
+            false,
+            Err(RouteError::before_dispatch("blocked")),
+        ));
+        assert!(matches!(
+            Transport::get(&*before, "https://node/tree"),
+            Err(TransportError::Request(message)) if message.contains("blocked")
+        ));
+        let ok = transport(true, Ok(200));
+        assert_eq!(
+            Transport::get(&ok, "https://node/tree").unwrap().status,
+            200
+        );
+        let _ = Method::GET;
     }
 }
 
