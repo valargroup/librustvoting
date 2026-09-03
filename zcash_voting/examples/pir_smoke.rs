@@ -139,7 +139,7 @@ fn prepare(args: Vec<String>) -> Result<()> {
         },
         "supported_versions": {
             "pir": ["v0"],
-            "vote_protocol": "v0",
+            "vote_protocol": "v1",
             "tally": "v0",
             "vote_server": "v1"
         },

@@ -24,7 +24,7 @@ pub use crate::wire::VotingRoundParams;
 pub const MIN_PROPOSAL_ID: u32 = 1;
 
 /// Highest valid on-chain proposal identifier supported by the vote circuit.
-pub const MAX_PROPOSAL_ID: u32 = 15;
+pub const MAX_PROPOSAL_ID: u32 = 50;
 
 /// Minimum number of options a proposal can declare.
 pub const MIN_VOTE_OPTIONS: u32 = 2;

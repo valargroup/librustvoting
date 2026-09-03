@@ -15,7 +15,7 @@ default-members = [
 resolver = "2"
 
 [workspace.dependencies]
-voting-circuits = { version = "=0.11.2", default-features = false }
+voting-circuits = { version = "=0.12.0-rc.1", default-features = false }
 voting-crypto-deps = { version = "=0.2.2", default-features = false }
 zcash_protocol = { version = "0.10.4" }
 

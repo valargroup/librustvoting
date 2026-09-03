@@ -1443,7 +1443,7 @@ mod tests {
         ChainSubmissionIdentity, ChainSubmissionTarget,
     };
     use crate::round::RoundParams;
-    use crate::types::{EncryptedShare, NoteInfo};
+    use crate::types::{EncryptedShare, NoteInfo, MAX_PROPOSAL_ID};
     use crate::vote::{DraftVote, VoteBatchRecovery, VoteRecoveryBundle};
 
     const ROUND: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -1779,7 +1779,7 @@ mod tests {
             .set_ballot_intent(ROUND, 0, Decision::Choice(0), 3)
             .is_err());
         assert!(db
-            .set_ballot_intent(ROUND, 16, Decision::Skipped, 3)
+            .set_ballot_intent(ROUND, MAX_PROPOSAL_ID + 1, Decision::Skipped, 3)
             .is_err());
     }
 
@@ -1839,7 +1839,7 @@ mod tests {
         let db = db_with_bundle();
 
         assert!(resume_plan(&db, ROUND, &[1, 0]).is_err());
-        assert!(resume_plan(&db, ROUND, &[1, 16]).is_err());
+        assert!(resume_plan(&db, ROUND, &[1, MAX_PROPOSAL_ID + 1]).is_err());
         assert!(resume_plan(&db, ROUND, &[1, 1]).is_err());
     }
 

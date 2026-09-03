@@ -1526,7 +1526,7 @@ pub struct Zkp2DelegationData {
     pub address_index: u32,
     pub ea_pk: Vec<u8>,
     pub voting_round_id: String,
-    /// Current proposal authority bitmask (starts at 0xFFFF, decremented per submitted vote).
+    /// Current proposal authority bitmask, decremented per submitted vote.
     /// Bit `i` is set iff the voter has not yet cast a vote for proposal `i`.
     /// Since proposal IDs are 1-indexed (matching on-chain IDs), bit 0 is never
     /// cleared and acts as a structural invariant — it corresponds to the circuit's
@@ -1557,9 +1557,9 @@ pub(crate) struct VotePreparationState {
     pub vote: Option<VoteRowState>,
 }
 
-/// Initial authority bitmask: all 16 bits set. Bit 0 is the dead sentinel
-/// (proposal_id=0 is rejected by the circuit); bits 1–15 are the usable slots.
-const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
+/// Initial authority bitmask. Bit 0 is the dead sentinel (proposal_id=0 is
+/// rejected by the circuit); bits 1–50 are the usable slots.
+const MAX_PROPOSAL_AUTHORITY: u64 = voting_circuits::MAX_PROPOSAL_AUTHORITY;
 
 /// Load all fields ZKP #2 needs from the bundles table (persisted during delegation).
 /// Computes proposal_authority from submitted votes — each submitted vote clears its

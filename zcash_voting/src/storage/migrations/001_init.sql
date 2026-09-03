@@ -222,7 +222,7 @@ CREATE TABLE chain_submissions (
     FOREIGN KEY (round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE,
     CHECK (length(identity_key) >= 32),
     CHECK ((kind = 'delegation' AND proposal_id IS NULL AND ordered_batch_digest IS NULL)
-        OR (kind = 'vote' AND proposal_id BETWEEN 1 AND 15 AND ordered_batch_digest IS NULL)
+        OR (kind = 'vote' AND proposal_id BETWEEN 1 AND 50 AND ordered_batch_digest IS NULL)
         OR (kind = 'vote_batch' AND proposal_id IS NULL AND length(ordered_batch_digest) = 32)),
     CHECK (candidate_transaction_hash IS NULL OR length(candidate_transaction_hash) = 32),
     CHECK (confirmed_transaction_hash IS NULL OR length(confirmed_transaction_hash) = 32),

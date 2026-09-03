@@ -1559,7 +1559,10 @@ mod tests {
         let empty_error = VoteCommitmentBatchWire { votes: vec![] }
             .to_json()
             .unwrap_err();
-        assert!(empty_error.to_string().contains("between 1 and 15 actions"));
+        assert!(empty_error.to_string().contains(&format!(
+            "between 1 and {} actions",
+            crate::vote::MAX_VOTE_BATCH_ACTIONS
+        )));
 
         let maximum = VoteCommitmentBatchWire {
             votes: vec![vote.clone(); crate::vote::MAX_VOTE_BATCH_ACTIONS],
@@ -1579,9 +1582,10 @@ mod tests {
         }
         .to_json()
         .unwrap_err();
-        assert!(oversized_error
-            .to_string()
-            .contains("between 1 and 15 actions"));
+        assert!(oversized_error.to_string().contains(&format!(
+            "between 1 and {} actions",
+            crate::vote::MAX_VOTE_BATCH_ACTIONS
+        )));
     }
 
     #[test]
