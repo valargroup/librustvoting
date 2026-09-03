@@ -131,7 +131,7 @@ mod round_executor {
             now_seconds: 10,
             ceremony_start_seconds: Some(0),
             vote_end_time_seconds: Some(100_000),
-            vote_tree_node_url: "http://node.invalid".to_string(),
+            vote_tree_node_urls: vec!["http://node.invalid".to_string()],
             delegation: None,
             chain_policy: ChainAdvancePolicy {
                 pending_repoll: Duration::from_millis(1),

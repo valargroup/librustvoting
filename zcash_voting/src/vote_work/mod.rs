@@ -92,8 +92,9 @@ pub struct RoundHostContext {
     pub ceremony_start_seconds: Option<u64>,
     /// Vote end time, when the round timing is authenticated.
     pub vote_end_time_seconds: Option<u64>,
-    /// Vote-tree node URL used by `CastVote`.
-    pub vote_tree_node_url: String,
+    /// Vote-tree node URLs used by `CastVote`, tried in order. A sync that
+    /// fails on one node resets the cached tree and retries on the next.
+    pub vote_tree_node_urls: Vec<String>,
     /// Delegation inputs, required by `Delegate` and `AdvanceDelegation`.
     pub delegation: Option<DelegationStepInputs>,
     /// Chain policy for fresh submissions; persisted work always starts

@@ -432,18 +432,53 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let round_id = binding.round_id.clone();
 
         // Tree sync and witness generation block on their own HTTP runtime.
-        let height = {
+        // Nodes are tried in order; a failed sync resets the cached tree so
+        // the next node starts from a consistent state.
+        if host.vote_tree_node_urls.is_empty() {
+            return Err(self.step_failure(
+                RoundStepFailureKind::InvalidInput,
+                Some(step),
+                None,
+                None,
+                "casting a vote requires at least one vote-tree node URL",
+            ));
+        }
+        let mut height = None;
+        let mut last_failure = None;
+        for (index, node_url) in host.vote_tree_node_urls.iter().enumerate() {
             let db = Arc::clone(&self.database);
             let round_id = round_id.clone();
-            let node_url = host.vote_tree_node_url.clone();
+            let node_url = node_url.clone();
             let transport = self.tree_transport.clone();
-            self.blocking(&step, "vote tree sync", move || match transport {
-                Some(transport) => {
-                    crate::precompute::sync_vote_tree_with(&db, &round_id, &node_url, transport)
+            let reset_first = index > 0;
+            let synced = self
+                .blocking(&step, "vote tree sync", move || {
+                    if reset_first {
+                        crate::precompute::reset_vote_tree(&db, &round_id)?;
+                    }
+                    match transport {
+                        Some(transport) => crate::precompute::sync_vote_tree_with(
+                            &db, &round_id, &node_url, transport,
+                        ),
+                        None => crate::precompute::sync_vote_tree(&db, &round_id, &node_url),
+                    }
+                })
+                .await;
+            match synced {
+                Ok(synced) => {
+                    height = Some(synced);
+                    break;
                 }
-                None => crate::precompute::sync_vote_tree(&db, &round_id, &node_url),
-            })
-            .await?
+                Err(failure) => {
+                    if control.is_cancelled() {
+                        return Err(failure);
+                    }
+                    last_failure = Some(failure);
+                }
+            }
+        }
+        let Some(height) = height else {
+            return Err(last_failure.expect("at least one node URL was tried"));
         };
         progress.report(RoundStepProgress::TreeSynced { height });
         let witness = {
