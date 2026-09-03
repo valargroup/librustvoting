@@ -104,6 +104,30 @@ fn memory_mode_without_explicit_cache_conservatively_shares_authority() {
 }
 
 #[test]
+fn special_memory_uri_without_explicit_cache_conservatively_shares_authority() {
+    let uri = "file::memory:";
+    let first = VotingDb::open(uri).unwrap();
+    let second = VotingDb::open(uri).unwrap();
+
+    assert!(Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}
+
+#[test]
+fn special_memory_uri_with_private_cache_has_independent_authorities() {
+    let uri = "file::memory:?cache=private";
+    let first = VotingDb::open(uri).unwrap();
+    let second = VotingDb::open(uri).unwrap();
+
+    assert!(!Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}
+
+#[test]
 fn rooted_memdb_handles_share_one_database_authority() {
     let label = unique_label("memdb");
     for uri in [
@@ -329,6 +353,21 @@ fn in_memory_handles_have_independent_database_authorities() {
 fn private_cache_memory_handles_have_independent_database_authorities() {
     let name = unique_label("private-memory");
     let uri = format!("file:{name}?mode=memory&cache=private");
+    let first = VotingDb::open(&uri).unwrap();
+    let second = VotingDb::open(&uri).unwrap();
+
+    assert!(!Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}
+
+#[test]
+fn private_memory_mode_overrides_rooted_memdb_sharing() {
+    let uri = format!(
+        "file:/{}?vfs=memdb&mode=memory&cache=private",
+        unique_label("private-rooted-memdb")
+    );
     let first = VotingDb::open(&uri).unwrap();
     let second = VotingDb::open(&uri).unwrap();
 

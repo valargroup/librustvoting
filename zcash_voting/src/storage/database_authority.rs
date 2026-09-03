@@ -45,8 +45,8 @@ impl DatabaseAuthority {
     /// File-backed databases are interned by canonical path. SQLite URI memory
     /// databases that may use shared caching and named `memdb` databases are
     /// interned by SQLite's decoded database name and selected VFS. Plain
-    /// `:memory:`, anonymous, temporary, and explicitly private-cache memory
-    /// databases receive private authorities.
+    /// `:memory:`, anonymous, temporary, and URI memory-mode databases with an
+    /// explicitly private cache receive private authorities.
     pub(super) fn for_connection(
         connection: &Connection,
         opening_path: &str,
@@ -192,12 +192,20 @@ fn shared_memory_name(opening_path: &str, is_memdb: bool) -> Option<Vec<u8>> {
         return None;
     }
 
-    let rooted_memdb_name =
-        is_memdb && database_name.len() > 1 && matches!(database_name[0], b'/' | b'\\');
+    // `mode=memory` bypasses the memdb VFS's named backing store, so an
+    // explicitly private cache must remain private even for a rooted name.
+    let rooted_memdb_name = is_memdb
+        && !uri_memory_mode
+        && database_name.len() > 1
+        && matches!(database_name[0], b'/' | b'\\');
     let uses_shared_cache = match shared_cache {
         Some(false) => false,
         Some(true) => database_name == b":memory:" || uri_memory_mode || is_memdb,
-        None => uri_memory_mode || (is_memdb && database_name != b"/" && database_name != b"\\"),
+        None => {
+            database_name == b":memory:"
+                || uri_memory_mode
+                || (is_memdb && database_name != b"/" && database_name != b"\\")
+        }
     };
     (rooted_memdb_name || uses_shared_cache).then_some(database_name)
 }

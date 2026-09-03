@@ -81,20 +81,20 @@ ledgers.
 One process exclusively owns a voting database. Every handle opened on the
 same canonical SQLite file in that process shares one database authority and
 therefore one lifecycle-coordination registry, including files whose native
-path is not valid UTF-8. Named `mode=memory` URIs without an explicit
-`cache=private` option conservatively share an authority because SQLite's
-process-wide shared-cache default can make them share one database. Named
-`memdb` databases likewise conservatively share unless an unrooted name is
-explicitly private; rooted `memdb` names remain shared even with
+path is not valid UTF-8. Named `mode=memory` URIs and the special
+`file::memory:` URI without an explicit `cache=private` option conservatively
+share an authority because SQLite's process-wide shared-cache default can make
+them share one database. Named `memdb` databases likewise conservatively share;
+rooted `memdb` names that do not select URI memory mode remain shared even with
 `cache=private`, while `cache=shared` also shares unrooted names. The selected
 SQLite VFS is part of that identity, so equal names opened through distinct
 VFSes remain independent. Anonymous memory databases, plain `:memory:`,
-private-cache unrooted memory databases, and SQLite temporary databases remain
-independent database authorities. Operations capture wallet, round,
-submission identity, and host operation epoch once; an account switch cannot
-retarget in-flight work. Opening one physical SQLite database through distinct
-hard-link paths is unsupported because SQLite's WAL sidecars and this authority
-identity are pathname-based.
+URI memory-mode databases with an explicit private cache, and SQLite temporary
+databases remain independent database authorities. Operations capture wallet,
+round, submission identity, and host operation epoch once; an account switch
+cannot retarget in-flight work. Opening one physical SQLite database through
+distinct hard-link paths is unsupported because SQLite's WAL sidecars and this
+authority identity are pathname-based.
 
 ## Identity and semantic generation
 
@@ -1131,6 +1131,7 @@ Public-lifecycle engine coverage is anchored by
 `coordinators_for_one_store_share_the_same_lock_authority`,
 `second_handle_cannot_delete_state_reserved_by_an_active_submission`,
 `shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission`,
+`special_memory_uri_without_explicit_cache_conservatively_shares_authority`,
 `memdb_handle_cannot_delete_state_reserved_by_an_active_submission`,
 `shared_cache_memdb_handle_cannot_delete_an_active_submission`,
 `exclusive_round_access_is_busy_until_lifecycle_work_finishes`,

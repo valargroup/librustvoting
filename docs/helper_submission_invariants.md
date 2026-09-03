@@ -1327,15 +1327,16 @@ cleared while their round remains live. Every `VotingDb` handle opened on the
 same canonical SQLite file in the owning process shares one database authority,
 including files whose native path is not valid UTF-8, so an exclusive deletion
 requested through one handle cannot bypass a chain submission lifecycle lease
-held through another handle. Named `mode=memory` URIs and named `memdb`
-databases conservatively share an authority unless an unrooted name explicitly
-selects `cache=private`; rooted `memdb` names remain shared even under that
-option. This covers SQLite's process-wide shared-cache default and explicit
-shared caching for unrooted `memdb` names. The decoded database name and
-selected VFS form the authority identity. Equal names opened through distinct
-VFSes, anonymous memory databases, plain `:memory:`, private-cache unrooted
-memory databases, and SQLite temporary databases remain independent
-authorities.
+held through another handle. Named `mode=memory` URIs, the special
+`file::memory:` URI, and named `memdb` databases conservatively share an
+authority unless URI memory mode explicitly selects `cache=private`. Rooted
+`memdb` names that do not select URI memory mode remain shared even under that
+cache option because the VFS itself shares their backing store. This covers
+SQLite's process-wide shared-cache default and explicit shared caching for
+unrooted `memdb` names. The decoded database name and selected VFS form the
+authority identity. Equal names opened through distinct VFSes, anonymous
+memory databases, plain `:memory:`, URI memory-mode databases with an explicit
+private cache, and SQLite temporary databases remain independent authorities.
 
 Enforcement:
 [`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),
@@ -1348,7 +1349,9 @@ standalone recovery-clear API or storage primitive remains.
 `second_handle_cannot_delete_state_reserved_by_an_active_submission` covers the
 file-backed cross-handle deletion boundary while recovery material is reserved;
 `shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission`
-covers the same boundary for URI-backed shared memory, and
+covers the same lifecycle boundary for URI-backed shared memory, while
+`special_memory_uri_without_explicit_cache_conservatively_shares_authority`
+covers authority identity for the special `file::memory:` form. The
 `memdb_handle_cannot_delete_state_reserved_by_an_active_submission` and
 `shared_cache_memdb_handle_cannot_delete_an_active_submission` cover rooted and
 explicitly shared-cache forms of SQLite's `memdb` VFS.
