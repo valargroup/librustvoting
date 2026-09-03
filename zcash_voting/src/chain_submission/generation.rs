@@ -4,7 +4,6 @@ use rusqlite::named_params;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    delegate::DelegationSigner,
     governance::BUNDLE_NOTE_SLOTS,
     storage::queries,
     types::{EncryptedShare, Network, VotingError},
@@ -793,7 +792,7 @@ pub(crate) fn generation_for_delegation(
 pub(super) fn derive_delegation(
     conn: &rusqlite::Connection,
     identity: &ChainSubmissionIdentity,
-    signer: DelegationSigner,
+    spend_auth_signature: [u8; 64],
 ) -> Result<DerivedChainSubmission, VotingError> {
     let bound = generation_for_delegation(conn, identity)?;
     let round_id = hex::encode(identity.vote_round_id());
@@ -802,7 +801,7 @@ pub(super) fn derive_delegation(
         identity.wallet_id(),
         &round_id,
         identity.bundle_index(),
-        signer,
+        spend_auth_signature,
     )?;
     let request = DelegationSubmissionWire::try_from(&submission)?;
     Ok(DerivedChainSubmission {
@@ -1175,12 +1174,7 @@ mod tests {
         (rk, (&signature).into())
     }
 
-    fn persisted_delegation() -> (
-        VotingDb,
-        ChainSubmissionIdentity,
-        DelegationSigner,
-        [u8; 64],
-    ) {
+    fn persisted_delegation() -> (VotingDb, ChainSubmissionIdentity, [u8; 64]) {
         use crate::backend::pasta_curves::group::ff::PrimeField;
 
         const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -1259,12 +1253,7 @@ mod tests {
             ChainSubmissionTarget::Delegation,
         )
         .unwrap();
-        (
-            db,
-            identity,
-            DelegationSigner::signature(signature, sighash),
-            signature,
-        )
+        (db, identity, signature)
     }
 
     /// Anchors the transcript encoding to an independently written byte
@@ -1440,8 +1429,8 @@ mod tests {
 
     #[test]
     fn persisted_delegation_derives_and_rejects_a_forged_signature() {
-        let (db, identity, signer, signature) = persisted_delegation();
-        let derived = derive_delegation(&db.conn(), &identity, signer).unwrap();
+        let (db, identity, signature) = persisted_delegation();
+        let derived = derive_delegation(&db.conn(), &identity, signature).unwrap();
         assert_eq!(derived.expected_layout().leaves(), vec![[0x10; 32]]);
         let ChainSubmissionRequest::Delegation(request) = derived.request() else {
             panic!("expected delegation request");
@@ -1451,8 +1440,7 @@ mod tests {
             base64::prelude::BASE64_STANDARD.encode(signature)
         );
 
-        let forged = DelegationSigner::signature([0xff; 64], [0x19; 32]);
-        let error = match derive_delegation(&db.conn(), &identity, forged) {
+        let error = match derive_delegation(&db.conn(), &identity, [0xff; 64]) {
             Ok(_) => panic!("forged signature must fail"),
             Err(error) => error,
         };
@@ -1460,8 +1448,54 @@ mod tests {
     }
 
     #[test]
+    fn persisted_delegation_rejects_malformed_authoritative_sighash() {
+        let (db, identity, signature) = persisted_delegation();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET pczt_sighash = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 0",
+                (
+                    vec![0x19; 31],
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                    "wallet-1",
+                ),
+            )
+            .unwrap();
+
+        let error = match derive_delegation(&db.conn(), &identity, signature) {
+            Ok(_) => panic!("malformed stored sighash must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("must be 32 bytes"));
+    }
+
+    #[test]
+    fn persisted_delegation_rejects_signature_for_another_sighash() {
+        let (db, identity, signature) = persisted_delegation();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET pczt_sighash = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 0",
+                (
+                    vec![0x29; 32],
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                    "wallet-1",
+                ),
+            )
+            .unwrap();
+
+        let error = match derive_delegation(&db.conn(), &identity, signature) {
+            Ok(_) => panic!("signature for another stored sighash must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("signature does not verify"));
+    }
+
+    #[test]
     fn persisted_delegation_rejects_noncanonical_sequence_storage() {
-        let (db, identity, signer, _) = persisted_delegation();
+        let (db, identity, signature) = persisted_delegation();
         db.conn()
             .execute(
                 "UPDATE bundles SET note_positions_blob = X'00'
@@ -1473,7 +1507,7 @@ mod tests {
             )
             .unwrap();
 
-        let error = match derive_delegation(&db.conn(), &identity, signer) {
+        let error = match derive_delegation(&db.conn(), &identity, signature) {
             Ok(_) => panic!("noncanonical sequence storage must fail"),
             Err(error) => error,
         };

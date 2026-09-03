@@ -116,10 +116,7 @@ fn confirmed_vote_refuses_a_later_delegation_reservation() {
 
     let failure = store
         .admit(
-            &StoreAdvancementRequest::delegation(
-                delegation,
-                crate::delegate::DelegationSigner::signature([7; 64], [8; 32]),
-            ),
+            &StoreAdvancementRequest::delegation(delegation, [7; 64]),
             true,
             1,
             10,

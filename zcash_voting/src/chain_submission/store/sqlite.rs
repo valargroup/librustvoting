@@ -69,17 +69,10 @@ fn derive(
     request: &SubmissionDerivationRequest,
 ) -> Result<DerivedChainSubmission, ChainSubmissionFailure> {
     match request {
-        SubmissionDerivationRequest::Delegation { identity, signer } => {
-            let signer = match signer {
-                crate::delegate::DelegationSigner::Signature { sig, sighash } => {
-                    crate::delegate::DelegationSigner::Signature {
-                        sig: *sig,
-                        sighash: *sighash,
-                    }
-                }
-            };
-            derive_delegation(tx, identity, signer)
-        }
+        SubmissionDerivationRequest::Delegation {
+            identity,
+            spend_auth_signature,
+        } => derive_delegation(tx, identity, *spend_auth_signature),
         SubmissionDerivationRequest::ImportedDelegation { identity } => {
             derive_imported_delegation(tx, identity)
         }

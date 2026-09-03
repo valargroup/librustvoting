@@ -25,8 +25,9 @@ precompute → delegate → vote → share lifecycle:
 4. Precompute delegation inputs with `note_witnesses` and `delegation_pir`.
 5. After `delegate::setup`, load `delegation_signing_request` and sign it in
    the wallet. Then prove with `delegate::prove` and drive the transaction with
-   `ChainSubmissionClient::advance_delegation`, passing
-   `DelegationSigner::signature`. The SDK builds the request, dispatches it
+   `ChainSubmissionClient::advance_delegation`, passing only the resulting
+   SpendAuth signature in `AdvanceDelegation`. The SDK loads the authoritative
+   sighash and randomized verification key, builds the request, dispatches it
    once, polls it, and writes the confirmed VAN position atomically. Call again
    while the result is `Pending`.
 6. Record each terminal ballot decision with `set_ballot_intent`, passing the
@@ -383,9 +384,10 @@ contract.
 Delegation signing follows the same boundary. After `setup_delegation`, call
 `delegation_signing_request` to load the account index, network, seed
 fingerprint, PCZT sighash, and spend auth randomizer. Software wallets should
-derive the account SpendAuth key locally, randomize it with `alpha`, sign the
-sighash, and pass `DelegationSigner::signature` to
-`ChainSubmissionClient::advance_delegation`.
+derive the account SpendAuth key locally, randomize it with `alpha`, and sign
+the sighash. Pass only the resulting signature to
+`ChainSubmissionClient::advance_delegation`; the client reloads the
+authoritative sighash and randomized verification key from the locked bundle.
 The crate no longer accepts root wallet seed material for delegation signing.
 An imported capability delegation instead uses
 `ChainSubmissionClient::advance_imported_delegation`: it adopts the package's
@@ -450,12 +452,11 @@ boundary, so production builds should not enable this feature.
   behavior.
 - Use `precompute::note_witnesses` instead of hand-validating cached
   `TreeState` bytes and manually constructing `WitnessData`.
-- Pass `DelegationSigner::signature(sig, sighash)` to
+- Pass the externally produced SpendAuth signature in `AdvanceDelegation` to
   `ChainSubmissionClient::advance_delegation` after signing
-  `delegation_signing_request` in the wallet. Signer variants that accepted
-  seeds and Keystone specific signature aliases were removed; software and
-  hardware flows both pass an externally produced SpendAuth signature and the
-  signed sighash. `PreparedDelegationBundle::signed_bundle` still assembles a
+  `delegation_signing_request` in the wallet. The client loads the signed
+  sighash from durable bundle state instead of accepting it from the host.
+  `PreparedDelegationBundle::signed_bundle` still assembles a
   `SignedDelegationBundle` for the capability-handoff export flow.
 - Use `generate_random_voting_hotkey` to create app-owned voting hotkeys for
   both software and hardware wallets, persist `VotingHotkey::stored_secret()`,

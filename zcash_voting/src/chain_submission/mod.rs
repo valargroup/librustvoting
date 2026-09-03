@@ -16,10 +16,18 @@
 //! apply its own parsed chain events were removed, and the raw storage writers
 //! behind them are no longer public. Event parsing, tree matching, and the
 //! domain and helper-share writes are private lifecycle mechanisms.
+//! Delegation callers likewise provide only a SpendAuth signature; the SDK
+//! loads the locked sighash and randomized verification key itself.
 //!
 //! The doctests below are the compile-time surface check required by
 //! `docs/chain_submission_invariants.md`. Each must fail to compile; if one
 //! starts compiling, a bypass has been reintroduced.
+//!
+//! Caller-controlled delegation sighash assembly is gone:
+//!
+//! ```compile_fail
+//! let _ = zcash_voting::delegate::DelegationSigner::signature;
+//! ```
 //!
 //! Caller-controlled confirmation is gone:
 //!

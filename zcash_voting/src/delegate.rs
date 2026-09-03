@@ -695,32 +695,6 @@ pub struct DelegationProof {
     pub gov_nullifiers: [[u8; 32]; BUNDLE_NOTE_SLOTS],
 }
 
-/// Signature source used when assembling a delegation transaction payload.
-pub enum DelegationSigner {
-    /// Signature that already covers the stored PCZT sighash.
-    Signature { sig: [u8; 64], sighash: [u8; 32] },
-}
-
-impl DelegationSigner {
-    /// Builds a delegation signer from an externally produced SpendAuth signature.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VotingError::InvalidInput`] unless `sig` is 64 bytes and
-    /// `sighash` is 32 bytes.
-    pub fn signature_from_bytes(sig: &[u8], sighash: &[u8]) -> Result<Self, VotingError> {
-        Ok(Self::Signature {
-            sig: array64_slice("signature", sig)?,
-            sighash: array32_slice("sighash", sighash)?,
-        })
-    }
-
-    /// Builds a delegation signer from an externally produced SpendAuth signature.
-    pub fn signature(sig: [u8; 64], sighash: [u8; 32]) -> Self {
-        Self::Signature { sig, sighash }
-    }
-}
-
 /// Signature source for a prepared delegation bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreparedSigner {
@@ -954,12 +928,17 @@ impl PreparedDelegationBundle {
         voting_db: &VotingDb,
         signer: PreparedSigner,
     ) -> Result<DelegationSubmission, VotingError> {
-        let signer = match signer {
-            PreparedSigner::Signature { sig, sighash } => DelegationSigner::signature(sig, sighash),
-        };
+        let PreparedSigner::Signature { sig, sighash } = signer;
         let wallet_id = voting_db.wallet_id();
         let conn = voting_db.conn();
-        submission_with_conn(&conn, &wallet_id, &self.round_id, self.bundle_index, signer)
+        submission_with_expected_sighash(
+            &conn,
+            &wallet_id,
+            &self.round_id,
+            self.bundle_index,
+            sig,
+            sighash,
+        )
     }
 
     /// Assembles a signed delegation bundle plus wallet-facing metadata.
@@ -1180,11 +1159,44 @@ pub(crate) fn submission_with_conn(
     wallet_id: &str,
     round_id: &str,
     bundle_index: u32,
-    signer: DelegationSigner,
+    spend_auth_signature: [u8; 64],
 ) -> Result<DelegationSubmission, VotingError> {
-    let (sig, sighash) = match signer {
-        DelegationSigner::Signature { sig, sighash } => (sig, sighash),
-    };
+    submission_with_sighash_constraint(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        spend_auth_signature,
+        None,
+    )
+}
+
+fn submission_with_expected_sighash(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    spend_auth_signature: [u8; 64],
+    expected_sighash: [u8; 32],
+) -> Result<DelegationSubmission, VotingError> {
+    submission_with_sighash_constraint(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        spend_auth_signature,
+        Some(expected_sighash),
+    )
+}
+
+fn submission_with_sighash_constraint(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    spend_auth_signature: [u8; 64],
+    expected_sighash: Option<[u8; 32]>,
+) -> Result<DelegationSubmission, VotingError> {
     let data = crate::storage::queries::load_delegation_submission_data(
         conn,
         round_id,
@@ -1201,16 +1213,22 @@ pub(crate) fn submission_with_conn(
             ),
         });
     }
-    if stored_sighash.as_slice() != sighash {
-        return Err(VotingError::InvalidInput {
-            message: "sighash does not match stored PCZT sighash".to_string(),
-        });
+    if let Some(expected_sighash) = expected_sighash {
+        if stored_sighash.as_slice() != expected_sighash {
+            return Err(VotingError::InvalidInput {
+                message: "sighash does not match stored PCZT sighash".to_string(),
+            });
+        }
     }
     crate::storage::operations::verify_delegation_spend_auth_signature(
         &data.rk,
         &stored_sighash,
-        &sig,
+        &spend_auth_signature,
     )?;
+
+    let sighash: [u8; 32] = stored_sighash
+        .try_into()
+        .expect("validated 32-byte sighash must convert to an array");
 
     Ok(DelegationSubmission {
         proof: data.proof,
@@ -1221,7 +1239,7 @@ pub(crate) fn submission_with_conn(
         gov_nullifiers: array32x_bundle_note_slots("gov_nullifiers", data.gov_nullifiers)?,
         alpha: array32("alpha", data.alpha)?,
         vote_round_id: data.vote_round_id,
-        spend_auth_sig: sig,
+        spend_auth_sig: spend_auth_signature,
         sighash,
         tx1_effects: data.tx1_effects,
     })
@@ -2214,17 +2232,17 @@ mod tests {
     }
 
     #[test]
-    fn external_signature_signer_validates_signature_shapes() {
+    fn prepared_signer_validates_signature_shapes() {
         assert!(matches!(
-            DelegationSigner::signature_from_bytes(&[1; 64], &[2; 32]).unwrap(),
-            DelegationSigner::Signature { .. }
+            PreparedSigner::signature_from_bytes(&[1; 64], &[2; 32]).unwrap(),
+            PreparedSigner::Signature { .. }
         ));
 
-        let sig_err = match DelegationSigner::signature_from_bytes(&[1; 63], &[2; 32]) {
+        let sig_err = match PreparedSigner::signature_from_bytes(&[1; 63], &[2; 32]) {
             Ok(_) => panic!("short signature should be rejected"),
             Err(err) => err.to_string(),
         };
-        let sighash_err = match DelegationSigner::signature_from_bytes(&[1; 64], &[2; 31]) {
+        let sighash_err = match PreparedSigner::signature_from_bytes(&[1; 64], &[2; 31]) {
             Ok(_) => panic!("short sighash should be rejected"),
             Err(err) => err.to_string(),
         };

@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{delegate::DelegationSigner, storage::VotingDb, HyperTransport, Network};
+use crate::{storage::VotingDb, HyperTransport, Network};
 
 use super::{
     coordinator::{
@@ -130,14 +130,47 @@ impl SubmissionControl for ChainSubmissionControl {
     }
 }
 
-/// Inputs that identify and sign one prepared delegation generation.
+/// Inputs that identify and authorize one prepared delegation generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdvanceDelegation {
     /// Canonical 32-byte round identifier used by the prepared bundle.
     pub vote_round_id: [u8; 32],
     /// Durable bundle containing the prepared delegation inputs.
     pub bundle_index: u32,
-    /// Signer for the delegation reconstructed from the locked durable inputs.
-    pub signer: DelegationSigner,
+    /// SpendAuth signature verified against the locked durable setup.
+    ///
+    /// The SDK loads the authoritative PCZT sighash and randomized verification
+    /// key from its database. Callers must not reconstruct that signing context.
+    pub spend_auth_signature: [u8; 64],
+}
+
+impl AdvanceDelegation {
+    /// Builds a delegation advancement request from external signature bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainSubmissionFailureKind::InvalidInput`] unless
+    /// `spend_auth_signature` is exactly 64 bytes.
+    pub fn from_signature_bytes(
+        vote_round_id: [u8; 32],
+        bundle_index: u32,
+        spend_auth_signature: &[u8],
+    ) -> Result<Self, ChainSubmissionFailure> {
+        let spend_auth_signature = spend_auth_signature.try_into().map_err(|_| {
+            ChainSubmissionFailure::without_state(
+                ChainSubmissionFailureKind::InvalidInput,
+                format!(
+                    "delegation SpendAuth signature must be 64 bytes, got {}",
+                    spend_auth_signature.len()
+                ),
+            )
+        })?;
+        Ok(Self {
+            vote_round_id,
+            bundle_index,
+            spend_auth_signature,
+        })
+    }
 }
 
 /// Identifies an already-broadcast delegation imported from a capability
@@ -279,7 +312,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         )?;
         self.coordinator
             .advance(
-                StoreAdvancementRequest::delegation(identity, request.signer),
+                StoreAdvancementRequest::delegation(identity, request.spend_auth_signature),
                 control,
             )
             .await
@@ -346,7 +379,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         )?;
         self.coordinator
             .advance_with_recovery(
-                StoreAdvancementRequest::delegation(identity, request.signer),
+                StoreAdvancementRequest::delegation(identity, request.spend_auth_signature),
                 recovery,
                 control,
             )
