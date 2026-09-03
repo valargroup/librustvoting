@@ -295,10 +295,12 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// A non-cancelled result represents the authoritative durable outcome
     /// reported by [`ChainSubmissionResult::durable_state`].
     ///
-    /// This status-only entry point cannot resolve a hashless `Recovering`
-    /// generation. Execute a local `NextStep::AdvanceDelegation` through
-    /// [`Self::advance_delegation_with_recovery`] with
-    /// [`ChainRecoveryMode::ExactTree`].
+    /// This status-only entry point never scans the tree. It may re-POST a
+    /// hashless `Recovering` generation whose diagnostic records dispatch
+    /// ambiguity, but it cannot confirm a generation that already landed
+    /// without a usable hash. Execute a local `NextStep::AdvanceDelegation`
+    /// through [`Self::advance_delegation_with_recovery`] with
+    /// [`ChainRecoveryMode::ExactTree`], which scans before any POST.
     ///
     /// # Errors
     ///
@@ -401,10 +403,12 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// commitment tree. A non-cancelled result represents the authoritative
     /// durable outcome reported by [`ChainSubmissionResult::durable_state`].
     ///
-    /// This status-only entry point cannot resolve a hashless `Recovering`
-    /// generation. Execute `NextStep::AdvanceVote` through
+    /// This status-only entry point never scans the tree. It may re-POST a
+    /// hashless `Recovering` generation whose diagnostic records dispatch
+    /// ambiguity, but it cannot confirm a generation that already landed
+    /// without a usable hash. Execute `NextStep::AdvanceVote` through
     /// [`Self::advance_vote_with_recovery`] with
-    /// [`ChainRecoveryMode::ExactTree`].
+    /// [`ChainRecoveryMode::ExactTree`], which scans before any POST.
     ///
     /// # Errors
     ///
@@ -472,10 +476,12 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// the authoritative durable outcome reported by
     /// [`ChainSubmissionResult::durable_state`].
     ///
-    /// This status-only entry point cannot resolve a hashless `Recovering`
-    /// generation. Execute `NextStep::AdvanceVoteBatch` through
+    /// This status-only entry point never scans the tree. It may re-POST a
+    /// hashless `Recovering` generation whose diagnostic records dispatch
+    /// ambiguity, but it cannot confirm a generation that already landed
+    /// without a usable hash. Execute `NextStep::AdvanceVoteBatch` through
     /// [`Self::advance_vote_batch_with_recovery`] with
-    /// [`ChainRecoveryMode::ExactTree`].
+    /// [`ChainRecoveryMode::ExactTree`], which scans before any POST.
     ///
     /// # Errors
     ///

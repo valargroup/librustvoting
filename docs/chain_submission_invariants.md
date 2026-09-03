@@ -30,11 +30,20 @@ a fresh bounded budget.
 An accepted hash that is usable for this generation returns to ordinary
 `Tracking`. A hash already owned by another generation is not usable and is
 classified as possible dispatch without a hash. Exhausting the budget with
-that collision or any other ambiguous final attempt, or receiving chain
-rejection code 2 while the durable row still carries unresolved dispatch
-evidence, produces terminal `SubmittedWithoutHash`. This outcome is not
-confirmation and carries no hash or positions. `Recovering` remains available for tracking-window expiry and
-exact-tree recovery; tree recovery never runs for `SubmittedWithoutHash`.
+that collision or any other ambiguous final attempt is local uncertainty, not
+chain evidence: the row stays hashless `Recovering` carrying the last attempt's
+dispatch diagnostic, and a later invocation receives a fresh budget. Only chain
+rejection code 2 received while the durable row still carries unresolved
+dispatch evidence produces terminal `SubmittedWithoutHash`, and under
+exact-tree advancement one complete no-match tree pass precedes even that.
+This outcome is not confirmation and carries no hash or positions.
+`Recovering` remains available for tracking-window expiry and exact-tree
+recovery; tree recovery never runs for `SubmittedWithoutHash`.
+
+Under exact-tree advancement a hashless dispatch-ambiguity row scans the tree
+before any POST, so a generation that already landed is confirmed with its
+positions rather than redispatched into a code-2 rejection. Only status-only
+advancement, which has no scan, re-POSTs such a row directly.
 
 ## Scope and authority
 
@@ -301,11 +310,11 @@ One canonical candidate or hash-confirmed transaction belongs to at most one
 native semantic generation. If POST acceptance returns a hash already owned by
 another generation, the lifecycle does not poll or confirm that hash for the
 new generation. It persists an invalid-protocol dispatch ambiguity as hashless
-`Recovering` when another attempt remains in the current invocation and then
-continues through the same bounded retry loop. It persists terminal
-`SubmittedWithoutHash` when the collision consumes the final attempt, including
-a final POST reserved after exact-tree recovery. Later advancement of that
-terminal row performs no POST. Confirmation rechecks ownership in the same
+`Recovering` and, when another attempt remains in the current invocation,
+continues through the same bounded retry loop, whether the colliding POST was
+a fresh attempt or one reserved after exact-tree recovery. A collision that
+consumes the final attempt leaves that hashless `Recovering` row for a later
+invocation; it is never terminal. Confirmation rechecks ownership in the same
 transaction as the terminal projection.
 Diagnostics are bounded, valid UTF-8, escaped, and redacted before storage.
 Raw response bodies and sensitive cryptographic material are never persisted in
@@ -340,10 +349,12 @@ Their meanings are:
   hash is polled before tree recovery. A canonical accepted hash from a
   hashless retry resumes `Tracking`; otherwise the row remains `Recovering`
   until confirmation, bounded hashless submission, or explicit deletion.
-- `SubmittedWithoutHash`: bounded POST dispatch is durably treated as submitted,
-  but no candidate hash or confirmation positions are available. It is terminal
-  and schedules neither polling nor tree recovery. A generation that previously
-  entered `Tracking` retains its immutable tracking-start timestamp.
+- `SubmittedWithoutHash`: chain rejection code 2 proved this generation's
+  nullifiers spent after unresolved dispatch, so an earlier dispatch landed,
+  but no candidate hash or confirmation positions are available; under
+  exact-tree advancement a complete tree pass found no layout first. It is
+  terminal and schedules neither polling nor tree recovery. A generation that
+  previously entered `Tracking` retains its immutable tracking-start timestamp.
 - `Confirmed`: chain success and all required local confirmation updates are
   durable. Its source records what the confirmation rests on: `hash` or
   `tree`, with the exact generation positions.
@@ -358,12 +369,12 @@ The normal transitions are:
 new -> Submitting
 Submitting -> Tracking       usable success hash
 Submitting -> Recovering     possible dispatch without usable hash
-Submitting -> SubmittedWithoutHash
-                             final attempt ambiguous
-Recovering -> Recovering     reserve and classify another ambiguous POST
+Recovering -> Recovering     reserve and classify another ambiguous POST,
+                             including the final one of an invocation
 Recovering -> Tracking       hashless retry returns a usable success hash
 Recovering -> SubmittedWithoutHash
-                             final attempt ambiguous or retry code 2
+                             retry code 2 after unresolved dispatch
+                             (exact tree: after a no-match pass)
 Submitting -> Recovering     chain rejection code
 Tracking -> Tracking         hash still pending
 Tracking -> Recovering       bounded tracking window expires inconclusively
@@ -389,10 +400,10 @@ new
                               |                           |-- window expires --> Recovering
                               |                           |-- committed success --> Confirmed
                               |                           `-- committed failure --> Recovering
-                              |-- final possible dispatch --> SubmittedWithoutHash
-                              |-- earlier possible dispatch --> Recovering
+                              |-- possible dispatch --> Recovering
                               |                           |-- candidate, scan, or retry --> Recovering
-                              |                           |-- final ambiguity or retry code 2
+                              |                           |-- code 2 after unresolved dispatch
+                              |                           |   (exact tree: after a no-match pass)
                               |                           |   --> SubmittedWithoutHash
                               |                           `-- candidate success or exact tree layout
                               |                               --> Confirmed
@@ -404,17 +415,19 @@ abandoned Submitting on restart -- normalize --> Recovering
 
 For locally constructed submissions, a hashless `Recovering` row may transition
 back to `Tracking` when a same-generation retry returns a canonical accepted
-hash. It may transition to `SubmittedWithoutHash` only under the bounded
-exhaustion or numeric code-2 rules above. Imported poll-only delegation never
-POSTs and retains its existing status-only behavior.
+hash. It may transition to `SubmittedWithoutHash` only under the numeric
+code-2 rule above; exhausting an invocation's budget never does. Imported
+poll-only delegation never POSTs and retains its existing status-only behavior.
 
 Other local recovery observations do not transition to `Tracking` or
 `Rejected`. In particular, a rejection, committed-failure candidate,
 cancellation, or empty scan cannot erase ambiguity. A hashless `Recovering` row
-may reserve the next bounded POST directly when its diagnostic came from the
-possibly-dispatched path, either `AmbiguousDispatch` or
-`InvalidProtocolResponse`; a hashless row created by a definite rejection
-carries `ChainRejected` and never reserves an ambiguous retry. A pending or
+may reserve the next bounded POST directly under status-only advancement when
+its diagnostic came from the possibly-dispatched path, either
+`AmbiguousDispatch` or `InvalidProtocolResponse`; exact-tree advancement
+completes a tree pass first and reaches a POST only through no-match
+authorization. A hashless row created by a definite rejection carries
+`ChainRejected` and never reserves an ambiguous retry. A pending or
 unreadable candidate is never overwritten and blocks another POST until it is
 atomically retired by the existing candidate-first reconciliation and valid
 full-tree no-match authorization. A definitively committed-failure candidate
@@ -515,7 +528,15 @@ diagnostic kind is `AmbiguousDispatch`, `InvalidProtocolResponse`, or
 those records a POST that left the wallet and never resolved. A diagnostic of
 `ChainRejected` records a definite outcome, a rejected POST or a candidate that
 committed unsuccessfully, which spent nothing; code 2 after such a row is
-handled like any other definite rejection. Other deterministic rejections
+handled like any other definite rejection.
+
+Under exact-tree advancement, code 2 after unresolved dispatch runs one tree
+pass before anything is persisted: a match confirms the generation with its
+positions; a completed valid no-match discards its retry authorization, which
+never dispatches, and persists `SubmittedWithoutHash`; a pass that cannot
+complete or is interrupted leaves the row `Recovering` with its dispatch
+evidence, so the next pass converges. Status-only advancement has no scan and
+persists `SubmittedWithoutHash` at once. Other deterministic rejections
 surface an operational error while preserving earlier durable ambiguity. A
 definite rejection with no earlier ambiguity may retain the compatibility
 `Recovering` behavior. A hash in an error response is never confirmation
@@ -526,7 +547,8 @@ durations, and backoffs are bounded by configuration with safe finite maxima.
 Redirects are not followed. Attempt limits may exceed endpoint count; endpoints
 cycle by reservation ordinal. A pre-existing hashless dispatch ambiguity begins
 a later invocation with a fresh bounded budget and a newly committed
-reservation. Retries are allowed only for the same semantic generation.
+reservation, after a tree pass under exact-tree advancement. Retries are
+allowed only for the same semantic generation.
 
 ## Reconciliation and retry
 
@@ -569,14 +591,14 @@ reserve one same-generation retry. The transaction consumes the no-match
 authorization. The authorization expires on cancellation, error, return, lock
 release, or process exit. A canonical accepted hash returned by that hashless
 retry transitions the row to `Tracking` and resumes normal candidate polling.
-An authorized retry that is itself possibly dispatched durably replaces the
-row's diagnostic with the new dispatch ambiguity before anything else happens.
-If the invocation budget permits, the remaining attempts continue through the
-same backoff and durable ambiguous-retry reservation as any other ambiguous
-retry, without another tree pass; if the budget is exhausted, the attempt is
-final and produces `SubmittedWithoutHash`. A later invocation that finds the
-row hashless with that dispatch-ambiguity diagnostic may reserve the next
-same-generation POST directly.
+An authorized retry that is itself possibly dispatched, or that returns a hash
+owned by another generation, durably replaces the row's diagnostic with the new
+dispatch ambiguity before anything else happens. If the invocation budget
+permits, the remaining attempts continue through the same backoff and durable
+ambiguous-retry reservation as any other ambiguous retry, without another tree
+pass; if the budget is exhausted, the row is left hashless `Recovering` with
+that diagnostic. A later status-only invocation may reserve the next
+same-generation POST directly; a later exact-tree invocation scans first.
 
 A pending or unreadable candidate is never treated as committed failure.
 Retirement during the authorized retry reservation likewise does not classify
@@ -630,8 +652,11 @@ steps through the matching `*_with_recovery` entry point with
 work because tree recovery activates only for a durable `Recovering` row.
 Routing these steps exclusively through the plain status-only methods is not
 conformant: a hashless `Recovering` row would never scan or receive private
-retry authorization. Imported delegation advancement remains status-only
-because it cannot scan or redispatch.
+retry authorization, and a dispatch-ambiguity row would be redispatched before
+the tree is consulted. Exact-tree advancement never POSTs such a row before
+scanning. Imported delegation advancement remains status-only because it
+cannot scan or redispatch, and exact-tree advancement of an imported row never
+scans.
 
 An unresolved generation blocks only later work that consumes its unknown
 successor VAN. Independent bundles remain schedulable.
@@ -1049,15 +1074,28 @@ Tests cover:
 - imported `Tracking` and `Recovering` never dispatch, scan, or retry, and a
   committed failure becomes terminal `Rejected` without becoming hashless;
 - rejection code 2 after durable ambiguity produces terminal
-  `SubmittedWithoutHash` by numeric code alone, while other deterministic
-  rejections surface an error and preserve earlier ambiguity;
+  `SubmittedWithoutHash` by numeric code alone under status-only advancement
+  (`nullifier_spent_after_ambiguity_is_terminal_and_idempotent`), while other
+  deterministic rejections surface an error and preserve earlier ambiguity;
 - `nullifier_spent_recovery_retry_after_unresolved_dispatch_is_terminal`,
   `nullifier_spent_after_definite_rejection_stays_recoverable`, and
   `nullifier_spent_after_definite_committed_failure_stays_recoverable` prove
   that the code-2 terminal rule follows the durable dispatch evidence: an
-  authorized retry after an expired tracking window ends hashless, while one
-  after a rejected POST or a committed failure surfaces an error and leaves the
-  row recoverable;
+  authorized retry after an expired tracking window ends hashless after one
+  more no-match pass, while one after a rejected POST or a committed failure
+  surfaces an error and leaves the row recoverable;
+- `nullifier_spent_after_unresolved_dispatch_confirms_from_tree_under_exact_tree`,
+  `nullifier_spent_recovery_retry_after_unresolved_dispatch_confirms_from_tree`,
+  `nullifier_spent_after_unresolved_dispatch_with_no_match_is_terminal_under_exact_tree`,
+  and `nullifier_spent_tree_pass_failure_keeps_unresolved_dispatch` prove that
+  exact-tree advancement runs one tree pass before persisting the code-2
+  terminal state: a match confirms with positions, a no-match ends hashless
+  without dispatching the discarded authorization, and a failed pass leaves the
+  row `Recovering` so the next pass confirms;
+- `ambiguous_dispatch_row_scans_before_redispatch_under_exact_tree` and
+  `ambiguous_dispatch_row_confirms_from_tree_without_redispatch_under_exact_tree`
+  prove that exact-tree advancement of a dispatch-ambiguity row scans before
+  any POST and confirms a landed generation without redispatch;
 - `post_timeout_before_the_dispatch_marker_is_definitely_unsent` and
   `post_timeout_after_the_dispatch_marker_is_ambiguous` prove that the SDK's
   POST deadline is classified against the dispatch marker: a transport that
@@ -1068,18 +1106,26 @@ Tests cover:
 - local committed failure clears the tracked candidate into `Recovering`;
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class is durably recorded before retry, and final
-  ambiguous-attempt exhaustion produces `SubmittedWithoutHash`;
+  ambiguous-attempt exhaustion leaves hashless `Recovering` for a later
+  invocation
+  (`single_ambiguous_attempt_stays_recovering_and_retries_on_the_next_advance`,
+  `attempts_cycle_endpoints_and_exhaust_to_hashless_recovery`,
+  `fresh_ambiguous_post_exhaustion_stays_recovering_without_scanning`,
+  `ambiguous_exhaustion_stays_recovering_and_a_later_exact_tree_pass_confirms`,
+  `cancellation_during_final_dispatch_persists_hashless_recovery`,
+  `operation_epoch_change_during_final_dispatch_persists_hashless_recovery`);
 - `ambiguous_retry_clock_failure_reports_the_durable_recovery_state` proves
   that a clock failure between a durable ambiguity and its retry reservation
   reports durable `Recovering` rather than a stateless failure;
 - `nonfinal_candidate_hash_collision_uses_the_remaining_bounded_retry` proves
   that a collision before the final attempt continues through the same
   invocation's remaining retry budget;
-- `final_candidate_hash_collision_exhausts_without_lookup_or_redispatch`
-  proves that a final accepted hash owned by another generation becomes
-  terminal `SubmittedWithoutHash` and later advancement sends no POST;
-- `final_recovery_hash_collision_exhausts_without_later_redispatch` proves the
-  same terminal rule for a final POST reserved by exact-tree recovery;
+- `final_candidate_hash_collision_stays_recovering_without_lookup` proves that
+  a final accepted hash owned by another generation is never polled, leaves
+  hashless `Recovering`, and is retried by a later invocation;
+- `final_recovery_hash_collision_stays_recovering_until_the_next_scan` proves
+  the same for a final POST reserved by exact-tree recovery, whose next
+  exact-tree pass scans before retrying;
 - restart from `Submitting` produces `Recovering`;
 - retry limits and endpoint failover are bounded per lifecycle invocation,
   attempts may exceed endpoint count, and endpoint selection cycles by ordinal;
@@ -1115,13 +1161,20 @@ Tests cover:
 - cancellation or definitely-unsent failure after the combined transaction
   leaves the monotonic reservation count unchanged, leaves hashless sticky
   recovery, and requires a new completed valid no-match pass before retry;
-- `nonfinal_ambiguous_recovery_retry_continues_bounded_retries` proves that a
-  possibly-dispatched authorized retry uses the invocation's remaining budget
-  through the ordinary backoff and ambiguous-retry reservation instead of
-  returning, and
+- `nonfinal_ambiguous_recovery_retry_continues_bounded_retries` and
+  `nonfinal_recovery_hash_collision_continues_bounded_retries` prove that a
+  possibly-dispatched or colliding authorized retry uses the invocation's
+  remaining budget through the ordinary backoff and ambiguous-retry
+  reservation instead of returning;
   `ambiguous_recovery_retry_qualifies_for_a_direct_retry_on_the_next_advance`
-  proves that the new dispatch ambiguity is durable, so a later invocation
-  reserves the next POST without another tree pass;
+  proves that the new dispatch ambiguity is durable, so a later status-only
+  invocation reserves the next POST directly, and
+  `interruption_inside_a_continued_retry_loop_keeps_the_reservation` proves
+  that interrupting the continued loop removes nothing;
+- `final_ambiguous_recovery_retry_stays_recovering` proves that exhausting the
+  budget on an authorized retry leaves hashless `Recovering`;
+- `imported_delegation_never_scans_under_exact_tree` proves that exact-tree
+  advancement of an imported delegation polls its candidate and never scans;
 - attempt count never decreases, is diagnostic rather than a permanent retry
   gate, and cannot underflow or be reopened by callback ordering;
 - each lifecycle invocation enforces independent finite attempt and backoff
@@ -1187,7 +1240,8 @@ Tests cover:
   removes only the fresh definitely-unsent reservation;
 - failure to persist that normalization reports an operational failure with
   the known possibly-dispatched state and never returns `Cancelled`;
-- cancellation after dispatch preserves `Recovering`; and
+- cancellation after dispatch preserves `Recovering`, including cancellation
+  or an operation-epoch change during an invocation's final dispatch; and
 - cancellation after the confirmation commit point cannot suppress
   persistence.
 
@@ -1208,8 +1262,9 @@ Tests cover:
 - a version-17 round id that cannot form a canonical identity creates no
   submission row and leaves its domain evidence untouched;
 - a hashless `Recovering` row becomes `SubmittedWithoutHash` only for code 2
-  after unresolved dispatch, while another deterministic rejection preserves
-  the ambiguity and errors;
+  after unresolved dispatch, after a no-match tree pass under exact-tree
+  advancement, while another deterministic rejection preserves the ambiguity
+  and errors;
 - version-18 rows migrate incrementally to version 19, fresh and migrated
   schemas are equivalent, and current-schema fingerprint rejection covers
   missing columns, indexes, and triggers;
@@ -1285,7 +1340,7 @@ Public-lifecycle engine coverage is anchored by
 `reservation_commits_before_post_and_accepted_hash_is_tracking`,
 `delegation_uses_the_same_lifecycle_and_atomic_confirmation_path`,
 `reservation_failure_dispatches_nothing_and_writes_nothing`,
-`attempts_cycle_endpoints_and_exhaust_to_hashless_submission`,
+`attempts_cycle_endpoints_and_exhaust_to_hashless_recovery`,
 `ambiguous_retry_waits_for_configured_backoff`,
 `malformed_accepted_response_reserves_the_next_bounded_retry`,
 `invalid_protocol_ambiguity_is_retryable_on_a_later_advance`,
@@ -1293,7 +1348,7 @@ Public-lifecycle engine coverage is anchored by
 `accepted_retry_short_circuits_to_normal_hash_tracking`,
 `nullifier_spent_after_ambiguity_is_terminal_and_idempotent`,
 `other_rejection_after_ambiguity_surfaces_error_and_preserves_ambiguity`,
-`single_ambiguous_attempt_is_terminal_and_idempotent`,
+`single_ambiguous_attempt_stays_recovering_and_retries_on_the_next_advance`,
 `failed_post_classification_reports_known_possible_dispatch`,
 `failed_tracking_reconciliation_reports_the_durable_state`,
 `tracking_deadline_survives_polling_and_coordinator_restart`,

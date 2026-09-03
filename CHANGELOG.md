@@ -132,6 +132,20 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Exhausting an invocation's POST budget on a possibly-dispatched attempt, a
+  colliding hash, or cancellation during the final dispatch no longer ends a
+  generation as `SubmittedWithoutHash`. The row stays hashless `Recovering`
+  with its last dispatch diagnostic, and a later invocation may scan or retry.
+  `SubmittedWithoutHash` is now reachable only through chain rejection code 2
+  after unresolved dispatch.
+- `ExactTree` advancement of a hashless dispatch-ambiguity row now scans the
+  tree before any POST, and a code-2 rejection after unresolved dispatch runs
+  one tree pass before the terminal transition, so a generation that already
+  landed is confirmed with positions instead of stranding its bundle.
+  Status-only advancement keeps the direct retry.
+- A non-final exact-tree recovery retry whose accepted hash collides with
+  another generation now continues through the remaining bounded attempts.
+- `ExactTree` advancement of an imported delegation never scans the tree.
 - A vote-chain POST that hits the SDK's own deadline before the transport
   marks dispatch is now classified as definitely unsent, so the fresh
   reservation is removed and bounded failover continues instead of persisting

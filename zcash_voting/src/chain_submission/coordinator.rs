@@ -10,7 +10,9 @@ use super::{
         ChainProtocolClient, ChainRejectionKind, LookupFailure, PostAttemptOutcome,
         TransactionStatusObservation,
     },
-    recovery::{scan_exact_layout, RecoveryScanFailure, RecoveryScanOutcome},
+    recovery::{
+        scan_exact_layout, RecoveryRetryAuthorization, RecoveryScanFailure, RecoveryScanOutcome,
+    },
     state::{SubmissionObservation, SubmissionRecordState},
     store::{
         ChainSubmissionStore, ConfirmationCommit, StoreAdmission, StoreAdvancementRequest,
@@ -182,7 +184,13 @@ where
             StoreAdmission::Ready {
                 derived, record, ..
             } => {
-                if is_retryable_dispatch_ambiguity(&record)
+                // Status-only advancement may re-POST a dispatch-ambiguity
+                // row directly. Exact-tree advancement falls through to
+                // reconciliation, which scans the tree before any POST so a
+                // generation that already landed is confirmed rather than
+                // redispatched into a "nullifier already spent" rejection.
+                if recovery == ChainRecoveryMode::StatusOnly
+                    && is_retryable_dispatch_ambiguity(&record)
                     && !request.is_imported_delegation()
                     && interruption(&operation, control).is_none()
                 {
@@ -226,10 +234,16 @@ where
     ///
     /// `first_attempt_index` is the number of POST attempts this invocation
     /// has already consumed; the loop runs the remaining budget. A fresh
-    /// `Submitting` reservation enters with index 0. A hashless `Recovering`
-    /// row that already carries dispatch ambiguity may enter later, after a
-    /// recovery retry was itself possibly dispatched, and continues with the
-    /// same backoff and reservation discipline as any other ambiguous retry.
+    /// `Submitting` reservation enters with index 0, as does a hashless
+    /// dispatch-ambiguity row reserved directly under status-only advancement.
+    /// A row whose exact-tree recovery retry was itself ambiguous enters later
+    /// and continues with the same backoff and reservation discipline.
+    ///
+    /// Exhausting the budget never ends the generation: the row stays hashless
+    /// `Recovering` with its last attempt's dispatch diagnostic, and a later
+    /// invocation receives a fresh budget. Only chain rejection code 2 after
+    /// unresolved dispatch is terminal, and under exact-tree advancement one
+    /// tree pass precedes even that.
     #[allow(
         clippy::too_many_arguments,
         reason = "the attempt loop keeps each captured authority explicit"
@@ -297,10 +311,9 @@ where
 
             match outcome {
                 PostAttemptOutcome::Accepted(candidate) => {
-                    let record = self.classify_returned_candidate(
+                    let record = self.classify_dispatched_post(
                         derived.generation(),
-                        candidate,
-                        attempt_index + 1 == self.policy.maximum_post_attempts,
+                        SubmissionObservation::UsableCandidateHash(candidate),
                     )?;
                     if returned_candidate_is_unusable(&record) {
                         reserved = record;
@@ -324,16 +337,11 @@ where
                     kind, diagnostic, ..
                 } => {
                     if ambiguity_seen && kind == ChainRejectionKind::NullifierAlreadySpent {
-                        let submitted = ChainSubmissionDiagnostic::from_redacted_message(
-                            ChainSubmissionDiagnosticKind::NullifierAlreadySpent,
-                            "vote chain reported nullifier already spent after ambiguous dispatch",
-                        );
                         return self
-                            .classify_dispatched_post(
-                                derived.generation(),
-                                SubmissionObservation::SubmittedWithoutHash(submitted),
-                            )?
-                            .public_result();
+                            .settle_nullifier_spent_after_dispatch(
+                                request, operation, lease, &derived, &reserved, recovery, control,
+                            )
+                            .await;
                     }
                     let record = self.classify_dispatched_post(
                         derived.generation(),
@@ -349,18 +357,6 @@ where
                     return record.public_result();
                 }
                 PostAttemptOutcome::PossiblyDispatched(diagnostic) => {
-                    if attempt_index + 1 == self.policy.maximum_post_attempts {
-                        let exhausted = ChainSubmissionDiagnostic::from_redacted_message(
-                            ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
-                            "configured POST attempts exhausted after ambiguous dispatch",
-                        );
-                        return self
-                            .classify_dispatched_post(
-                                derived.generation(),
-                                SubmissionObservation::SubmittedWithoutHash(exhausted),
-                            )?
-                            .public_result();
-                    }
                     reserved = self.classify_dispatched_post(
                         derived.generation(),
                         SubmissionObservation::PossiblyDispatched(diagnostic),
@@ -415,6 +411,13 @@ where
                 }
             }
 
+            // Every non-ambiguous arm returned above on a final attempt. An
+            // ambiguous final attempt leaves the durable ambiguity for a later
+            // invocation; it must not reach the backoff table, which has one
+            // entry fewer than the attempt budget.
+            if attempt_index + 1 == self.policy.maximum_post_attempts {
+                return reserved.public_result();
+            }
             if ambiguity_seen {
                 reserved = match self
                     .reserve_ambiguous_retry_after_backoff(
@@ -569,34 +572,6 @@ where
             .map_err(|error| {
                 ChainSubmissionFailure::with_known_possible_dispatch(error.kind(), error.message())
             })
-    }
-
-    /// Persists a returned hash, including store-detected ownership collisions.
-    ///
-    /// A collision is dispatch ambiguity rather than usable acceptance. It
-    /// consumes the current attempt and becomes terminal when no attempt remains.
-    fn classify_returned_candidate(
-        &self,
-        generation: &super::ChainSubmissionGeneration,
-        candidate: super::CandidateTransactionHash,
-        is_final_attempt: bool,
-    ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
-        let record = self.classify_dispatched_post(
-            generation,
-            SubmissionObservation::UsableCandidateHash(candidate),
-        )?;
-        if !is_final_attempt || !returned_candidate_is_unusable(&record) {
-            return Ok(record);
-        }
-        self.classify_dispatched_post(
-            generation,
-            SubmissionObservation::SubmittedWithoutHash(
-                ChainSubmissionDiagnostic::from_redacted_message(
-                    ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
-                    "configured POST attempts exhausted after vote-chain returned an unusable transaction hash",
-                ),
-            ),
-        )
     }
 
     fn remove_fresh_reservation(
@@ -922,7 +897,10 @@ where
         post_attempts_used: usize,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        // An imported delegation cannot be reconstructed or redispatched by
+        // the voter, so it never scans; only its candidate hash is polled.
         if recovery == ChainRecoveryMode::StatusOnly
+            || request.is_imported_delegation()
             || !matches!(record.state(), SubmissionRecordState::Recovering { .. })
         {
             return record.public_result();
@@ -937,20 +915,14 @@ where
             } => *candidate_transaction_hash,
             _ => unreachable!("checked above"),
         };
-        match scan_exact_layout(
-            &self.protocol,
-            &derived,
-            candidate,
-            operation,
-            lease,
-            || interruption(operation, control).is_some(),
-        )
-        .await
+        match self
+            .scan_tree(&derived, candidate, operation, lease, control)
+            .await?
         {
-            Ok(RecoveryScanOutcome::Match {
+            RecoveryScan::Match {
                 final_van_position,
                 vote_commitment_positions,
-            }) => self.confirm_tree(
+            } => self.confirm_tree(
                 request,
                 operation,
                 &derived,
@@ -958,7 +930,8 @@ where
                 vote_commitment_positions,
                 control,
             ),
-            Ok(RecoveryScanOutcome::NoMatch(authorization)) => {
+            RecoveryScan::Interrupted => record.public_result(),
+            RecoveryScan::NoMatch(authorization) => {
                 if post_attempts_used >= self.policy.maximum_post_attempts {
                     return record.public_result();
                 }
@@ -1013,7 +986,39 @@ where
                 )
                 .await
             }
-            Err(RecoveryScanFailure::Interrupted) => record.public_result(),
+        }
+    }
+
+    /// Runs one bounded exact-tree pass for a durable `Recovering` row.
+    ///
+    /// A scan that cannot complete (malformed or contradictory tree data, a
+    /// transport failure) records a bounded diagnostic on the row, leaves it
+    /// `Recovering`, and surfaces an error; it never produces authorization or
+    /// retires a candidate. Interruption is reported as such with no error.
+    async fn scan_tree<'a>(
+        &self,
+        derived: &DerivedChainSubmission,
+        candidate: Option<super::CandidateTransactionHash>,
+        operation: &'a CapturedSubmissionOperation,
+        lease: &'a SubmissionOperationLease,
+        control: &dyn SubmissionControl,
+    ) -> Result<RecoveryScan<'a>, ChainSubmissionFailure> {
+        match scan_exact_layout(&self.protocol, derived, candidate, operation, lease, || {
+            interruption(operation, control).is_some()
+        })
+        .await
+        {
+            Ok(RecoveryScanOutcome::Match {
+                final_van_position,
+                vote_commitment_positions,
+            }) => Ok(RecoveryScan::Match {
+                final_van_position,
+                vote_commitment_positions,
+            }),
+            Ok(RecoveryScanOutcome::NoMatch(authorization)) => {
+                Ok(RecoveryScan::NoMatch(authorization))
+            }
+            Err(RecoveryScanFailure::Interrupted) => Ok(RecoveryScan::Interrupted),
             Err(RecoveryScanFailure::Invalid(diagnostic)) => {
                 self.reconcile_with_durable_state(
                     derived.generation(),
@@ -1047,16 +1052,77 @@ where
         }
     }
 
+    /// Resolves chain rejection code 2 observed after unresolved dispatch.
+    ///
+    /// Code 2 proves this generation's nullifiers are spent, so an earlier
+    /// dispatch landed. Under exact-tree advancement one tree pass runs first:
+    /// a match confirms the generation with its positions; a completed valid
+    /// no-match discards its retry authorization, which must never dispatch
+    /// again, and ends the generation as `SubmittedWithoutHash`. A scan that
+    /// cannot complete leaves the row `Recovering` with its dispatch evidence
+    /// so a later pass converges. Status-only advancement has no scan and ends
+    /// the generation at once.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the code-2 settlement keeps each captured authority explicit"
+    )]
+    async fn settle_nullifier_spent_after_dispatch(
+        &self,
+        request: &StoreAdvancementRequest,
+        operation: &CapturedSubmissionOperation,
+        lease: &SubmissionOperationLease,
+        derived: &DerivedChainSubmission,
+        current: &StoredChainSubmission,
+        recovery: ChainRecoveryMode,
+        control: &dyn SubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let end_hashless = || {
+            let submitted = ChainSubmissionDiagnostic::from_redacted_message(
+                ChainSubmissionDiagnosticKind::NullifierAlreadySpent,
+                "vote chain reported nullifier already spent after ambiguous dispatch",
+            );
+            self.classify_dispatched_post(
+                derived.generation(),
+                SubmissionObservation::SubmittedWithoutHash(submitted),
+            )?
+            .public_result()
+        };
+        if recovery == ChainRecoveryMode::StatusOnly {
+            return end_hashless();
+        }
+        match self
+            .scan_tree(derived, None, operation, lease, control)
+            .await?
+        {
+            RecoveryScan::Match {
+                final_van_position,
+                vote_commitment_positions,
+            } => self.confirm_tree(
+                request,
+                operation,
+                derived,
+                final_van_position,
+                vote_commitment_positions,
+                control,
+            ),
+            // The no-match authorization is deliberately discarded: code 2
+            // already proved the nullifiers spent, so nothing may dispatch.
+            RecoveryScan::NoMatch(_discarded_authorization) => end_hashless(),
+            RecoveryScan::Interrupted => current.public_result(),
+        }
+    }
+
     /// Dispatches the one POST authorized by a completed valid no-match tree
     /// pass.
     ///
     /// `post_attempts_used` counts this invocation's earlier POSTs; this
-    /// attempt is final when it exhausts the configured budget. Whether a
-    /// "nullifier already spent" rejection may end the generation as
+    /// attempt is final when it exhausts the configured budget, in which case
+    /// an ambiguous outcome is left for a later invocation rather than ended.
+    /// Whether a "nullifier already spent" rejection may end the generation as
     /// `SubmittedWithoutHash` is decided by the durable row, not by the fact
     /// that a retry was authorized: only a row still carrying unresolved
     /// dispatch evidence treats that rejection as proof of an earlier
-    /// submission.
+    /// submission, and even then one tree pass runs first.
     #[allow(
         clippy::too_many_arguments,
         reason = "the recovery retry keeps each captured authority explicit"
@@ -1110,24 +1176,33 @@ where
                 outcome = &mut post => outcome,
             }
         };
-        match outcome {
-            PostAttemptOutcome::Accepted(candidate) => self
-                .classify_returned_candidate(derived.generation(), candidate, is_final_attempt)?
-                .public_result(),
+        // Both ambiguous outcomes, a lost response and a colliding hash, leave
+        // the row hashless `Recovering` with this attempt's dispatch
+        // diagnostic and share the continuation below.
+        let ambiguous = match outcome {
+            PostAttemptOutcome::Accepted(candidate) => {
+                let record = self.classify_dispatched_post(
+                    derived.generation(),
+                    SubmissionObservation::UsableCandidateHash(candidate),
+                )?;
+                if !returned_candidate_is_unusable(&record) {
+                    return record.public_result();
+                }
+                record
+            }
+            PostAttemptOutcome::PossiblyDispatched(diagnostic) => self.classify_dispatched_post(
+                derived.generation(),
+                SubmissionObservation::PossiblyDispatched(diagnostic),
+            )?,
             PostAttemptOutcome::Rejected {
                 kind, diagnostic, ..
             } => {
                 if ambiguity_preceded && kind == ChainRejectionKind::NullifierAlreadySpent {
-                    let submitted = ChainSubmissionDiagnostic::from_redacted_message(
-                        ChainSubmissionDiagnosticKind::NullifierAlreadySpent,
-                        "vote chain reported nullifier already spent after ambiguous dispatch",
-                    );
                     return self
-                        .classify_dispatched_post(
-                            derived.generation(),
-                            SubmissionObservation::SubmittedWithoutHash(submitted),
-                        )?
-                        .public_result();
+                        .settle_nullifier_spent_after_dispatch(
+                            request, operation, lease, &derived, &reserved, recovery, control,
+                        )
+                        .await;
                 }
                 // Without unresolved dispatch evidence a code-2 rejection is
                 // handled like any other definite rejection: the row stays
@@ -1138,64 +1213,11 @@ where
                     derived.generation(),
                     SubmissionObservation::DefiniteRejection(diagnostic.clone()),
                 )?;
-                Err(ChainSubmissionFailure::with_durable_state(
+                return Err(ChainSubmissionFailure::with_durable_state(
                     ChainSubmissionFailureKind::Protocol,
                     record.durable_state(),
                     diagnostic.message(),
-                ))
-            }
-            PostAttemptOutcome::PossiblyDispatched(diagnostic) => {
-                if is_final_attempt {
-                    let exhausted = ChainSubmissionDiagnostic::from_redacted_message(
-                        ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
-                        "configured POST attempts exhausted after ambiguous dispatch",
-                    );
-                    return self
-                        .classify_dispatched_post(
-                            derived.generation(),
-                            SubmissionObservation::SubmittedWithoutHash(exhausted),
-                        )?
-                        .public_result();
-                }
-                // The row now durably carries this attempt's dispatch
-                // ambiguity, so the remaining budget continues through the
-                // ordinary ambiguous-retry loop rather than ending here.
-                let reserved = self.classify_dispatched_post(
-                    derived.generation(),
-                    SubmissionObservation::PossiblyDispatched(diagnostic),
-                )?;
-                drop(in_flight);
-                if interruption(operation, control).is_some() {
-                    return reserved.public_result();
-                }
-                let reserved = match self
-                    .reserve_ambiguous_retry_after_backoff(
-                        post_attempts_used,
-                        derived.generation(),
-                        reserved,
-                        operation,
-                        control,
-                    )
-                    .await?
-                {
-                    AmbiguousRetryReservation::Reserved(reserved) => reserved,
-                    AmbiguousRetryReservation::Interrupted(reserved) => {
-                        return reserved.public_result()
-                    }
-                };
-                // Boxed: the attempt loop can reach recovery again through
-                // reconciliation, so this edge closes an async cycle.
-                Box::pin(self.submit_reserved_attempts(
-                    request,
-                    operation,
-                    lease,
-                    derived,
-                    reserved,
-                    recovery,
-                    post_attempts_used + 1,
-                    control,
-                ))
-                .await
+                ));
             }
             PostAttemptOutcome::DefinitelyUnsent(error) => {
                 self.reconcile_with_durable_state(
@@ -1207,11 +1229,11 @@ where
                     )),
                     ChainSubmissionState::Recovering,
                 )?;
-                Err(ChainSubmissionFailure::with_durable_state(
+                return Err(ChainSubmissionFailure::with_durable_state(
                     ChainSubmissionFailureKind::Transport,
                     ChainSubmissionState::Recovering,
                     error.message(),
-                ))
+                ));
             }
             PostAttemptOutcome::LocalFailure(diagnostic) => {
                 self.reconcile_with_durable_state(
@@ -1220,13 +1242,51 @@ where
                     Some(diagnostic.clone()),
                     ChainSubmissionState::Recovering,
                 )?;
-                Err(ChainSubmissionFailure::with_durable_state(
+                return Err(ChainSubmissionFailure::with_durable_state(
                     ChainSubmissionFailureKind::Protocol,
                     ChainSubmissionState::Recovering,
                     diagnostic.message(),
-                ))
+                ));
             }
+        };
+        // A final ambiguous attempt leaves the durable ambiguity for a later
+        // invocation's fresh budget; it is not chain evidence.
+        if is_final_attempt {
+            return ambiguous.public_result();
         }
+        // The row now durably carries this attempt's dispatch ambiguity, so
+        // the remaining budget continues through the ordinary ambiguous-retry
+        // loop rather than ending here.
+        drop(in_flight);
+        if interruption(operation, control).is_some() {
+            return ambiguous.public_result();
+        }
+        let reserved = match self
+            .reserve_ambiguous_retry_after_backoff(
+                post_attempts_used,
+                derived.generation(),
+                ambiguous,
+                operation,
+                control,
+            )
+            .await?
+        {
+            AmbiguousRetryReservation::Reserved(reserved) => reserved,
+            AmbiguousRetryReservation::Interrupted(reserved) => return reserved.public_result(),
+        };
+        // Boxed: the attempt loop can reach recovery again through
+        // reconciliation, so this edge closes an async cycle.
+        Box::pin(self.submit_reserved_attempts(
+            request,
+            operation,
+            lease,
+            derived,
+            reserved,
+            recovery,
+            post_attempts_used + 1,
+            control,
+        ))
+        .await
     }
 
     fn confirm_tree(
@@ -1432,6 +1492,20 @@ fn interrupted_without_state(
     }
 }
 
+/// Outcome of one completed or interrupted exact-tree pass.
+enum RecoveryScan<'a> {
+    /// The complete expected layout was found once; confirm with positions.
+    Match {
+        final_van_position: u64,
+        vote_commitment_positions: Vec<u64>,
+    },
+    /// A valid complete pass found no layout; the private authorization may
+    /// reserve exactly one same-generation retry, or be discarded.
+    NoMatch(RecoveryRetryAuthorization<'a>),
+    /// The host interrupted the pass; the row is unchanged.
+    Interrupted,
+}
+
 /// Outcome of waiting out a backoff and reserving the next ambiguous retry.
 enum AmbiguousRetryReservation {
     /// The next same-generation POST is durably reserved.
@@ -1444,6 +1518,9 @@ fn is_retryable_dispatch_ambiguity(record: &StoredChainSubmission) -> bool {
     record.state().permits_ambiguous_retry()
 }
 
+/// True when the store classified a returned hash as a collision: the hash is
+/// already bound to another generation, so the response is dispatch ambiguity
+/// rather than usable acceptance and consumes the attempt like a timeout.
 fn returned_candidate_is_unusable(record: &StoredChainSubmission) -> bool {
     matches!(
         record.state(),

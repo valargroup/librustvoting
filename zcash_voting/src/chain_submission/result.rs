@@ -19,14 +19,18 @@ pub enum ChainSubmissionState {
     /// tracking ended inconclusively; further bounded retries, polling, or
     /// exact-tree recovery may still resolve the submission.
     Recovering,
-    /// Terminal: the bounded POST dispatch is durably treated as submitted, but
-    /// no transaction hash and no confirmation positions are available.
+    /// Terminal: the vote chain rejected a retry with "nullifier already
+    /// spent" after this generation was possibly dispatched, which proves an
+    /// earlier dispatch landed, but no transaction hash and no confirmation
+    /// positions are available. Under exact-tree advancement one complete
+    /// tree pass found no layout before this state was written.
     ///
     /// This is not a confirmation. The lifecycle performs no further retry,
     /// polling, or tree recovery for the generation, and dependent work (such
     /// as the next bundle generation) stays blocked exactly as it would behind
-    /// an unresolved submission. Hosts surface the stored diagnostic to the
-    /// user rather than scheduling another pass.
+    /// an unresolved submission. Exhausting an invocation's POST budget never
+    /// produces this state; that leaves the row `Recovering`. Hosts surface the
+    /// stored diagnostic to the user rather than scheduling another pass.
     SubmittedWithoutHash,
     /// Terminal: the transaction committed successfully and its positions are
     /// recorded.

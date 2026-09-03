@@ -204,7 +204,8 @@ pub(super) fn apply_submission_observation(
         // A retry that is itself possibly dispatched replaces the stored
         // diagnostic: the row now carries fresh dispatch ambiguity, which
         // qualifies the next same-generation POST for a direct ambiguous
-        // retry instead of another full tree pass.
+        // retry under status-only advancement. Exact-tree advancement still
+        // scans first.
         (
             Some(State::Recovering {
                 candidate_transaction_hash: None,
