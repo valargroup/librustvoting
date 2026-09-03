@@ -6,6 +6,51 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+<<<<<<< HEAD
+=======
+### Added
+
+- Added the inactive private chain-submission lifecycle coordinator and store
+  contract, including durable pre-POST reservation, bounded failover,
+  candidate reconciliation, restart-stable tracking deadlines, sticky
+  recovery, atomic confirmation, canonical lifecycle serialization,
+  store-owned lock authority, causal bundle admission, strict batch-roster and
+  confirmation-event validation, unique candidate ownership, and exact
+  committed-reservation accounting.
+
+### Changed
+
+- **Breaking:** delegation recovery views now expose VAN positions as `u64`,
+  matching lifecycle confirmation and SQLite's supported non-negative range.
+
+### Fixed
+
+- Chain-submission cancellation now removes a fresh reservation when transport
+  dispatch has not begun. Batch admission derives its identity locks from the
+  complete request roster, verifies the persisted roster before reading
+  migration guards, and rejects oversized rosters before lock allocation.
+- Session cleanup now preserves delegation setup fields for bundles with a
+  successful proof so wallets can resume signing without regenerating ZKP1.
+- VAN positions above `u32::MAX` are now read losslessly; legacy `u32` readers
+  return a range error instead of wrapping.
+
+### Removed
+
+- Removed the standalone `recovery::clear` and
+  `VotingDb::clear_recovery_state` APIs. Ordinary reset preserves durable
+  submission evidence; explicit round or account deletion remains the
+  destructive cleanup boundary.
+
+## v3.1.0
+
+### Changed
+
+- Released the exact `v3.1.0-rc.16` implementation as `v3.1.0` without
+  implementation changes. Its supporting production snapshots were released
+  as `pir-types 0.6.2`, `pir-client 0.7.2`, `voting-circuits 0.11.2`,
+  `vote-commitment-tree 0.6.0`, and `vote-commitment-tree-client 0.8.0`.
+
+>>>>>>> 5df3810 (Prepare zcash_voting 3.1.0 (#280))
 ## v3.1.0-rc.16
 
 ### Changed
