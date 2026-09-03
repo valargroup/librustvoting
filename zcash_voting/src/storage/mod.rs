@@ -87,6 +87,8 @@ pub struct KeystoneSignatureBatchResult {
 pub struct VotingDb {
     conn: Mutex<Connection>,
     wallet_id: Mutex<String>,
+    pub(crate) chain_submission_coordination:
+        crate::chain_submission::coordination::SubmissionCoordination,
 }
 
 impl VotingDb {
@@ -117,6 +119,7 @@ impl VotingDb {
         Ok(Self {
             conn: Mutex::new(conn),
             wallet_id: Mutex::new(String::new()),
+            chain_submission_coordination: Default::default(),
         })
     }
 
@@ -173,7 +176,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
     }
 
     #[test]

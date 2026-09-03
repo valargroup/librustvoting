@@ -7,11 +7,9 @@ This document is the normative specification for vote-chain submission in
 document and its behavior-oriented conformance tests in the same change.
 
 The design has one authoritative `chain_submissions` row for each semantic
-generation, plus migration-only legacy guards for v17 chain evidence whose
-generation cannot be reconstructed. A complete legacy confirmation uses
-`LegacyConfirmed`; incomplete evidence uses a digestless `Recovering` guard.
-Digestless guards remain permanently unbound. The design does not use an
-attempt journal or a durable scan workflow.
+generation, and every row is created by the lifecycle itself: no pre-upgrade
+evidence is imported into it. The design does not use an attempt journal or a
+durable scan workflow.
 
 The normal path is:
 
@@ -47,12 +45,38 @@ All public submission entry points are typed. Callers cannot submit arbitrary
 JSON or directly record hashes, confirmation positions, or lifecycle states.
 Domain hash and position columns are projections maintained by the lifecycle,
 not competing sources of submission state.
+An implementation phase that cannot yet perform the complete candidate-first
+recovery, fixed-snapshot tree scan, and authorized same-generation retry keeps
+its submission entry points private. A partial public lifecycle that can enter
+`Recovering` without advancing it is not conformant.
+An implementation is not releasable unless it provides the complete recovery
+lifecycle described by this specification and explicitly resolves a
+proven-absent rejected generation that cannot succeed unchanged. A conformant
+resolution may allow a replacement generation after a valid no-match pass or
+may rely on a versioned chain contract that proves replacement is unnecessary.
 
 Vote API and commitment-tree endpoints are trusted for chain status, events,
 and validated snapshots. A malformed, incomplete, contradictory, or
 unsupported response is not evidence. Routes that promise privacy fail closed,
 mutation and lookup redirects are not followed, and production endpoints use
 authenticated encryption.
+
+The supported deployment topology has exactly one vote ledger for each
+production `Network` value: one mainnet ledger and one testnet ledger. Every
+Vote API endpoint, commitment-tree endpoint, and configured vote-chain id used
+with a network, including replacements made across process restarts, must refer
+to that same ledger and its canonical commitment tree. Endpoint rotation and
+failover select replicas or gateways for the ledger; they are not a chain
+migration mechanism.
+
+Running two independent ledgers under the same `Network`, mixing endpoints from
+different ledgers, or reusing a voting database after repointing that network
+to another ledger is unsupported operator misconfiguration and is outside the
+submission lifecycle's threat model. Each independent regtest ledger likewise
+requires a fresh voting database or an otherwise separate storage namespace.
+The lifecycle is therefore not required to persist an additional routing
+identifier or reconcile an ambiguous attempt safely across independent
+ledgers.
 
 One process exclusively owns a voting database. Operations capture wallet,
 round, submission identity, and host operation epoch once; an account switch
@@ -63,16 +87,22 @@ cannot retarget in-flight work.
 A submission identity contains:
 
 ```text
-(wallet, chain/network, round, kind, bundle, proposal-or-batch)
+(wallet, network, round, kind, bundle, proposal-or-batch)
 ```
 
-The migration-only legacy singleton identity is the recovery-independent key
-`(wallet, chain/network, round, vote, bundle, proposal)`. `LegacyConfirmed` is
-eligible only for a v17 vote with no batch markers and with both recorded
-bundle VAN and vote-commitment positions. It is never inferred for delegation
-or for an atomic batch. A row is batch-indicated exactly when recovery JSON
-contains a non-null value for `batch_digest`, `batch_index`, or `batch_size`,
-or when two or more vote rows share one non-null historical transaction hash.
+There is exactly one kind of submission identity. The configured vote-chain id
+selects where a request is dispatched, not what it means, so it binds neither
+the identity nor the generation digest and no request is built from it. Under
+the single-ledger-per-network deployment precondition, one identity therefore
+covers a wallet's round, bundle, and target across endpoint or chain-id
+configuration changes that still address that network's same ledger.
+Reconfiguration cannot reserve a second generation against the same persisted
+VAN. A configuration change to an independent ledger is not supported.
+An unresolved predecessor is bundle-wide. Only a terminal predecessor permits
+later work in that bundle. The lifecycle admits no vote or batch while the
+bundle's delegation row is unresolved, and it refuses a delegation reservation
+once a confirmed vote or batch exists in the bundle, so an unresolved
+delegation row can never sit beside a confirmed successor.
 
 `kind` is exactly one of:
 
@@ -108,10 +138,10 @@ signed request body. Field tags, ordering, and the frozen digest vector are
 part of the durable version-18 compatibility contract.
 
 The common identity field order is `identity.wallet_id`, `identity.network`,
-`identity.vote_chain_id`, `identity.vote_round_id`, `identity.bundle_index`,
-and `identity.kind`, followed by `identity.proposal_id` for a singleton or
-`identity.ordered_batch_digest` for a batch. Delegation fields then appear in
-this order:
+`identity.vote_round_id`, `identity.bundle_index`, and `identity.kind`,
+followed by `identity.proposal_id` for a singleton or
+`identity.ordered_batch_digest` for a batch. There is no vote-chain-id field.
+Delegation fields then appear in this order:
 
 ```text
 delegation.note_positions
@@ -150,13 +180,20 @@ Delegation padded-note-secret elements use `.rho` followed by `.rseed`.
 
 The complete v1 frozen digests are:
 
-- delegation: `41b0eecb59da7f911b94c7ae540f1674fb9b399feb2c71233024a297b2df5c63`;
-- singleton vote: `bfb3ebc460d3300aa9f3943cf023ee30ccc3bfae5a93ba9b131b4f99fa7706b1`;
-- ordered two-vote batch: `40e3bfefec14a5a21b9c11e6ee0140996fe1f9025140303de97dd7e89bf31b6c`.
+- delegation: `e04a9aab05cc403c3e4fd5818c38439a49da4239f22726ba7a8331ac5dcd4145`;
+- singleton vote: `e69db505c93cb02ab3e20c81322d1101da17e2c826ff167d1ae61a8d59551048`;
+- ordered two-vote batch: `304c59580189347446783a472ef6489751f3fd100578a8667af97ef73bee7335`.
 
 Their complete typed fixtures are maintained by
 `generation_digest_v1_matches_frozen_vector`; changing a fixture or digest is
 a generation-format version change, not an ordinary refactor.
+
+Those three values are recorded outputs and cannot by themselves detect a
+framing change, so the encoding is stated independently:
+`generation_transcript_encodes_exact_framing_bytes` asserts the literal
+transcript byte sequence, and `identity_transcript_binds_no_vote_chain_id`
+asserts the complete identity prefix. Both must be satisfied before a recorded
+digest is trusted.
 
 No final signed request body is persisted. Every request is reconstructed as a
 closed SDK wire type from locked durable inputs. The database stores neither a
@@ -177,43 +214,37 @@ outputs.
 
 ## Authoritative durable record
 
-There is exactly one `chain_submissions` row for a semantic generation. A
-database uniqueness constraint covers its full identity and generation digest.
-Creation and every durable state or field mutation occur in immediate
-transactions. Migration-only legacy guards are instead keyed by the available
-legacy identity, have no invented generation digest, and permanently block a
-fresh singleton submission for that identity. They also block any batch that
-contains the guarded `(bundle, proposal)` member; changing `kind` from `vote`
-to `vote_batch` cannot bypass a legacy guard. A partial unique index permits at
-most one digestless guard per legacy identity, and reservation checks every
-applicable singleton or batch-member legacy identity under canonically ordered
-submission-identity locks before deriving or inserting a generation. The same
-transaction prohibits a legacy guard from coexisting with a native singleton
-row or overlapping batch row.
+There is exactly one `chain_submissions` row for a semantic generation. The
+durable primary key is derived from the identity alone, and one total
+uniqueness constraint covers the decoded identity columns, so two reservations
+for one submission cannot coexist. Creation and every durable state or field
+mutation occur in immediate transactions.
+
+Every row carries the generation digest it was reserved for; the column is not
+nullable. Reservation acquires every applicable batch-member identity lock in
+canonical order before deriving or inserting a generation.
 
 The row stores only:
 
 - the typed identity;
-- generation digest, nullable only for migration-only `LegacyConfirmed` and
-  digestless `Recovering` guards;
+- generation digest;
 - durable state;
 - one optional canonical candidate transaction hash;
 - monotonic count of committed POST reservations;
 - an optional immutable tracking-start timestamp;
 - a bounded redacted diagnostic;
 - final confirmation source;
-- final VAN and vote-commitment positions in generation order, or the
-  unvalidated legacy domain positions for `LegacyConfirmed`; and
+- final VAN and vote-commitment positions in generation order; and
 - creation and update timestamps.
+
+The latest bounded lookup diagnostic for `Tracking` is durable operational
+context. A reopen must return the same diagnostic until a later observation or
+terminal transition replaces it; persistence cannot silently discard it.
 
 Final ordered positions use a closed typed encoding, not descriptor JSON. All
 positions are `u64` in the lifecycle and must fit SQLite's signed integer range.
-Position zero is valid. Schema checks require a digest for every native row.
-They require `LegacyConfirmed` to have source `legacy_projection`, both
-observed positions, no candidate hash, attempts, or tracking-start timestamp,
-and no recovery transitions. A digestless `Recovering` guard likewise has no
-candidate, attempts, or tracking-start timestamp. It can never acquire a
-generation digest or candidate and cannot scan, retry, or confirm.
+Position zero is valid. Schema checks require a 32-byte digest for every row,
+and the generation digest is immutable.
 
 The row does not store:
 
@@ -230,9 +261,9 @@ Candidate hashes are canonical lowercase 32-byte hashes. A candidate is only a
 current handle to poll; it is not confirmation, has no durable provenance
 class, and need not be retained when a completed valid recovery pass directly
 authorizes an atomic same-generation retry reservation. Retirement makes no
-claim about the transaction's chain outcome. Legacy guards do not import a
-candidate or confirmed hash; any historical hash remains only in its unchanged
-legacy projection column.
+claim about the transaction's chain outcome. A historical
+version-17 hash is never a candidate: it was never checked against a chain
+result, and it remains only in its unchanged domain column.
 One canonical candidate or hash-confirmed transaction belongs to at most one
 native semantic generation. If POST acceptance returns a hash already owned by
 another generation, the new reservation becomes hashless `Recovering` with an
@@ -243,9 +274,9 @@ Diagnostics are bounded, valid UTF-8, escaped, and redacted before storage.
 Raw response bodies and sensitive cryptographic material are never persisted in
 diagnostics or emitted through ordinary logging.
 
-Domain transaction hashes and positions are written only by atomic
-confirmation. After migration, runtime planning and status reads begin with
-`chain_submissions`; legacy domain columns cannot override its state.
+Domain transaction hashes and positions are written by atomic confirmation.
+Runtime planning and status reads begin with `chain_submissions` whenever a row
+exists; domain columns cannot override its state.
 
 ## Durable states
 
@@ -256,7 +287,6 @@ Submitting
 Tracking
 Recovering
 Confirmed
-LegacyConfirmed
 Rejected
 ```
 
@@ -269,22 +299,15 @@ Their meanings are:
 - `Recovering`: ordinary candidate polling is no longer sufficient to resolve
   the outcome because a request may have been dispatched without a usable hash
   or the bounded tracking window expired inconclusively. An optional candidate
-  hash is polled before tree recovery. Migration may also create a digestless
-  guard when v17 contains incomplete chain evidence without derivation inputs;
-  that guard remains permanently unbound and performs no network work. An
-  ordinary generation-bound state is sticky until confirmation or explicit
-  deletion; a digestless guard remains until explicit deletion.
+  hash is polled before tree recovery. The state is sticky until confirmation
+  or explicit deletion.
 - `Confirmed`: chain success and all required local confirmation updates are
-  durable. New confirmations record `hash` or `tree` as their source and record
-  the exact generation positions. Fully reconstructable migrated version-17
-  confirmations record `legacy_import`.
-- `LegacyConfirmed`: version 17 recorded the required domain confirmation
-  positions, but lacks the recovery material needed to derive a generation
-  digest or validate the exact output layout. It preserves the known
-  confirmation with source `legacy_projection` without claiming either fact
-  and permits no submission, reconciliation, or recovery.
-- `Rejected`: the generation received a definite chain rejection, or its sole
-  tracked hash is committed unsuccessfully.
+  durable. Its source records what the confirmation rests on: `hash` or
+  `tree`, with the exact generation positions.
+- `Rejected`: a compatibility-only terminal row retained for previously
+  persisted lifecycle data. Current runtime rejection codes are diagnostic
+  because they may depend on node state or chain time; new runtime work does
+  not enter this state.
 
 The normal transitions are:
 
@@ -292,11 +315,11 @@ The normal transitions are:
 new -> Submitting
 Submitting -> Tracking       usable success hash
 Submitting -> Recovering     possible dispatch without usable hash
-Submitting -> Rejected       definite chain rejection
+Submitting -> Recovering     chain rejection code
 Tracking -> Tracking         hash still pending
 Tracking -> Recovering       bounded tracking window expires inconclusively
 Tracking -> Confirmed        committed success and atomic persistence
-Tracking -> Rejected         committed failure
+Tracking -> Recovering       committed failure, failed candidate cleared
 Recovering -> Recovering     candidate, retry, no match, or interruption
 Recovering -> Confirmed      candidate success or exact tree layout
 ```
@@ -310,17 +333,15 @@ new
                               |                           |-- pending --> Tracking
                               |                           |-- window expires --> Recovering
                               |                           |-- committed success --> Confirmed
-                              |                           `-- committed failure --> Rejected
+                              |                           `-- committed failure --> Recovering
                               |-- possibly dispatched --> Recovering
                               |                           |-- candidate, scan, or retry --> Recovering
                               |                           `-- candidate success or exact tree layout
                               |                               --> Confirmed
-                              |-- definite rejection --> Rejected
+                              |-- chain rejection code --> Recovering
                               `-- definitely unsent first attempt --> no row
 
 abandoned Submitting on restart -- normalize --> Recovering
-unresolved legacy evidence ------ migrate ----> Recovering
-complete legacy projection ------ migrate ----> LegacyConfirmed
 ```
 
 The absence of `Recovering -> Tracking` and `Recovering -> Rejected` edges is
@@ -340,11 +361,8 @@ remains `Recovering`, the original ambiguity remains durable, and tree recovery
 remains available.
 
 Terminal rows are immutable except for idempotent replay of identical
-confirmation data and explicit round or account deletion. `LegacyConfirmed` is
-terminal, rejects every runtime transition and confirmation replay, and cannot
-be promoted or replaced by a reconstructed generation. Only deterministic
-reclassification during a retried atomic migration may recreate the same
-marker. Conflicting terminal data is an invariant error and writes nothing.
+confirmation data and explicit round or account deletion. Conflicting terminal
+data is an invariant error and writes nothing.
 
 ## Reservation and transport classification
 
@@ -353,27 +371,23 @@ Before releasing any POST byte, the lifecycle:
 1. derives the recovery-independent identity lock set from the request, then
    acquires the round/account gate, bundle lock where applicable, and those
    submission-identity locks in canonical order;
-2. loads the authoritative row plus every batch member's legacy singleton row
-   when applicable;
-3. returns `LegacyConfirmed` for a matching singleton, returns a digestless
-   guard as pending with `RecoveryUnavailable`, or rejects an overlapping
-   batch without dispatch, before requiring recovery material;
-4. loads and locks the generation inputs and derives the generation digest and
+2. loads the authoritative row;
+3. loads and locks the generation inputs and derives the generation digest and
    expected layout;
-5. creates the `Submitting` row, or validates the existing same-generation
+4. creates the `Submitting` row, or validates the existing same-generation
    `Recovering` row;
-6. increments the attempt count for the request; and
-7. commits the reservation.
+5. increments the attempt count for the request; and
+6. commits the reservation.
 
-For a recovery retry, steps 5 through 7 additionally consume the private
+For a recovery retry, steps 4 through 6 additionally consume the private
 single-use authorization produced by the immediately preceding valid no-match
 pass. They clear any inconclusive candidate and increment the attempt count in
 the same immediate transaction. There is no standalone candidate-retirement
 mutation and an empty candidate slot is not retry authorization.
 
-Guard lookup and native row insertion share the same canonically ordered
-identity locks and immediate transaction, so a concurrent singleton or batch
-call cannot bypass or replace the guard.
+Row lookup and insertion share the same canonically ordered identity locks and
+immediate transaction, so a concurrent singleton or batch call cannot bypass or
+replace an existing row.
 
 If reservation fails, dispatch does not occur. A process-local in-flight guard
 prevents cleanup, replacement, or deletion from racing response
@@ -418,13 +432,16 @@ A canonical success hash transitions the first attempt to `Tracking`. If the
 row was already `Recovering`, the hash becomes its candidate and the state
 remains `Recovering`.
 
-A definite chain rejection transitions `Submitting` to `Rejected`. A rejection
-while already `Recovering` cannot settle the earlier possible dispatch. Its
-code and log are diagnostic; if it also contains a canonical hash, that hash
-may fill an absent recovery-candidate slot and is polled before the next tree
-scan. It never overwrites a pending or unreadable candidate. Because the
-protocol does not specify that an error hash identifies an earlier accepted
-transaction, the hash is only a recovery handle.
+A chain rejection code transitions `Submitting` to bound hashless
+`Recovering`. Numeric rejection codes are diagnostic rather than proof that a
+generation can never succeed: validation can depend on the receiving node's
+local anchor state or on chain time. A rejection while already `Recovering`
+likewise cannot settle the earlier possible dispatch. Because the protocol does
+not specify that an error hash identifies an earlier accepted transaction, a
+hash in an error response is not confirmation evidence.
+Until the release prerequisite above is implemented, this row blocks later
+submissions that consume its unknown successor VAN. Same-generation retry alone
+does not resolve a generation whose anchor has become permanently stale.
 
 Within each lifecycle invocation, POST attempts, endpoints, body sizes, request
 durations, and backoffs are bounded by configuration with safe finite maxima.
@@ -444,31 +461,31 @@ Reconciliation is state-driven:
 - `Tracking` polls its candidate hash and never scans the tree. If a configured
   finite tracking window expires without a definitive result, it atomically
   becomes `Recovering` while retaining the candidate hash.
-- a bound `Recovering` row polls its candidate hash first. If hash polling does
+- a `Recovering` row polls its candidate hash first. If hash polling does
   not confirm, the lifecycle may perform one bounded tree recovery pass.
-- a digestless, unbound `Recovering` guard performs no network work and returns
-  pending with `RecoveryUnavailable`.
-- `Confirmed`, `LegacyConfirmed`, and `Rejected` perform no network mutation.
+- `Confirmed` and compatibility `Rejected` rows perform no network mutation,
+  whatever the confirmation source.
 
 A pending or temporarily unreadable candidate remains available for later
 polling. In `Recovering`, it does not disable tree recovery and prohibits
 another POST until it is either committed unsuccessfully or retired after a
 completed valid no-match tree pass. A committed-success candidate proceeds to
 confirmation. A `Tracking` candidate that is committed unsuccessfully becomes
-`Rejected`; a `Recovering` candidate that is committed unsuccessfully is
-atomically cleared while the row remains `Recovering`.
+hashless `Recovering` with the committed-failure diagnostic; a `Recovering`
+candidate that is committed unsuccessfully is atomically cleared while the row
+remains `Recovering`.
 
 After candidate polling and a bounded no-match tree pass, the lifecycle
 receives one private process-local authorization for the captured identity,
 generation, host operation epoch, and continuously held round, bundle, and
 identity locks. The authorization is not persisted, cloned, returned, or
 reconstructed from a hashless row. It is consumed only by one immediate
-transaction that validates the same bound `Recovering` row, atomically clears
+transaction that validates the same `Recovering` row, atomically clears
 any remaining inconclusive candidate, and increments the attempt count to
 reserve one same-generation retry. The transaction consumes the no-match
 authorization. The authorization expires on cancellation, error, return, lock
 release, or process exit. A later usable hash fills the empty candidate slot,
-but sticky recovery remains in force. An unbound guard is never eligible.
+but sticky recovery remains in force.
 
 A pending or unreadable candidate is never treated as committed failure.
 Retirement during the authorized retry reservation likewise does not classify
@@ -492,30 +509,20 @@ timestamp maintenance cannot reset or extend the window.
 Restart plans are derived from the authoritative row:
 
 - `Tracking` schedules hash polling;
-- bound `Recovering` schedules candidate-first reconciliation and tree
+- `Recovering` schedules candidate-first reconciliation and tree
   recovery, then same-generation retry when permitted;
-- unbound `Recovering` schedules no network work and reports
-  `RecoveryUnavailable`;
 - `Confirmed` enables dependent domain and helper work;
-- `LegacyConfirmed` satisfies the chain-confirmation dependency and blocks
-  resubmission, but missing helper inputs are not invented or scheduled;
-- `Rejected` schedules no reconciliation; and
-- absent rows permit fresh work if bundle causality allows it and no matching
-  `LegacyConfirmed` or digestless `Recovering` guard exists, including for
-  every member of a proposed batch.
+- a compatibility `Rejected` row schedules no reconciliation; and
+- absent rows permit fresh work if bundle causality allows it.
 
-The observed successor VAN of a `LegacyConfirmed` singleton permits a different
-singleton proposal in the same bundle to advance. The marker still blocks its
-own resubmission and any atomic batch that overlaps its proposal identity.
-
-An unresolved generation or legacy guard blocks only later work that consumes
-its unknown successor VAN. Independent bundles remain schedulable.
+An unresolved generation blocks only later work that consumes its unknown
+successor VAN. Independent bundles remain schedulable.
 
 ## Sticky recovery and tree matching
 
-Tree recovery is authorized only by a bound durable `Recovering` row. It never
-runs for a digestless guard, ordinary `Tracking` even when its hash is pending,
-or fresh unsubmitted work. A pending candidate carried by a bound `Recovering`
+Tree recovery is authorized only by a durable `Recovering` row. It never runs
+for ordinary `Tracking` even when its hash is pending, or for fresh unsubmitted
+work. A pending candidate carried by a `Recovering`
 row is polled first and does not prevent the subsequent tree pass.
 
 Before scanning, the lifecycle re-derives the generation digest and complete
@@ -658,28 +665,23 @@ domain/helper updates are durable. It exposes a transaction hash as confirmed
 only when confirmation source is `hash`; a candidate retained by tree
 confirmation is never presented as the confirming transaction.
 `Pending(Tracking)` always carries the candidate hash needed to continue.
-For a bound row, `Pending(Recovering)` may carry a candidate hash and preserves
-that tree recovery remains authorized. It may carry no candidate after an
-atomic retirement-and-reservation or committed-failure clearing, without
-implying that a retired transaction failed or that another retry is already
-authorized. For an unbound legacy guard it also carries no candidate, uses the
-stable `RecoveryUnavailable` diagnostic, authorizes no network recovery, and
-is never automatically rescheduled.
-`Rejected` means the durable row is terminally rejected.
-
-`LegacyConfirmed` is returned publicly as `Confirmed` with source
-`legacy_projection` and no transaction hash. This source is distinct from the
-validated `legacy_import` source. Its positions are explicitly legacy domain
-observations, not a re-derived or validated generation layout; it does not
-imply that missing helper inputs or plans were reconstructed.
+`Pending(Recovering)` may carry a candidate hash and preserves that tree
+recovery remains authorized. It may carry no candidate after an atomic
+retirement-and-reservation or committed-failure clearing, without implying that
+a retired transaction failed or that another retry is already authorized.
+`Rejected` means a compatibility row is terminally rejected. New HTTP 422 and
+committed-failure observations return `Pending(Recovering)` instead, preserving
+the bound generation for exact-tree recovery and same-generation retry.
 
 `Cancelled` is returned only when cancellation occurs before possible dispatch
 and no stronger durable state exists. Cancellation never hides `Tracking`,
-`Recovering`, `Confirmed`, `LegacyConfirmed`, or `Rejected`. A call cancelled
+`Recovering`, `Confirmed`, or `Rejected`. A call cancelled
 on entry loads the authoritative durable state under the normal lifecycle
 locks. If it finds an abandoned `Submitting` row, it must atomically normalize
 that row to `Recovering` and return `Pending(Recovering)`; the possibly
 dispatched request is stronger evidence than the current call's cancellation.
+For a batch, an existing authoritative batch row is loaded and returned before
+consulting the caller's possibly stale member roster.
 This conservative normalization is the only write permitted on a
 cancelled-entry path. If it cannot be persisted, the call returns an
 operational storage failure that preserves the known possibly-dispatched
@@ -704,16 +706,16 @@ The lock order is:
 5. immediate SQLite transaction.
 
 The identity locks serialize lifecycle work for the authoritative row and, for
-a batch, every member's legacy singleton key. The bundle lock prevents two
+a batch, every member's singleton identity. The bundle lock prevents two
 proposals from deriving successors from the same VAN. Different bundles remain
 independent.
 For active batch admission, the request's complete ordered roster supplies the
 recovery-independent identity lock set. Under those locks, admission loads the
-persisted roster and requires an exact ordered match before reading any member
-guard or inserting a native row. A missing, truncated, reordered, duplicated,
-or otherwise changed roster fails without touching an identity that was not
-locked. The request rejects rosters above the 15-action protocol maximum before
-allocating lock identities. No persisted roster is read before the operation
+persisted roster and requires an exact ordered match before inserting a batch
+row. A missing, truncated, reordered,
+duplicated, or otherwise changed roster fails without touching an identity that
+was not locked. The request rejects rosters above the 15-action protocol
+maximum before allocating lock identities. No persisted roster is read before the operation
 and identity locks.
 The coordination authority is owned by the database authority, so constructing
 multiple coordinators for one store cannot create disjoint lock registries.
@@ -725,6 +727,19 @@ locked. Once a batch is possibly dispatched, member proposals, choices, count,
 order, and batch digest are locked. Delegation setup, nullifiers, proof inputs,
 and VAN randomizer are likewise locked. Re-selecting the same generation is
 idempotent; changing it is rejected.
+
+A compatibility terminal rejection does not release an atomic batch's member
+locks. The rejected row still projects its phase through the signed recovery
+rows that define its ordered roster, so a conflicting ballot-intent change must
+fail before clearing vote recovery or helper-delivery records. A rejected
+singleton does not depend on a recovery-derived roster and is not additionally
+locked by this batch-roster rule.
+
+Confirmation does not release those locks. A vote that a generation has already
+placed on chain cannot have its ballot intent changed, whatever the confirmation
+source. Independently, any vote carrying a version-17 transaction hash or
+vote-commitment position locks its choice from the domain columns, so
+pre-upgrade evidence is protected without a lifecycle row.
 
 Cancellation is checked before reservation, dispatch, retries, lookups, scan
 requests, and the confirmation commit point. It has the following safety
@@ -744,7 +759,7 @@ The captured host operation epoch is checked at the same pre-commit boundaries.
 
 Ordinary cleanup and reset use the authoritative state under the same operation
 and bundle locks. They preserve every `Submitting`, `Tracking`, `Recovering`,
-`Confirmed`, and `LegacyConfirmed` row. For native generations they preserve
+and `Confirmed` row. For bound generations they preserve
 all domain material required to reconcile, retry, prove, or apply that
 generation, including:
 
@@ -753,13 +768,6 @@ generation, including:
 - locked proposal choices, batch membership, and order;
 - current and generation-specific VAN/VC positions; and
 - helper plans and durable helper-delivery rows bound to the generation.
-
-For `LegacyConfirmed`, cleanup preserves the marker, its legacy identity and
-observed positions, the original domain projections, and any independently
-durable helper records that already exist. It neither requires missing
-recovery material nor creates, regenerates, or advances a generation-bound
-helper plan. A digestless `Recovering` guard likewise preserves its original
-evidence and any independently durable records.
 
 There is no standalone recovery-clear operation or
 `clear_recovery_state` primitive. Ordinary cleanup and reset preserve recovery
@@ -771,10 +779,10 @@ Hashless `Recovering` is exactly the case that requires preservation. Bundle
 indexes are never renumbered, and imported capability bundle sets remain
 indivisible.
 
-Rejected generations may release their exact unused recovery material only when
-no earlier unresolved generation or later dependent generation needs it.
-Cleanup must not infer safety from legacy domain hashes independently of the
-authoritative row.
+Compatibility `Rejected` generations may release their exact unused recovery
+material only when no earlier unresolved generation or later dependent
+generation needs it. Cleanup must not infer safety from legacy domain hashes
+independently of the authoritative row.
 
 Explicit round or account deletion is the destructive escape hatch. It closes
 the matching operation gate before checking active work, prevents new entrants,
@@ -784,6 +792,12 @@ undo a transaction that may already be on chain. Round deletion removes the
 gated round directly, and account deletion removes every gated round for the
 account. Their foreign-key cascades remove the owned recovery and helper
 records; neither operation selectively clears those records from a live round.
+Round-wide reset may still clear independent unsigned setup bundles: its single
+atomic update excludes exactly the bundle indexes owned by any submission row,
+rather than letting evidence in one bundle block cleanup of every other bundle.
+Version-17 round ids that cannot form a canonical native lifecycle identity
+have no possible in-process lifecycle holder; pruning and explicit round
+deletion skip that impossible gate and remain available.
 
 ## Version 17 to version 18
 
@@ -795,96 +809,51 @@ schema is replaced in place:
 - `CURRENT_VERSION` remains 18; and
 - there is no `18 -> 19` migration.
 
-Migration constructs at most one authoritative row for each semantic generation
-after re-deriving identity and expected layout from the version-17 domain and
-recovery rows. When that derivation is impossible for an otherwise complete
-legacy confirmation, it instead constructs one `LegacyConfirmed` marker for
-the available legacy identity. When derivation is impossible but incomplete
-chain evidence remains, it constructs a digestless `Recovering` guard.
+The `17 -> 18` step is schema only. It creates `chain_submissions` and imports
+nothing: every version-17 row of `votes`, `bundles`, and `rounds` is preserved
+byte for byte, and no lifecycle row is created for any pre-upgrade evidence,
+whatever its shape. The lifecycle therefore never owns a submission it did not
+reserve itself.
 
-Migration classifies version-17 rows in this order:
+Completed pre-upgrade rounds stay displayable through the domain columns. A
+vote with no `chain_submissions` row projects its workflow phase from
+`tx_hash`, `vc_tree_position`, and the presence of recovery material:
+`Confirmed` when all three are present, `Submitted` with a hash, `Committed`
+with recovery material only, and `Prepared` otherwise. Round snapshots expose
+the stored choice, hash, and positions from the same columns. Whenever an
+authoritative row exists it wins: any unresolved row reports
+`SubmissionManaged` and a confirmation reports `Confirmed`.
 
-1. Validate non-null recovery JSON and group every provable atomic batch.
-   Missing JSON is absence, not corruption; malformed or internally
-   inconsistent non-null JSON aborts migration.
-2. A reconstructable generation with complete, internally consistent
-   confirmation positions becomes `Confirmed` with source `legacy_import`,
-   its available canonical hash, and its exact positions.
-3. A legacy-singleton-eligible vote with complete VAN and VC domain positions
-   but absent recovery JSON becomes `LegacyConfirmed`. Migration records the
-   checked observed positions, preserves the original projection columns, and
-   leaves its digest and candidate hash absent. A delegation, marked batch,
-   or shared-hash group cannot enter this class.
-4. A reconstructable unconfirmed generation with a canonical hash becomes
-   `Tracking`. A reconstructable generation with an unusable historical hash
-   or with committed recovery material but no hash becomes `Recovering`
-   without a candidate.
-5. Incomplete singleton chain evidence with absent recovery JSON becomes a
-   digestless `Recovering` guard with no candidate. Its original columns remain
-   intact, but it remains permanently unbound and performs no polling,
-   scanning, retry, or confirmation.
-6. Any remaining shape, including an unprovable batch or delegation that
-   cannot be represented without guessing, aborts migration atomically.
+Upgrading a database that holds an in-flight version-17 submission is
+unsupported. Such a vote still projects as `Submitted` and, when its recovery
+material is present, the session plan still emits the host-driven legacy poll
+step, exactly as version 17 did, but
+the specification makes no guarantee about its outcome and the lifecycle
+neither owns nor reconciles it. Version-17 hash values remain byte for byte in
+their domain columns; runtime lookup never treats them as candidates.
 
-A row has chain evidence when at least one transaction hash or confirmation
-position is present, or when committed recovery material exists. An ordinary
-vote row with none of those creates no submission row or guard.
+Version-17 round ids that cannot form a canonical lifecycle identity remain
+domain data that is prunable and explicitly deletable.
 
-Migration safety note: in version 17, a missing hash is not evidence that no
-POST was dispatched. Likewise, a canonical historical hash is not imported as
-a candidate when the generation needed to validate its result cannot be
-derived. An advanced current bundle VAN is never attributed to the original
-delegation output. A reconstructable delegation with that shape follows the
-`Tracking` or `Recovering` rules above; a shape that cannot be represented
-without guessing aborts migration atomically and preserves the version-17
-database.
+The migration changes `user_version` in the same transaction as the DDL, so a
+process killed during migration leaves either the untouched version-17
+database or a complete version 18. Fresh and migrated version-18 schemas must
+match. A database created with an older unreleased version-18 shape is rejected
+by schema fingerprint with an explicit recreation error; it is not silently
+upgraded. The fingerprint compares the complete canonical `chain_submissions`
+table, every owned uniqueness index, and every immutability/monotonicity
+trigger.
 
-Permanently guarding an affected legacy identity can block that identity and
-dependent work whether its pre-upgrade transaction committed, failed, was
-never dispatched, or never committed. Progress then requires explicit
-destructive round or account deletion. This availability risk is accepted as a
-product decision because the required combination of independently persisted
-incomplete version-17 chain evidence and absent recovery JSON is expected to
-occur with low probability; that expectation is not based on measured
-telemetry. Later recovery inputs are not accepted as proof of the original
-generation: without a durable cryptographic anchor, they may describe a
-different input nullifier or output layout.
-
-Migration validates complete unique ownership of canonical hashes imported
-into authoritative candidate or confirmation fields across wallet,
-chain/network, round, kind, bundle, and proposal or batch. The only allowed
-shared hash is the complete ordered membership of one valid atomic batch.
-Historical hashes retained only in legacy-guard projection columns are not
-treated as candidates or ownership evidence. Every exact reconstructed output
-position and every legacy-observed VC position must fit the allowed range and
-belong to only one commitment; duplicate ownership aborts migration. A
-`LegacyConfirmed` bundle VAN is only an unvalidated current-domain observation,
-so it is range-checked but excluded from output-ownership collision checks.
-Valid batch outputs remain distinct; the batch exception applies only to
-shared hash ownership. Cross-generation collisions, partial batches,
-inconsistent positions, or malformed recovery metadata abort the whole
-migration; migration does not guess, merge, or silently normalize ownership.
-
-`Confirmed` imports validate the complete expected singleton or batch layout
-and position ranges. `LegacyConfirmed` is the non-destructive exception for a
-complete v17 domain confirmation that cannot be re-derived; it is never used
-for new confirmations. Partial confirmation becomes `Recovering`, not
-`Confirmed`, and uses a digestless guard when it also lacks derivation inputs.
-Canonical imported candidates are normalized to lowercase. Unusable historical
-values may remain byte-for-byte in legacy projection columns for compatibility,
-but runtime lookup never treats them as candidates.
-
-The migration inserts rows, validates identity, hash, and position collisions,
-and changes `user_version` in one transaction. Failure preserves version 17,
-`user_version`, and all original bytes; rollback followed by retry classifies
-the same markers, and reopening a successful migration creates no duplicates.
-Fresh and migrated version-18 schemas must match. A database created with an
-older unreleased version-18 shape is rejected by schema fingerprint with an
-explicit recreation error; it is not silently upgraded.
-
-After migration, only `chain_submissions` is authoritative. Version-17 domain
-hash and position columns remain confirmation projections and compatibility
-data.
+A vote's authoritative row is its own singleton row or the `vote_batch` row that
+contains it. Because a batch binds once and owns no per-member rows, membership
+is not read from a stored roster: the projection re-derives the batch
+generation from the persisted signed members and requires the persisted
+generation digest to match before applying the batch's phase to any member.
+Those signed members remain immutable while any authoritative batch row,
+including a rejected row, still relies on them. A mismatch, a noncanonical
+round id, or a vote claimed by two batches is an invariant error rather than a
+silently different phase. Session plans emit no submit, poll, or reconstruction
+step for a lifecycle-owned or terminal row.
 
 ## Removed legacy APIs
 
@@ -921,7 +890,9 @@ Tests cover:
 - polling, diagnostics, and restart do not reset the durable tracking window;
 - promotion alone does not retire the candidate or permit redispatch;
 - hash polling produces atomic `Confirmed`;
-- definite rejection produces `Rejected`;
+- a chain rejection code produces bound hashless `Recovering` with a redacted
+  diagnostic;
+- committed failure clears the tracked candidate into `Recovering`;
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class produces `Recovering`;
 - restart from `Submitting` produces `Recovering`;
@@ -963,7 +934,7 @@ Tests cover:
   limits even though later invocations may reconcile and retry;
 - restart after the combined transaction conservatively requires a new
   completed valid no-match pass before retry;
-- an originally hashless bound `Recovering` row likewise cannot POST before a
+- an originally hashless `Recovering` row likewise cannot POST before a
   completed valid no-match pass, so retry permission never depends on
   non-durable scan history;
 - a retired transaction that later commits is confirmed by its exact tree
@@ -975,8 +946,7 @@ Tests cover:
 - no match, delayed indexing, malformed pages, cancellation, and exhausted
   bounds remain `Recovering`;
 - candidate-less `Pending(Recovering)` after retirement-and-reservation or
-  committed-failure clearing neither claims failure nor authorizes retry and
-  remains distinct from an unbound guard's `RecoveryUnavailable`;
+  committed-failure clearing neither claims failure nor authorizes retry;
 - delegation, singleton, and batch exact layouts recover positions;
 - partial, reordered, nonadjacent, and duplicate layouts do not confirm;
 - scans use one validated fixed complete snapshot;
@@ -992,8 +962,12 @@ Tests cover:
 Tests cover:
 
 - singleton choice and complete batch membership lock after possible dispatch;
+- active singleton and batch generations reject conflicting ballot-intent
+  changes before recovery or helper-delivery material is touched;
 - concurrent work cannot reserve two generations for one identity;
 - bundle locking prevents two successors from consuming the same VAN;
+- a confirmed vote or batch refuses a later delegation reservation for its
+  bundle before derivation or dispatch;
 - independent bundles continue while one is unresolved;
 - hash and tree confirmation atomically update submission, domain, recovery,
   and helper state;
@@ -1004,8 +978,13 @@ Tests cover:
   without releasing bytes;
 - entry cancellation with an abandoned `Submitting` row atomically normalizes
   it to `Recovering` and returns `Pending(Recovering)` without network work;
+- cancelled batch entry returns an existing authoritative batch before checking
+  a stale caller roster;
+- active admission also normalizes an abandoned batch `Submitting` row before
+  attempting roster derivation, so missing or corrupt recovery bytes cannot
+  strand it in `Submitting`;
 - entry cancellation over `Tracking`, `Recovering`, `Confirmed`,
-  `LegacyConfirmed`, or `Rejected` returns the authoritative stronger result;
+  `Confirmed`, or `Rejected` returns the authoritative stronger result;
 - cancellation after reservation but before dispatch releases no bytes and
   removes only the fresh definitely-unsent reservation;
 - failure to persist that normalization reports an operational failure with
@@ -1018,52 +997,30 @@ Tests cover:
 
 Tests cover:
 
-- each v17 import class: confirmed, legacy-confirmed without recovery material,
-  canonical unconfirmed hash with and without recovery material, unusable hash,
-  partial confirmation with and without recovery material, and hashless
-  committed recovery material;
-- `record_vc_position_without_recovery_json_updates_column`-shaped rows with
-  complete recorded VAN and VC positions migrate to `LegacyConfirmed`, expose
-  source `legacy_projection`, no confirmed hash or validated layout, block
-  dispatch, and survive cleanup;
-- digestless `Recovering` guards preserve incomplete v17 evidence, remain
-  permanently unbound, cannot dispatch or reconcile, reject every runtime
-  transition, and survive cleanup;
-- after migrating a digestless guard, adding complete recovery inputs and
-  invoking planning or advancement leaves every guard field unchanged,
-  including its null digest, null candidate, and zero attempts; inserts no
-  native row; and performs no network call;
-- an empty v17 vote row creates no submission row or guard;
-- unbound `Pending(Recovering)` reports `RecoveryUnavailable`, authorizes and
-  schedules no network work across restart, and atomically excludes a competing
-  native row or attempted replacement;
-- singleton planning and batch planning both check every applicable legacy
-  identity, and a batch containing a `LegacyConfirmed` or digestless guarded
-  `(bundle, proposal)` member dispatches nothing and cannot insert an
-  overlapping native batch row;
-- schema constraints cover digest nullability, legacy sources, zero attempts,
-  null candidates and tracking timestamps, required observed positions,
-  partial guard uniqueness, and legacy/native identity exclusion;
-- fixtures cover position zero, historical hash present or absent, absent
-  versus malformed recovery JSON, duplicate legacy identities, position
-  collisions under the exact ownership rules, each batch indicator,
-  present-but-null batch fields as non-indicators, singleton/batch ambiguity,
-  and unreconstructable delegation;
-- an advanced v17 bundle VAN is never imported as the original delegation
-  output position;
-- rollback/retry and reopen are deterministic and create no duplicate guards;
-- planning, cancellation, cleanup, deletion, and public results perform no
-  derivation, network work, helper-plan creation, invented hash, or validated
-  layout claim for `LegacyConfirmed`;
-- a hashless v17 import remains `Recovering` after a retry receives a definite
-  rejection, leaving exact tree recovery available for a possibly successful
-  pre-upgrade POST;
-- canonical-hash ownership collision rollback and the exact atomic-batch
-  exception;
+- version-17 domain evidence of every shape (confirmed vote, hash-only vote,
+  delegation-only bundle, committed recovery material) migrates with every
+  domain column byte-identical and creates no submission row;
+- migrated version-17 votes project `Confirmed`, `Submitted`, and `Committed`
+  from the domain columns, and the round snapshot exposes their stored choice,
+  hash, and positions;
+- the version-18 schema rejects a null or short generation digest and every
+  legacy confirmation source;
+- a proved but unsubmitted version-17 delegation migrates with no submission
+  row and remains fresh delegate work;
+- a version-17 round id that cannot form a canonical identity creates no
+  submission row and leaves its domain evidence untouched;
+- a hashless `Recovering` row remains `Recovering` after a retry receives
+  a definite rejection, leaving exact tree recovery available;
 - fresh and migrated v18 schema equivalence and stale-v18 fingerprint
-  rejection;
+  rejection, including missing columns, indexes, and triggers;
 - ordinary cleanup and reset preserve every unresolved generation, its
   retry/recovery data, helper plan, and complete delivery history;
+- round reset preserves a protected bundle while clearing an independent
+  unsigned bundle, and noncanonical legacy round ids remain prunable and
+  explicitly deletable;
+- compatibility hash, VAN, VC, and confirmation writers acquire an immediate
+  write transaction before testing lifecycle ownership, so admission cannot
+  commit in a precheck-to-write gap;
 - no standalone recovery-clear API or storage primitive exists, and only
   exclusive round or account deletion removes owned recovery and helper rows;
 - partial pruning refuses protected ranges without renumbering bundles;
@@ -1074,6 +1031,8 @@ Tests cover:
 These tests are the review contract for changes to chain submission behavior.
 
 Generation and confirmation coverage is anchored by
+`generation_transcript_encodes_exact_framing_bytes`,
+`identity_transcript_binds_no_vote_chain_id`,
 `generation_digest_v1_matches_frozen_vector`,
 `generation_digest_binds_semantics_and_ignores_confirmation_positions`,
 `batch_generation_digest_and_layout_preserve_action_order`,
@@ -1084,7 +1043,7 @@ Generation and confirmation coverage is anchored by
 `records_vote_confirmation_atomically`, and
 `records_vote_batch_confirmation_replay_and_helper_positions`.
 
-Phase 4 private-coordinator coverage is anchored by
+Private-coordinator lifecycle coverage is anchored by
 `reservation_commits_before_post_and_accepted_hash_is_tracking`,
 `delegation_uses_the_same_lifecycle_and_atomic_confirmation_path`,
 `reservation_failure_dispatches_nothing_and_writes_nothing`,
@@ -1093,18 +1052,20 @@ Phase 4 private-coordinator coverage is anchored by
 `failed_post_classification_reports_known_possible_dispatch`,
 `failed_tracking_reconciliation_reports_the_durable_state`,
 `tracking_deadline_survives_polling_and_coordinator_restart`,
-`committed_failure_rejects_tracking_but_only_clears_recovery_candidate`,
+`chain_rejection_preserves_bound_recovery_and_redacts_diagnostics`,
+`committed_failure_moves_tracking_to_recovery_and_clears_recovery_candidate`,
 `hash_confirmation_updates_submission_and_projection_atomically`,
 `failed_confirmation_rolls_back_submission_and_projection`,
 `cancellation_after_confirmation_commit_point_cannot_suppress_persistence`,
-`migration_guards_return_before_derivation_or_network_work`,
-`guarded_batch_is_rejected_before_derivation_or_dispatch`,
 `changed_generation_is_rejected_before_reconciliation`,
-`terminal_state_is_idempotent_only_for_the_same_generation`,
+`rejected_recovery_accepts_only_the_same_generation`,
 `same_identity_concurrency_releases_only_one_post`,
 `same_bundle_blocks_a_successor_until_the_predecessor_is_authoritative`,
+`active_predecessor_blocks_the_next_bundle_generation`,
 `atomically_confirmed_predecessor_allows_the_next_bundle_generation`,
-`legacy_confirmed_predecessor_allows_the_next_bundle_generation`,
+`confirmed_predecessor_allows_the_next_bundle_generation`,
+`confirmed_vote_refuses_a_later_delegation_reservation`,
+`confirmed_successor_refuses_delegation_reservation`,
 `independent_bundles_progress_while_another_post_is_blocked`,
 `coordinators_for_one_store_share_the_same_lock_authority`,
 `exclusive_round_access_is_busy_until_lifecycle_work_finishes`,
@@ -1112,20 +1073,45 @@ Phase 4 private-coordinator coverage is anchored by
 `batch_request_supplies_its_complete_recovery_independent_lock_set`,
 `batch_request_enforces_protocol_action_bounds`,
 `persisted_batch_roster_mismatch_never_checks_unlocked_members`,
+`abandoned_batch_normalizes_before_roster_derivation`,
 `exclusive_round_gate_prevents_batch_roster_reads`,
 `active_batch_admission_requires_a_persisted_roster`,
-`omitted_batch_member_fails_before_its_unlocked_legacy_guard_is_read`,
+`omitted_batch_member_fails_before_its_unlocked_row_is_read`,
 `request_kind_must_match_the_identity_target`,
 `candidate_hash_reuse_across_generations_fails_closed_without_lookup`,
+`duplicate_candidate_hash_becomes_hashless_recovery`,
+`tracking_and_atomic_confirmation_survive_reopen`,
 `ambiguous_confirmation_attributes_leave_tracking_authoritative`,
 `event_round_requires_exactly_one_supported_attribute`,
 `confirmation_attribute_requires_exactly_one_value`,
 `matching_event_for_round_must_be_unique`,
 `cancelled_entry_normalizes_abandoned_submitting_without_network_work`,
 `cancelled_batch_entry_requires_no_recovery_or_roster_derivation`,
-`cancelled_batch_entry_preserves_requested_member_guard_without_roster_read`,
+`cancelled_batch_entry_returns_authoritative_batch_before_stale_roster`,
 `cancellation_after_reservation_before_dispatch_removes_fresh_reservation`,
 `failed_cancelled_entry_normalization_reports_possible_dispatch`,
 `failed_active_entry_normalization_reports_possible_dispatch`,
+`failed_abandoned_normalization_reports_possible_dispatch`,
+`lifecycle_timestamps_clamp_when_wall_clock_moves_backward`,
+`active_singleton_generation_locks_intent_and_recovery_material`,
+`active_batch_generation_locks_every_member_intent`,
+`delete_skipped_bundles_preserves_chain_submission_evidence_atomically`,
+`v17_projectionless_proved_delegation_remains_fresh_work`,
+`v17_domain_evidence_is_preserved_and_creates_no_submission_rows`,
+`migrated_v17_votes_project_domain_phases`,
+`fresh_v18_schema_requires_a_bound_generation`,
+`noncanonical_v17_round_ids_create_no_submission`,
+`v18_fingerprint_rejects_missing_columns_indexes_and_triggers`,
+`reset_voting_session_state_scopes_submission_protection_to_its_bundle`,
+`reset_voting_session_state_preserves_proved_bundle_setup_fields`,
+`noncanonical_legacy_round_ids_remain_deletable`,
+`lifecycle_owned_delegation_and_vote_yield_no_legacy_steps`,
+`bound_hashless_recovery_is_contained_until_tree_recovery_lands`,
+`rejected_singleton_vote_never_yields_submit_or_poll_work`,
+`rejected_vote_batch_never_reschedules_its_members`,
+`rejected_delegation_never_yields_delegate_work`,
+`round_snapshot_reports_lifecycle_owned_recovery`,
+`lifecycle_owned_vote_locks_conflicting_intent`,
+`public_vote_writers_reserve_before_validation_and_wait_on_contention`,
 `cancellation_during_dispatch_persists_recovery`, and
 `operation_epoch_change_during_dispatch_persists_recovery`.

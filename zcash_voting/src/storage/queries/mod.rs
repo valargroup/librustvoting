@@ -457,8 +457,13 @@ pub fn load_round_network(
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
         |row| row.get::<_, String>(0),
     )
-    .map_err(|e| VotingError::InvalidInput {
-        message: format!("round not found: {} ({})", round_id, e),
+    .map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => VotingError::InvalidInput {
+            message: format!("round not found: {round_id}"),
+        },
+        error => VotingError::Storage {
+            message: format!("failed to load round network for {round_id}: {error}"),
+        },
     })
     .and_then(|network| network_from_storage(&network))
 }
@@ -1699,8 +1704,8 @@ pub(crate) fn load_vote_row_state(
         },
     )
     .optional()
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to load vote state before vote preparation: {e}"),
+    .map_err(|error| VotingError::Storage {
+        message: format!("failed to load vote state before vote preparation: {error}"),
     })
 }
 
@@ -2838,6 +2843,28 @@ pub fn delete_bundles_from(
         });
     }
 
+    let protected: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM chain_submissions
+              WHERE round_id = :round_id
+                AND wallet_id = :wallet_id
+                AND bundle_index >= :from_index)",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":from_index": from_index as i64,
+            },
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to check chain-submission prune guard: {error}"),
+        })?;
+    if protected {
+        return Err(VotingError::Busy {
+            message: "cannot prune bundles protected by chain-submission evidence".to_string(),
+        });
+    }
+
     let rows = tx
         .execute(
             "DELETE FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index >= :from_index",
@@ -3280,6 +3307,13 @@ pub fn clear_unsigned_delegation_setup_fields(
                SELECT bundle_index
                FROM keystone_signatures
                WHERE round_id = :round_id AND wallet_id = :wallet_id
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM chain_submissions submission
+                WHERE submission.round_id = bundles.round_id
+                  AND submission.wallet_id = bundles.wallet_id
+                  AND submission.bundle_index = bundles.bundle_index
            )",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )

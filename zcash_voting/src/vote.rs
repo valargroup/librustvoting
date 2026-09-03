@@ -2128,6 +2128,12 @@ pub fn record_batch_submission(
         .map_err(|e| VotingError::Internal {
             message: format!("begin vote batch submission transaction failed: {e}"),
         })?;
+    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+    )?;
     let recoveries = load_vote_batch_recoveries_with_conn(
         &tx,
         &wallet_id,
@@ -2163,8 +2169,8 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND commitment_bundle_json IS NOT NULL",
         )
-        .map_err(|e| VotingError::Internal {
-            message: format!("prepare vote batch recovery query failed: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("prepare vote batch recovery query failed: {error}"),
         })?;
     let rows = stmt
         .query_map(
@@ -2175,13 +2181,13 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
             },
             |row| row.get::<_, String>(0),
         )
-        .map_err(|e| VotingError::Internal {
-            message: format!("query vote batch recovery rows failed: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("query vote batch recovery rows failed: {error}"),
         })?;
     let mut recoveries = Vec::new();
     for row in rows {
-        let recovery = parse_recovery(&row.map_err(|e| VotingError::Internal {
-            message: format!("read vote batch recovery row failed: {e}"),
+        let recovery = parse_recovery(&row.map_err(|error| VotingError::Storage {
+            message: format!("read vote batch recovery row failed: {error}"),
         })?)?;
         if recovery
             .batch
@@ -2313,6 +2319,14 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
 
     let mut batches = Vec::with_capacity(batch_keys.len());
     for (bundle_index, digest) in batch_keys {
+        ensure_vote_recovery_is_not_lifecycle_owned(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            proposal_id,
+            Some(&digest),
+        )?;
         let recoveries =
             load_vote_batch_recoveries_with_conn(conn, wallet_id, round_id, bundle_index, digest)?;
         for recovery in &recoveries {
@@ -2341,6 +2355,14 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
     }
 
     for &(bundle_index, singleton_proposal_id) in &singleton_keys {
+        ensure_vote_recovery_is_not_lifecycle_owned(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            singleton_proposal_id,
+            None,
+        )?;
         let state = crate::storage::queries::load_vote_row_state(
             conn,
             round_id,
@@ -2383,6 +2405,56 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
         )?;
     }
 
+    Ok(())
+}
+
+/// Rejects intent changes that would erase recovery material still owned by
+/// the chain-submission lifecycle.
+///
+/// Active singleton and batch submissions require their recovery generation.
+/// Rejected batches also retain it because their authoritative member roster is
+/// re-derived from the signed batch recovery rows.
+fn ensure_vote_recovery_is_not_lifecycle_owned(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    batch_digest: Option<&[u8; 32]>,
+) -> Result<(), VotingError> {
+    let lifecycle_owned: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM chain_submissions
+                  WHERE round_id = :round_id
+                    AND wallet_id = :wallet_id
+                    AND bundle_index = :bundle_index
+                    AND (state IN ('submitting','tracking','recovering')
+                         OR (state = 'rejected' AND kind = 'vote_batch'))
+                    AND ((kind = 'vote' AND proposal_id = :proposal_id)
+                         OR (kind = 'vote_batch' AND ordered_batch_digest = :batch_digest))
+             )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+                ":batch_digest": batch_digest.map(|digest| digest.as_slice()),
+            },
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!(
+                "failed to check lifecycle-owned vote recovery before changing ballot intent: {error}"
+            ),
+        })?;
+    if lifecycle_owned {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} bundle {bundle_index} proposal {proposal_id} has lifecycle-owned vote recovery and its ballot intent is locked"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -2458,6 +2530,12 @@ pub fn record_vc_position(
         .map_err(|e| VotingError::Internal {
             message: format!("begin vote VC position transaction failed: {e}"),
         })?;
+    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+    )?;
     ensure_singleton_vote_update_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?;
     record_vc_position_with_conn(
         &tx,
@@ -2604,8 +2682,8 @@ fn recovery_json_with_conn(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to load vote recovery bundle: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("failed to load vote recovery bundle: {error}"),
         })?;
     Ok(json.flatten())
 }

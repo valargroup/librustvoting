@@ -13,12 +13,17 @@ use super::{
     ChainSubmissionTarget,
 };
 
+mod sqlite;
+#[allow(
+    unused_imports,
+    reason = "SQLite lifecycle authority is activated by a later public phase"
+)]
+pub(super) use sqlite::SqliteChainSubmissionStore;
+
 #[cfg(test)]
 use super::{
-    confirmation::validate_hash_confirmation,
-    coordination::BundleOperationKey,
-    result::LegacyProjectionConfirmation,
-    state::{apply_submission_observation, DigestlessRecoveryGuard},
+    confirmation::validate_hash_confirmation, coordination::BundleOperationKey,
+    state::apply_submission_observation,
 };
 
 /// Inputs from which storage reconstructs a closed semantic generation.
@@ -48,7 +53,11 @@ impl SubmissionDerivationRequest {
 /// One advancement request plus recovery-independent legacy identities.
 pub(super) struct StoreAdvancementRequest {
     derivation: SubmissionDerivationRequest,
-    legacy_identities: Vec<ChainSubmissionIdentity>,
+    /// Singleton member identities an atomic batch would overlap.
+    ///
+    /// Empty for delegation and for a singleton, whose own identity is already
+    /// the authoritative one.
+    member_identities: Vec<ChainSubmissionIdentity>,
     ordered_batch_proposal_ids: Option<Vec<u32>>,
 }
 
@@ -56,14 +65,14 @@ impl StoreAdvancementRequest {
     pub(super) fn delegation(identity: ChainSubmissionIdentity, signer: DelegationSigner) -> Self {
         Self {
             derivation: SubmissionDerivationRequest::Delegation { identity, signer },
-            legacy_identities: vec![],
+            member_identities: vec![],
             ordered_batch_proposal_ids: None,
         }
     }
 
     pub(super) fn vote(identity: ChainSubmissionIdentity) -> Self {
         Self {
-            legacy_identities: vec![identity.clone()],
+            member_identities: vec![],
             derivation: SubmissionDerivationRequest::Vote { identity },
             ordered_batch_proposal_ids: None,
         }
@@ -90,13 +99,12 @@ impl StoreAdvancementRequest {
                 ),
             ));
         }
-        let mut legacy_identities = ordered_proposal_ids
+        let mut member_identities = ordered_proposal_ids
             .iter()
             .map(|proposal_id| {
                 ChainSubmissionIdentity::new(
                     identity.wallet_id(),
                     identity.network(),
-                    identity.vote_chain_id(),
                     *identity.vote_round_id(),
                     identity.bundle_index(),
                     ChainSubmissionTarget::Vote {
@@ -111,10 +119,10 @@ impl StoreAdvancementRequest {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        legacy_identities.sort_by_key(SubmissionOperationKey::from_identity);
-        let original_len = legacy_identities.len();
-        legacy_identities.dedup();
-        if legacy_identities.len() != original_len {
+        member_identities.sort_by_key(SubmissionOperationKey::from_identity);
+        let original_len = member_identities.len();
+        member_identities.dedup();
+        if member_identities.len() != original_len {
             return Err(ChainSubmissionFailure::without_state(
                 ChainSubmissionFailureKind::InvalidInput,
                 "vote-batch proposal roster contains duplicates",
@@ -122,7 +130,7 @@ impl StoreAdvancementRequest {
         }
         Ok(Self {
             derivation: SubmissionDerivationRequest::VoteBatch { identity },
-            legacy_identities,
+            member_identities,
             ordered_batch_proposal_ids: Some(ordered_proposal_ids),
         })
     }
@@ -136,10 +144,9 @@ impl StoreAdvancementRequest {
     }
 
     pub(super) fn applicable_identities(&self) -> Vec<ChainSubmissionIdentity> {
-        self.legacy_identities
+        self.member_identities
             .iter()
             .cloned()
-            .into_iter()
             .chain(std::iter::once(self.identity().clone()))
             .collect()
     }
@@ -164,26 +171,6 @@ impl StoreAdvancementRequest {
             }
         }
         Ok(())
-    }
-
-    fn singleton_identity(
-        &self,
-        proposal_id: u32,
-    ) -> Result<ChainSubmissionIdentity, ChainSubmissionFailure> {
-        ChainSubmissionIdentity::new(
-            self.identity().wallet_id(),
-            self.identity().network(),
-            self.identity().vote_chain_id(),
-            *self.identity().vote_round_id(),
-            self.identity().bundle_index(),
-            ChainSubmissionTarget::Vote { proposal_id },
-        )
-        .map_err(|error| {
-            ChainSubmissionFailure::without_state(
-                ChainSubmissionFailureKind::InvalidInput,
-                error.to_string(),
-            )
-        })
     }
 
     fn validate_target(&self) -> Result<(), ChainSubmissionFailure> {
@@ -215,7 +202,7 @@ impl StoreAdvancementRequest {
 #[derive(Clone)]
 pub(super) struct StoredChainSubmission {
     identity: ChainSubmissionIdentity,
-    generation_digest: Option<ChainSubmissionGenerationDigest>,
+    generation_digest: ChainSubmissionGenerationDigest,
     state: SubmissionRecordState,
     committed_post_reservations: u64,
     tracking_started_at: Option<u64>,
@@ -232,48 +219,9 @@ impl StoredChainSubmission {
     ) -> Self {
         Self {
             identity: generation.identity().clone(),
-            generation_digest: Some(generation.digest()),
+            generation_digest: generation.digest(),
             state: SubmissionRecordState::Submitting,
             committed_post_reservations,
-            tracking_started_at: None,
-            diagnostic: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn digestless_guard(identity: ChainSubmissionIdentity, now: u64) -> Self {
-        Self {
-            identity,
-            generation_digest: None,
-            state: SubmissionRecordState::DigestlessRecoveryGuard(DigestlessRecoveryGuard::new()),
-            committed_post_reservations: 0,
-            tracking_started_at: None,
-            diagnostic: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn legacy_confirmed(
-        identity: ChainSubmissionIdentity,
-        final_van_position: u64,
-        vote_commitment_position: u64,
-        now: u64,
-    ) -> Self {
-        Self {
-            identity,
-            generation_digest: None,
-            state: SubmissionRecordState::LegacyConfirmed(
-                LegacyProjectionConfirmation::from_positions(
-                    final_van_position,
-                    vote_commitment_position,
-                )
-                .expect("valid legacy positions"),
-            ),
-            committed_post_reservations: 0,
             tracking_started_at: None,
             diagnostic: None,
             created_at: now,
@@ -285,7 +233,7 @@ impl StoredChainSubmission {
         &self.identity
     }
 
-    pub(super) fn generation_digest(&self) -> Option<ChainSubmissionGenerationDigest> {
+    pub(super) fn generation_digest(&self) -> ChainSubmissionGenerationDigest {
         self.generation_digest
     }
 
@@ -340,16 +288,7 @@ impl StoredChainSubmission {
                     diagnostic: ambiguity_diagnostic,
                 },
             )),
-            SubmissionRecordState::DigestlessRecoveryGuard(guard) => Ok(
-                ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
-                    candidate_transaction_hash: None,
-                    diagnostic: guard.diagnostic().clone(),
-                }),
-            ),
             SubmissionRecordState::Confirmed(confirmation) => {
-                Ok(ChainSubmissionResult::Confirmed(confirmation.into_public()))
-            }
-            SubmissionRecordState::LegacyConfirmed(confirmation) => {
                 Ok(ChainSubmissionResult::Confirmed(confirmation.into_public()))
             }
             SubmissionRecordState::Rejected(diagnostic) => {
@@ -428,19 +367,19 @@ pub(super) trait ChainSubmissionStore: Send + Sync {
     ) -> Result<ConfirmationCommit, ChainSubmissionFailure>;
 }
 
-fn abandoned_diagnostic() -> ChainSubmissionDiagnostic {
+pub(super) fn abandoned_diagnostic() -> ChainSubmissionDiagnostic {
     ChainSubmissionDiagnostic::from_redacted_message(
         ChainSubmissionDiagnosticKind::AmbiguousDispatch,
         "an unclassified submission reservation survived process interruption",
     )
 }
 
-fn ensure_generation(
+pub(super) fn ensure_generation(
     record: &StoredChainSubmission,
     generation: &ChainSubmissionGeneration,
 ) -> Result<(), ChainSubmissionFailure> {
     if record.identity() != generation.identity()
-        || record.generation_digest() != Some(generation.digest())
+        || record.generation_digest() != generation.digest()
     {
         return Err(ChainSubmissionFailure::with_durable_state(
             ChainSubmissionFailureKind::InvalidInput,
@@ -451,7 +390,7 @@ fn ensure_generation(
     Ok(())
 }
 
-fn transition_failure(
+pub(super) fn transition_failure(
     state: ChainSubmissionState,
     error: impl std::fmt::Display,
 ) -> ChainSubmissionFailure {
@@ -462,7 +401,7 @@ fn transition_failure(
     )
 }
 
-fn preserve_loaded_state(
+pub(super) fn preserve_loaded_state(
     error: ChainSubmissionFailure,
     record: Option<&StoredChainSubmission>,
 ) -> ChainSubmissionFailure {
@@ -476,8 +415,7 @@ fn preserve_loaded_state(
     }
 }
 
-#[allow(dead_code, reason = "used by the phase-5 SQLite store")]
-fn map_generation_error(error: VotingError) -> ChainSubmissionFailure {
+pub(super) fn map_generation_error(error: VotingError) -> ChainSubmissionFailure {
     ChainSubmissionFailure::without_state(
         match error {
             VotingError::InvalidInput { .. } => ChainSubmissionFailureKind::InvalidInput,
@@ -674,17 +612,36 @@ pub(super) mod memory {
                     && BundleOperationKey::from_identity(record.identity())
                         == BundleOperationKey::from_identity(requested)
                     && match record.state() {
-                        SubmissionRecordState::Rejected(_)
-                        | SubmissionRecordState::LegacyConfirmed(_) => false,
+                        SubmissionRecordState::Rejected(_) => false,
+                        // A confirmed predecessor is authoritative once its
+                        // domain projection has been applied.
                         SubmissionRecordState::Confirmed(_) => {
                             !state.projections.contains_key(record.identity())
                         }
                         SubmissionRecordState::Submitting
                         | SubmissionRecordState::Tracking { .. }
-                        | SubmissionRecordState::Recovering { .. }
-                        | SubmissionRecordState::DigestlessRecoveryGuard(_) => true,
+                        | SubmissionRecordState::Recovering { .. } => true,
                     }
             })
+        }
+
+        /// A confirmed vote or batch has consumed the bundle's delegation
+        /// output, so a new delegation generation is refused before derivation.
+        fn delegation_is_superseded(
+            state: &MemoryState,
+            requested: &ChainSubmissionIdentity,
+        ) -> bool {
+            matches!(requested.target(), ChainSubmissionTarget::Delegation)
+                && state.records.values().any(|successor| {
+                    BundleOperationKey::from_identity(successor.identity())
+                        == BundleOperationKey::from_identity(requested)
+                        && matches!(
+                            successor.identity().target(),
+                            ChainSubmissionTarget::Vote { .. }
+                                | ChainSubmissionTarget::VoteBatch { .. }
+                        )
+                        && matches!(successor.state(), SubmissionRecordState::Confirmed(_))
+                })
         }
 
         fn candidate_owner<'a>(
@@ -753,46 +710,10 @@ pub(super) mod memory {
                         ));
                     }
                 }
-                if !request.is_batch() {
-                    for legacy_identity in &request.legacy_identities {
-                        let Some(guard) = state.records.get(legacy_identity).cloned() else {
-                            continue;
-                        };
-                        if !matches!(
-                            guard.state(),
-                            SubmissionRecordState::LegacyConfirmed(_)
-                                | SubmissionRecordState::DigestlessRecoveryGuard(_)
-                        ) {
-                            continue;
-                        }
-                        return Ok(StoreAdmission::Authoritative(guard));
-                    }
-                }
-
                 let existing = state.records.get(request.identity()).cloned();
-                if request.is_batch() && !work_allowed {
-                    for legacy_identity in &request.legacy_identities {
-                        let Some(guard) = state.records.get(legacy_identity) else {
-                            continue;
-                        };
-                        if matches!(
-                            guard.state(),
-                            SubmissionRecordState::LegacyConfirmed(_)
-                                | SubmissionRecordState::DigestlessRecoveryGuard(_)
-                        ) {
-                            return Err(ChainSubmissionFailure::with_durable_state(
-                                ChainSubmissionFailureKind::InvalidInput,
-                                guard.durable_state(),
-                                "atomic vote batch overlaps a migration-only singleton guard",
-                            ));
-                        }
-                    }
-                }
                 if !work_allowed {
-                    return match existing {
-                        Some(mut record)
-                            if matches!(record.state, SubmissionRecordState::Submitting) =>
-                        {
+                    if let Some(mut record) = existing {
+                        if matches!(record.state, SubmissionRecordState::Submitting) {
                             record.state = apply_submission_observation(
                                 Some(record.state),
                                 SubmissionObservation::AbandonedSubmitting(abandoned_diagnostic()),
@@ -812,11 +733,10 @@ pub(super) mod memory {
                             state
                                 .records
                                 .insert(request.identity().clone(), record.clone());
-                            Ok(StoreAdmission::Authoritative(record))
                         }
-                        Some(record) => Ok(StoreAdmission::Authoritative(record)),
-                        None => Ok(StoreAdmission::NoAuthoritativeState),
-                    };
+                        return Ok(StoreAdmission::Authoritative(record));
+                    }
+                    return Ok(StoreAdmission::NoAuthoritativeState);
                 }
 
                 if request.is_batch() {
@@ -836,23 +756,6 @@ pub(super) mod memory {
                     request
                         .verify_batch_roster(authoritative_roster)
                         .map_err(|error| preserve_loaded_state(error, existing.as_ref()))?;
-                    for proposal_id in authoritative_roster {
-                        let member_identity = request.singleton_identity(*proposal_id)?;
-                        let Some(guard) = state.records.get(&member_identity) else {
-                            continue;
-                        };
-                        if matches!(
-                            guard.state(),
-                            SubmissionRecordState::LegacyConfirmed(_)
-                                | SubmissionRecordState::DigestlessRecoveryGuard(_)
-                        ) {
-                            return Err(ChainSubmissionFailure::with_durable_state(
-                                ChainSubmissionFailureKind::InvalidInput,
-                                guard.durable_state(),
-                                "atomic vote batch overlaps a migration-only singleton guard",
-                            ));
-                        }
-                    }
                 }
 
                 if let Some(mut record) = existing {
@@ -876,13 +779,6 @@ pub(super) mod memory {
                         state
                             .records
                             .insert(request.identity().clone(), record.clone());
-                        return Ok(StoreAdmission::Authoritative(record));
-                    }
-                    if matches!(
-                        record.state,
-                        SubmissionRecordState::LegacyConfirmed(_)
-                            | SubmissionRecordState::DigestlessRecoveryGuard(_)
-                    ) {
                         return Ok(StoreAdmission::Authoritative(record));
                     }
                     let derived = Self::derive(state, request.derivation()).map_err(|error| {
@@ -913,6 +809,12 @@ pub(super) mod memory {
                     return Err(ChainSubmissionFailure::without_state(
                         ChainSubmissionFailureKind::InvalidInput,
                         "another submission for this bundle has not established an authoritative successor",
+                    ));
+                }
+                if Self::delegation_is_superseded(state, request.identity()) {
+                    return Err(ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvalidInput,
+                        "a confirmed vote already succeeds this bundle's delegation",
                     ));
                 }
 

@@ -11,10 +11,10 @@
 #[allow(dead_code, reason = "internal confirmation projection")]
 mod confirmation;
 #[allow(dead_code, reason = "inactive lifecycle coordination foundation")]
-mod coordination;
+pub(crate) mod coordination;
 #[allow(dead_code, reason = "inactive lifecycle coordinator")]
 mod coordinator;
-#[allow(dead_code, reason = "internal generation derivation and migration")]
+#[allow(dead_code, reason = "internal generation derivation")]
 mod generation;
 mod identity;
 #[allow(dead_code, reason = "internal submission protocol")]
@@ -26,6 +26,11 @@ mod state;
 mod store;
 mod transport;
 
+#[cfg(test)]
+pub(crate) use generation::generation_for_vote;
+pub(crate) use generation::generation_for_vote_batch;
+#[cfg(test)]
+pub(crate) use identity::submission_identity_key;
 pub use identity::{
     CandidateTransactionHash, CandidateTransactionHashError, ChainSubmissionGeneration,
     ChainSubmissionGenerationDigest, ChainSubmissionIdentity, ChainSubmissionIdentityError,

@@ -326,6 +326,55 @@ mod tests {
     }
 
     #[test]
+    fn round_snapshot_reports_lifecycle_owned_recovery() {
+        let db = db_with_round(WALLET_ID);
+        db.store_delegation_tx_hash(ROUND_ID, 0, "delegation-tx")
+            .unwrap();
+        insert_vote(&db, 0, 1, 0, b"vote-0-1");
+        store_commitment_bundle(&db, 0, 1, r#"{"bundle":"pending"}"#, None);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, ?4,
+                         'recovering', 0, 'ambiguous_dispatch',
+                         'vote response was lost after dispatch', 9, 9)",
+                rusqlite::params![vec![0x72_u8; 32], ROUND_ID, WALLET_ID, vec![0x62_u8; 32]],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', NULL,
+                         ?4, 'recovering', 0, 'ambiguous_dispatch',
+                         'delegation response was lost after dispatch', 9, 9)",
+                rusqlite::params![vec![0x74_u8; 32], ROUND_ID, WALLET_ID, vec![0x64_u8; 32]],
+            )
+            .unwrap();
+
+        let snapshot = round_snapshot(&db, ROUND_ID).unwrap();
+
+        assert_eq!(snapshot.votes.len(), 1);
+        assert_eq!(
+            snapshot.delegation[0].phase,
+            DelegationPhase::SubmissionManaged
+        );
+        assert_eq!(snapshot.votes[0].phase, VotePhase::SubmissionManaged);
+        assert_eq!(
+            snapshot.votes[0].workflow_phase(),
+            WorkflowPhase::SubmissionManaged
+        );
+        assert!(snapshot.votes[0].has_commitment_bundle);
+    }
+
+    #[test]
     fn round_snapshot_is_scoped_by_wallet_id() {
         let db = db_with_round(WALLET_ID);
         db.store_delegation_tx_hash(ROUND_ID, 0, "wallet-a-tx")

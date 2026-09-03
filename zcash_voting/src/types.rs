@@ -42,6 +42,11 @@ pub enum VotingError {
     KeystoneSignatureConflict { bundle_index: u32 },
     #[error("Proof generation failed: {message}")]
     ProofFailed { message: String },
+    #[error("Voting state is busy: {message}")]
+    Busy { message: String },
+    /// A durable-state read or write failed before its result could be interpreted.
+    #[error("Storage error: {message}")]
+    Storage { message: String },
     #[error("Internal error: {message}")]
     Internal { message: String },
 }

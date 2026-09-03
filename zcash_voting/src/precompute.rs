@@ -1250,6 +1250,34 @@ mod session_reset_tests {
     }
 
     #[test]
+    fn reset_voting_session_state_scopes_submission_protection_to_its_bundle() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.create_round(crate::Network::Testnet, &round_params(ROUND_ID), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[note(0), note(1)]).unwrap();
+        seed_unsigned_setup_fields(&db, ROUND_ID, 0);
+        seed_unsigned_setup_fields(&db, ROUND_ID, 1);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, proposal_id, generation_digest, state, committed_post_reservations,
+                  diagnostic_kind, diagnostic, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, ?4,
+                         'recovering', 0, 'reconciliation_pending',
+                         'possible dispatch awaits tree recovery', 10, 10)",
+                rusqlite::params![vec![0x31_u8; 32], ROUND_ID, WALLET_ID, vec![0x32_u8; 32]],
+            )
+            .unwrap();
+
+        reset_voting_session_state(&db, ROUND_ID).unwrap();
+
+        assert!(has_unsigned_setup_fields(&db, ROUND_ID, 0));
+        assert!(!has_unsigned_setup_fields(&db, ROUND_ID, 1));
+    }
+
+    #[test]
     fn confirmed_local_delegation_survives_recovery_and_session_cleanup() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);

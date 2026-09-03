@@ -2,9 +2,7 @@ use std::{fmt, str::FromStr};
 
 use thiserror::Error;
 
-use crate::types::{
-    validate_vote_chain_id, validate_vote_round_id_bytes, Network, MAX_PROPOSAL_ID, MIN_PROPOSAL_ID,
-};
+use crate::types::{validate_vote_round_id_bytes, Network, MAX_PROPOSAL_ID, MIN_PROPOSAL_ID};
 
 const DIGEST_BYTES: usize = 32;
 const CANONICAL_HASH_HEX_BYTES: usize = DIGEST_BYTES * 2;
@@ -26,7 +24,6 @@ pub enum ChainSubmissionTarget {
 pub struct ChainSubmissionIdentity {
     wallet_id: String,
     network: Network,
-    vote_chain_id: String,
     vote_round_id: [u8; 32],
     bundle_index: u32,
     target: ChainSubmissionTarget,
@@ -35,12 +32,19 @@ pub struct ChainSubmissionIdentity {
 impl ChainSubmissionIdentity {
     /// Constructs and validates a semantic submission identity.
     ///
+    /// The configured vote-chain id is deliberately absent: it selects where a
+    /// request is dispatched, not what the request means, so it binds neither
+    /// this identity nor the generation digest. The deployment contract permits
+    /// only one vote ledger per network, so one identity covers endpoint or
+    /// chain-id changes only while they continue to address that same ledger.
+    /// Reusing a voting database with an independent ledger under the same
+    /// network is unsupported.
+    ///
     /// Generation derivation later verifies this identity against the locked
     /// round and recovery inputs before reservation or dispatch.
     pub fn new(
         wallet_id: impl Into<String>,
         network: Network,
-        vote_chain_id: impl Into<String>,
         vote_round_id: [u8; 32],
         bundle_index: u32,
         target: ChainSubmissionTarget,
@@ -50,10 +54,6 @@ impl ChainSubmissionIdentity {
             return Err(ChainSubmissionIdentityError::EmptyWalletId);
         }
 
-        let vote_chain_id = vote_chain_id.into();
-        if validate_vote_chain_id(&vote_chain_id).is_err() {
-            return Err(ChainSubmissionIdentityError::InvalidVoteChainId);
-        }
         if validate_vote_round_id_bytes(&vote_round_id).is_err() {
             return Err(ChainSubmissionIdentityError::InvalidVoteRoundId);
         }
@@ -67,7 +67,6 @@ impl ChainSubmissionIdentity {
         Ok(Self {
             wallet_id,
             network,
-            vote_chain_id,
             vote_round_id,
             bundle_index,
             target,
@@ -80,10 +79,6 @@ impl ChainSubmissionIdentity {
 
     pub fn network(&self) -> Network {
         self.network
-    }
-
-    pub fn vote_chain_id(&self) -> &str {
-        &self.vote_chain_id
     }
 
     pub fn vote_round_id(&self) -> &[u8; 32] {
@@ -99,13 +94,55 @@ impl ChainSubmissionIdentity {
     }
 }
 
+/// The exact lowercase network name used by durable keys and columns.
+pub(crate) fn network_name(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Regtest => "regtest",
+    }
+}
+
+/// Derives the durable primary key for one submission identity.
+///
+/// This is the only identity key in the system, so two reservations for the
+/// same identity collide on the primary key instead of needing a separate
+/// namespace and exclusion checks.
+///
+/// Every variable-length component is length-prefixed, so no two distinct
+/// identities can produce the same key by rearranging their field boundaries.
+pub(crate) fn submission_identity_key(identity: &ChainSubmissionIdentity) -> Vec<u8> {
+    let mut key = b"zcash_voting.chain_submission.identity.v1\0".to_vec();
+    for value in [
+        identity.wallet_id().as_bytes(),
+        network_name(identity.network()).as_bytes(),
+        identity.vote_round_id().as_slice(),
+    ] {
+        key.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        key.extend_from_slice(value);
+    }
+    key.extend_from_slice(&identity.bundle_index().to_be_bytes());
+    match identity.target() {
+        ChainSubmissionTarget::Delegation => key.push(0),
+        ChainSubmissionTarget::Vote { proposal_id } => {
+            key.push(1);
+            key.extend_from_slice(&proposal_id.to_be_bytes());
+        }
+        ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        } => {
+            key.push(2);
+            key.extend_from_slice(&ordered_batch_digest);
+        }
+    }
+    key
+}
+
 /// Validation failure for a semantic submission identity.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ChainSubmissionIdentityError {
     #[error("chain submission wallet_id must not be empty")]
     EmptyWalletId,
-    #[error("vote_chain_id must be 1 to 128 printable non-whitespace ASCII bytes")]
-    InvalidVoteChainId,
     #[error("vote_round_id must be a canonical Pallas field encoding")]
     InvalidVoteRoundId,
     #[error(
@@ -218,15 +255,7 @@ mod tests {
     use super::*;
 
     fn identity(target: ChainSubmissionTarget) -> ChainSubmissionIdentity {
-        ChainSubmissionIdentity::new(
-            "wallet-1",
-            Network::Testnet,
-            "vote-chain-1",
-            [1; 32],
-            7,
-            target,
-        )
-        .unwrap()
+        ChainSubmissionIdentity::new("wallet-1", Network::Testnet, [1; 32], 7, target).unwrap()
     }
 
     #[test]
@@ -247,7 +276,6 @@ mod tests {
             ChainSubmissionIdentity::new(
                 "",
                 Network::Testnet,
-                "vote-chain-1",
                 [1; 32],
                 0,
                 ChainSubmissionTarget::Delegation,
@@ -258,18 +286,6 @@ mod tests {
             ChainSubmissionIdentity::new(
                 "wallet-1",
                 Network::Testnet,
-                "vote chain",
-                [1; 32],
-                0,
-                ChainSubmissionTarget::Delegation,
-            ),
-            Err(ChainSubmissionIdentityError::InvalidVoteChainId)
-        );
-        assert_eq!(
-            ChainSubmissionIdentity::new(
-                "wallet-1",
-                Network::Testnet,
-                "vote-chain-1",
                 [0xff; 32],
                 0,
                 ChainSubmissionTarget::Delegation,
@@ -280,7 +296,6 @@ mod tests {
             ChainSubmissionIdentity::new(
                 "wallet-1",
                 Network::Testnet,
-                "vote-chain-1",
                 [1; 32],
                 0,
                 ChainSubmissionTarget::Vote { proposal_id: 0 },

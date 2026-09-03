@@ -18,6 +18,25 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Changed
 
+- **Breaking:** the configured vote-chain id no longer binds a chain-submission
+  identity or its generation digest. It selects where a request is dispatched,
+  not what the request means, so one identity now covers a wallet's round,
+  bundle, and target across every configured vote chain. The version-1
+  generation digest vectors change accordingly, and `chain_submissions` drops
+  its `vote_chain_id` column and its partial identity indexes in favour of one
+  identity key.
+- **Breaking:** the `VotePhase::LegacyConfirmed` workflow phase and the
+  `legacy_import` / `legacy_projection` confirmation sources are removed, and
+  `ChainSubmissionDiagnosticKind` drops `RecoveryUnavailable`,
+  `GenerationDerivationFailed`, and `LegacyEvidenceInvalid`. Every
+  `chain_submissions` row now carries a non-null generation digest; there is
+  no unbound or migration-only row class.
+- The version 17 to 18 migration only adds the `chain_submissions` schema.
+  Version-17 domain columns are preserved untouched so completed rounds keep
+  displaying through the existing domain-column phase projection; no
+  version-17 evidence is imported and the lifecycle never owns a pre-upgrade
+  submission. Upgrading a database that holds an in-flight version-17
+  submission is unsupported.
 - **Breaking:** delegation recovery views now expose VAN positions as `u64`,
   matching lifecycle confirmation and SQLite's supported non-negative range.
 
@@ -25,8 +44,20 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 - Chain-submission cancellation now removes a fresh reservation when transport
   dispatch has not begun. Batch admission derives its identity locks from the
-  complete request roster, verifies the persisted roster before reading
-  migration guards, and rejects oversized rosters before lock allocation.
+  complete request roster, verifies the persisted roster before reading any
+  member row, and rejects oversized rosters before lock allocation.
+- SQLite chain-submission admission now permits confirmed predecessors to
+  advance, refuses a delegation reservation once a confirmed vote or batch
+  exists in the bundle, classifies reused candidate hashes as hashless recovery, preserves
+  monotonic lifecycle timestamps across wall-clock rollback, and retains
+  possible-dispatch evidence when restart normalization cannot be persisted.
+- Ballot-intent changes and bundle pruning now preserve every active semantic
+  generation and its helper-delivery material under the lifecycle round gate.
+- Lifecycle ownership checks now serialize with every compatibility projection
+  write, unresolved bundle predecessors remain blocked across vote-chain id
+  changes, and tracking diagnostics survive database reopen. Migration rejects
+  the earlier unreleased v18 schema by fingerprint; session reset and deletion
+  retain bundle-scoped and legacy-round progress.
 - Session cleanup now preserves delegation setup fields for bundles with a
   successful proof so wallets can resume signing without regenerating ZKP1.
 - VAN positions above `u32::MAX` are now read losslessly; legacy `u32` readers

@@ -39,7 +39,6 @@ impl CapturedSubmissionOperation {
 struct RoundOperationKey {
     wallet_id: String,
     network: u8,
-    vote_chain_id: String,
     vote_round_id: [u8; 32],
 }
 
@@ -58,7 +57,7 @@ impl BundleOperationKey {
     }
 }
 
-/// Canonical process-local key for native and migration-only identities.
+/// Canonical process-local key for one submission identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct SubmissionOperationKey {
     bundle: BundleOperationKey,
@@ -100,7 +99,6 @@ fn round_key(identity: &ChainSubmissionIdentity) -> RoundOperationKey {
     RoundOperationKey {
         wallet_id: identity.wallet_id().to_string(),
         network: network_rank(identity.network()),
-        vote_chain_id: identity.vote_chain_id().to_string(),
         vote_round_id: *identity.vote_round_id(),
     }
 }
@@ -110,7 +108,8 @@ fn round_key(identity: &ChainSubmissionIdentity) -> RoundOperationKey {
 /// Weak entries prevent a long-running wallet from retaining a lock for every
 /// historical round. Registry mutexes are never held across an async wait.
 #[derive(Default)]
-pub(super) struct SubmissionCoordination {
+pub(crate) struct SubmissionCoordination {
+    account_gates: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
     round_gates: Mutex<HashMap<RoundOperationKey, Weak<tokio::sync::RwLock<()>>>>,
     bundle_locks: Mutex<HashMap<BundleOperationKey, Weak<tokio::sync::Mutex<()>>>>,
     identity_locks: Mutex<HashMap<SubmissionOperationKey, Weak<tokio::sync::Mutex<()>>>>,
@@ -125,6 +124,12 @@ impl SubmissionCoordination {
         operation: &CapturedSubmissionOperation,
         applicable_identities: &[ChainSubmissionIdentity],
     ) -> Result<SubmissionOperationLease, ChainSubmissionFailure> {
+        let account_gate = shared_lock(
+            &self.account_gates,
+            operation.identity().wallet_id().to_string(),
+            || tokio::sync::RwLock::new(()),
+        )?;
+        let account_guard = account_gate.read_owned().await;
         let round_key = round_key(operation.identity());
         let round_gate = shared_lock(&self.round_gates, round_key.clone(), || {
             tokio::sync::RwLock::new(())
@@ -156,11 +161,25 @@ impl SubmissionCoordination {
         }
 
         Ok(SubmissionOperationLease {
+            _account_guard: account_guard,
             _round_guard: round_guard,
             _bundle_guard: bundle_guard,
             _identity_guards: identity_guards,
             identity_keys,
         })
+    }
+
+    pub(crate) fn try_acquire_account_exclusive(
+        &self,
+        wallet_id: &str,
+    ) -> Result<ExclusiveAccountLease, ExclusiveRoundAcquireError> {
+        let gate = shared_lock(&self.account_gates, wallet_id.to_string(), || {
+            tokio::sync::RwLock::new(())
+        })
+        .map_err(ExclusiveRoundAcquireError::Failure)?;
+        gate.try_write_owned()
+            .map(|guard| ExclusiveAccountLease { _guard: guard })
+            .map_err(|_| ExclusiveRoundAcquireError::Busy)
     }
 
     pub(super) fn register_in_flight(
@@ -185,7 +204,7 @@ impl SubmissionCoordination {
     /// Attempts to exclude lifecycle work for cleanup or deletion of a round.
     /// A busy result is authoritative and must not be bypassed by consulting
     /// the registry separately.
-    pub(super) fn try_acquire_round_exclusive(
+    pub(crate) fn try_acquire_round_exclusive(
         &self,
         identity: &ChainSubmissionIdentity,
     ) -> Result<ExclusiveRoundLease, ExclusiveRoundAcquireError> {
@@ -231,12 +250,16 @@ impl SubmissionCoordination {
     }
 }
 
-pub(super) enum ExclusiveRoundAcquireError {
+pub(crate) enum ExclusiveRoundAcquireError {
     Busy,
     Failure(ChainSubmissionFailure),
 }
 
-pub(super) struct ExclusiveRoundLease {
+pub(crate) struct ExclusiveRoundLease {
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
+pub(crate) struct ExclusiveAccountLease {
     _guard: OwnedRwLockWriteGuard<()>,
 }
 
@@ -265,6 +288,7 @@ where
 
 /// Continuously-held lifecycle locks. Dropping this value ends the operation.
 pub(super) struct SubmissionOperationLease {
+    _account_guard: OwnedRwLockReadGuard<()>,
     _round_guard: OwnedRwLockReadGuard<()>,
     _bundle_guard: OwnedMutexGuard<()>,
     _identity_guards: Vec<OwnedMutexGuard<()>>,
@@ -302,15 +326,8 @@ mod tests {
     use crate::chain_submission::ChainSubmissionTarget;
 
     fn identity(target: ChainSubmissionTarget, bundle_index: u32) -> ChainSubmissionIdentity {
-        ChainSubmissionIdentity::new(
-            "wallet",
-            Network::Testnet,
-            "chain",
-            [1; 32],
-            bundle_index,
-            target,
-        )
-        .unwrap()
+        ChainSubmissionIdentity::new("wallet", Network::Testnet, [1; 32], bundle_index, target)
+            .unwrap()
     }
 
     #[tokio::test]
@@ -361,5 +378,26 @@ mod tests {
         drop(lease);
         assert!(!coordination.has_in_flight_for_round(&identity).unwrap());
         assert!(coordination.try_acquire_round_exclusive(&identity).is_ok());
+    }
+
+    #[tokio::test]
+    async fn exclusive_account_access_blocks_every_round_for_the_wallet() {
+        let identity = identity(ChainSubmissionTarget::Vote { proposal_id: 1 }, 3);
+        let operation = CapturedSubmissionOperation::new(identity.clone(), 4);
+        let coordination = SubmissionCoordination::default();
+        let lease = coordination
+            .acquire(&operation, std::slice::from_ref(&identity))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            coordination.try_acquire_account_exclusive("wallet"),
+            Err(ExclusiveRoundAcquireError::Busy)
+        ));
+        assert!(coordination
+            .try_acquire_account_exclusive("different-wallet")
+            .is_ok());
+        drop(lease);
+        assert!(coordination.try_acquire_account_exclusive("wallet").is_ok());
     }
 }

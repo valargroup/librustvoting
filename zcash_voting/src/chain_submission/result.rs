@@ -7,16 +7,13 @@ use super::CandidateTransactionHash;
 /// Maximum encoded size of a diagnostic retained by the lifecycle.
 pub const MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES: usize = 512;
 
-/// The durable lifecycle states stored for native and migrated submissions.
+/// The durable lifecycle states stored for lifecycle-owned submissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChainSubmissionState {
     Submitting,
     Tracking,
     Recovering,
     Confirmed,
-    /// Migration-only confirmation whose generation layout could not be
-    /// re-derived from version-17 recovery data.
-    LegacyConfirmed,
     Rejected,
 }
 
@@ -28,7 +25,6 @@ pub enum ChainSubmissionDiagnosticKind {
     ChainRejected,
     ReconciliationPending,
     InvalidProtocolResponse,
-    RecoveryUnavailable,
     StorageFailure,
 }
 
@@ -90,12 +86,6 @@ fn bounded_redacted_text(redacted_message: &str) -> String {
 pub enum ChainSubmissionConfirmationSource {
     Hash,
     Tree,
-    /// Version-17 confirmation whose generation and exact layout were
-    /// reconstructed and validated during migration.
-    LegacyImport,
-    /// Version-17 singleton positions preserved without claiming a validated
-    /// generation digest or output layout.
-    LegacyProjection,
 }
 
 /// Exact terminal data whose identical replay is idempotent.
@@ -128,21 +118,18 @@ impl ChainSubmissionConfirmation {
 /// Generation-validated terminal evidence accepted by the runtime lifecycle.
 ///
 /// The variant determines which combinations of source and transaction hash
-/// can be represented. Legacy projections deliberately use a separate type.
+/// can be represented.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ValidatedChainSubmissionConfirmation {
     Hash(ChainSubmissionConfirmation),
     Tree(ChainSubmissionConfirmation),
-    LegacyImport(ChainSubmissionConfirmation),
 }
 
 impl ValidatedChainSubmissionConfirmation {
     /// Returns the validated confirmation payload independent of evidence kind.
     pub(super) fn confirmation(&self) -> &ChainSubmissionConfirmation {
         match self {
-            Self::Hash(confirmation)
-            | Self::Tree(confirmation)
-            | Self::LegacyImport(confirmation) => confirmation,
+            Self::Hash(confirmation) | Self::Tree(confirmation) => confirmation,
         }
     }
 
@@ -175,53 +162,11 @@ impl ValidatedChainSubmissionConfirmation {
         }))
     }
 
-    #[allow(dead_code, reason = "used by the version-18 migration")]
-    pub(super) fn from_legacy_import(
-        transaction_hash: Option<CandidateTransactionHash>,
-        final_van_position: u64,
-        vote_commitment_positions: Vec<u64>,
-    ) -> Result<Self, ChainSubmissionConfirmationError> {
-        validate_sqlite_positions(final_van_position, &vote_commitment_positions)?;
-        Ok(Self::LegacyImport(ChainSubmissionConfirmation {
-            source: ChainSubmissionConfirmationSource::LegacyImport,
-            transaction_hash,
-            final_van_position,
-            vote_commitment_positions,
-        }))
-    }
-
     #[allow(dead_code, reason = "returned by the chain submission coordinator")]
     pub(super) fn into_public(self) -> ChainSubmissionConfirmation {
         match self {
-            Self::Hash(confirmation)
-            | Self::Tree(confirmation)
-            | Self::LegacyImport(confirmation) => confirmation,
+            Self::Hash(confirmation) | Self::Tree(confirmation) => confirmation,
         }
-    }
-}
-
-/// Migration-only positions that lack a validated generation layout.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct LegacyProjectionConfirmation(ChainSubmissionConfirmation);
-
-impl LegacyProjectionConfirmation {
-    #[allow(dead_code, reason = "used by the version-18 migration")]
-    pub(super) fn from_positions(
-        final_van_position: u64,
-        vote_commitment_position: u64,
-    ) -> Result<Self, ChainSubmissionConfirmationError> {
-        validate_sqlite_positions(final_van_position, &[vote_commitment_position])?;
-        Ok(Self(ChainSubmissionConfirmation {
-            source: ChainSubmissionConfirmationSource::LegacyProjection,
-            transaction_hash: None,
-            final_van_position,
-            vote_commitment_positions: vec![vote_commitment_position],
-        }))
-    }
-
-    #[allow(dead_code, reason = "returned for migration projections")]
-    pub(super) fn into_public(self) -> ChainSubmissionConfirmation {
-        self.0
     }
 }
 
@@ -271,15 +216,11 @@ pub enum ChainSubmissionResult {
 impl ChainSubmissionResult {
     /// Returns the durable state represented by this result.
     ///
-    /// `Cancelled` has no durable state. A migrated legacy projection is
-    /// intentionally distinguished from a generation-validated confirmation.
+    /// `Cancelled` has no durable state. Every confirmation is `Confirmed`
+    /// regardless of provenance; callers that care whether a layout was
+    /// validated read [`ChainSubmissionConfirmation::source`].
     pub fn durable_state(&self) -> Option<ChainSubmissionState> {
         match self {
-            Self::Confirmed(confirmation)
-                if confirmation.source() == ChainSubmissionConfirmationSource::LegacyProjection =>
-            {
-                Some(ChainSubmissionState::LegacyConfirmed)
-            }
             Self::Confirmed(_) => Some(ChainSubmissionState::Confirmed),
             Self::Pending(ChainSubmissionPending::Tracking { .. }) => {
                 Some(ChainSubmissionState::Tracking)
@@ -486,38 +427,6 @@ mod tests {
         assert_eq!(
             ValidatedChainSubmissionConfirmation::from_tree(0, vec![i64::MAX as u64 + 1]),
             Err(ChainSubmissionConfirmationError::PositionOutOfRange)
-        );
-    }
-
-    #[test]
-    fn legacy_projection_is_distinct_from_validated_legacy_import() {
-        let legacy_projection = LegacyProjectionConfirmation::from_positions(4, 5)
-            .unwrap()
-            .into_public();
-        let legacy_import = ValidatedChainSubmissionConfirmation::from_legacy_import(
-            Some(CandidateTransactionHash::from_bytes([7; 32])),
-            4,
-            vec![5],
-        )
-        .unwrap()
-        .into_public();
-
-        assert_eq!(
-            legacy_projection.source(),
-            ChainSubmissionConfirmationSource::LegacyProjection
-        );
-        assert_eq!(legacy_projection.transaction_hash(), None);
-        assert_eq!(
-            ChainSubmissionResult::Confirmed(legacy_projection).durable_state(),
-            Some(ChainSubmissionState::LegacyConfirmed)
-        );
-        assert_eq!(
-            legacy_import.source(),
-            ChainSubmissionConfirmationSource::LegacyImport
-        );
-        assert_eq!(
-            ChainSubmissionResult::Confirmed(legacy_import).durable_state(),
-            Some(ChainSubmissionState::Confirmed)
         );
     }
 
