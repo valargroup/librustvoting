@@ -22,7 +22,7 @@ fn restart_normalizes_unclassified_reservation_without_redispatch() {
     }
     {
         let db = open_prepared(&path);
-        let store = SqliteChainSubmissionStore::new(db);
+        let store = SqliteChainSubmissionStore::new(Arc::clone(&db));
         let admission = store
             .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 20)
             .unwrap();
@@ -31,6 +31,17 @@ fn restart_normalizes_unclassified_reservation_without_redispatch() {
         };
         assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
         assert_eq!(record.committed_post_reservations(), 1);
+        let recovery_count: u64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM votes
+                  WHERE round_id=?1 AND wallet_id='wallet'
+                    AND commitment_bundle_json IS NOT NULL",
+                [ROUND],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovery_count, 1);
     }
     let _ = std::fs::remove_file(path);
 }

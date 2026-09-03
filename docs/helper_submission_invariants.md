@@ -1323,7 +1323,10 @@ submissions.
 Explicit round and account deletion are destructive escape hatches. They delete
 the owning rows, and foreign-key cascades remove the round's helper plans and
 delivery history as part of that deletion. The records are not selectively
-cleared while their round remains live.
+cleared while their round remains live. Every `VotingDb` handle opened on the
+same canonical SQLite file in the owning process shares one database authority,
+so an exclusive deletion requested through one handle cannot bypass a chain
+submission lifecycle lease held through another handle.
 
 Enforcement:
 [`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),
@@ -1333,6 +1336,8 @@ and the `rounds` foreign-key cascades.
 Regression coverage must show that ordinary cleanup and reset preserve delivery
 rows, explicit round or account deletion removes their owning rows, and no
 standalone recovery-clear API or storage primitive remains.
+`second_handle_cannot_delete_state_reserved_by_an_active_submission` covers the
+cross-handle deletion boundary while recovery material is reserved.
 
 ## Helper identity and payload invariants
 

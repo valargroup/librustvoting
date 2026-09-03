@@ -4,4 +4,5 @@ mod fixtures;
 
 mod admission;
 mod bundle_causality;
+mod database_authority;
 mod persistence;

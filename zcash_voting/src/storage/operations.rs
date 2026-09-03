@@ -512,7 +512,7 @@ impl VotingDb {
         let _lease = deletion_identity
             .as_ref()
             .map(|identity| {
-                self.chain_submission_coordination
+                self.chain_submission_coordination()
                     .try_acquire_round_exclusive(identity)
                     .map_err(|error| match error {
                         crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
@@ -587,7 +587,7 @@ impl VotingDb {
     pub fn clear_wallet_state(&self) -> Result<u32, VotingError> {
         let wallet_id = self.wallet_id();
         let _lease = self
-            .chain_submission_coordination
+            .chain_submission_coordination()
             .try_acquire_account_exclusive(&wallet_id)
             .map_err(|error| match error {
                 crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
@@ -1760,7 +1760,7 @@ impl VotingDb {
         let _lease = pruning_identity
             .as_ref()
             .map(|identity| {
-                self.chain_submission_coordination
+                self.chain_submission_coordination()
                     .try_acquire_round_exclusive(identity)
                     .map_err(|error| {
                         match error {

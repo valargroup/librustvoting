@@ -1,12 +1,18 @@
+mod database_authority;
 mod migrations;
 pub mod operations;
 pub mod queries;
 
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use rusqlite::Connection;
 
 use crate::types::{Network, VotingError};
+
+use self::database_authority::DatabaseAuthority;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -87,8 +93,7 @@ pub struct KeystoneSignatureBatchResult {
 pub struct VotingDb {
     conn: Mutex<Connection>,
     wallet_id: Mutex<String>,
-    pub(crate) chain_submission_coordination:
-        crate::chain_submission::coordination::SubmissionCoordination,
+    database_authority: Arc<DatabaseAuthority>,
 }
 
 impl VotingDb {
@@ -116,10 +121,16 @@ impl VotingDb {
 
         migrations::migrate(&mut conn)?;
 
+        let database_authority = if path == ":memory:" {
+            DatabaseAuthority::in_memory()
+        } else {
+            DatabaseAuthority::for_connection(&conn)?
+        };
+
         Ok(Self {
             conn: Mutex::new(conn),
             wallet_id: Mutex::new(String::new()),
-            chain_submission_coordination: Default::default(),
+            database_authority,
         })
     }
 
@@ -145,6 +156,13 @@ impl VotingDb {
     /// Get a lock on the underlying connection for query execution.
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("database mutex poisoned")
+    }
+
+    /// Returns lifecycle coordination shared by every handle to this database.
+    pub(crate) fn chain_submission_coordination(
+        &self,
+    ) -> &crate::chain_submission::coordination::SubmissionCoordination {
+        self.database_authority.chain_submission()
     }
 }
 
