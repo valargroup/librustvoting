@@ -7,8 +7,20 @@ use crate::{chain_submission::coordination::CapturedSubmissionOperation, types::
 #[tokio::test]
 async fn second_handle_cannot_delete_state_reserved_by_an_active_submission() {
     let path = temporary_path("shared-authority-deletion");
-    let submitting_db = open_prepared(&path);
-    let deleting_db = Arc::new(VotingDb::open(&path).unwrap());
+    assert_second_handle_cannot_delete_active_submission(&path).await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission() {
+    let name = temporary_path("shared-memory-authority-deletion").replace(['/', '.'], "-");
+    let uri = format!("file:{name}?mode=memory&cache=shared");
+    assert_second_handle_cannot_delete_active_submission(&uri).await;
+}
+
+async fn assert_second_handle_cannot_delete_active_submission(path: &str) {
+    let submitting_db = open_prepared(path);
+    let deleting_db = Arc::new(VotingDb::open(path).unwrap());
     deleting_db.set_wallet_id("wallet");
 
     let store = SqliteChainSubmissionStore::new(Arc::clone(&submitting_db));
@@ -72,5 +84,4 @@ async fn second_handle_cannot_delete_state_reserved_by_an_active_submission() {
     assert!(!deleting_db.has_round(ROUND).unwrap());
 
     drop((store, submitting_db, deleting_db));
-    let _ = std::fs::remove_file(path);
 }

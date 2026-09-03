@@ -1,20 +1,27 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Barrier},
 };
 
-use super::*;
-use crate::storage::VotingDb;
+use super::super::*;
 
-fn temporary_path(label: &str) -> PathBuf {
+fn unique_label(label: &str) -> String {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "voting-database-authority-{label}-{}-{nonce}.sqlite",
+    format!(
+        "voting-database-authority-{label}-{}-{nonce}",
         std::process::id()
-    ))
+    )
+}
+
+fn temporary_path(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{}.sqlite", unique_label(label)))
+}
+
+fn shared_memory_uri(label: &str) -> String {
+    format!("file:{}?mode=memory&cache=shared", unique_label(label))
 }
 
 fn remove_sqlite_files(path: &Path) {
@@ -45,6 +52,34 @@ fn file_backed_handles_share_one_database_authority() {
 
     drop((second, third));
     remove_sqlite_files(&path);
+}
+
+#[test]
+fn shared_memory_handles_share_one_database_authority() {
+    let uri = shared_memory_uri("shared-memory");
+    let first = VotingDb::open(&uri).unwrap();
+    let second = VotingDb::open(&uri).unwrap();
+
+    assert!(Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}
+
+#[test]
+fn equivalent_shared_memory_uris_share_one_database_authority() {
+    let name = unique_label("shared-memory-alias");
+    let encoded_name = name.replace('-', "%2D");
+    let first = VotingDb::open(&format!("file:{name}?mode=memory&cache=shared")).unwrap();
+    let second = VotingDb::open(&format!(
+        "file:{encoded_name}?cache=shared&mode=memory#ignored"
+    ))
+    .unwrap();
+
+    assert!(Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
 }
 
 #[test]
@@ -90,6 +125,17 @@ fn different_files_have_independent_database_authorities() {
 }
 
 #[test]
+fn different_shared_memory_names_have_independent_database_authorities() {
+    let first = VotingDb::open(&shared_memory_uri("different-memory-first")).unwrap();
+    let second = VotingDb::open(&shared_memory_uri("different-memory-second")).unwrap();
+
+    assert!(!Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}
+
+#[test]
 fn normalized_paths_share_one_database_authority() {
     let directory = temporary_path("normalized-parent");
     std::fs::create_dir_all(directory.join("alias")).unwrap();
@@ -112,6 +158,19 @@ fn normalized_paths_share_one_database_authority() {
 fn in_memory_handles_have_independent_database_authorities() {
     let first = VotingDb::open(":memory:").unwrap();
     let second = VotingDb::open(":memory:").unwrap();
+
+    assert!(!Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}
+
+#[test]
+fn private_cache_memory_handles_have_independent_database_authorities() {
+    let name = unique_label("private-memory");
+    let uri = format!("file:{name}?mode=memory&cache=private");
+    let first = VotingDb::open(&uri).unwrap();
+    let second = VotingDb::open(&uri).unwrap();
 
     assert!(!Arc::ptr_eq(
         &first.database_authority,

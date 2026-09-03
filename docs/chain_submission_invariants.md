@@ -80,12 +80,14 @@ ledgers.
 
 One process exclusively owns a voting database. Every handle opened on the
 same canonical SQLite file in that process shares one database authority and
-therefore one lifecycle-coordination registry. In-memory connections and
-SQLite temporary databases remain independent database authorities. Operations
-capture wallet, round, submission identity, and host operation epoch once; an
-account switch cannot retarget in-flight work. Opening one physical SQLite
-database through distinct hard-link paths is unsupported because SQLite's WAL
-sidecars and this authority identity are pathname-based.
+therefore one lifecycle-coordination registry. Connections using the same
+shared-cache SQLite memory URI share an authority by decoded database name.
+Plain `:memory:`, explicitly private-cache memory, and SQLite temporary
+databases remain independent database authorities. Operations capture wallet,
+round, submission identity, and host operation epoch once; an account switch
+cannot retarget in-flight work. Opening one physical SQLite database through
+distinct hard-link paths is unsupported because SQLite's WAL sidecars and this
+authority identity are pathname-based.
 
 ## Identity and semantic generation
 
@@ -743,12 +745,13 @@ was not locked. The request rejects rosters above the 15-action protocol
 maximum before allocating lock identities. No persisted roster is read before the operation
 and identity locks.
 The coordination authority is owned by the process-local database authority,
-which is interned by canonical SQLite file path. Constructing multiple stores,
-coordinators, or `VotingDb` handles for one file cannot create disjoint lock
-registries. Cleanup and deletion acquire the same round gate exclusively and
-treat an active shared lifecycle lease from any handle as busy. Process death
-drops these ephemeral gates; the durable submission row determines restart
-behavior, including conservative recovery of an abandoned `Submitting` row.
+which is interned by canonical SQLite file path or decoded shared-memory
+database name. Constructing multiple stores, coordinators, or `VotingDb`
+handles for one database cannot create disjoint lock registries. Cleanup and
+deletion acquire the same round gate exclusively and treat an active shared
+lifecycle lease from any handle as busy. Process death drops these ephemeral
+gates; the durable submission row determines restart behavior, including
+conservative recovery of an abandoned `Submitting` row.
 
 Once a singleton request is possibly dispatched, its proposal and choice are
 locked. Once a batch is possibly dispatched, member proposals, choices, count,
@@ -1120,6 +1123,7 @@ Public-lifecycle engine coverage is anchored by
 `independent_bundles_progress_while_another_post_is_blocked`,
 `coordinators_for_one_store_share_the_same_lock_authority`,
 `second_handle_cannot_delete_state_reserved_by_an_active_submission`,
+`shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission`,
 `exclusive_round_access_is_busy_until_lifecycle_work_finishes`,
 `batch_roster_mismatch_never_creates_a_reservation`,
 `batch_request_supplies_its_complete_recovery_independent_lock_set`,

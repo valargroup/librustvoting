@@ -1326,8 +1326,10 @@ delivery history as part of that deletion. The records are not selectively
 cleared while their round remains live. Every `VotingDb` handle opened on the
 same canonical SQLite file in the owning process shares one database authority,
 so an exclusive deletion requested through one handle cannot bypass a chain
-submission lifecycle lease held through another handle. In-memory connections
-and SQLite temporary databases remain independent authorities.
+submission lifecycle lease held through another handle. Connections using the
+same shared-cache SQLite memory URI share an authority by decoded database
+name. Plain `:memory:`, explicitly private-cache memory, and SQLite temporary
+databases remain independent authorities.
 
 Enforcement:
 [`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),
@@ -1338,7 +1340,9 @@ Regression coverage must show that ordinary cleanup and reset preserve delivery
 rows, explicit round or account deletion removes their owning rows, and no
 standalone recovery-clear API or storage primitive remains.
 `second_handle_cannot_delete_state_reserved_by_an_active_submission` covers the
-cross-handle deletion boundary while recovery material is reserved.
+file-backed cross-handle deletion boundary while recovery material is reserved;
+`shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission`
+covers the same boundary for URI-backed shared memory.
 
 ## Helper identity and payload invariants
 

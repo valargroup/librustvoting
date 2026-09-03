@@ -99,6 +99,8 @@ pub struct VotingDb {
 impl VotingDb {
     /// Open (or create) the voting database at the given path.
     /// An empty path opens an independent SQLite temporary database.
+    /// Plain `:memory:` databases are independent, while handles using the
+    /// same shared-cache SQLite memory URI share lifecycle coordination.
     /// Runs migrations automatically.
     /// Call `set_wallet_id` before performing any round operations.
     pub fn open(path: &str) -> Result<Self, VotingError> {
@@ -122,7 +124,7 @@ impl VotingDb {
 
         migrations::migrate(&mut conn)?;
 
-        let database_authority = DatabaseAuthority::for_connection(&conn)?;
+        let database_authority = DatabaseAuthority::for_connection(&conn, path)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -165,6 +167,8 @@ impl VotingDb {
 
 #[cfg(test)]
 mod tests {
+    mod database_authority;
+
     use super::*;
     use crate::types::VotingRoundParams;
 

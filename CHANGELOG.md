@@ -63,6 +63,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   successful proof so wallets can resume signing without regenerating ZKP1.
 - VAN positions above `u32::MAX` are now read losslessly; legacy `u32` readers
   return a range error instead of wrapping.
+- Independently opened SQLite handles now share chain-submission lifecycle
+  coordination for one canonical file or named shared-memory database, so a
+  destructive operation cannot bypass an in-flight submission lease.
 
 ### Removed
 
