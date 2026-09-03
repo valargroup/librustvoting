@@ -6,7 +6,8 @@
 
 pub use crate::chain_submission::{
     AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
-    CandidateTransactionHash, CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainAdvanceOutcome,
+    ChainAdvancePolicy, ChainAdvanceRequest, ChainHttpRequest, ChainHttpResponse,
     ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
     ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
     ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
@@ -127,6 +128,10 @@ pub use crate::vote::{
     SignedVoteCommitments, VanWitness, VoteBatchRecovery, VoteCommit, VoteCommitBatch,
     VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
     DEFAULT_BATCH_PROOF_CONCURRENCY, MAX_VOTE_BATCH_ACTIONS,
+};
+pub use crate::vote::{
+    persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
+    PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
 };
 pub use crate::vote_work::{
     NoopVoteRecoveryProgressReporter, VoteRecoveryAdvance, VoteRecoveryDisposition,

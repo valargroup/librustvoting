@@ -209,6 +209,19 @@ impl<T: ChainTransport> VoteRecoveryExecutor<T> {
                 vote.proposal_id(),
             )
             .map_err(|error| self.voting_failure(error, Some(work.clone()), request))?;
+            let vote = vote
+                .confirmed(&self.database)
+                .map_err(|error| self.voting_failure(error, Some(work.clone()), request))?
+                .ok_or_else(|| {
+                    self.failure(
+                        VoteRecoveryFailureKind::InvariantViolation,
+                        Some(work.clone()),
+                        None,
+                        chain_outcome.clone(),
+                        "vote was reported confirmed but its recovery material has no tree position",
+                        request,
+                    )
+                })?;
             let cancel = || control.is_cancelled();
             let delivery = vote
                 .submit_prepared_shares(
@@ -223,7 +236,7 @@ impl<T: ChainTransport> VoteRecoveryExecutor<T> {
                 .await
                 .map_err(|error| self.voting_failure(error, Some(work.clone()), request))?;
             let report = VoteShareDeliveryReport {
-                vote: vote_key(&vote),
+                vote: vote_key(vote.vote()),
                 delivery,
             };
             progress.report(VoteRecoveryProgress::ShareOutcome(report.clone()));

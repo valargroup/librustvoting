@@ -70,7 +70,8 @@ pub mod zkp2;
 
 pub use chain_submission::{
     AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
-    CandidateTransactionHash, CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainAdvanceOutcome,
+    ChainAdvancePolicy, ChainAdvanceRequest, ChainHttpRequest, ChainHttpResponse,
     ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
     ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
     ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
@@ -103,6 +104,10 @@ pub use pir::{PirFleet, PirProofSource, PirSession};
 pub use transport::{
     DirectRoute, PirHttpFailure, PirHttpFailurePhase, RouteError, RouteFuture, RouteHttp,
     RoutePhase, RouteRequest, RouteResponse,
+};
+pub use vote::{
+    persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
+    PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
 };
 pub use vote_work::{
     NoopVoteRecoveryProgressReporter, VoteRecoveryAdvance, VoteRecoveryDisposition,

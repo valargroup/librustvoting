@@ -325,7 +325,7 @@ async fn later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan(
         .unwrap();
     let transport = Arc::new(MockTransport::default());
     let error = second
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -429,7 +429,7 @@ async fn stale_handle_cannot_submit_same_commitment_replacement_plan() {
     let transport = Arc::new(MockTransport::default());
 
     let error = stale_handle
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -468,7 +468,7 @@ async fn same_commitment_replacement_after_plan_load_stops_every_post() {
     };
 
     let error = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -502,7 +502,7 @@ async fn delayed_immediate_plan_is_rejected_before_network() {
     let transport = Arc::new(MockTransport::default());
     queue_successes(&transport, &configured, plan.share_plans.len());
     let error = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -545,7 +545,7 @@ async fn prepared_batch_stays_bound_to_its_starting_wallet() {
     };
 
     let report = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport),
             submission_params(&configured),
@@ -592,7 +592,7 @@ async fn preconfirmation_plan_survives_confirmation_restart_and_submission() {
     let transport = Arc::new(MockTransport::default());
     queue_successes(&transport, &configured, prepared.share_plans.len());
     let report = committed_after
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -630,7 +630,7 @@ async fn preconfirmation_handle_is_stale_after_confirmation_transition() {
 
     let transport = Arc::new(MockTransport::default());
     let error = committed_before
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -675,7 +675,7 @@ async fn restart_resumes_with_a_replaced_helper_without_contacting_the_removed_t
     queue_successes(&transport, &drifted, plan.share_plans.len());
 
     let report = recovered
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&drifted),
@@ -712,7 +712,7 @@ async fn fleet_reordering_preserves_persisted_fleet_identity() {
     queue_successes(&transport, &configured, plan.share_plans.len());
 
     let report = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&reordered),
@@ -751,7 +751,7 @@ async fn restart_after_fleet_expansion_preserves_the_original_target() {
     queue_successes(&transport, &expanded, plan.share_plans.len());
 
     let report = recovered
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&expanded),
@@ -793,7 +793,7 @@ async fn restart_after_fleet_contraction_clamps_delivery_to_current_helpers() {
     queue_successes(&transport, &contracted, plan.share_plans.len());
 
     let report = recovered
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&contracted),
@@ -837,7 +837,7 @@ async fn one_helper_fleet_is_planned_and_submitted_by_the_sdk() {
     queue_successes(&transport, &configured, plan.share_plans.len());
 
     let report = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport),
             submission_params(&configured),
@@ -867,7 +867,7 @@ async fn every_payload_is_validated_before_the_first_post() {
     queue_successes(&transport, &configured, 2);
 
     let error = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -899,7 +899,7 @@ async fn restart_reuses_the_plan_and_resumes_definite_delivery_deficits() {
         );
     }
     let first = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(failing_transport),
             submission_params(&configured),
@@ -917,7 +917,7 @@ async fn restart_reuses_the_plan_and_resumes_definite_delivery_deficits() {
     let transport = Arc::new(MockTransport::default());
     queue_successes(&transport, &configured, plan.share_plans.len());
     let resumed = recovered
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport),
             submission_params(&configured),
@@ -962,7 +962,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
     replace_stored_share_plans(&strict_db, &concentrated);
     let strict_transport = Arc::new(MockTransport::default());
     let error = strict
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &strict_db,
             &client_with(strict_transport.clone()),
             submission_params(&configured),
@@ -1002,7 +1002,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
     replace_stored_share_plans(&legacy_db, &concentrated);
     let legacy_transport = Arc::new(MockTransport::default());
     let error = legacy
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &legacy_db,
             &client_with(legacy_transport.clone()),
             submission_params(&configured),
@@ -1017,7 +1017,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
     let valid_legacy_transport = Arc::new(MockTransport::default());
     queue_successes(&valid_legacy_transport, &configured, 16);
     let report = legacy
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &legacy_db,
             &client_with(valid_legacy_transport),
             submission_params(&configured),
@@ -1076,7 +1076,7 @@ async fn global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_share
         let queued_finished = queued_finished.clone();
         async move {
             let result = queued_vote
-                .submit_prepared_shares(
+                .submit_prepared_shares_unchecked(
                     queued_db_ref,
                     queued_client,
                     submission_params(queued_configured),
@@ -1105,7 +1105,7 @@ async fn global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_share
     };
 
     let (saturating_report, queued_report, ()) = tokio::join!(
-        saturating.submit_prepared_shares(
+        saturating.submit_prepared_shares_unchecked(
             &saturating_db,
             &client,
             submission_params(&configured),

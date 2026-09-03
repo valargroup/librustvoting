@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use super::{ChainSubmissionConfirmation, ChainSubmissionDiagnostic, ChainSubmissionPending};
 use crate::{storage::VotingDb, HyperTransport, Network};
 
 use super::{
@@ -106,6 +107,80 @@ impl ChainSubmissionClientConfig {
         self.maximum_post_attempts = attempts;
         self.retry_backoffs = retry_backoffs;
         self
+    }
+}
+
+/// One chain advancement request in any of its shapes.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum ChainAdvanceRequest {
+    Delegation(AdvanceDelegation),
+    ImportedDelegation(AdvanceImportedDelegation),
+    Vote(AdvanceVote),
+    VoteBatch(AdvanceVoteBatch),
+}
+
+/// Policy for one advancement episode, a finite composition of bounded passes.
+#[derive(Clone, Debug)]
+pub struct ChainAdvancePolicy {
+    /// Recovery mode of the first pass. Fresh submissions can start with
+    /// `StatusOnly`; resumed durable work should start with `ExactTree`.
+    pub initial_recovery_mode: ChainRecoveryMode,
+    /// Delay between passes while the row is `Tracking`.
+    pub pending_repoll: Duration,
+    /// Whether a `Recovering` result escalates to `ExactTree` once.
+    pub escalate_to_exact_tree: bool,
+    /// Passes per episode; `0` means until the row leaves `Tracking`.
+    pub max_passes: usize,
+}
+
+impl Default for ChainAdvancePolicy {
+    fn default() -> Self {
+        Self {
+            initial_recovery_mode: ChainRecoveryMode::StatusOnly,
+            pending_repoll: Duration::from_secs(2),
+            escalate_to_exact_tree: true,
+            max_passes: 45,
+        }
+    }
+}
+
+impl ChainAdvancePolicy {
+    /// Policy for work that is already durable: exact-tree reconciliation
+    /// from the first pass, as the resume planner requires.
+    pub fn for_persisted_work() -> Self {
+        Self {
+            initial_recovery_mode: ChainRecoveryMode::ExactTree,
+            ..Self::default()
+        }
+    }
+}
+
+/// Where an advancement episode ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChainAdvanceOutcome {
+    Confirmed(ChainSubmissionConfirmation),
+    SubmittedWithoutHash(ChainSubmissionDiagnostic),
+    Rejected(ChainSubmissionDiagnostic),
+    /// The episode's pass budget ended, or recovery is exhausted for now;
+    /// schedule another episode.
+    StillPending(ChainSubmissionPending),
+    Cancelled,
+}
+
+impl ChainAdvanceOutcome {
+    /// The last pass result the episode observed.
+    pub fn into_result(self) -> ChainSubmissionResult {
+        match self {
+            Self::Confirmed(confirmation) => ChainSubmissionResult::Confirmed(confirmation),
+            Self::SubmittedWithoutHash(diagnostic) => {
+                ChainSubmissionResult::SubmittedWithoutHash(diagnostic)
+            }
+            Self::Rejected(diagnostic) => ChainSubmissionResult::Rejected(diagnostic),
+            Self::StillPending(pending) => ChainSubmissionResult::Pending(pending),
+            Self::Cancelled => ChainSubmissionResult::Cancelled,
+        }
     }
 }
 
@@ -600,5 +675,77 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
                 error.to_string(),
             )
         })
+    }
+}
+
+impl<T: ChainTransport> ChainSubmissionClient<T> {
+    /// Runs bounded passes until the request reaches a terminal outcome or
+    /// the policy's pass budget ends.
+    ///
+    /// Each iteration is one bounded `advance_*_with_recovery` pass. A
+    /// `Tracking` result waits `pending_repoll` and passes again; a
+    /// `Recovering` result escalates to `ExactTree` at most once per episode
+    /// and otherwise ends the episode as `StillPending`; terminal results are
+    /// never retried; cancellation is checked between passes.
+    pub async fn advance_until_terminal(
+        &self,
+        request: ChainAdvanceRequest,
+        policy: &ChainAdvancePolicy,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure> {
+        let mut recovery = policy.initial_recovery_mode;
+        let mut escalated = recovery == ChainRecoveryMode::ExactTree;
+        let mut passes = 0usize;
+        loop {
+            if control.is_cancelled() {
+                return Ok(ChainAdvanceOutcome::Cancelled);
+            }
+            passes += 1;
+            let result = match &request {
+                ChainAdvanceRequest::Delegation(inner) => {
+                    self.advance_delegation_with_recovery(*inner, recovery, control)
+                        .await?
+                }
+                ChainAdvanceRequest::ImportedDelegation(inner) => {
+                    self.advance_imported_delegation(*inner, control).await?
+                }
+                ChainAdvanceRequest::Vote(inner) => {
+                    self.advance_vote_with_recovery(*inner, recovery, control)
+                        .await?
+                }
+                ChainAdvanceRequest::VoteBatch(inner) => {
+                    self.advance_vote_batch_with_recovery(inner.clone(), recovery, control)
+                        .await?
+                }
+            };
+            let pending = match result {
+                ChainSubmissionResult::Confirmed(confirmation) => {
+                    return Ok(ChainAdvanceOutcome::Confirmed(confirmation))
+                }
+                ChainSubmissionResult::SubmittedWithoutHash(diagnostic) => {
+                    return Ok(ChainAdvanceOutcome::SubmittedWithoutHash(diagnostic))
+                }
+                ChainSubmissionResult::Rejected(diagnostic) => {
+                    return Ok(ChainAdvanceOutcome::Rejected(diagnostic))
+                }
+                ChainSubmissionResult::Cancelled => return Ok(ChainAdvanceOutcome::Cancelled),
+                ChainSubmissionResult::Pending(pending) => pending,
+            };
+            match &pending {
+                ChainSubmissionPending::Recovering { .. } => {
+                    if policy.escalate_to_exact_tree && !escalated {
+                        escalated = true;
+                        recovery = ChainRecoveryMode::ExactTree;
+                    } else {
+                        return Ok(ChainAdvanceOutcome::StillPending(pending));
+                    }
+                }
+                ChainSubmissionPending::Tracking { .. } => {}
+            }
+            if policy.max_passes != 0 && passes >= policy.max_passes {
+                return Ok(ChainAdvanceOutcome::StillPending(pending));
+            }
+            tokio::time::sleep(policy.pending_repoll).await;
+        }
     }
 }

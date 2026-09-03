@@ -153,7 +153,8 @@ mod transport;
 mod tests;
 
 pub use client::{
-    AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch, ChainRecoveryMode,
+    AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
+    ChainAdvanceOutcome, ChainAdvancePolicy, ChainAdvanceRequest, ChainRecoveryMode,
     ChainSubmissionClient, ChainSubmissionClientConfig, ChainSubmissionControl,
     DEFAULT_CHAIN_MAXIMUM_POST_ATTEMPTS, DEFAULT_CHAIN_RETRY_BACKOFFS,
     DEFAULT_CHAIN_TRACKING_WINDOW,

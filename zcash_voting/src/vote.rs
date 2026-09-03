@@ -382,7 +382,48 @@ impl CommittedVote {
     /// This handle must match the exact durable recovery snapshot; recover a
     /// fresh `CommittedVote` after confirmation synchronizes a pre-confirmation
     /// plan to its confirmed VC tree position.
-    pub async fn submit_prepared_shares(
+    /// Returns the confirmed form of this vote, if its chain confirmation is
+    /// durable for this exact commitment generation.
+    ///
+    /// Helper-share submission needs the vote's commitment-tree position, so
+    /// it is only offered on [`ConfirmedVote`]. A vote whose confirmation is
+    /// still pending returns `None`; recover it again after the next chain
+    /// advancement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when the durable commitment
+    /// changed since this handle was recovered, and an internal error when the
+    /// recovery material is missing.
+    pub fn confirmed(self, db: &VotingDb) -> Result<Option<ConfirmedVote>, VotingError> {
+        let scope = crate::share::ShareOperationScope::capture(db);
+        let recovery = crate::recovery::helper_recovery_material_for_wallet(
+            db,
+            scope.wallet_id(),
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+        )?;
+        match recovery {
+            crate::recovery::HelperRecoveryMaterial::Ready(bundle)
+                if bundle.commitment_bundle_json == self.commitment_bundle_json =>
+            {
+                Ok(Some(ConfirmedVote {
+                    vote: self,
+                    vc_tree_position: bundle.vc_tree_position,
+                }))
+            }
+            crate::recovery::HelperRecoveryMaterial::Ready(_) => Err(VotingError::InvalidInput {
+                message: "committed vote changed after it was recovered".to_string(),
+            }),
+            crate::recovery::HelperRecoveryMaterial::AwaitingVcPosition => Ok(None),
+            crate::recovery::HelperRecoveryMaterial::Missing => Err(VotingError::Internal {
+                message: "committed vote is missing durable helper recovery material".to_string(),
+            }),
+        }
+    }
+
+    pub(crate) async fn submit_prepared_shares_unchecked(
         &self,
         db: &VotingDb,
         client: &crate::helper::client::HelperClient,
@@ -684,6 +725,200 @@ pub struct VoteCommitBatch<'a> {
 /// `drafts` must contain exactly one item because multiple singleton proofs from
 /// one witness would spend the same current VAN. Use
 /// [`commit_atomic_vote_batch`] for multiple proposals.
+/// A committed vote whose chain confirmation is durable.
+///
+/// Only a confirmed vote can submit helper shares, because the share payloads
+/// carry the vote's commitment-tree position. The type has no public
+/// constructor: it comes from [`CommittedVote::confirmed`], which reads the
+/// durable confirmation, so a host cannot submit shares for a vote the chain
+/// has not confirmed.
+///
+/// ```compile_fail
+/// # async fn demo(vote: zcash_voting::vote::CommittedVote, db: &zcash_voting::round::VotingDb,
+/// #   client: &zcash_voting::HelperClient,
+/// #   params: zcash_voting::share_tracking::ShareDeliverySubmissionParams<'_>) {
+/// let _ = vote.submit_prepared_shares(db, client, params, &|| false).await;
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct ConfirmedVote {
+    vote: CommittedVote,
+    vc_tree_position: u64,
+}
+
+impl ConfirmedVote {
+    /// The underlying committed vote.
+    pub fn vote(&self) -> &CommittedVote {
+        &self.vote
+    }
+
+    /// Durable commitment-tree position of the confirmed vote.
+    pub fn vc_tree_position(&self) -> u64 {
+        self.vc_tree_position
+    }
+
+    /// Submits the vote's helper shares from its persisted complete plan.
+    ///
+    /// Call [`CommittedVote::prepare_share_delivery`] before the chain
+    /// broadcast so the plan is durable first; this method loads that plan,
+    /// limits delivery to `configured_server_urls`, journals every attempt,
+    /// and resumes only the remaining definite-delivery deficits.
+    pub async fn submit_prepared_shares(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<crate::share_tracking::ShareBatchDeliveryReport, VotingError> {
+        self.vote
+            .submit_prepared_shares_unchecked(db, client, params, cancel)
+            .await
+    }
+}
+
+/// Recovered commitment for a vote, in whichever shape it was committed.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum VoteCommitmentRecovery {
+    /// A legacy singleton commitment submitted through the singleton endpoint.
+    Singleton(SignedVoteCommitments),
+    /// A member of an atomic batch; the whole batch is recovered.
+    AtomicBatch(SignedVoteBatch),
+}
+
+impl VoteCommitmentRecovery {
+    pub fn bundle_index(&self) -> u32 {
+        match self {
+            Self::Singleton(commitments) => commitments.bundle_index,
+            Self::AtomicBatch(batch) => batch.bundle_index,
+        }
+    }
+
+    /// Proposal ids in signed order.
+    pub fn proposal_ids(&self) -> Vec<u32> {
+        match self {
+            Self::Singleton(commitments) => commitments
+                .commitments
+                .iter()
+                .map(|commitment| commitment.proposal_id)
+                .collect(),
+            Self::AtomicBatch(batch) => batch
+                .commitments
+                .iter()
+                .map(|commitment| commitment.proposal_id)
+                .collect(),
+        }
+    }
+}
+
+/// Recovers a vote's durable commitment without the caller knowing whether it
+/// was committed alone or inside an atomic batch.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] when no recovery bundle exists for
+/// the vote.
+pub fn recover_vote_commitment(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<VoteCommitmentRecovery, VotingError> {
+    let requested = recovery_bundle(db, round_id, bundle_index, proposal_id)?.ok_or_else(|| {
+        VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+            ),
+        }
+    })?;
+    if requested.batch.is_some() {
+        recover_atomic_vote_batch(db, round_id, bundle_index, proposal_id)
+            .map(VoteCommitmentRecovery::AtomicBatch)
+    } else {
+        recover_signed_commitments(db, round_id, bundle_index, proposal_id)
+            .map(VoteCommitmentRecovery::Singleton)
+    }
+}
+
+/// Inputs for committing every draft of one bundle in one call.
+pub struct VoteWorkRequest<'a> {
+    pub round_id: &'a str,
+    pub bundle_index: u32,
+    /// One draft commits as a singleton; several commit as one atomic batch.
+    pub drafts: &'a [DraftVote],
+    pub witness: &'a VanWitness,
+    pub stages: &'a dyn crate::types::VoteCommitStageReporter,
+    /// Proof concurrency for an atomic batch; ignored for a singleton.
+    pub max_proof_concurrency: usize,
+}
+
+/// Proved but not yet persisted vote work from [`prepare_vote_work`].
+#[non_exhaustive]
+pub enum PreparedVoteWork {
+    Singleton(PreparedVoteCommitments),
+    AtomicBatch(PreparedAtomicVoteBatch),
+}
+
+/// Proves every draft for one bundle, choosing the singleton or atomic shape.
+///
+/// A single draft is committed through the legacy singleton path; two or more
+/// drafts become one atomic batch so the chain accepts or rejects them
+/// together. Proofs run on the calling thread.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] for an empty draft list or a zero
+/// concurrency, and otherwise whatever the underlying preparation returns.
+pub fn prepare_vote_work(
+    db: &VotingDb,
+    signer: VoteSigner<'_>,
+    request: VoteWorkRequest<'_>,
+) -> Result<PreparedVoteWork, VotingError> {
+    if request.drafts.is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: "vote batch must contain at least one draft".to_string(),
+        });
+    }
+    if request.drafts.len() == 1 {
+        prepare_commit_batch(
+            db,
+            signer,
+            VoteCommitBatch {
+                round_id: request.round_id,
+                bundle_index: request.bundle_index,
+                drafts: request.drafts,
+                witness: request.witness,
+                stages: request.stages,
+            },
+        )
+        .map(PreparedVoteWork::Singleton)
+    } else {
+        let batch = AtomicVoteBatch::new(
+            request.round_id,
+            request.bundle_index,
+            request.drafts,
+            request.witness,
+            request.stages,
+        )
+        .with_max_proof_concurrency(request.max_proof_concurrency)?;
+        prepare_atomic_vote_batch(db, signer, batch).map(PreparedVoteWork::AtomicBatch)
+    }
+}
+
+/// Persists prepared vote work under one write transaction.
+pub fn persist_prepared_vote_work(
+    db: &VotingDb,
+    prepared: PreparedVoteWork,
+) -> Result<VoteCommitmentRecovery, VotingError> {
+    match prepared {
+        PreparedVoteWork::Singleton(prepared) => {
+            persist_prepared_commit_batch(db, prepared).map(VoteCommitmentRecovery::Singleton)
+        }
+        PreparedVoteWork::AtomicBatch(prepared) => persist_prepared_atomic_vote_batch(db, prepared)
+            .map(VoteCommitmentRecovery::AtomicBatch),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn commit_batch(
     db: &VotingDb,

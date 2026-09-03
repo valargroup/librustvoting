@@ -113,6 +113,9 @@ async fn submit(
     urls: &[String],
 ) -> ShareBatchDeliveryReport {
     committed_vote(db)
+        .confirmed(db)
+        .unwrap()
+        .expect("fixture vote is confirmed")
         .submit_prepared_shares(
             db,
             client,
@@ -485,6 +488,9 @@ async fn current_boundary_rejects_schema_invalid_bodies_and_canonical_duplicates
     let mut duplicated = urls.clone();
     duplicated[9] = format!("{}/", urls[0]);
     let result = committed_vote(&db)
+        .confirmed(&db)
+        .unwrap()
+        .expect("fixture vote is confirmed")
         .submit_prepared_shares(
             &db,
             &helper_client,
