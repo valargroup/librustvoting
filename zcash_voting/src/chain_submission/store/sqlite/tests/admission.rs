@@ -22,7 +22,7 @@ fn restart_normalizes_unclassified_reservation_without_redispatch() {
     }
     {
         let db = open_prepared(&path);
-        let store = SqliteChainSubmissionStore::new(db);
+        let store = SqliteChainSubmissionStore::new(Arc::clone(&db));
         let admission = store
             .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 20)
             .unwrap();
@@ -31,13 +31,24 @@ fn restart_normalizes_unclassified_reservation_without_redispatch() {
         };
         assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
         assert_eq!(record.committed_post_reservations(), 1);
+        let recovery_count: u64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM votes
+                  WHERE round_id=?1 AND wallet_id='wallet'
+                    AND commitment_bundle_json IS NOT NULL",
+                [ROUND],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovery_count, 1);
     }
     let _ = std::fs::remove_file(path);
 }
 
 #[test]
 fn abandoned_batch_normalizes_before_roster_derivation() {
-    let db = open_prepared(":memory:");
+    let db = open_prepared_in_memory();
     let digest = store_two_vote_batch(&db);
     let store = SqliteChainSubmissionStore::new(Arc::clone(&db));
     let request = StoreAdvancementRequest::vote_batch(batch_identity(digest), vec![1, 2])
@@ -67,7 +78,7 @@ fn abandoned_batch_normalizes_before_roster_derivation() {
 
 #[test]
 fn cancelled_batch_returns_authoritative_state_before_stale_member() {
-    let db = open_prepared(":memory:");
+    let db = open_prepared_in_memory();
     let digest = store_two_vote_batch(&db);
     let store = SqliteChainSubmissionStore::new(Arc::clone(&db));
     let batch = batch_identity(digest);
@@ -107,7 +118,7 @@ fn cancelled_batch_returns_authoritative_state_before_stale_member() {
 
 #[test]
 fn failed_abandoned_normalization_reports_possible_dispatch() {
-    let db = open_prepared(":memory:");
+    let db = open_prepared_in_memory();
     let store = SqliteChainSubmissionStore::new(Arc::clone(&db));
     store
         .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 10)
@@ -137,7 +148,7 @@ fn failed_abandoned_normalization_reports_possible_dispatch() {
 
 #[test]
 fn duplicate_candidate_hash_becomes_hashless_recovery() {
-    let db = open_prepared(":memory:");
+    let db = open_prepared_in_memory();
     queries::insert_bundle(&db.conn(), ROUND, "wallet", 1, &[2]).unwrap();
     crate::vote::insert_recovery_fixture(&db, &recovery_for(1, 2)).unwrap();
     let store = SqliteChainSubmissionStore::new(db);

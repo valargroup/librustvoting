@@ -40,6 +40,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   submission is unsupported.
 - **Breaking:** delegation recovery views now expose VAN positions as `u64`,
   matching lifecycle confirmation and SQLite's supported non-negative range.
+- **Breaking:** `VotingDb::open` now accepts only UTF-8 filesystem paths and
+  rejects empty paths, `:memory:`, and `file:` URIs. Use `open_path` for native
+  filesystem paths, including non-UTF-8 paths where SQLite supports them, and
+  `open_in_memory` for a fresh private in-memory database. SQLite URI,
+  temporary-database, and custom-VFS modes are no longer supported.
 
 ### Fixed
 
@@ -63,6 +68,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   successful proof so wallets can resume signing without regenerating ZKP1.
 - VAN positions above `u32::MAX` are now read losslessly; legacy `u32` readers
   return a range error instead of wrapping.
+- Independently opened SQLite handles now share chain-submission lifecycle
+  coordination for one canonical filesystem path, including supported
+  non-UTF-8 native paths, so a destructive operation cannot bypass an in-flight
+  submission lease. The canonical path is resolved before SQLite opens it, so
+  symlink retargeting and dangling targets cannot bind a connection to a
+  different authority; the final open refuses symlinks introduced after
+  resolution, and the opened path is canonicalized again so concurrent first
+  opens through case variants share authority on case-insensitive filesystems.
+  Explicit in-memory databases remain private to one handle.
 
 ### Removed
 

@@ -422,7 +422,7 @@ mod tests {
         params: &VotingRoundParams,
         tree_state: &TreeState,
     ) -> VotingDb {
-        let db = VotingDb::open(":memory:").unwrap();
+        let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
         db.init_round(network, params, None).unwrap();
         db.store_tree_state(ROUND_ID, &tree_state.encode_to_vec())
@@ -553,7 +553,7 @@ mod tests {
         let (wallet_db, frontier) = seeded_ironwood_wallet_db(SNAPSHOT_HEIGHT, 200, &positions);
         let params = round_params(SNAPSHOT_HEIGHT, &frontier);
         let tree_state = tree_state_from_frontiers(SNAPSHOT_HEIGHT, None, Some(&frontier));
-        let db = VotingDb::open(":memory:").unwrap();
+        let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
         db.init_round(crate::Network::Regtest, &params, None)
             .unwrap();
@@ -601,7 +601,7 @@ mod tests {
             .collect::<Vec<_>>();
         let (wallet_db, frontier) = seeded_ironwood_wallet_db(SNAPSHOT_HEIGHT, 200, &positions);
         let params = round_params(SNAPSHOT_HEIGHT, &frontier);
-        let db = VotingDb::open(":memory:").unwrap();
+        let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
         db.init_round(crate::Network::Regtest, &params, None)
             .unwrap();
@@ -693,7 +693,7 @@ mod tests {
         let (_wallet_db, frontier) = seeded_wallet_db(SNAPSHOT_HEIGHT, 200, &positions);
         let params = round_params(SNAPSHOT_HEIGHT, &frontier);
         let tree_state = tree_state_from_frontier(SNAPSHOT_HEIGHT, &frontier);
-        let voting_db = VotingDb::open(":memory:").unwrap();
+        let voting_db = VotingDb::open_in_memory().unwrap();
         voting_db.set_wallet_id(WALLET_ID);
         voting_db
             .init_round(crate::Network::Testnet, &params, None)
@@ -822,7 +822,7 @@ mod tests {
         let frontier = test_frontier();
         let params = round_params(u64::from(u32::MAX) + 1, &frontier);
         let tree_state = tree_state_from_frontier(u64::from(u32::MAX) + 1, &frontier);
-        let voting_db = VotingDb::open(":memory:").unwrap();
+        let voting_db = VotingDb::open_in_memory().unwrap();
         voting_db.set_wallet_id(WALLET_ID);
         voting_db
             .init_round(crate::Network::Testnet, &params, None)

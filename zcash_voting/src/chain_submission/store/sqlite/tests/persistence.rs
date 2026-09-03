@@ -88,7 +88,7 @@ fn tracking_and_atomic_confirmation_survive_reopen() {
 
 #[test]
 fn lifecycle_timestamps_clamp_when_wall_clock_moves_backward() {
-    let db = open_prepared(":memory:");
+    let db = open_prepared_in_memory();
     let store = SqliteChainSubmissionStore::new(db);
     let StoreAdmission::Ready { derived, .. } = store
         .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 100)

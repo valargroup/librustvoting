@@ -1,12 +1,19 @@
+mod database_authority;
 mod migrations;
 pub mod operations;
 pub mod queries;
 
-use std::{sync::Mutex, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::types::{Network, VotingError};
+
+use self::database_authority::DatabaseAuthority;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -87,39 +94,68 @@ pub struct KeystoneSignatureBatchResult {
 pub struct VotingDb {
     conn: Mutex<Connection>,
     wallet_id: Mutex<String>,
-    pub(crate) chain_submission_coordination:
-        crate::chain_submission::coordination::SubmissionCoordination,
+    database_authority: Arc<DatabaseAuthority>,
 }
 
 impl VotingDb {
-    /// Open (or create) the voting database at the given path.
-    /// Runs migrations automatically.
-    /// Call `set_wallet_id` before performing any round operations.
+    /// Opens or creates a voting database at a UTF-8 filesystem path.
+    ///
+    /// Empty paths, SQLite's `:memory:` magic name, and `file:` URIs are
+    /// rejected. Use [`VotingDb::open_path`] for native filesystem paths and
+    /// [`VotingDb::open_in_memory`] for an independent in-memory database.
     pub fn open(path: &str) -> Result<Self, VotingError> {
-        let mut conn = if path == ":memory:" {
-            Connection::open_in_memory()
-        } else {
-            Connection::open(path)
-        }
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to open database: {}", e),
+        Self::open_path(Path::new(path))
+    }
+
+    /// Opens or creates a voting database at a native filesystem path.
+    ///
+    /// URI interpretation is disabled so database identity is determined only
+    /// by the filesystem path. Handles resolving to the same canonical path
+    /// share lifecycle coordination.
+    pub fn open_path(path: &Path) -> Result<Self, VotingError> {
+        validate_database_path(path)?;
+        let opening_path = canonical_database_path(path)?;
+        let connection = open_canonical_database_file(&opening_path)?;
+        // A first open creates the final path. Resolve it again so concurrent
+        // casing aliases on a case-insensitive filesystem converge before
+        // authority interning.
+        let canonical_path = canonical_opened_database_path(&opening_path)?;
+        let database_authority = DatabaseAuthority::for_file(canonical_path)?;
+
+        Self::initialize(connection, database_authority)
+    }
+
+    /// Opens a fresh private in-memory voting database.
+    pub fn open_in_memory() -> Result<Self, VotingError> {
+        let connection = Connection::open_in_memory().map_err(|error| VotingError::Internal {
+            message: format!("failed to open in-memory database: {error}"),
         })?;
+        Self::initialize(connection, DatabaseAuthority::private())
+    }
 
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to configure database busy timeout: {}", e),
-            })?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to set pragmas: {}", e),
+    /// Configures and migrates one newly opened voting database.
+    fn initialize(
+        mut connection: Connection,
+        database_authority: Arc<DatabaseAuthority>,
+    ) -> Result<Self, VotingError> {
+        connection
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to configure database busy timeout: {error}"),
             })?;
 
-        migrations::migrate(&mut conn)?;
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to set pragmas: {error}"),
+            })?;
+
+        migrations::migrate(&mut connection)?;
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(connection),
             wallet_id: Mutex::new(String::new()),
-            chain_submission_coordination: Default::default(),
+            database_authority,
         })
     }
 
@@ -146,17 +182,127 @@ impl VotingDb {
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("database mutex poisoned")
     }
+
+    /// Returns lifecycle coordination shared by every handle to this database.
+    pub(crate) fn chain_submission_coordination(
+        &self,
+    ) -> &crate::chain_submission::coordination::SubmissionCoordination {
+        self.database_authority.chain_submission()
+    }
+}
+
+/// Opens a resolved database path without following a later symlink change.
+fn open_canonical_database_file(canonical_path: &Path) -> Result<Connection, VotingError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Connection::open_with_flags(canonical_path, flags).map_err(|error| VotingError::Internal {
+        message: format!("failed to open database: {error}"),
+    })
+}
+
+/// Rejects SQLite's non-filesystem magic names before any database is opened.
+fn validate_database_path(path: &Path) -> Result<(), VotingError> {
+    let invalid_path = path.as_os_str().is_empty()
+        || path == Path::new(":memory:")
+        || path.to_str().is_some_and(|path| path.starts_with("file:"));
+    if invalid_path {
+        return Err(VotingError::InvalidInput {
+            message: "voting database must be a filesystem path; use open_in_memory for an independent in-memory database".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Resolves the exact filesystem path before SQLite opens it.
+///
+/// Existing symlinks resolve to their current target. For a new database, the
+/// parent is resolved first and the new filename is appended, so SQLite and the
+/// authority registry receive the same path.
+fn canonical_database_path(path: &Path) -> Result<std::path::PathBuf, VotingError> {
+    canonical_database_path_with_symlink_limit(path, 40)
+}
+
+/// Resolves symlink chains whose final database file does not exist yet.
+fn canonical_database_path_with_symlink_limit(
+    path: &Path,
+    remaining_symlinks: usize,
+) -> Result<std::path::PathBuf, VotingError> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical_path) => Ok(canonical_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    if remaining_symlinks == 0 {
+                        return Err(VotingError::InvalidInput {
+                            message: "voting database path has too many symbolic links".to_string(),
+                        });
+                    }
+                    let symlink_target =
+                        std::fs::read_link(path).map_err(|error| VotingError::Storage {
+                            message: format!("failed to read SQLite database symlink: {error}"),
+                        })?;
+                    let target_path = if symlink_target.is_absolute() {
+                        symlink_target
+                    } else {
+                        path.parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                            .unwrap_or_else(|| Path::new("."))
+                            .join(symlink_target)
+                    };
+                    canonical_database_path_with_symlink_limit(&target_path, remaining_symlinks - 1)
+                }
+                Ok(_) => Err(VotingError::Storage {
+                    message: "SQLite database path disappeared while resolving it".to_string(),
+                }),
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    canonical_new_database_path(path)
+                }
+                Err(metadata_error) => Err(VotingError::Storage {
+                    message: format!("failed to inspect SQLite database path: {metadata_error}"),
+                }),
+            }
+        }
+        Err(error) => Err(VotingError::Storage {
+            message: format!("failed to resolve SQLite database path: {error}"),
+        }),
+    }
+}
+
+/// Resolves the parent of a database file that has not been created yet.
+fn canonical_new_database_path(path: &Path) -> Result<std::path::PathBuf, VotingError> {
+    let file_name = path.file_name().ok_or_else(|| VotingError::InvalidInput {
+        message: "voting database path must name a file".to_string(),
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| VotingError::Storage {
+        message: format!("failed to resolve SQLite database parent: {error}"),
+    })?;
+    Ok(canonical_parent.join(file_name))
+}
+
+/// Resolves the filesystem identity of a path SQLite has created or opened.
+fn canonical_opened_database_path(path: &Path) -> Result<std::path::PathBuf, VotingError> {
+    std::fs::canonicalize(path).map_err(|error| VotingError::Storage {
+        message: format!("failed to resolve opened SQLite database path: {error}"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    mod database_authority;
+
     use super::*;
     use crate::types::VotingRoundParams;
 
     const W: &str = "test-wallet";
 
     fn test_db() -> VotingDb {
-        VotingDb::open(":memory:").unwrap()
+        VotingDb::open_in_memory().unwrap()
     }
 
     fn test_params() -> VotingRoundParams {

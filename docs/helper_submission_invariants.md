@@ -1323,7 +1323,22 @@ submissions.
 Explicit round and account deletion are destructive escape hatches. They delete
 the owning rows, and foreign-key cascades remove the round's helper plans and
 delivery history as part of that deletion. The records are not selectively
-cleared while their round remains live.
+cleared while their round remains live. Every `VotingDb` handle opened on the
+same canonical SQLite file in the owning process shares one database authority,
+so an exclusive deletion requested through one handle cannot bypass a chain
+submission lifecycle lease held through another handle. `VotingDb::open_path`
+opens only filesystem databases, accepts non-UTF-8 native paths on platforms
+where SQLite supports them, and disables SQLite URI interpretation. The path is
+resolved before opening, including a dangling symlink whose target database
+must be created. SQLite's final no-follow open makes a post-resolution symlink
+change fail closed. The opened pathname is canonicalized again before its
+authority is interned, so concurrent first opens through case variants share
+one authority on a case-insensitive filesystem;
+`VotingDb::open_in_memory` creates an independent database with a private
+authority. The legacy UTF-8 string constructor accepts only filesystem paths.
+Empty paths, SQLite's `:memory:` magic name, and `file:` URIs are rejected
+before opening a database, and replacing SQLite's process-default filesystem
+VFS is unsupported.
 
 Enforcement:
 [`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),
@@ -1333,6 +1348,11 @@ and the `rounds` foreign-key cascades.
 Regression coverage must show that ordinary cleanup and reset preserve delivery
 rows, explicit round or account deletion removes their owning rows, and no
 standalone recovery-clear API or storage primitive remains.
+`second_handle_cannot_delete_state_reserved_by_an_active_submission` covers the
+file-backed cross-handle deletion boundary while recovery material is reserved.
+`file_handles_share_physical_state_and_database_authority` and
+`in_memory_handles_have_independent_database_authorities` cover the supported
+filesystem and private-memory identity boundaries.
 
 ## Helper identity and payload invariants
 

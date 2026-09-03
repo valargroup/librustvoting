@@ -5,7 +5,7 @@ use super::fixtures::*;
 
 #[test]
 fn confirmed_predecessor_allows_the_next_bundle_generation() {
-    let db = open_prepared(":memory:");
+    let db = open_prepared_in_memory();
     let store = SqliteChainSubmissionStore::new(Arc::clone(&db));
     let request = StoreAdvancementRequest::vote(identity());
     let StoreAdmission::Ready { derived, .. } = store.admit(&request, true, 1, 10).unwrap() else {
@@ -56,7 +56,7 @@ fn confirmed_predecessor_allows_the_next_bundle_generation() {
 
 #[test]
 fn active_predecessor_blocks_the_next_bundle_generation() {
-    let db = open_prepared(":memory:");
+    let db = open_prepared_in_memory();
     crate::vote::insert_recovery_fixture(&db, &recovery_for(0, 2)).unwrap();
     let store = SqliteChainSubmissionStore::new(db);
     let first = StoreAdvancementRequest::vote(identity_for(0, 1));
@@ -86,7 +86,7 @@ fn active_predecessor_blocks_the_next_bundle_generation() {
 
 #[test]
 fn confirmed_vote_refuses_a_later_delegation_reservation() {
-    let db = open_prepared(":memory:");
+    let db = open_prepared_in_memory();
     db.conn()
         .execute(
             "INSERT INTO chain_submissions
