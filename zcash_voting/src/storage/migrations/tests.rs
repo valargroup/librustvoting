@@ -342,6 +342,50 @@ fn fresh_v18_schema_requires_a_bound_generation() {
     insert(Some(vec![0x42; 32]), "recovering", None).unwrap();
 }
 
+#[test]
+fn fresh_and_migrated_v18_schemas_accept_supported_singleton_proposals() {
+    let mut fresh = Connection::open_in_memory().unwrap();
+    migrate(&mut fresh).unwrap();
+
+    let mut migrated = Connection::open_in_memory().unwrap();
+    migrated.execute_batch(&v17_schema()).unwrap();
+    migrated.pragma_update(None, "user_version", 17).unwrap();
+    migrate(&mut migrated).unwrap();
+
+    for (schema_kind, conn) in [("fresh", fresh), ("migrated", migrated)] {
+        queries::insert_round(
+            &conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        let insert = |identity_byte: u8, proposal_id: u32| {
+            conn.execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index, kind,
+                  proposal_id, generation_digest, state, committed_post_reservations,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', ?3, ?4,
+                         'submitting', 1, 9, 9)",
+                rusqlite::params![
+                    vec![identity_byte; 32],
+                    ROUND,
+                    i64::from(proposal_id),
+                    vec![0x42_u8; 32],
+                ],
+            )
+        };
+
+        insert(0x50, crate::types::MAX_PROPOSAL_ID).unwrap_or_else(|error| {
+            panic!("{schema_kind} schema rejected the maximum proposal: {error}")
+        });
+        let error = insert(0x51, crate::types::MAX_PROPOSAL_ID + 1).unwrap_err();
+        assert!(is_constraint_violation(&error), "{schema_kind}: {error}");
+    }
+}
+
 fn is_constraint_violation(error: &rusqlite::Error) -> bool {
     matches!(
         error,
