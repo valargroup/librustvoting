@@ -105,6 +105,15 @@ One process exclusively owns a voting database. Operations capture wallet,
 round, submission identity, and host operation epoch once; an account switch
 cannot retarget in-flight work.
 
+Locally generated delegation proofs are single-flighted within that owning
+process by `(wallet, round, bundle)`. A caller arriving while the same proof is
+being generated waits, then reloads and validates the durable proof before any
+chain-submission reservation. Failure releases the proof operation so a waiter
+may retry from durable state. Different bundle identities remain independent
+and may prove or advance concurrently. This coordination changes neither the
+submission identity nor its generation digest, and it creates no durable
+in-flight state of its own.
+
 ## Identity and semantic generation
 
 A submission identity contains:
@@ -1228,6 +1237,8 @@ Tests cover:
 - active singleton and batch generations reject conflicting ballot-intent
   changes before recovery or helper-delivery material is touched;
 - concurrent work cannot reserve two generations for one identity;
+- concurrent producers generate at most one delegation proof for one
+  wallet/round/bundle while distinct bundles remain parallel;
 - bundle locking prevents two successors from consuming the same VAN;
 - a confirmed vote or batch refuses a later delegation reservation for its
   bundle before derivation or dispatch;
@@ -1309,6 +1320,11 @@ The compile-time surface check is the `compile_fail` doctest set on the
 `chain_submission` module. It covers every removed confirmation entry point,
 transaction-hash and position recorder, payload builder, the private
 chain-event vocabulary, and the raw storage writers.
+
+Delegation proof coordination is anchored by
+`identical_proof_work_waits_and_reuses_durable_completion`,
+`different_bundles_enter_proof_work_concurrently`, and
+`failed_leader_releases_the_waiting_retry`.
 
 These tests are the review contract for changes to chain submission behavior.
 
