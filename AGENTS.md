@@ -110,6 +110,20 @@ and carry inline test modules and mixed responsibilities. They are legacy, not
 the pattern; do not copy their layout into new code, and do not reformat them
 wholesale as a side effect of an unrelated change.
 
+## Release branches
+
+`main` is the development line for the next release. Each shipped major series
+is maintained on a `release/vMAJOR.x` branch, currently `release/v3.x`.
+
+Do not push a fix directly to a maintenance branch. Land it on `main` first,
+then apply the `A:backport/v3.x` label so Mergify opens a reviewed backport PR.
+Only semver-compatible changes may be backported.
+
+Read [`docs/release-branches.md`](docs/release-branches.md) before deciding
+which branch a change targets, applying a backport label, or cutting a new
+maintenance line. It is the source of truth for the branching and release
+process; keep it updated in the same change whenever that process changes.
+
 ## Helper-share submission
 
 Before changing helper-share planning, submission, transport, persistence,
