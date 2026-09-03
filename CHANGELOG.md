@@ -40,6 +40,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   submission is unsupported.
 - **Breaking:** delegation recovery views now expose VAN positions as `u64`,
   matching lifecycle confirmation and SQLite's supported non-negative range.
+- Expanded the supported proposal-ID and atomic vote-batch ranges from 1–15 to
+  1–50 while retaining 16 encrypted shares per vote commitment. This consumes
+  the breaking circuit and verification-key change from `voting-circuits
+  0.12.0-rc.1`.
 
 ### Fixed
 
@@ -187,12 +191,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   use immediate transactions, preventing concurrent WAL writers from causing
   stale-snapshot `database is locked` failures during submission and
   confirmation recording.
-
-### Changed
-- Expanded the supported proposal-ID and atomic vote-batch ranges from 1–15 to
-  1–50 while retaining 16 encrypted shares per vote commitment. This consumes
-  the breaking circuit and verification-key change from `voting-circuits
-  0.12.0-rc.1`.
 
 ## v3.1.0-rc.13
 
