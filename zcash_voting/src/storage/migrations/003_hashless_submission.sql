@@ -1,3 +1,11 @@
+DROP TRIGGER chain_submissions_immutable_identity;
+DROP TRIGGER chain_submissions_monotonic_reservations;
+DROP TRIGGER chain_submissions_immutable_tracking_start;
+DROP INDEX chain_submissions_identity;
+DROP INDEX chain_submissions_candidate_owner;
+DROP INDEX chain_submissions_confirmation_hash_owner;
+ALTER TABLE chain_submissions RENAME TO chain_submissions_v18;
+
 CREATE TABLE chain_submissions (
     identity_key BLOB NOT NULL PRIMARY KEY,
     round_id TEXT NOT NULL,
@@ -43,6 +51,9 @@ CREATE TABLE chain_submissions (
         (confirmed_transaction_hash IS NOT NULL AND candidate_transaction_hash = confirmed_transaction_hash)),
     CHECK (confirmation_source != 'tree' OR confirmed_transaction_hash IS NULL)
 );
+
+INSERT INTO chain_submissions SELECT * FROM chain_submissions_v18;
+DROP TABLE chain_submissions_v18;
 
 CREATE UNIQUE INDEX chain_submissions_identity
     ON chain_submissions(wallet_id, network, round_id, kind, bundle_index,

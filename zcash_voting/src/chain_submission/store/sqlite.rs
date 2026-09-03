@@ -150,6 +150,9 @@ fn load_one<P: rusqlite::Params>(
                 candidate_transaction_hash: candidate,
                 ambiguity_diagnostic: diagnostic.clone().ok_or(rusqlite::Error::InvalidQuery)?,
             },
+            "submitted_without_hash" => SubmissionRecordState::SubmittedWithoutHash(
+                diagnostic.clone().ok_or(rusqlite::Error::InvalidQuery)?,
+            ),
             "confirmed" => {
                 let (source, final_van, positions, hash) =
                     confirmation.ok_or(rusqlite::Error::InvalidQuery)?;
@@ -222,6 +225,10 @@ fn encode_positions(positions: &[u64]) -> Vec<u8> {
 fn parse_diagnostic_kind(value: &str) -> rusqlite::Result<ChainSubmissionDiagnosticKind> {
     match value {
         "ambiguous_dispatch" => Ok(ChainSubmissionDiagnosticKind::AmbiguousDispatch),
+        "ambiguous_attempts_exhausted" => {
+            Ok(ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted)
+        }
+        "nullifier_already_spent" => Ok(ChainSubmissionDiagnosticKind::NullifierAlreadySpent),
         "tracking_window_expired" => Ok(ChainSubmissionDiagnosticKind::TrackingWindowExpired),
         "chain_rejected" => Ok(ChainSubmissionDiagnosticKind::ChainRejected),
         "reconciliation_pending" => Ok(ChainSubmissionDiagnosticKind::ReconciliationPending),
@@ -234,6 +241,8 @@ fn parse_diagnostic_kind(value: &str) -> rusqlite::Result<ChainSubmissionDiagnos
 fn diagnostic_name(value: ChainSubmissionDiagnosticKind) -> &'static str {
     match value {
         ChainSubmissionDiagnosticKind::AmbiguousDispatch => "ambiguous_dispatch",
+        ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted => "ambiguous_attempts_exhausted",
+        ChainSubmissionDiagnosticKind::NullifierAlreadySpent => "nullifier_already_spent",
         ChainSubmissionDiagnosticKind::TrackingWindowExpired => "tracking_window_expired",
         ChainSubmissionDiagnosticKind::ChainRejected => "chain_rejected",
         ChainSubmissionDiagnosticKind::ReconciliationPending => "reconciliation_pending",
@@ -325,6 +334,9 @@ fn persist_mutable(
             Some(ambiguity_diagnostic),
             None,
         ),
+        SubmissionRecordState::SubmittedWithoutHash(diagnostic) => {
+            ("submitted_without_hash", None, Some(diagnostic), None)
+        }
         SubmissionRecordState::Confirmed(value) => (
             "confirmed",
             value.confirmation().transaction_hash(),
@@ -453,7 +465,12 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                 };
                 request.verify_batch_roster(derived.ordered_proposal_ids()).map_err(|error| preserve_loaded_state(error, Some(&record)))?;
                 ensure_generation(&record, derived.generation())?;
-                if matches!(record.state(), SubmissionRecordState::Confirmed(_) | SubmissionRecordState::Rejected(_)) {
+                if matches!(
+                    record.state(),
+                    SubmissionRecordState::Confirmed(_)
+                        | SubmissionRecordState::Rejected(_)
+                        | SubmissionRecordState::SubmittedWithoutHash(_)
+                ) {
                     return Ok(StoreAdmission::Authoritative(record));
                 }
                 return Ok(StoreAdmission::Ready { derived: Box::new(derived), record, fresh_reservation: false });
@@ -461,7 +478,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
             let predecessor: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM chain_submissions WHERE wallet_id=:wallet AND network=:network
                   AND round_id=:round AND bundle_index=:bundle
-                  AND state IN ('submitting','tracking','recovering')) ",
+                  AND state IN ('submitting','tracking','recovering','submitted_without_hash')) ",
                 named_params! { ":wallet": request.identity().wallet_id(), ":network": network_name(request.identity().network()),
                     ":round": hex::encode(request.identity().vote_round_id()), ":bundle": request.identity().bundle_index() },
                 |row| row.get(0),
@@ -570,6 +587,50 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
         now: u64,
     ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
         self.apply_observation(generation, observation, None, now)
+    }
+
+    fn reserve_ambiguous_retry(
+        &self,
+        generation: &ChainSubmissionGeneration,
+        now: u64,
+    ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
+        self.transact(|tx| {
+            let mut record = load_submission(tx, generation.identity())?.ok_or_else(|| {
+                ChainSubmissionFailure::without_state(
+                    ChainSubmissionFailureKind::InvariantViolation,
+                    "submission disappeared before ambiguous retry reservation",
+                )
+            })?;
+            ensure_generation(&record, generation)?;
+            if !matches!(
+                record.state(),
+                SubmissionRecordState::Recovering {
+                    candidate_transaction_hash: None,
+                    ambiguity_diagnostic,
+                } if ambiguity_diagnostic.kind()
+                    == ChainSubmissionDiagnosticKind::AmbiguousDispatch
+            ) {
+                return Err(ChainSubmissionFailure::with_durable_state(
+                    ChainSubmissionFailureKind::InvariantViolation,
+                    record.durable_state(),
+                    "ambiguous retry requires hashless durable dispatch ambiguity",
+                ));
+            }
+            record.committed_post_reservations = record
+                .committed_post_reservations
+                .checked_add(1)
+                .filter(|count| *count <= i64::MAX as u64)
+                .ok_or_else(|| {
+                    ChainSubmissionFailure::with_durable_state(
+                        ChainSubmissionFailureKind::InvariantViolation,
+                        ChainSubmissionState::Recovering,
+                        "submission reservation counter overflowed",
+                    )
+                })?;
+            record.updated_at = now.max(record.updated_at);
+            persist_mutable(tx, &record)?;
+            Ok(record)
+        })
     }
 
     fn reconcile(
@@ -834,6 +895,7 @@ impl SqliteChainSubmissionStore {
                     ambiguity_diagnostic,
                     ..
                 }
+                | SubmissionRecordState::SubmittedWithoutHash(ambiguity_diagnostic)
                 | SubmissionRecordState::Rejected(ambiguity_diagnostic) => {
                     Some(ambiguity_diagnostic.clone())
                 }

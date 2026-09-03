@@ -1093,14 +1093,19 @@ pub fn resume_plan(
             !stale_vote_keys.contains(key)
                 && matches!(
                     phase,
-                    VotePhase::Committed | VotePhase::Submitted | VotePhase::SubmissionManaged
+                    VotePhase::Committed
+                        | VotePhase::Submitted
+                        | VotePhase::SubmissionManaged
+                        | VotePhase::SubmittedWithoutHash
                 )
         })
         .map(|(&(bundle_index, _), _)| bundle_index)
         .chain(delegation.iter().filter_map(|(&bundle_index, phase)| {
             matches!(
                 phase,
-                DelegationPhase::SubmissionManaged | DelegationPhase::SubmissionRejected
+                DelegationPhase::SubmissionManaged
+                    | DelegationPhase::SubmittedWithoutHash
+                    | DelegationPhase::SubmissionRejected
             )
             .then_some(bundle_index)
         }))
@@ -1112,6 +1117,7 @@ pub fn resume_plan(
             Some(
                 VotePhase::Submitted
                     | VotePhase::SubmissionManaged
+                    | VotePhase::SubmittedWithoutHash
                     | VotePhase::SubmissionRejected
                     | VotePhase::Confirmed
             )
@@ -1217,6 +1223,7 @@ pub fn resume_plan(
                         });
                     }
                 }
+                Some(VotePhase::SubmittedWithoutHash) => {}
                 Some(VotePhase::SubmissionRejected) => {}
                 // Prepared or no row yet -> still needs casting.
                 _ => {
@@ -1246,6 +1253,7 @@ pub fn resume_plan(
                     steps.push(NextStep::AdvanceDelegation { bundle_index: b });
                 }
             }
+            Some(DelegationPhase::SubmittedWithoutHash) => {}
             Some(DelegationPhase::SubmissionRejected) => {}
             // Prepared / PcztBuilt / Proved: still needs the delegate flow.
             _ => {
@@ -1300,12 +1308,17 @@ pub fn resume_plan(
         .map(|share| (share.bundle_index, share.proposal_id, share.share_index))
         .collect::<BTreeSet<_>>();
     let blocking_share_work = !blocking_confirm_share_keys.is_empty();
-    let submission_managed = delegation
-        .values()
-        .any(|phase| *phase == DelegationPhase::SubmissionManaged)
-        || votes
-            .values()
-            .any(|phase| *phase == VotePhase::SubmissionManaged);
+    let submission_managed = delegation.values().any(|phase| {
+        matches!(
+            phase,
+            DelegationPhase::SubmissionManaged | DelegationPhase::SubmittedWithoutHash
+        )
+    }) || votes.values().any(|phase| {
+        matches!(
+            phase,
+            VotePhase::SubmissionManaged | VotePhase::SubmittedWithoutHash
+        )
+    });
     let submission_rejected = delegation
         .values()
         .any(|phase| *phase == DelegationPhase::SubmissionRejected)
@@ -2152,9 +2165,15 @@ mod tests {
                 "INSERT INTO chain_submissions
                  (identity_key, round_id, wallet_id, network, bundle_index,
                   kind, proposal_id, generation_digest, state, candidate_transaction_hash,
-                  committed_post_reservations, tracking_started_at, created_at, updated_at)
+                  committed_post_reservations, tracking_started_at,
+                  diagnostic_kind, diagnostic, created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'testnet', 0, ?4, ?5, ?6,
-                         ?7, ?8, 1, ?9, 9, 10)",
+                         ?7, ?8, 1, ?9,
+                         CASE WHEN ?7 IN ('recovering','submitted_without_hash')
+                              THEN 'ambiguous_attempts_exhausted' END,
+                         CASE WHEN ?7 IN ('recovering','submitted_without_hash')
+                              THEN 'submission has no usable hash' END,
+                         9, 10)",
                 rusqlite::params![
                     vec![0x51_u8; 32],
                     ROUND,
@@ -2327,6 +2346,30 @@ mod tests {
                     proposal_id: 2,
                 }));
         }
+    }
+
+    #[test]
+    fn submitted_without_hash_schedules_no_chain_recovery_step() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+        insert_in_flight_submission(&db, "submitted_without_hash", "vote", Some(2), None);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            db.vote_phase(ROUND, 0, 2).unwrap(),
+            VotePhase::SubmittedWithoutHash
+        );
+        assert!(!plan.next_steps.iter().any(|step| matches!(
+            step,
+            NextStep::AdvanceVote { .. } | NextStep::AdvanceVoteBatch { .. }
+        )));
+        assert!(plan.blocking_recovery);
     }
 
     #[test]

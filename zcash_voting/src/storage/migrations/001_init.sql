@@ -207,7 +207,7 @@ CREATE TABLE chain_submissions (
     proposal_id                  INTEGER,
     ordered_batch_digest         BLOB,
     generation_digest            BLOB NOT NULL CHECK (length(generation_digest) = 32),
-    state                        TEXT NOT NULL CHECK (state IN ('submitting','tracking','recovering','confirmed','rejected')),
+    state                        TEXT NOT NULL CHECK (state IN ('submitting','tracking','recovering','submitted_without_hash','confirmed','rejected')),
     candidate_transaction_hash   BLOB,
     committed_post_reservations  INTEGER NOT NULL DEFAULT 0 CHECK (committed_post_reservations >= 0),
     tracking_started_at          INTEGER,
@@ -228,7 +228,11 @@ CREATE TABLE chain_submissions (
     CHECK (confirmed_transaction_hash IS NULL OR length(confirmed_transaction_hash) = 32),
     CHECK ((state = 'submitting' AND candidate_transaction_hash IS NULL AND tracking_started_at IS NULL)
         OR (state = 'tracking' AND candidate_transaction_hash IS NOT NULL AND tracking_started_at IS NOT NULL)
-        OR state IN ('recovering','confirmed','rejected')),
+        OR state IN ('recovering','submitted_without_hash','confirmed','rejected')),
+    CHECK (state != 'submitted_without_hash'
+        OR (candidate_transaction_hash IS NULL AND tracking_started_at IS NULL
+            AND confirmed_transaction_hash IS NULL AND final_van_position IS NULL
+            AND vote_commitment_positions IS NULL AND diagnostic_kind IS NOT NULL)),
     CHECK ((diagnostic_kind IS NULL) = (diagnostic IS NULL)),
     CHECK (diagnostic IS NULL OR length(CAST(diagnostic AS BLOB)) <= 512),
     CHECK ((state = 'confirmed') = (confirmation_source IS NOT NULL)),

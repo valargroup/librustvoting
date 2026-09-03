@@ -2310,7 +2310,7 @@ fn ensure_vote_recovery_is_not_lifecycle_owned(
                   WHERE round_id = :round_id
                     AND wallet_id = :wallet_id
                     AND bundle_index = :bundle_index
-                    AND (state IN ('submitting','tracking','recovering')
+                    AND (state IN ('submitting','tracking','recovering','submitted_without_hash')
                          OR (state = 'rejected' AND kind = 'vote_batch'))
                     AND ((kind = 'vote' AND proposal_id = :proposal_id)
                          OR (kind = 'vote_batch' AND ordered_batch_digest = :batch_digest))
