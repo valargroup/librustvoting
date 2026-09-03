@@ -436,6 +436,10 @@ that request bytes were never released.
 A canonical success hash transitions the first attempt to `Tracking`. If the
 row was already `Recovering`, the hash becomes its candidate and the state
 remains `Recovering`.
+An atomic batch response must also contain the canonical lowercase batch digest
+matching the submission identity, for both acceptance and rejection. A missing,
+malformed, noncanonical, or mismatched response digest is not evidence and is
+classified as possibly dispatched without accepting the response hash.
 
 A chain rejection code transitions `Submitting` to bound hashless
 `Recovering`. Numeric rejection codes are diagnostic rather than proof that a
@@ -923,6 +927,8 @@ Tests cover:
 - reservation commits before any POST byte is released;
 - reservation failure dispatches nothing;
 - usable success hash produces `Tracking`;
+- batch acceptance and rejection retain a usable hash only when the response
+  carries the matching canonical batch digest;
 - inconclusive hash polling has a bounded promotion to candidate-preserving
   `Recovering`;
 - polling, diagnostics, and restart do not reset the durable tracking window;
