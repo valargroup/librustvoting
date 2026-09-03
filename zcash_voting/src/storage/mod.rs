@@ -213,26 +213,68 @@ fn validate_database_path(path: &Path) -> Result<(), VotingError> {
 /// parent is resolved first and the new filename is appended, so SQLite and the
 /// authority registry receive the same path.
 fn canonical_database_path(path: &Path) -> Result<std::path::PathBuf, VotingError> {
+    canonical_database_path_with_symlink_limit(path, 40)
+}
+
+/// Resolves symlink chains whose final database file does not exist yet.
+fn canonical_database_path_with_symlink_limit(
+    path: &Path,
+    remaining_symlinks: usize,
+) -> Result<std::path::PathBuf, VotingError> {
     match std::fs::canonicalize(path) {
         Ok(canonical_path) => Ok(canonical_path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let file_name = path.file_name().ok_or_else(|| VotingError::InvalidInput {
-                message: "voting database path must name a file".to_string(),
-            })?;
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let canonical_parent =
-                std::fs::canonicalize(parent).map_err(|error| VotingError::Storage {
-                    message: format!("failed to resolve SQLite database parent: {error}"),
-                })?;
-            Ok(canonical_parent.join(file_name))
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    if remaining_symlinks == 0 {
+                        return Err(VotingError::InvalidInput {
+                            message: "voting database path has too many symbolic links".to_string(),
+                        });
+                    }
+                    let symlink_target =
+                        std::fs::read_link(path).map_err(|error| VotingError::Storage {
+                            message: format!("failed to read SQLite database symlink: {error}"),
+                        })?;
+                    let target_path = if symlink_target.is_absolute() {
+                        symlink_target
+                    } else {
+                        path.parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                            .unwrap_or_else(|| Path::new("."))
+                            .join(symlink_target)
+                    };
+                    canonical_database_path_with_symlink_limit(&target_path, remaining_symlinks - 1)
+                }
+                Ok(_) => Err(VotingError::Storage {
+                    message: "SQLite database path disappeared while resolving it".to_string(),
+                }),
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    canonical_new_database_path(path)
+                }
+                Err(metadata_error) => Err(VotingError::Storage {
+                    message: format!("failed to inspect SQLite database path: {metadata_error}"),
+                }),
+            }
         }
         Err(error) => Err(VotingError::Storage {
             message: format!("failed to resolve SQLite database path: {error}"),
         }),
     }
+}
+
+/// Resolves the parent of a database file that has not been created yet.
+fn canonical_new_database_path(path: &Path) -> Result<std::path::PathBuf, VotingError> {
+    let file_name = path.file_name().ok_or_else(|| VotingError::InvalidInput {
+        message: "voting database path must name a file".to_string(),
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| VotingError::Storage {
+        message: format!("failed to resolve SQLite database parent: {error}"),
+    })?;
+    Ok(canonical_parent.join(file_name))
 }
 
 #[cfg(test)]

@@ -232,6 +232,30 @@ fn retargeted_symlink_opens_use_the_resolved_database_authority() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_and_created_target_share_one_database_authority() {
+    let directory = temporary_path("dangling-symlink-parent");
+    std::fs::create_dir_all(&directory).unwrap();
+    let target_path = directory.join("target.sqlite");
+    let alias_path = directory.join("alias.sqlite");
+    symlink("target.sqlite", &alias_path).unwrap();
+
+    let alias = VotingDb::open_path(&alias_path).unwrap();
+    assert!(target_path.exists());
+    let target = VotingDb::open_path(&target_path).unwrap();
+
+    assert!(Arc::ptr_eq(
+        &alias.database_authority,
+        &target.database_authority
+    ));
+
+    drop((alias, target));
+    std::fs::remove_file(alias_path).unwrap();
+    remove_sqlite_files(&target_path);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_file_paths_share_one_database_authority() {

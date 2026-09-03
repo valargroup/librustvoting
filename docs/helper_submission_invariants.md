@@ -1329,9 +1329,10 @@ so an exclusive deletion requested through one handle cannot bypass a chain
 submission lifecycle lease held through another handle. `VotingDb::open_path`
 opens only filesystem databases, accepts non-UTF-8 native paths on platforms
 where SQLite supports them, and disables SQLite URI interpretation. The path is
-resolved before opening and the same canonical path is given to SQLite and the
-authority registry, preventing a symlink retarget from splitting the opened
-database from its lifecycle authority;
+resolved before opening, including a dangling symlink whose target database
+must be created, and the same canonical path is given to SQLite and the
+authority registry. A symlink cannot therefore split the opened database from
+its lifecycle authority;
 `VotingDb::open_in_memory` creates an independent database with a private
 authority. The legacy UTF-8 string constructor accepts only filesystem paths.
 Empty paths, SQLite's `:memory:` magic name, and `file:` URIs are rejected
