@@ -4,28 +4,34 @@
 //! may make more than one bounded network attempt for that generation, but it
 //! must never reinterpret an attempt as a different vote or delegation.
 //!
-//! This module exposes the durable data model and host-owned HTTP transport
-//! seam. Persistence and lifecycle entry points remain private so callers use
-//! the SDK-owned coordination boundary.
+//! This module exposes the durable data model, host-owned HTTP transport seam,
+//! and bounded delegation and singleton-vote lifecycle client. Persistence and
+//! coordination remain internal SDK mechanisms.
 
+mod client;
 #[allow(dead_code, reason = "internal confirmation projection")]
 mod confirmation;
-#[allow(dead_code, reason = "inactive lifecycle coordination foundation")]
+#[allow(dead_code, reason = "internal lifecycle coordination")]
 pub(crate) mod coordination;
-#[allow(dead_code, reason = "inactive lifecycle coordinator")]
+#[allow(dead_code, reason = "internal lifecycle engine")]
 mod coordinator;
 #[allow(dead_code, reason = "internal generation derivation")]
 mod generation;
 mod identity;
 #[allow(dead_code, reason = "internal submission protocol")]
 mod protocol;
+mod recovery;
 mod result;
 #[allow(dead_code, reason = "internal lifecycle transition validation")]
 mod state;
-#[allow(dead_code, reason = "private persistence contract for the lifecycle")]
+#[allow(dead_code, reason = "internal persistence contract for the lifecycle")]
 mod store;
 mod transport;
 
+pub use client::{
+    AdvanceDelegation, AdvanceVote, ChainRecoveryMode, ChainSubmissionClient,
+    ChainSubmissionClientConfig, ChainSubmissionControl,
+};
 #[cfg(test)]
 pub(crate) use generation::generation_for_vote;
 pub(crate) use generation::generation_for_vote_batch;

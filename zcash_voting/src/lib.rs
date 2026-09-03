@@ -3,11 +3,12 @@
 //! Wallet SDKs should import [`prelude`] and follow the lifecycle:
 //! create a round, bind eligible notes into bundles, precompute witness/PIR
 //! data, build a delegation PCZT, prove delegation, sync the vote commitment
-//! tree, cast votes with `vote::commit`, confirm chain submissions through
-//! `confirmation`, then recover helper-share payloads through `share`. New
-//! integrations should use `round`, `precompute`, `delegate`, `vote`,
-//! `confirmation`, `share`, and `session` rather than writing storage rows
-//! directly.
+//! tree, cast votes with `vote::commit`, advance delegation and singleton-vote
+//! submissions through [`ChainSubmissionClient`], then recover helper-share
+//! payloads through `share`. New integrations should use `round`, `precompute`,
+//! `delegate`, `vote`, `chain_submission`, `share`, and `session` rather than
+//! writing storage rows directly. Exact commitment-tree recovery is explicit
+//! per advancement call; status-only advancement remains the default.
 
 #[cfg(all(feature = "lrz", feature = "zakura"))]
 compile_error!("features `lrz` and `zakura` cannot be enabled together");
@@ -58,15 +59,17 @@ pub mod zkp1;
 pub mod zkp2;
 
 pub use chain_submission::{
-    CandidateTransactionHash, CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse,
-    ChainPostDispatch, ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
-    ChainSubmissionConfirmationSource, ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind,
-    ChainSubmissionFailure, ChainSubmissionFailureKind, ChainSubmissionFailureState,
-    ChainSubmissionGeneration, ChainSubmissionGenerationDigest, ChainSubmissionIdentity,
-    ChainSubmissionIdentityError, ChainSubmissionPending, ChainSubmissionResult,
-    ChainSubmissionState, ChainSubmissionStateEvidence, ChainSubmissionTarget, ChainTransport,
-    ChainTransportError, ChainTransportFailureKind, ChainTransportFuture,
-    MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
+    AdvanceDelegation, AdvanceVote, CandidateTransactionHash, CandidateTransactionHashError,
+    ChainHttpRequest, ChainHttpResponse, ChainPostDispatch, ChainRecoveryMode,
+    ChainSubmissionClient, ChainSubmissionClientConfig, ChainSubmissionConfirmation,
+    ChainSubmissionConfirmationError, ChainSubmissionConfirmationSource, ChainSubmissionControl,
+    ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind, ChainSubmissionFailure,
+    ChainSubmissionFailureKind, ChainSubmissionFailureState, ChainSubmissionGeneration,
+    ChainSubmissionGenerationDigest, ChainSubmissionIdentity, ChainSubmissionIdentityError,
+    ChainSubmissionPending, ChainSubmissionResult, ChainSubmissionState,
+    ChainSubmissionStateEvidence, ChainSubmissionTarget, ChainTransport, ChainTransportError,
+    ChainTransportFailureKind, ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES,
+    MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
 pub use helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,

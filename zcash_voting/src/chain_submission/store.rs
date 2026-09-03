@@ -1,4 +1,4 @@
-//! Private transactional storage contract for the submission coordinator.
+//! Internal transactional storage contract for the public submission lifecycle.
 
 use crate::{delegate::DelegationSigner, types::VotingError};
 
@@ -6,6 +6,7 @@ use super::{
     coordination::{SubmissionCoordination, SubmissionOperationKey},
     generation::DerivedChainSubmission,
     protocol::CommittedTransaction,
+    recovery::RecoveryRetryAuthorization,
     state::{SubmissionObservation, SubmissionRecordState},
     ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind, ChainSubmissionFailure,
     ChainSubmissionFailureKind, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
@@ -14,16 +15,15 @@ use super::{
 };
 
 mod sqlite;
-#[allow(
-    unused_imports,
-    reason = "SQLite lifecycle authority is activated by a later public phase"
-)]
 pub(super) use sqlite::SqliteChainSubmissionStore;
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 use super::{
     confirmation::validate_hash_confirmation, coordination::BundleOperationKey,
-    state::apply_submission_observation,
+    result::ValidatedChainSubmissionConfirmation, state::apply_submission_observation,
 };
 
 /// Inputs from which storage reconstructs a closed semantic generation.
@@ -198,7 +198,7 @@ impl StoreAdvancementRequest {
     }
 }
 
-/// Complete durable record used by the coordinator and future SQLite adapter.
+/// Complete durable record used by the coordinator and SQLite adapter.
 #[derive(Clone)]
 pub(super) struct StoredChainSubmission {
     identity: ChainSubmissionIdentity,
@@ -365,6 +365,26 @@ pub(super) trait ChainSubmissionStore: Send + Sync {
         commit_allowed: &dyn Fn() -> bool,
         now: u64,
     ) -> Result<ConfirmationCommit, ChainSubmissionFailure>;
+
+    /// Re-derives and atomically confirms an exact tree-layout match.
+    fn confirm_tree(
+        &self,
+        request: &StoreAdvancementRequest,
+        expected_generation: &ChainSubmissionGeneration,
+        final_van_position: u64,
+        vote_commitment_positions: Vec<u64>,
+        commit_allowed: &dyn Fn() -> bool,
+        now: u64,
+    ) -> Result<ConfirmationCommit, ChainSubmissionFailure>;
+
+    /// Atomically consumes a continuously-held complete no-match proof,
+    /// retires its candidate, and reserves one same-generation recovery POST.
+    fn reserve_recovery_retry(
+        &self,
+        request: &StoreAdvancementRequest,
+        authorization: RecoveryRetryAuthorization<'_>,
+        now: u64,
+    ) -> Result<StoredChainSubmission, ChainSubmissionFailure>;
 }
 
 pub(super) fn abandoned_diagnostic() -> ChainSubmissionDiagnostic {
@@ -444,6 +464,7 @@ pub(super) mod memory {
         batch_rosters: HashMap<ChainSubmissionIdentity, Vec<u32>>,
         projections: HashMap<ChainSubmissionIdentity, super::super::ChainSubmissionConfirmation>,
         fail_before_commit: bool,
+        fail_before_commit_without_state: bool,
     }
 
     pub(in crate::chain_submission) struct InMemoryChainSubmissionStore {
@@ -539,6 +560,10 @@ pub(super) mod memory {
             self.state.lock().unwrap().fail_before_commit = true;
         }
 
+        pub(in crate::chain_submission) fn fail_next_commit_without_state(&self) {
+            self.state.lock().unwrap().fail_before_commit_without_state = true;
+        }
+
         pub(in crate::chain_submission) fn fail_next_confirmation(&self) {
             self.fail_confirmation.store(true, Ordering::SeqCst);
         }
@@ -563,6 +588,13 @@ pub(super) mod memory {
             })?;
             let mut staged = state.clone();
             let result = operation(&mut staged)?;
+            if state.fail_before_commit_without_state {
+                state.fail_before_commit_without_state = false;
+                return Err(ChainSubmissionFailure::without_state(
+                    ChainSubmissionFailureKind::Storage,
+                    "injected stateless submission transaction commit failure",
+                ));
+            }
             if state.fail_before_commit {
                 state.fail_before_commit = false;
                 let message = "injected submission transaction commit failure";
@@ -1028,9 +1060,8 @@ pub(super) mod memory {
                     hook();
                 }
                 if self.fail_confirmation.swap(false, Ordering::SeqCst) {
-                    return Err(ChainSubmissionFailure::with_durable_state(
+                    return Err(ChainSubmissionFailure::without_state(
                         ChainSubmissionFailureKind::Storage,
-                        record.durable_state(),
                         "injected atomic confirmation failure",
                     ));
                 }
@@ -1053,6 +1084,150 @@ pub(super) mod memory {
                     .records
                     .insert(expected_generation.identity().clone(), confirmed.clone());
                 Ok(ConfirmationCommit::Confirmed(confirmed))
+            })
+        }
+
+        fn confirm_tree(
+            &self,
+            request: &StoreAdvancementRequest,
+            expected_generation: &ChainSubmissionGeneration,
+            final_van_position: u64,
+            vote_commitment_positions: Vec<u64>,
+            commit_allowed: &dyn Fn() -> bool,
+            now: u64,
+        ) -> Result<ConfirmationCommit, ChainSubmissionFailure> {
+            self.transact(Some(expected_generation.identity()), |state| {
+                let record = state
+                    .records
+                    .get(expected_generation.identity())
+                    .cloned()
+                    .ok_or_else(|| {
+                        ChainSubmissionFailure::without_state(
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            "submission disappeared before tree confirmation",
+                        )
+                    })?;
+                ensure_generation(&record, expected_generation)?;
+                let derived = Self::derive(state, request.derivation())
+                    .map_err(|error| preserve_loaded_state(error, Some(&record)))?;
+                request
+                    .verify_batch_roster(derived.ordered_proposal_ids())
+                    .map_err(|error| preserve_loaded_state(error, Some(&record)))?;
+                if derived.generation() != expected_generation {
+                    return Err(ChainSubmissionFailure::with_durable_state(
+                        ChainSubmissionFailureKind::InvalidInput,
+                        record.durable_state(),
+                        "semantic generation changed before tree confirmation",
+                    ));
+                }
+                if !commit_allowed() {
+                    return Ok(ConfirmationCommit::Interrupted(record));
+                }
+                let confirmation = ValidatedChainSubmissionConfirmation::from_tree(
+                    final_van_position,
+                    vote_commitment_positions,
+                )
+                .map_err(|error| {
+                    ChainSubmissionFailure::with_durable_state(
+                        ChainSubmissionFailureKind::Protocol,
+                        record.durable_state(),
+                        error.to_string(),
+                    )
+                })?;
+                if self.fail_confirmation.swap(false, Ordering::SeqCst) {
+                    return Err(ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::Storage,
+                        "injected atomic confirmation failure",
+                    ));
+                }
+                let previous = record.durable_state();
+                let mut confirmed = record;
+                confirmed.state = apply_submission_observation(
+                    Some(confirmed.state),
+                    SubmissionObservation::Confirmed(confirmation.clone()),
+                )
+                .map_err(|error| transition_failure(previous, error))?
+                .expect("tree confirmation remains durable");
+                confirmed.diagnostic = None;
+                confirmed.updated_at = now.max(confirmed.updated_at);
+                state.projections.insert(
+                    expected_generation.identity().clone(),
+                    confirmation.confirmation().clone(),
+                );
+                state
+                    .records
+                    .insert(expected_generation.identity().clone(), confirmed.clone());
+                Ok(ConfirmationCommit::Confirmed(confirmed))
+            })
+        }
+
+        fn reserve_recovery_retry(
+            &self,
+            request: &StoreAdvancementRequest,
+            authorization: RecoveryRetryAuthorization<'_>,
+            now: u64,
+        ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
+            let identity = authorization.operation().identity().clone();
+            self.transact(Some(&identity), |state| {
+                if request.identity() != &identity {
+                    return Err(ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvalidInput,
+                        "recovery request does not match its authorization identity",
+                    ));
+                }
+                let mut record = state.records.get(&identity).cloned().ok_or_else(|| {
+                    ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvariantViolation,
+                        "submission disappeared before recovery retry reservation",
+                    )
+                })?;
+                if record.generation_digest() != authorization.generation_digest() {
+                    return Err(ChainSubmissionFailure::with_durable_state(
+                        ChainSubmissionFailureKind::InvalidInput,
+                        record.durable_state(),
+                        "recovery authorization belongs to a different generation",
+                    ));
+                }
+                let derived = Self::derive(state, request.derivation())
+                    .map_err(|error| preserve_loaded_state(error, Some(&record)))?;
+                request
+                    .verify_batch_roster(derived.ordered_proposal_ids())
+                    .map_err(|error| preserve_loaded_state(error, Some(&record)))?;
+                ensure_generation(&record, derived.generation())?;
+                match record.state() {
+                    SubmissionRecordState::Recovering {
+                        candidate_transaction_hash,
+                        ..
+                    } if *candidate_transaction_hash == authorization.candidate() => {}
+                    _ => {
+                        return Err(ChainSubmissionFailure::with_durable_state(
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            record.durable_state(),
+                            "recovery authorization no longer matches durable state",
+                        ));
+                    }
+                }
+                record.committed_post_reservations = record
+                    .committed_post_reservations
+                    .checked_add(1)
+                    .filter(|value| *value <= i64::MAX as u64)
+                    .ok_or_else(|| {
+                        ChainSubmissionFailure::with_durable_state(
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            ChainSubmissionState::Recovering,
+                            "recovery reservation counter overflowed",
+                        )
+                    })?;
+                if let SubmissionRecordState::Recovering {
+                    candidate_transaction_hash,
+                    ..
+                } = &mut record.state
+                {
+                    *candidate_transaction_hash = None;
+                }
+                record.updated_at = now.max(record.updated_at);
+                state.records.insert(identity.clone(), record.clone());
+                Ok(record)
             })
         }
     }

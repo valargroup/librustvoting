@@ -3,11 +3,13 @@
 use std::{sync::Arc, time::Duration};
 
 use super::{
-    coordination::CapturedSubmissionOperation,
+    client::ChainRecoveryMode,
+    coordination::{CapturedSubmissionOperation, SubmissionOperationLease},
     generation::{ChainSubmissionRequest, DerivedChainSubmission},
     protocol::{
         ChainProtocolClient, LookupFailure, PostAttemptOutcome, TransactionStatusObservation,
     },
+    recovery::{scan_exact_layout, RecoveryScanFailure, RecoveryScanOutcome},
     state::{SubmissionObservation, SubmissionRecordState},
     store::{
         ChainSubmissionStore, ConfirmationCommit, StoreAdmission, StoreAdvancementRequest,
@@ -22,7 +24,7 @@ const MAX_POST_ATTEMPTS_PER_PASS: usize = 8;
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(10 * 60);
 const CONTROL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Finite policy for one private coordinator instance.
+/// Finite policy for one bounded coordinator instance.
 #[derive(Clone)]
 pub(super) struct CoordinatorPolicy {
     tracking_window_seconds: u64,
@@ -86,7 +88,7 @@ pub(super) trait SubmissionControl: Send + Sync {
     fn operation_epoch(&self) -> u64;
 }
 
-/// Private lifecycle engine shared by Phase 5's future public entry points.
+/// Internal lifecycle engine backing the public chain-submission client.
 pub(super) struct ChainSubmissionCoordinator<T, S, C> {
     protocol: ChainProtocolClient<T>,
     store: Arc<S>,
@@ -136,10 +138,20 @@ where
         request: StoreAdvancementRequest,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        self.advance_with_recovery(request, ChainRecoveryMode::StatusOnly, control)
+            .await
+    }
+
+    pub(super) async fn advance_with_recovery(
+        &self,
+        request: StoreAdvancementRequest,
+        recovery: ChainRecoveryMode,
+        control: &dyn SubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         let operation =
             CapturedSubmissionOperation::new(request.identity().clone(), control.operation_epoch());
         let applicable_identities = request.applicable_identities();
-        let _lease = self
+        let lease = self
             .store
             .coordination()
             .acquire(&operation, &applicable_identities)
@@ -167,14 +179,16 @@ where
                 record: _,
                 fresh_reservation,
             } if fresh_reservation => {
-                self.submit_fresh(request, operation, *derived, control)
+                self.submit_fresh(request, operation, &lease, *derived, recovery, control)
                     .await
             }
             StoreAdmission::Ready {
                 derived, record, ..
             } => {
-                self.reconcile_existing(&request, &operation, *derived, record, control)
-                    .await
+                self.reconcile_existing(
+                    &request, &operation, &lease, *derived, record, recovery, 0, control,
+                )
+                .await
             }
         }
     }
@@ -183,7 +197,9 @@ where
         &self,
         request: StoreAdvancementRequest,
         operation: CapturedSubmissionOperation,
+        lease: &SubmissionOperationLease,
         mut derived: DerivedChainSubmission,
+        recovery: ChainRecoveryMode,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         for attempt_index in 0..self.policy.maximum_post_attempts {
@@ -231,7 +247,16 @@ where
                         SubmissionObservation::UsableCandidateHash(candidate),
                     )?;
                     return self
-                        .reconcile_existing(&request, &operation, derived, record, control)
+                        .reconcile_existing(
+                            &request,
+                            &operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            attempt_index + 1,
+                            control,
+                        )
                         .await;
                 }
                 PostAttemptOutcome::Rejected { diagnostic, .. } => {
@@ -246,7 +271,18 @@ where
                         derived.generation(),
                         SubmissionObservation::PossiblyDispatched(diagnostic),
                     )?;
-                    return record.public_result();
+                    return self
+                        .reconcile_existing(
+                            &request,
+                            &operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            attempt_index + 1,
+                            control,
+                        )
+                        .await;
                 }
                 PostAttemptOutcome::LocalFailure(diagnostic) => {
                     self.remove_fresh_reservation(derived.generation())?;
@@ -395,12 +431,19 @@ where
             .map_err(attach_state)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the lifecycle boundary keeps each captured authority explicit"
+    )]
     async fn reconcile_existing(
         &self,
         request: &StoreAdvancementRequest,
         operation: &CapturedSubmissionOperation,
+        lease: &SubmissionOperationLease,
         derived: DerivedChainSubmission,
         record: StoredChainSubmission,
+        recovery: ChainRecoveryMode,
+        post_attempts_used: usize,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         match record.state() {
@@ -417,15 +460,37 @@ where
                 {
                     LookupProgress::Interrupted => record.public_result(),
                     LookupProgress::Observed(TransactionStatusObservation::Pending) => {
-                        self.finish_inconclusive_tracking(derived, record, None)
+                        let record = self.finish_inconclusive_tracking(&derived, record, None)?;
+                        self.recover_if_enabled(
+                            request,
+                            operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            post_attempts_used,
+                            control,
+                        )
+                        .await
                     }
                     LookupProgress::Failed(failure) => {
                         if self.tracking_expired(&record)? {
-                            self.finish_inconclusive_tracking(
-                                derived,
+                            let record = self.finish_inconclusive_tracking(
+                                &derived,
                                 record,
                                 Some(lookup_diagnostic(&failure)),
+                            )?;
+                            self.recover_if_enabled(
+                                request,
+                                operation,
+                                lease,
+                                derived,
+                                record,
+                                recovery,
+                                post_attempts_used,
+                                control,
                             )
+                            .await
                         } else {
                             self.reconcile_with_durable_state(
                                 derived.generation(),
@@ -465,7 +530,19 @@ where
             SubmissionRecordState::Recovering {
                 candidate_transaction_hash: None,
                 ..
-            } => record.public_result(),
+            } => {
+                self.recover_if_enabled(
+                    request,
+                    operation,
+                    lease,
+                    derived,
+                    record,
+                    recovery,
+                    post_attempts_used,
+                    control,
+                )
+                .await
+            }
             SubmissionRecordState::Recovering {
                 candidate_transaction_hash: Some(candidate),
                 ..
@@ -491,7 +568,7 @@ where
                         control,
                     }),
                     LookupProgress::Observed(TransactionStatusObservation::CommittedFailure(_)) => {
-                        self.reconcile_with_durable_state(
+                        let record = self.reconcile_with_durable_state(
                             derived.generation(),
                             SubmissionObservation::CandidateCommittedFailure(
                                 ChainSubmissionDiagnostic::from_redacted_message(
@@ -501,25 +578,57 @@ where
                             ),
                             None,
                             ChainSubmissionState::Recovering,
-                        )?
-                        .public_result()
+                        )?;
+                        self.recover_if_enabled(
+                            request,
+                            operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            post_attempts_used,
+                            control,
+                        )
+                        .await
                     }
-                    LookupProgress::Observed(TransactionStatusObservation::Pending) => self
-                        .reconcile_with_durable_state(
+                    LookupProgress::Observed(TransactionStatusObservation::Pending) => {
+                        let record = self.reconcile_with_durable_state(
                             derived.generation(),
                             SubmissionObservation::CandidatePending,
                             None,
                             ChainSubmissionState::Recovering,
-                        )?
-                        .public_result(),
-                    LookupProgress::Failed(failure) => self
-                        .reconcile_with_durable_state(
+                        )?;
+                        self.recover_if_enabled(
+                            request,
+                            operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            post_attempts_used,
+                            control,
+                        )
+                        .await
+                    }
+                    LookupProgress::Failed(failure) => {
+                        let record = self.reconcile_with_durable_state(
                             derived.generation(),
                             SubmissionObservation::ContinueRecovery,
                             Some(lookup_diagnostic(&failure)),
                             ChainSubmissionState::Recovering,
-                        )?
-                        .public_result(),
+                        )?;
+                        self.recover_if_enabled(
+                            request,
+                            operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            post_attempts_used,
+                            control,
+                        )
+                        .await
+                    }
                 }
             }
             _ => record.public_result(),
@@ -528,10 +637,10 @@ where
 
     fn finish_inconclusive_tracking(
         &self,
-        derived: DerivedChainSubmission,
+        derived: &DerivedChainSubmission,
         record: StoredChainSubmission,
         diagnostic: Option<ChainSubmissionDiagnostic>,
-    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+    ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
         let now = self.clock.now_seconds().map_err(|error| {
             ChainSubmissionFailure::with_durable_state(
                 error.kind(),
@@ -556,8 +665,275 @@ where
             observation,
             diagnostic,
             record.durable_state(),
-        )?
-        .public_result()
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "recovery keeps the request, operation, lease, state, and host authority explicit"
+    )]
+    async fn recover_if_enabled(
+        &self,
+        request: &StoreAdvancementRequest,
+        operation: &CapturedSubmissionOperation,
+        lease: &SubmissionOperationLease,
+        derived: DerivedChainSubmission,
+        record: StoredChainSubmission,
+        recovery: ChainRecoveryMode,
+        post_attempts_used: usize,
+        control: &dyn SubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        if recovery == ChainRecoveryMode::StatusOnly
+            || !matches!(record.state(), SubmissionRecordState::Recovering { .. })
+        {
+            return record.public_result();
+        }
+        if interruption(operation, control).is_some() {
+            return record.public_result();
+        }
+        let candidate = match record.state() {
+            SubmissionRecordState::Recovering {
+                candidate_transaction_hash,
+                ..
+            } => *candidate_transaction_hash,
+            _ => unreachable!("checked above"),
+        };
+        match scan_exact_layout(
+            &self.protocol,
+            &derived,
+            candidate,
+            operation,
+            lease,
+            || interruption(operation, control).is_some(),
+        )
+        .await
+        {
+            Ok(RecoveryScanOutcome::Match {
+                final_van_position,
+                vote_commitment_positions,
+            }) => self.confirm_tree(
+                request,
+                operation,
+                &derived,
+                final_van_position,
+                vote_commitment_positions,
+                control,
+            ),
+            Ok(RecoveryScanOutcome::NoMatch(authorization)) => {
+                if post_attempts_used >= self.policy.maximum_post_attempts {
+                    return record.public_result();
+                }
+                if interruption(operation, control).is_some() {
+                    return record.public_result();
+                }
+                if post_attempts_used > 0
+                    && self
+                        .wait_backoff_or_interruption(
+                            self.policy.retry_backoffs[post_attempts_used - 1],
+                            operation,
+                            control,
+                        )
+                        .await
+                        .is_some()
+                {
+                    return record.public_result();
+                }
+                if interruption(operation, control).is_some() {
+                    return record.public_result();
+                }
+                let now = self.clock.now_seconds().map_err(|error| {
+                    ChainSubmissionFailure::with_durable_state(
+                        error.kind(),
+                        ChainSubmissionState::Recovering,
+                        error.message(),
+                    )
+                })?;
+                let reserved = self
+                    .store
+                    .reserve_recovery_retry(request, authorization, now)
+                    .map_err(|error| {
+                        if error.strongest_state().is_some() {
+                            error
+                        } else {
+                            ChainSubmissionFailure::with_durable_state(
+                                error.kind(),
+                                record.durable_state(),
+                                error.message(),
+                            )
+                        }
+                    })?;
+                self.submit_recovery_retry(operation, derived, reserved, control)
+                    .await
+            }
+            Err(RecoveryScanFailure::Interrupted) => record.public_result(),
+            Err(RecoveryScanFailure::Invalid(diagnostic)) => {
+                self.reconcile_with_durable_state(
+                    derived.generation(),
+                    SubmissionObservation::ContinueRecovery,
+                    Some(diagnostic.clone()),
+                    ChainSubmissionState::Recovering,
+                )?;
+                Err(ChainSubmissionFailure::with_durable_state(
+                    ChainSubmissionFailureKind::Protocol,
+                    ChainSubmissionState::Recovering,
+                    diagnostic.message(),
+                ))
+            }
+            Err(RecoveryScanFailure::Transport(error)) => {
+                let diagnostic = ChainSubmissionDiagnostic::from_redacted_message(
+                    ChainSubmissionDiagnosticKind::ReconciliationPending,
+                    error.message(),
+                );
+                self.reconcile_with_durable_state(
+                    derived.generation(),
+                    SubmissionObservation::ContinueRecovery,
+                    Some(diagnostic),
+                    ChainSubmissionState::Recovering,
+                )?;
+                Err(ChainSubmissionFailure::with_durable_state(
+                    ChainSubmissionFailureKind::Transport,
+                    ChainSubmissionState::Recovering,
+                    error.message(),
+                ))
+            }
+        }
+    }
+
+    async fn submit_recovery_retry(
+        &self,
+        operation: &CapturedSubmissionOperation,
+        derived: DerivedChainSubmission,
+        reserved: StoredChainSubmission,
+        control: &dyn SubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        if interruption(operation, control).is_some() {
+            return reserved.public_result();
+        }
+        let _in_flight = self
+            .store
+            .coordination()
+            .register_in_flight(derived.generation().identity())
+            .map_err(|error| {
+                ChainSubmissionFailure::with_durable_state(
+                    error.kind(),
+                    ChainSubmissionState::Recovering,
+                    error.message(),
+                )
+            })?;
+        let ordinal = usize::try_from(reserved.committed_post_reservations()).unwrap_or(usize::MAX);
+        let endpoint_index = ordinal.saturating_sub(1) % self.protocol.endpoint_count();
+        let dispatch = ChainPostDispatch::default();
+        let post = self.submit_to_endpoint(endpoint_index, &derived, dispatch.clone());
+        tokio::pin!(post);
+        let outcome = tokio::select! {
+            biased;
+            reason = wait_for_interruption(operation, control) => {
+                if !dispatch.is_possible() {
+                    return reserved.public_result();
+                }
+                PostAttemptOutcome::PossiblyDispatched(
+                    ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::AmbiguousDispatch,
+                        reason.after_dispatch_message(),
+                    ),
+                )
+            }
+            outcome = &mut post => outcome,
+        };
+        match outcome {
+            PostAttemptOutcome::Accepted(candidate) => self
+                .classify_dispatched_post(
+                    derived.generation(),
+                    SubmissionObservation::UsableCandidateHash(candidate),
+                )?
+                .public_result(),
+            PostAttemptOutcome::Rejected { diagnostic, .. } => self
+                .classify_dispatched_post(
+                    derived.generation(),
+                    SubmissionObservation::DefiniteRejection(diagnostic),
+                )?
+                .public_result(),
+            PostAttemptOutcome::PossiblyDispatched(diagnostic) => self
+                .classify_dispatched_post(
+                    derived.generation(),
+                    SubmissionObservation::PossiblyDispatched(diagnostic),
+                )?
+                .public_result(),
+            PostAttemptOutcome::DefinitelyUnsent(error) => {
+                self.reconcile_with_durable_state(
+                    derived.generation(),
+                    SubmissionObservation::DefinitelyUnsent,
+                    Some(ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::ReconciliationPending,
+                        error.message(),
+                    )),
+                    ChainSubmissionState::Recovering,
+                )?;
+                Err(ChainSubmissionFailure::with_durable_state(
+                    ChainSubmissionFailureKind::Transport,
+                    ChainSubmissionState::Recovering,
+                    error.message(),
+                ))
+            }
+            PostAttemptOutcome::LocalFailure(diagnostic) => {
+                self.reconcile_with_durable_state(
+                    derived.generation(),
+                    SubmissionObservation::ContinueRecovery,
+                    Some(diagnostic.clone()),
+                    ChainSubmissionState::Recovering,
+                )?;
+                Err(ChainSubmissionFailure::with_durable_state(
+                    ChainSubmissionFailureKind::Protocol,
+                    ChainSubmissionState::Recovering,
+                    diagnostic.message(),
+                ))
+            }
+        }
+    }
+
+    fn confirm_tree(
+        &self,
+        request: &StoreAdvancementRequest,
+        operation: &CapturedSubmissionOperation,
+        derived: &DerivedChainSubmission,
+        final_van_position: u64,
+        vote_commitment_positions: Vec<u64>,
+        control: &dyn SubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let allowed = || interruption(operation, control).is_none();
+        let now = self.clock.now_seconds().map_err(|error| {
+            ChainSubmissionFailure::with_durable_state(
+                error.kind(),
+                ChainSubmissionState::Recovering,
+                error.message(),
+            )
+        })?;
+        let committed = self
+            .store
+            .confirm_tree(
+                request,
+                derived.generation(),
+                final_van_position,
+                vote_commitment_positions,
+                &allowed,
+                now,
+            )
+            .map_err(|error| {
+                if error.strongest_state().is_some() {
+                    error
+                } else {
+                    ChainSubmissionFailure::with_durable_state(
+                        error.kind(),
+                        ChainSubmissionState::Recovering,
+                        error.message(),
+                    )
+                }
+            })?;
+        match committed {
+            ConfirmationCommit::Interrupted(record) | ConfirmationCommit::Confirmed(record) => {
+                record.public_result()
+            }
+        }
     }
 
     fn tracking_expired(

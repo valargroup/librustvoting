@@ -106,6 +106,13 @@ pub(super) struct ChainProtocolClient<T> {
 }
 
 impl<T: ChainTransport> ChainProtocolClient<T> {
+    pub(super) fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub(super) fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
     pub(super) fn new(
         transport: T,
         network: Network,
