@@ -472,3 +472,13 @@ pub struct VotingErrorView {
     pub http_status: Option<u16>,
     pub endpoint: Option<String>,
 }
+
+/// One pending helper-share round for one wallet, as returned by
+/// [`crate::share::pending_rounds_for_accounts`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingShareRoundView {
+    pub wallet_id: String,
+    pub round_id: String,
+    pub session_json: Option<String>,
+}

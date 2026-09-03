@@ -27,10 +27,11 @@ use crate::{
     wire::{
         CompletedVoteChoiceView, CompletedVoteDisplayView, DelegationPirPrecomputeResultView,
         DelegationRecoveryView, DelegationRecoveryWorkView, DelegationStatusView,
-        DelegationSubmissionWire, NextStepView, RoundPlanView, RoundRecoveryStateView,
-        ShareDelegationRecordView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
-        SignedVoteBatchView, SignedVoteCommitmentView, SignedVoteCommitmentsView,
-        SubmissionDiagnosticView, VoteCommitmentBatchWire, VoteCommitmentWire, VoteRecoveryView,
+        DelegationSubmissionWire, NextStepView, PendingShareRoundView, RoundPlanView,
+        RoundRecoveryStateView, ShareDelegationRecordView, ShareWorkflowRecoveryView,
+        SignedDelegationPayloadView, SignedVoteBatchView, SignedVoteCommitmentView,
+        SignedVoteCommitmentsView, SubmissionDiagnosticView, VoteCommitmentBatchWire,
+        VoteCommitmentWire, VoteRecoveryView,
         VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView, VotingErrorView,
         VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView, VotingRoundParams,
     },
@@ -863,6 +864,16 @@ fn helper_tree_position(value: u64) -> Result<u64, VotingError> {
     Ok(value)
 }
 
+impl From<crate::share::PendingShareRoundForAccount> for PendingShareRoundView {
+    fn from(round: crate::share::PendingShareRoundForAccount) -> Self {
+        Self {
+            wallet_id: round.wallet_id,
+            round_id: round.round_id,
+            session_json: round.session_json,
+        }
+    }
+}
+
 impl From<&VotingError> for VotingErrorView {
     fn from(error: &VotingError) -> Self {
         let mut view = VotingErrorView {
@@ -971,7 +982,10 @@ mod tests {
         }
         .with_snapshot_height(42)
         .to_view();
-        assert_eq!(eligibility.kind, VotingErrorKindView::InsufficientEligibility);
+        assert_eq!(
+            eligibility.kind,
+            VotingErrorKindView::InsufficientEligibility
+        );
         assert!(!eligibility.retryable);
         assert_eq!(eligibility.snapshot_height, Some(42));
         assert_eq!(eligibility.required_weight_zatoshi, Some(12_500_000));

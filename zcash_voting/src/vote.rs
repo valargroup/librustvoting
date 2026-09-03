@@ -844,8 +844,8 @@ pub fn prepare_atomic_vote_batch(
     // snapshots under one Immediate write transaction.
     let (captured, recovered) = {
         let mut conn = db.conn();
-        let tx = conn.transaction().map_err(|e| VotingError::Internal {
-            message: format!("failed to begin vote batch preparation transaction: {e}"),
+        let tx = conn.transaction().map_err(|e| {
+            VotingError::from_sqlite("failed to begin vote batch preparation transaction", &e)
         })?;
         let mut recoveries = Vec::with_capacity(batch.drafts.len());
         for draft in batch.drafts {
@@ -916,8 +916,8 @@ pub fn prepare_atomic_vote_batch(
                 .collect::<Result<Vec<_>, VotingError>>()?;
             (captured, None)
         };
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to finish vote batch preparation transaction: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("failed to finish vote batch preparation transaction", &e)
         })?;
         (captured, recovered)
     };
@@ -1690,8 +1690,8 @@ pub fn prepare_commit(
     let wallet_id = db.wallet_id();
     let recovered = {
         let mut conn = db.conn();
-        let tx = conn.transaction().map_err(|e| VotingError::Internal {
-            message: format!("failed to begin recovered vote preparation transaction: {e}"),
+        let tx = conn.transaction().map_err(|e| {
+            VotingError::from_sqlite("failed to begin recovered vote preparation transaction", &e)
         })?;
         let recovered =
             recovery_bundle_with_conn(&tx, &wallet_id, round_id, bundle_index, draft.proposal_id)?;
@@ -1721,8 +1721,11 @@ pub fn prepare_commit(
                 &[draft.proposal_id],
             )?;
         }
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to finish recovered vote preparation transaction: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite(
+                "failed to finish recovered vote preparation transaction",
+                &e,
+            )
         })?;
         recovered
     };
@@ -1863,8 +1866,8 @@ fn persist_prepared_commits(
     // SQLITE_BUSY (which WAL often returns without waiting out busy_timeout).
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to begin prepared vote persistence transaction: {e}"),
+        .map_err(|e| {
+            VotingError::from_sqlite("failed to begin prepared vote persistence transaction", &e)
         })?;
     let fresh_proposal_ids = prepared
         .iter()
@@ -1954,8 +1957,8 @@ fn persist_prepared_commits(
             crate::storage::RoundPhase::VoteReady,
         )?;
     }
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit prepared vote persistence transaction: {e}"),
+    tx.commit().map_err(|e| {
+        VotingError::from_sqlite("failed to commit prepared vote persistence transaction", &e)
     })?;
     drop(conn);
 
@@ -2637,8 +2640,8 @@ pub fn insert_recovery_fixture(
     let commitment = stored_vote_commitment_bytes(bundle)?;
     let wallet_id = db.wallet_id();
     let mut conn = db.conn();
-    let tx = conn.transaction().map_err(|e| VotingError::Internal {
-        message: format!("begin vote recovery fixture transaction failed: {e}"),
+    let tx = conn.transaction().map_err(|e| {
+        VotingError::from_sqlite("begin vote recovery fixture transaction failed", &e)
     })?;
 
     let bundle_exists = tx
@@ -2759,8 +2762,8 @@ pub fn insert_recovery_fixture(
         &recovery_json,
     )?;
 
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote recovery fixture transaction failed: {e}"),
+    tx.commit().map_err(|e| {
+        VotingError::from_sqlite("commit vote recovery fixture transaction failed", &e)
     })
 }
 
@@ -3610,8 +3613,8 @@ pub(crate) fn record_batch_submission(
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin vote batch submission transaction failed: {e}"),
+        .map_err(|e| {
+            VotingError::from_sqlite("begin vote batch submission transaction failed", &e)
         })?;
     let recoveries = load_vote_batch_recoveries_with_conn(
         &tx,
@@ -3630,8 +3633,8 @@ pub(crate) fn record_batch_submission(
             tx_hash,
         )?;
     }
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote batch submission transaction failed: {e}"),
+    tx.commit().map_err(|e| {
+        VotingError::from_sqlite("commit vote batch submission transaction failed", &e)
     })
 }
 
@@ -3648,9 +3651,7 @@ pub(crate) fn record_vc_position(
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin vote VC position transaction failed: {e}"),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("begin vote VC position transaction failed", &e))?;
     ensure_singleton_vote_update_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?;
     record_vc_position_with_conn(
         &tx,
@@ -3660,9 +3661,8 @@ pub(crate) fn record_vc_position(
         proposal_id,
         vc_tree_position,
     )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote VC position transaction failed: {e}"),
-    })
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("commit vote VC position transaction failed", &e))
 }
 #[cfg(test)]
 mod tests {

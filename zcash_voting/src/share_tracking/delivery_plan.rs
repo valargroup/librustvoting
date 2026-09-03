@@ -36,9 +36,7 @@ pub(crate) fn prepare_share_delivery_plan(
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin helper-share plan transaction failed: {e}"),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("begin helper-share plan transaction failed", &e))?;
     let commitment_bundle_json: String = tx
         .query_row(
             "SELECT commitment_bundle_json FROM votes
@@ -88,8 +86,8 @@ pub(crate) fn prepare_share_delivery_plan(
     )? {
         validate_share_delivery_plan(&existing, payloads.len())?;
         validate_immediate_plan(&existing, immediate_position)?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit helper-share plan read transaction failed: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("commit helper-share plan read transaction failed", &e)
         })?;
         return Ok(existing);
     }
@@ -190,9 +188,8 @@ pub(crate) fn prepare_share_delivery_plan(
     validate_share_delivery_plan(&persisted, payloads.len())?;
     validate_immediate_plan(&persisted, immediate_position)?;
     validate_round_immediate_plans(&tx, round_id, &wallet_id, immediate_key)?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit helper-share plan transaction failed: {e}"),
-    })?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("commit helper-share plan transaction failed", &e))?;
     Ok(persisted)
 }
 

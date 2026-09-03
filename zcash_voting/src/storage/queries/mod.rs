@@ -2932,9 +2932,8 @@ pub fn delete_bundles_from(
             message: format!("failed to clear bundle policy after deleting all bundles: {e}"),
         })?;
     }
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit bundle deletion: {e}"),
-    })?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("failed to commit bundle deletion", &e))?;
     Ok(rows as u64)
 }
 

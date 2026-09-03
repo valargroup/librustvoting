@@ -402,9 +402,7 @@ pub fn import_delegation_capability(
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin delegation capability import failed: {e}"),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("begin delegation capability import failed", &e))?;
     if queries::has_round(&tx, &capability.vote_round_id, &wallet_id)? {
         let (stored, network) =
             queries::load_round_params_with_network(&tx, &capability.vote_round_id, &wallet_id)?;
@@ -451,9 +449,8 @@ pub fn import_delegation_capability(
     .map_err(|e| VotingError::Internal {
         message: format!("advance imported round phase failed: {e}"),
     })?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit delegation capability import failed: {e}"),
-    })?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("commit delegation capability import failed", &e))?;
     Ok(digest)
 }
 

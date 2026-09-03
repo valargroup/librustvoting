@@ -4,7 +4,11 @@
 //! ownership in [`VotingDb`] while hiding the low-level query helpers that back
 //! the SQLite schema.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
 use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -205,6 +209,46 @@ pub fn quantized_bundle_set_weight(bundles: &[Vec<NoteInfo>]) -> Result<u64, Vot
     })
 }
 
+type SidecarRegistry = Mutex<HashMap<PathBuf, Weak<crate::storage::SidecarConnection>>>;
+
+fn sidecar_registry() -> &'static SidecarRegistry {
+    static REGISTRY: OnceLock<SidecarRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Canonical registry key: the parent directory is resolved when it exists so
+/// two spellings of one sidecar path share a connection; the file itself may
+/// not exist yet.
+fn sidecar_registry_key(sidecar_path: &Path) -> PathBuf {
+    match (sidecar_path.parent(), sidecar_path.file_name()) {
+        (Some(parent), Some(file_name)) => parent
+            .canonicalize()
+            .map(|parent| parent.join(file_name))
+            .unwrap_or_else(|_| sidecar_path.to_path_buf()),
+        _ => sidecar_path.to_path_buf(),
+    }
+}
+
+/// Opening runs migrations, which need the write lock. Another process
+/// finishing its own open can hold that lock briefly, so retry a bounded
+/// number of times before reporting [`VotingError::DbBusy`].
+fn open_connection_with_busy_retry(path: &str) -> Result<rusqlite::Connection, VotingError> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        match VotingDb::open_connection(path) {
+            Ok(conn) => return Ok(conn),
+            Err(error)
+                if error.kind() == crate::VotingErrorKind::DbBusy && attempt < MAX_ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl VotingDb {
     /// Returns the sidecar voting DB path for a wallet DB path.
     ///
@@ -217,14 +261,37 @@ impl VotingDb {
     }
 
     /// Opens the voting sidecar database for `wallet_db_path` and binds `wallet_id`.
+    ///
+    /// One connection is kept per sidecar path for as long as any handle on
+    /// it is alive; later calls for the same path, for any wallet id, share
+    /// that connection through [`VotingDb::scoped`]. In-process writers then
+    /// serialize on the connection instead of contending for the SQLite file
+    /// lock, and hosts no longer need their own per-path write locks. A
+    /// `SQLITE_BUSY` from another process past the busy timeout surfaces as
+    /// [`VotingError::DbBusy`].
     pub fn open_wallet_sidecar(
         wallet_db_path: &Path,
         wallet_id: &str,
-    ) -> Result<Self, VotingError> {
+    ) -> Result<Arc<Self>, VotingError> {
         let sidecar_path = Self::wallet_sidecar_path(wallet_db_path);
-        let db = Self::open_path(&sidecar_path)?;
+        let key = sidecar_registry_key(&sidecar_path);
+        let mut registry = sidecar_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.retain(|_, shared| shared.strong_count() > 0);
+        if let Some(shared) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(Arc::new(Self::from_shared(shared, wallet_id)));
+        }
+        let path = sidecar_path
+            .to_str()
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "voting database path is not valid UTF-8".to_string(),
+            })?;
+        let conn = open_connection_with_busy_retry(path)?;
+        let db = Self::from_connection(conn);
         db.set_wallet_id(wallet_id);
-        Ok(db)
+        registry.insert(key, Arc::downgrade(&db.shared_connection()));
+        Ok(Arc::new(db))
     }
 
     /// Opens or creates a voting database at `path` and runs migrations.
@@ -652,6 +719,17 @@ mod tests {
         assert_eq!(db.wallet_id(), "wallet-sidecar");
         assert!(db.list_rounds().unwrap().is_empty());
         assert!(sidecar.exists());
+
+        let other = VotingDb::open_wallet_sidecar(&wallet_path, "other-wallet").unwrap();
+        assert!(db.shares_connection_with(&other));
+        assert_eq!(other.wallet_id(), "other-wallet");
+        assert_eq!(db.wallet_id(), "wallet-sidecar");
+
+        drop(other);
+        drop(db);
+        let reopened = VotingDb::open_wallet_sidecar(&wallet_path, "wallet-sidecar").unwrap();
+        assert_eq!(reopened.wallet_id(), "wallet-sidecar");
+        drop(reopened);
 
         std::fs::remove_file(sidecar).ok();
     }

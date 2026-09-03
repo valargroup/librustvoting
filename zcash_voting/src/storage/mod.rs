@@ -2,9 +2,12 @@ mod migrations;
 pub mod operations;
 pub mod queries;
 
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::types::{Network, VotingError};
 
@@ -82,45 +85,117 @@ pub struct KeystoneSignatureBatchResult {
     pub already_present: u32,
 }
 
-/// Database handle for voting state. Wraps a SQLite connection and a
-/// wallet identifier that scopes all round data to a single wallet.
-pub struct VotingDb {
+/// One SQLite connection to a voting database, shared by every [`VotingDb`]
+/// handle opened on the same sidecar path in this process.
+///
+/// In-process writers serialize on the connection mutex, so SQLite reports
+/// `SQLITE_BUSY` only when another process holds the file.
+pub(crate) struct SidecarConnection {
     conn: Mutex<Connection>,
+    chain_submission_coordination: crate::chain_submission::coordination::SubmissionCoordination,
+}
+
+/// Database handle for voting state: a shared SQLite connection plus a
+/// wallet identifier that scopes all round data to a single wallet.
+///
+/// Handles are cheap to clone through [`VotingDb::scoped`]; each carries its
+/// own wallet id while sharing the connection and the process-local chain
+/// submission coordination.
+pub struct VotingDb {
+    inner: Arc<SidecarConnection>,
     wallet_id: Mutex<String>,
-    pub(crate) chain_submission_coordination:
-        crate::chain_submission::coordination::SubmissionCoordination,
 }
 
 impl VotingDb {
     /// Open (or create) the voting database at the given path.
     /// Runs migrations automatically.
     /// Call `set_wallet_id` before performing any round operations.
+    ///
+    /// Every call opens its own connection. Wallet integrations should use
+    /// [`VotingDb::open_wallet_sidecar`], which shares one connection per
+    /// sidecar path.
     pub fn open(path: &str) -> Result<Self, VotingError> {
+        Ok(Self::from_connection(Self::open_connection(path)?))
+    }
+
+    pub(crate) fn open_connection(path: &str) -> Result<Connection, VotingError> {
         let mut conn = if path == ":memory:" {
             Connection::open_in_memory()
         } else {
             Connection::open(path)
         }
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to open database: {}", e),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("failed to open database", &e))?;
 
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to configure database busy timeout: {}", e),
-            })?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(|e| {
+            VotingError::from_sqlite("failed to configure database busy timeout", &e)
+        })?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to set pragmas: {}", e),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to set pragmas", &e))?;
 
         migrations::migrate(&mut conn)?;
+        Ok(conn)
+    }
 
-        Ok(Self {
-            conn: Mutex::new(conn),
+    pub(crate) fn from_connection(conn: Connection) -> Self {
+        Self {
+            inner: Arc::new(SidecarConnection {
+                conn: Mutex::new(conn),
+                chain_submission_coordination: Default::default(),
+            }),
             wallet_id: Mutex::new(String::new()),
-            chain_submission_coordination: Default::default(),
-        })
+        }
+    }
+
+    pub(crate) fn from_shared(inner: Arc<SidecarConnection>, wallet_id: &str) -> Self {
+        Self {
+            inner,
+            wallet_id: Mutex::new(wallet_id.to_string()),
+        }
+    }
+
+    pub(crate) fn shared_connection(&self) -> Arc<SidecarConnection> {
+        Arc::clone(&self.inner)
+    }
+
+    /// Returns a handle on the same connection scoped to another wallet.
+    ///
+    /// Use this to read several accounts' state through one open sidecar
+    /// instead of opening a connection per account.
+    pub fn scoped(&self, wallet_id: &str) -> Self {
+        Self::from_shared(Arc::clone(&self.inner), wallet_id)
+    }
+
+    /// Whether two handles share one underlying connection.
+    pub fn shares_connection_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn chain_submission_coordination(
+        &self,
+    ) -> &crate::chain_submission::coordination::SubmissionCoordination {
+        &self.inner.chain_submission_coordination
+    }
+
+    /// Runs `body` inside one `BEGIN IMMEDIATE` transaction and commits it.
+    ///
+    /// SQLite waits up to its busy timeout for another process to release the
+    /// write lock; a failure past that timeout surfaces as
+    /// [`VotingError::DbBusy`] so hosts can retry later instead of parsing
+    /// text. `body` must be pure over the database: it must not perform
+    /// network I/O or proof work while the lock is held.
+    pub(crate) fn write_transaction<T>(
+        &self,
+        context: &str,
+        body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, VotingError>,
+    ) -> Result<T, VotingError> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::from_sqlite(context, &e))?;
+        let value = body(&tx)?;
+        tx.commit()
+            .map_err(|e| VotingError::from_sqlite(context, &e))?;
+        Ok(value)
     }
 
     /// Set the wallet identifier used to scope all subsequent operations.
@@ -144,7 +219,7 @@ impl VotingDb {
 
     /// Get a lock on the underlying connection for query execution.
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("database mutex poisoned")
+        self.inner.conn.lock().expect("database mutex poisoned")
     }
 }
 
@@ -210,6 +285,75 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(300));
 
         release.join().unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
+    }
+
+    #[test]
+    fn scoped_handles_share_one_connection_and_keep_their_own_wallet_id() {
+        let db = test_db();
+        db.set_wallet_id("wallet-a");
+        let other = db.scoped("wallet-b");
+        assert!(db.shares_connection_with(&other));
+        assert_eq!(db.wallet_id(), "wallet-a");
+        assert_eq!(other.wallet_id(), "wallet-b");
+
+        db.conn()
+            .execute_batch("CREATE TABLE scoped_probe (value INTEGER NOT NULL)")
+            .unwrap();
+        other
+            .conn()
+            .execute("INSERT INTO scoped_probe (value) VALUES (7)", [])
+            .unwrap();
+        let value: i64 = db
+            .conn()
+            .query_row("SELECT value FROM scoped_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn write_transaction_reports_db_busy_past_the_busy_timeout() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zcash-voting-db-busy-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let db = VotingDb::open(&path_string).unwrap();
+        db.conn()
+            .execute_batch("CREATE TABLE busy_probe (value INTEGER NOT NULL)")
+            .unwrap();
+        db.conn().busy_timeout(Duration::from_millis(100)).unwrap();
+
+        let lock = Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let error = db
+            .write_transaction("busy probe", |tx| {
+                tx.execute("INSERT INTO busy_probe (value) VALUES (1)", [])
+                    .map_err(|e| VotingError::from_sqlite("insert", &e))?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::VotingErrorKind::DbBusy, "{error}");
+        assert!(error.retryable());
+        assert!(error.to_string().contains("busy probe"), "{error}");
+
+        lock.execute_batch("ROLLBACK").unwrap();
+        db.write_transaction("busy probe", |tx| {
+            tx.execute("INSERT INTO busy_probe (value) VALUES (1)", [])
+                .map_err(|e| VotingError::from_sqlite("insert", &e))?;
+            Ok(())
+        })
+        .unwrap();
+
+        drop(lock);
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path_string}-shm"));

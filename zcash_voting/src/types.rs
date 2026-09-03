@@ -1744,14 +1744,21 @@ mod error_kind_tests {
         assert_eq!(with_height.kind(), VotingErrorKind::InsufficientEligibility);
         assert!(!with_height.retryable());
 
-        let unchanged = VotingError::NoSpendableNotes { snapshot_height: 7 }.with_snapshot_height(9);
-        assert_eq!(unchanged.to_string(), "no spendable voting notes at snapshot height 7");
+        let unchanged =
+            VotingError::NoSpendableNotes { snapshot_height: 7 }.with_snapshot_height(9);
+        assert_eq!(
+            unchanged.to_string(),
+            "no spendable voting notes at snapshot height 7"
+        );
 
         let setup = VotingError::SetupAlreadyPersisted {
             round_id: "ab".to_string(),
             bundle_index: 3,
             field: DelegationSetupField::PcztSighash,
         };
-        assert_eq!(setup.to_string(), "refusing to overwrite pczt_sighash for round=ab, bundle=3");
+        assert_eq!(
+            setup.to_string(),
+            "refusing to overwrite pczt_sighash for round=ab, bundle=3"
+        );
     }
 }

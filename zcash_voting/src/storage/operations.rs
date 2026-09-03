@@ -593,7 +593,7 @@ impl VotingDb {
         let _lease = deletion_identity
             .as_ref()
             .map(|identity| {
-                self.chain_submission_coordination
+                self.chain_submission_coordination()
                     .try_acquire_round_exclusive(identity)
                     .map_err(|error| match error {
                         crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
@@ -668,7 +668,7 @@ impl VotingDb {
     pub fn clear_wallet_state(&self) -> Result<u32, VotingError> {
         let wallet_id = self.wallet_id();
         let _lease = self
-            .chain_submission_coordination
+            .chain_submission_coordination()
             .try_acquire_account_exclusive(&wallet_id)
             .map_err(|error| match error {
                 crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
@@ -685,8 +685,8 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to begin wallet voting-state cleanup: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("failed to begin wallet voting-state cleanup", &e)
             })?;
         let deleted_rounds = tx
             .execute(
@@ -703,8 +703,8 @@ impl VotingDb {
         .map_err(|e| VotingError::Internal {
             message: format!("failed to delete wallet PIR proof cache: {e}"),
         })?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to commit wallet voting-state cleanup: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("failed to commit wallet voting-state cleanup", &e)
         })?;
         u32::try_from(deleted_rounds).map_err(|_| VotingError::Internal {
             message: format!("deleted voting round count exceeds u32 range: {deleted_rounds}"),
@@ -734,8 +734,8 @@ impl VotingDb {
         }
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to begin bundle setup transaction: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("failed to begin bundle setup transaction", &e)
             })?;
         for (i, chunk) in plan.bundles.iter().enumerate() {
             queries::insert_bundle_notes(&tx, round_id, &wallet_id, i as u32, chunk)?;
@@ -744,8 +744,8 @@ impl VotingDb {
         // has bundle rows to describe. A plan whose bundles were all sub-ballot
         // writes nothing, so a retry can replan under a corrected policy.
         queries::set_round_bundle_policy(&tx, round_id, &wallet_id, policy)?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to commit bundle setup transaction: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("failed to commit bundle setup transaction", &e)
         })?;
         Ok((plan.bundles.len() as u32, plan.eligible_weight))
     }
@@ -1161,9 +1161,9 @@ impl VotingDb {
             network,
             pir_client.circuit_root(),
             |nfs| {
-                pir_client
-                    .fetch_proofs(nfs)
-                    .map_err(|e| crate::pir::map_pir_fetch_error(None, "PIR parallel fetch failed", e))
+                pir_client.fetch_proofs(nfs).map_err(|e| {
+                    crate::pir::map_pir_fetch_error(None, "PIR parallel fetch failed", e)
+                })
             },
         )
     }
@@ -1589,8 +1589,8 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to begin proof result transaction: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("failed to begin proof result transaction", &e)
             })?;
         queries::store_proof(&tx, round_id, wallet_id, bundle_index, &result.proof)?;
         queries::store_proof_result_fields_with_van_comm(
@@ -1605,8 +1605,8 @@ impl VotingDb {
             &result.van_comm,
         )?;
         queries::advance_round_phase(&tx, round_id, wallet_id, RoundPhase::DelegationProved)?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to commit proof result transaction: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("failed to commit proof result transaction", &e)
         })?;
 
         let total_elapsed = total_start.elapsed();
@@ -1650,8 +1650,8 @@ impl VotingDb {
     ) -> Result<PreparedVoteProof, VotingError> {
         let mut conn = self.conn();
         let wallet_id = self.wallet_id();
-        let tx = conn.transaction().map_err(|e| VotingError::Internal {
-            message: format!("failed to begin vote preparation transaction: {e}"),
+        let tx = conn.transaction().map_err(|e| {
+            VotingError::from_sqlite("failed to begin vote preparation transaction", &e)
         })?;
         // Check the signer's network before loading the rest of the state. Capturing
         // state first makes a mismatched network surface as a missing-row error from
@@ -1665,8 +1665,8 @@ impl VotingDb {
             bundle_index,
             proposal_id,
         )?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to finish vote preparation transaction: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("failed to finish vote preparation transaction", &e)
         })?;
         drop(conn);
 
@@ -1906,7 +1906,7 @@ impl VotingDb {
         let _lease = pruning_identity
             .as_ref()
             .map(|identity| {
-                self.chain_submission_coordination
+                self.chain_submission_coordination()
                     .try_acquire_round_exclusive(identity)
                     .map_err(|error| {
                         match error {
@@ -1996,8 +1996,8 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("begin vote submission transaction failed: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("begin vote submission transaction failed", &e)
             })?;
         reject_legacy_chain_mutation_in_tx(&tx, &wallet_id, round_id, bundle_index)?;
         crate::vote::ensure_singleton_vote_update_with_conn(
@@ -2015,9 +2015,8 @@ impl VotingDb {
             proposal_id,
             tx_hash,
         )?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit vote submission transaction failed: {e}"),
-        })
+        tx.commit()
+            .map_err(|e| VotingError::from_sqlite("commit vote submission transaction failed", &e))
     }
 
     /// Atomically records a delegation transaction hash with idempotency checks.
@@ -2035,15 +2034,15 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("begin delegation submitted transaction failed: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("begin delegation submitted transaction failed", &e)
             })?;
         reject_legacy_chain_mutation_in_tx(&tx, &wallet_id, round_id, bundle_index)?;
         let stored = queries::get_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index)?;
         check_text_conflict(stored.as_deref(), tx_hash, "delegation tx_hash")?;
         queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit delegation submitted transaction failed: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("commit delegation submitted transaction failed", &e)
         })
     }
 
@@ -2066,9 +2065,7 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("begin vote submitted transaction failed: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("begin vote submitted transaction failed", &e))?;
         reject_legacy_chain_mutation_in_tx(&tx, &wallet_id, round_id, bundle_index)?;
         crate::vote::ensure_singleton_vote_update_with_conn(
             &tx,
@@ -2088,9 +2085,8 @@ impl VotingDb {
             proposal_id,
             tx_hash,
         )?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit vote submitted transaction failed: {e}"),
-        })
+        tx.commit()
+            .map_err(|e| VotingError::from_sqlite("commit vote submitted transaction failed", &e))
     }
 
     pub fn get_commitment_bundle(
@@ -2197,8 +2193,8 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to begin Keystone signature batch transaction: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("failed to begin Keystone signature batch transaction", &e)
             })?;
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2260,8 +2256,8 @@ impl VotingDb {
             inserted += 1;
         }
 
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to commit Keystone signature batch: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("failed to commit Keystone signature batch", &e)
         })?;
         Ok(KeystoneSignatureBatchResult {
             inserted,
@@ -2375,8 +2371,8 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("begin share delegation transaction failed: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("begin share delegation transaction failed", &e)
             })?;
         let effective_submit_at = queries::record_share_delegation(
             &tx,
@@ -2391,8 +2387,8 @@ impl VotingDb {
             nullifier,
             submit_at,
         )?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit share delegation transaction failed: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("commit share delegation transaction failed", &e)
         })?;
         Ok(effective_submit_at)
     }
@@ -2476,9 +2472,7 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("begin share attempt transaction failed: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("begin share attempt transaction failed", &e))?;
         let reservation = queries::add_attempting_server_for_generation(
             &tx,
             round_id,
@@ -2492,9 +2486,8 @@ impl VotingDb {
             capacity_policy,
             expected_nullifier,
         )?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit share attempt transaction failed: {e}"),
-        })?;
+        tx.commit()
+            .map_err(|e| VotingError::from_sqlite("commit share attempt transaction failed", &e))?;
         Ok(reservation)
     }
 
@@ -2512,9 +2505,7 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("begin share attempt transaction failed: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("begin share attempt transaction failed", &e))?;
         let removed = queries::remove_attempting_server_for_generation(
             &tx,
             round_id,
@@ -2525,9 +2516,8 @@ impl VotingDb {
             server_url,
             expected_nullifier,
         )?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit share attempt transaction failed: {e}"),
-        })?;
+        tx.commit()
+            .map_err(|e| VotingError::from_sqlite("commit share attempt transaction failed", &e))?;
         Ok(removed)
     }
 
@@ -2659,8 +2649,8 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("begin share confirmation transaction failed: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("begin share confirmation transaction failed", &e)
             })?;
         let confirmed = queries::mark_share_confirmed(
             &tx,
@@ -2671,8 +2661,8 @@ impl VotingDb {
             share_index,
             expected_nullifier,
         )?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit share confirmation transaction failed: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("commit share confirmation transaction failed", &e)
         })?;
         Ok(confirmed)
     }
@@ -2723,8 +2713,8 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("begin sent-server update transaction failed: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("begin sent-server update transaction failed", &e)
             })?;
         let updated = if reset_submit_at {
             queries::add_sent_servers_for_generation(
@@ -2749,8 +2739,8 @@ impl VotingDb {
                 expected_nullifier,
             )
         }?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit sent-server update transaction failed: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("commit sent-server update transaction failed", &e)
         })?;
         Ok(updated)
     }
@@ -2803,8 +2793,8 @@ impl VotingDb {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("begin ambiguous-server update transaction failed: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("begin ambiguous-server update transaction failed", &e)
             })?;
         let updated = queries::add_ambiguous_servers_for_generation(
             &tx,
@@ -2817,8 +2807,8 @@ impl VotingDb {
             reset_submit_at,
             expected_nullifier,
         )?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit ambiguous-server update transaction failed: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("commit ambiguous-server update transaction failed", &e)
         })?;
         Ok(updated)
     }

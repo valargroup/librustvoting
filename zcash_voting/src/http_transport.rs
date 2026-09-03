@@ -1138,15 +1138,22 @@ mod typed_pir_failure_tests {
         let typed = PirHttpFailure::from_error_chain(&error).expect("typed failure in chain");
         assert_eq!(typed.http_status, Some(502));
 
-        let mapped =
-            crate::pir::map_pir_fetch_error(Some("https://pir"), "PIR parallel fetch failed", error);
+        let mapped = crate::pir::map_pir_fetch_error(
+            Some("https://pir"),
+            "PIR parallel fetch failed",
+            error,
+        );
         assert!(mapped.retryable());
         assert_eq!(mapped.kind(), crate::VotingErrorKind::PirUnavailable);
         let text = mapped.to_string();
         assert!(text.contains("PIR parallel fetch failed"), "{text}");
         assert!(text.contains("https://pir"), "{text}");
 
-        let foreign = crate::pir::map_pir_fetch_error(None, "PIR parallel fetch failed", anyhow::anyhow!("opaque"));
+        let foreign = crate::pir::map_pir_fetch_error(
+            None,
+            "PIR parallel fetch failed",
+            anyhow::anyhow!("opaque"),
+        );
         assert!(!foreign.retryable());
     }
 }

@@ -80,6 +80,7 @@ pub use chain_submission::{
     ChainSubmissionTarget, ChainTransport, ChainTransportError, ChainTransportFailureKind,
     ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
+pub use error::{DelegationSetupField, VotingErrorKind, VotingErrorKindView, VotingErrorView};
 pub use helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
     ShareSubmissionStatus,
@@ -93,7 +94,6 @@ pub use pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, ImtProofData, NegotiatedPirLayout,
     PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
-pub use error::{DelegationSetupField, VotingErrorKind, VotingErrorKindView, VotingErrorView};
 pub use transport::{PirHttpFailure, PirHttpFailurePhase};
 pub use vote_work::{
     NoopVoteRecoveryProgressReporter, VoteRecoveryAdvance, VoteRecoveryDisposition,

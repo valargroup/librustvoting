@@ -444,8 +444,8 @@ pub(crate) fn record_share_delegation_for_vote_generation(
 ) -> Result<u64, VotingError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to lock committed vote for helper delivery: {e}"),
+        .map_err(|e| {
+            VotingError::from_sqlite("failed to lock committed vote for helper delivery", &e)
         })?;
     let current_commitment_bundle_json: Option<String> = tx
         .query_row(
@@ -486,8 +486,8 @@ pub(crate) fn record_share_delegation_for_vote_generation(
         submit_at,
         &mut || {},
     )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit helper-share generation transaction: {e}"),
+    tx.commit().map_err(|e| {
+        VotingError::from_sqlite("failed to commit helper-share generation transaction", &e)
     })?;
     Ok(submit_at)
 }

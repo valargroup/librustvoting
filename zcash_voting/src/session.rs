@@ -5,7 +5,7 @@
 //! APIs in `crate::phases`. The wallet executes each step with its own
 //! network/proof/sign plumbing.
 
-use rusqlite::{named_params, TransactionBehavior};
+use rusqlite::named_params;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -107,91 +107,84 @@ impl VotingDb {
             Decision::Skipped => (1, None),
         };
         let now = now_secs();
-        let mut conn = self.conn();
         let wallet_id = self.wallet_id();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        self.write_transaction("set_ballot_intent transaction failed", |tx| {
+            let skipped_bool = skipped != 0;
+            let choice_u32 = choice.map(|c| c as u32);
+            queries::ensure_no_submitted_vote_conflict_for_intent(
+                tx,
+                round_id,
+                &wallet_id,
+                proposal_id,
+                skipped_bool,
+                choice_u32,
+            )?;
+            crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
+                tx,
+                &wallet_id,
+                round_id,
+                proposal_id,
+                choice_u32,
+            )?;
+            tx.execute(
+                "INSERT INTO ballot_intent
+                    (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
+                 VALUES (:round_id, :wallet_id, :proposal_id, :skipped, :choice, :now, :now)
+                 ON CONFLICT(round_id, wallet_id, proposal_id)
+                 DO UPDATE SET skipped = :skipped, choice = :choice, updated_at = :now",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":proposal_id": proposal_id as i64,
+                    ":skipped": skipped,
+                    ":choice": choice,
+                    ":now": now,
+                },
+            )
             .map_err(|e| VotingError::Internal {
-                message: format!("set_ballot_intent transaction failed: {e}"),
+                message: format!("set_ballot_intent failed: {e}"),
             })?;
-        let skipped_bool = skipped != 0;
-        let choice_u32 = choice.map(|c| c as u32);
-        queries::ensure_no_submitted_vote_conflict_for_intent(
-            &tx,
-            round_id,
-            &wallet_id,
-            proposal_id,
-            skipped_bool,
-            choice_u32,
-        )?;
-        crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
-            &tx,
-            &wallet_id,
-            round_id,
-            proposal_id,
-            choice_u32,
-        )?;
-        tx.execute(
-            "INSERT INTO ballot_intent
-                (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
-             VALUES (:round_id, :wallet_id, :proposal_id, :skipped, :choice, :now, :now)
-             ON CONFLICT(round_id, wallet_id, proposal_id)
-             DO UPDATE SET skipped = :skipped, choice = :choice, updated_at = :now",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":proposal_id": proposal_id as i64,
-                ":skipped": skipped,
-                ":choice": choice,
-                ":now": now,
-            },
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("set_ballot_intent failed: {e}"),
-        })?;
-        if skipped_bool {
-            tx.execute(
-                "DELETE FROM share_delegations
-                 WHERE round_id = :round_id
-                   AND wallet_id = :wallet_id
-                   AND proposal_id = :proposal_id",
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":proposal_id": proposal_id as i64,
-                },
-            )
-        } else if let Some(choice) = choice_u32 {
-            tx.execute(
-                "DELETE FROM share_delegations
-                 WHERE round_id = :round_id
-                   AND wallet_id = :wallet_id
-                   AND proposal_id = :proposal_id
-                   AND NOT EXISTS (
-                       SELECT 1 FROM votes
-                       WHERE votes.round_id = share_delegations.round_id
-                         AND votes.wallet_id = share_delegations.wallet_id
-                         AND votes.bundle_index = share_delegations.bundle_index
-                         AND votes.proposal_id = share_delegations.proposal_id
-                         AND votes.choice = :choice
-                   )",
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":proposal_id": proposal_id as i64,
-                    ":choice": choice as i64,
-                },
-            )
-        } else {
-            Ok(0)
-        }
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to clear stale share delegations: {e}"),
-        })?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("set_ballot_intent commit failed: {e}"),
-        })?;
-        Ok(())
+            if skipped_bool {
+                tx.execute(
+                    "DELETE FROM share_delegations
+                     WHERE round_id = :round_id
+                       AND wallet_id = :wallet_id
+                       AND proposal_id = :proposal_id",
+                    named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": wallet_id,
+                        ":proposal_id": proposal_id as i64,
+                    },
+                )
+            } else if let Some(choice) = choice_u32 {
+                tx.execute(
+                    "DELETE FROM share_delegations
+                     WHERE round_id = :round_id
+                       AND wallet_id = :wallet_id
+                       AND proposal_id = :proposal_id
+                       AND NOT EXISTS (
+                           SELECT 1 FROM votes
+                           WHERE votes.round_id = share_delegations.round_id
+                             AND votes.wallet_id = share_delegations.wallet_id
+                             AND votes.bundle_index = share_delegations.bundle_index
+                             AND votes.proposal_id = share_delegations.proposal_id
+                             AND votes.choice = :choice
+                       )",
+                    named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": wallet_id,
+                        ":proposal_id": proposal_id as i64,
+                        ":choice": choice as i64,
+                    },
+                )
+            } else {
+                Ok(0)
+            }
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to clear stale share delegations: {e}"),
+            })?;
+            Ok(())
+        })
     }
 
     /// Load the voter's decisions for a round, sorted by proposal id.
