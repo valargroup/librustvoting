@@ -1,9 +1,10 @@
 use thiserror::Error;
 
 use super::result::ValidatedChainSubmissionConfirmation;
-#[cfg(test)]
-use super::ChainSubmissionDiagnosticKind;
-use super::{CandidateTransactionHash, ChainSubmissionDiagnostic, ChainSubmissionState};
+use super::{
+    CandidateTransactionHash, ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind,
+    ChainSubmissionState,
+};
 
 /// Authoritative typed state for one semantic generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +23,28 @@ pub(super) enum SubmissionRecordState {
 }
 
 impl SubmissionRecordState {
+    /// True for a hashless `Recovering` row created by a possibly-dispatched
+    /// POST, which may reserve the next same-generation POST directly.
+    ///
+    /// Both `AmbiguousDispatch` (timeout, transport ambiguity, interruption
+    /// after dispatch, abandoned reservation) and `InvalidProtocolResponse`
+    /// (an unusable or malformed response after dispatch, including a hash
+    /// owned by another generation) are dispatch ambiguities. A definite
+    /// rejection lands here with `ChainRejected` and never reserves this way.
+    pub(super) fn permits_ambiguous_retry(&self) -> bool {
+        matches!(
+            self,
+            Self::Recovering {
+                candidate_transaction_hash: None,
+                ambiguity_diagnostic,
+            } if matches!(
+                ambiguity_diagnostic.kind(),
+                ChainSubmissionDiagnosticKind::AmbiguousDispatch
+                    | ChainSubmissionDiagnosticKind::InvalidProtocolResponse
+            )
+        )
+    }
+
     pub(super) fn durable_state(&self) -> ChainSubmissionState {
         match self {
             Self::Submitting => ChainSubmissionState::Submitting,

@@ -405,12 +405,15 @@ POSTs and retains its existing status-only behavior.
 Other local recovery observations do not transition to `Tracking` or
 `Rejected`. In particular, a rejection, committed-failure candidate,
 cancellation, or empty scan cannot erase ambiguity. A hashless `Recovering` row
-may reserve the next bounded POST directly. A pending or unreadable candidate
-is never overwritten and blocks another POST until it is atomically retired by
-the existing candidate-first reconciliation and valid full-tree no-match
-authorization. A definitively committed-failure candidate is atomically
-cleared without requiring that pass. Either candidate-clearing operation
-leaves the row `Recovering` and tree recovery available.
+may reserve the next bounded POST directly when its diagnostic came from the
+possibly-dispatched path, either `AmbiguousDispatch` or
+`InvalidProtocolResponse`; a hashless row created by a definite rejection
+carries `ChainRejected` and never reserves an ambiguous retry. A pending or
+unreadable candidate is never overwritten and blocks another POST until it is
+atomically retired by the existing candidate-first reconciliation and valid
+full-tree no-match authorization. A definitively committed-failure candidate
+is atomically cleared without requiring that pass. Either candidate-clearing
+operation leaves the row `Recovering` and tree recovery available.
 
 Terminal rows are immutable except for idempotent replay of identical
 confirmation data and explicit round or account deletion. Conflicting terminal
@@ -1207,6 +1210,9 @@ Public-lifecycle engine coverage is anchored by
 `reservation_failure_dispatches_nothing_and_writes_nothing`,
 `attempts_cycle_endpoints_and_exhaust_to_hashless_submission`,
 `ambiguous_retry_waits_for_configured_backoff`,
+`malformed_accepted_response_reserves_the_next_bounded_retry`,
+`invalid_protocol_ambiguity_is_retryable_on_a_later_advance`,
+`definite_rejection_recovery_never_reserves_an_ambiguous_retry`,
 `accepted_retry_short_circuits_to_normal_hash_tracking`,
 `nullifier_spent_after_ambiguity_is_terminal_and_idempotent`,
 `other_rejection_after_ambiguity_surfaces_error_and_preserves_ambiguity`,
@@ -1268,8 +1274,11 @@ Public-lifecycle engine coverage is anchored by
 `current_fingerprint_rejects_missing_columns_indexes_and_triggers`,
 `tracked_recovery_completes_without_hash_and_retains_tracking_start`,
 `submitted_without_hash_survives_reopen_without_domain_confirmation`,
+`invalid_protocol_response_ambiguity_reserves_the_next_retry`,
+`definite_rejection_recovery_refuses_an_ambiguous_retry`,
 `hashless_submission_blocks_same_bundle_but_not_unrelated_bundles`,
 `submitted_without_hash_schedules_no_chain_recovery_step`,
+`submitted_without_hash_delegation_blocks_without_pending_recovery`,
 `reset_voting_session_state_scopes_submission_protection_to_its_bundle`,
 `reset_voting_session_state_preserves_proved_bundle_setup_fields`,
 `noncanonical_legacy_round_ids_remain_deletable`,

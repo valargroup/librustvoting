@@ -1311,17 +1311,20 @@ pub fn resume_plan(
         .map(|share| (share.bundle_index, share.proposal_id, share.share_index))
         .collect::<BTreeSet<_>>();
     let blocking_share_work = !blocking_confirm_share_keys.is_empty();
-    let submission_managed = delegation.values().any(|phase| {
-        matches!(
-            phase,
-            DelegationPhase::SubmissionManaged | DelegationPhase::SubmittedWithoutHash
-        )
-    }) || votes.values().any(|phase| {
-        matches!(
-            phase,
-            VotePhase::SubmissionManaged | VotePhase::SubmittedWithoutHash
-        )
-    });
+    let submission_managed = delegation
+        .values()
+        .any(|phase| *phase == DelegationPhase::SubmissionManaged)
+        || votes
+            .values()
+            .any(|phase| *phase == VotePhase::SubmissionManaged);
+    // Terminal hashless dispatch keeps the foreground closed but schedules
+    // no recovery step, so it contributes to `blocking_recovery` only.
+    let submitted_without_hash = delegation
+        .values()
+        .any(|phase| *phase == DelegationPhase::SubmittedWithoutHash)
+        || votes
+            .values()
+            .any(|phase| *phase == VotePhase::SubmittedWithoutHash);
     let submission_rejected = delegation
         .values()
         .any(|phase| *phase == DelegationPhase::SubmissionRejected)
@@ -1329,6 +1332,7 @@ pub fn resume_plan(
             .values()
             .any(|phase| *phase == VotePhase::SubmissionRejected);
     let blocking_recovery = submission_managed
+        || submitted_without_hash
         || submission_rejected
         || steps.iter().any(|step| match step {
             NextStep::ConfirmShare {
@@ -1388,6 +1392,8 @@ pub fn resume_plan(
             voted_at,
         )
     });
+    // `SubmittedWithoutHash` and `SubmissionRejected` are terminal: they block
+    // the foreground above but are not pending recovery work.
     let pending_recovery = submission_managed || !steps.is_empty();
     let needs_draft_setup = !blocking_recovery && !all_decided && !open_proposals.is_empty();
     let primary_action = select_primary_action(
@@ -2373,6 +2379,26 @@ mod tests {
             NextStep::AdvanceVote { .. } | NextStep::AdvanceVoteBatch { .. }
         )));
         assert!(plan.blocking_recovery);
+        assert!(
+            !plan.pending_recovery,
+            "terminal hashless dispatch is not pending recovery work"
+        );
+    }
+
+    #[test]
+    fn submitted_without_hash_delegation_blocks_without_pending_recovery() {
+        let db = db_with_bundle();
+        insert_in_flight_submission(&db, "submitted_without_hash", "delegation", None, None);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            db.delegation_phase(ROUND, 0).unwrap(),
+            DelegationPhase::SubmittedWithoutHash
+        );
+        assert!(plan.next_steps.is_empty(), "{:?}", plan.next_steps);
+        assert!(plan.blocking_recovery);
+        assert!(!plan.pending_recovery);
     }
 
     #[test]

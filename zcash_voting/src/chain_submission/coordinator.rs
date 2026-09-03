@@ -1280,13 +1280,7 @@ fn interrupted_without_state(
 }
 
 fn is_retryable_dispatch_ambiguity(record: &StoredChainSubmission) -> bool {
-    matches!(
-        record.state(),
-        SubmissionRecordState::Recovering {
-            candidate_transaction_hash: None,
-            ambiguity_diagnostic,
-        } if ambiguity_diagnostic.kind() == ChainSubmissionDiagnosticKind::AmbiguousDispatch
-    )
+    record.state().permits_ambiguous_retry()
 }
 
 fn lookup_diagnostic(failure: &LookupFailure) -> ChainSubmissionDiagnostic {

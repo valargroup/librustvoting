@@ -398,8 +398,12 @@ pub(super) trait ChainSubmissionStore: Send + Sync {
 
     /// Reserves another same-generation POST after durable dispatch ambiguity.
     ///
-    /// The reservation count is monotonic and is diagnostic only; invocation
-    /// attempt budgets remain coordinator-local.
+    /// Only a hashless `Recovering` row whose diagnostic came from the
+    /// possibly-dispatched path (`AmbiguousDispatch` or
+    /// `InvalidProtocolResponse`) qualifies; see
+    /// `SubmissionRecordState::permits_ambiguous_retry`. Any other row is an
+    /// invariant violation. The reservation count is monotonic and is
+    /// diagnostic only; invocation attempt budgets remain coordinator-local.
     fn reserve_ambiguous_retry(
         &self,
         generation: &ChainSubmissionGeneration,
@@ -1088,18 +1092,11 @@ pub(super) mod memory {
                         )
                     })?;
                 ensure_generation(&record, generation)?;
-                if !matches!(
-                    record.state(),
-                    SubmissionRecordState::Recovering {
-                        candidate_transaction_hash: None,
-                        ambiguity_diagnostic,
-                    } if ambiguity_diagnostic.kind()
-                        == ChainSubmissionDiagnosticKind::AmbiguousDispatch
-                ) {
+                if !record.state().permits_ambiguous_retry() {
                     return Err(ChainSubmissionFailure::with_durable_state(
                         ChainSubmissionFailureKind::InvariantViolation,
                         record.durable_state(),
-                        "ambiguous retry requires hashless durable dispatch ambiguity",
+                        "ambiguous retry requires a hashless possibly-dispatched recovery row",
                     ));
                 }
                 record.committed_post_reservations = record

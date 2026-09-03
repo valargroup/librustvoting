@@ -602,18 +602,11 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                 )
             })?;
             ensure_generation(&record, generation)?;
-            if !matches!(
-                record.state(),
-                SubmissionRecordState::Recovering {
-                    candidate_transaction_hash: None,
-                    ambiguity_diagnostic,
-                } if ambiguity_diagnostic.kind()
-                    == ChainSubmissionDiagnosticKind::AmbiguousDispatch
-            ) {
+            if !record.state().permits_ambiguous_retry() {
                 return Err(ChainSubmissionFailure::with_durable_state(
                     ChainSubmissionFailureKind::InvariantViolation,
                     record.durable_state(),
-                    "ambiguous retry requires hashless durable dispatch ambiguity",
+                    "ambiguous retry requires a hashless possibly-dispatched recovery row",
                 ));
             }
             record.committed_post_reservations = record
