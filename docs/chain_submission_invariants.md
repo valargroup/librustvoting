@@ -19,16 +19,20 @@ The normal path is:
 reserve Submitting -> POST -> store hash as Tracking -> poll -> Confirmed
 ```
 
-If ordinary candidate polling can no longer safely determine the outcome, the
-row becomes `Recovering`: either a request may have been dispatched without a
-usable hash, or the bounded `Tracking` window expired inconclusively. Recovery
-polls a candidate hash first when one exists, then may search the commitment
-tree for the generation's exact output layout. `Recovering` is sticky: later
-responses and retries may add a candidate hash, but they do not erase the
-durable recovery ambiguity. A completed valid recovery pass may authorize one
-atomic candidate-retirement and same-generation retry reservation; retirement
-is not evidence that the candidate failed or was never dispatched. Tree
-recovery never runs for ordinary `Tracking`.
+If a POST may have been dispatched without a usable hash, the row first becomes
+`Recovering` durably. The same advancement call then waits its configured
+backoff, reserves another same-generation POST, and continues within its
+invocation-local attempt budget without requiring tree reconciliation. Endpoint
+selection follows the monotonic reservation ordinal modulo endpoint count, so
+three attempts over endpoints A and B use A, B, A. A later invocation receives
+a fresh bounded budget.
+
+An accepted hash returns to ordinary `Tracking`. Exhausting the budget with an
+ambiguous final attempt, or receiving chain rejection code 2 after an ambiguous
+dispatch, produces terminal `SubmittedWithoutHash`. This outcome is not
+confirmation and carries no hash or positions. `Recovering` remains available
+for tracking-window expiry and exact-tree recovery; tree recovery never runs
+for `SubmittedWithoutHash`.
 
 ## Scope and authority
 
@@ -313,6 +317,7 @@ The only durable states are:
 Submitting
 Tracking
 Recovering
+SubmittedWithoutHash
 Confirmed
 Rejected
 ```
@@ -326,8 +331,12 @@ Their meanings are:
 - `Recovering`: ordinary candidate polling is no longer sufficient to resolve
   the outcome because a request may have been dispatched without a usable hash
   or the bounded tracking window expired inconclusively. An optional candidate
-  hash is polled before tree recovery. The state is sticky until confirmation
-  or explicit deletion.
+  hash is polled before tree recovery. A canonical accepted hash from a
+  hashless retry resumes `Tracking`; otherwise the row remains `Recovering`
+  until confirmation, bounded hashless submission, or explicit deletion.
+- `SubmittedWithoutHash`: bounded POST dispatch is durably treated as submitted,
+  but no candidate hash or confirmation positions are available. It is terminal
+  and schedules neither polling nor tree recovery.
 - `Confirmed`: chain success and all required local confirmation updates are
   durable. Its source records what the confirmation rests on: `hash` or
   `tree`, with the exact generation positions.
@@ -342,6 +351,12 @@ The normal transitions are:
 new -> Submitting
 Submitting -> Tracking       usable success hash
 Submitting -> Recovering     possible dispatch without usable hash
+Submitting -> SubmittedWithoutHash
+                             final attempt ambiguous
+Recovering -> Recovering     reserve and classify another ambiguous POST
+Recovering -> Tracking       hashless retry returns a usable success hash
+Recovering -> SubmittedWithoutHash
+                             final attempt ambiguous or retry code 2
 Submitting -> Recovering     chain rejection code
 Tracking -> Tracking         hash still pending
 Tracking -> Recovering       bounded tracking window expires inconclusively
@@ -367,8 +382,11 @@ new
                               |                           |-- window expires --> Recovering
                               |                           |-- committed success --> Confirmed
                               |                           `-- committed failure --> Recovering
-                              |-- possibly dispatched --> Recovering
+                              |-- final possible dispatch --> SubmittedWithoutHash
+                              |-- earlier possible dispatch --> Recovering
                               |                           |-- candidate, scan, or retry --> Recovering
+                              |                           |-- final ambiguity or retry code 2
+                              |                           |   --> SubmittedWithoutHash
                               |                           `-- candidate success or exact tree layout
                               |                               --> Confirmed
                               |-- chain rejection code --> Recovering
@@ -377,23 +395,21 @@ new
 abandoned Submitting on restart -- normalize --> Recovering
 ```
 
-For locally constructed submissions, the absence of `Recovering -> Tracking`
-and `Recovering -> Rejected` edges is intentional. Once local recovery
-ambiguity exists, only confirmation or explicit deletion can resolve or remove
-it. Imported poll-only delegation is the narrow exception: its immutable
-candidate can become terminally `Rejected` from `Recovering`.
+For locally constructed submissions, a hashless `Recovering` row may transition
+back to `Tracking` when a same-generation retry returns a canonical accepted
+hash. It may transition to `SubmittedWithoutHash` only under the bounded
+exhaustion or numeric code-2 rules above. Imported poll-only delegation never
+POSTs and retains its existing status-only behavior.
 
-Local `Recovering` does not transition to `Tracking` or `Rejected`. In
-particular, a later hash, rejection, committed-failure candidate, cancellation,
-or empty scan cannot erase the original ambiguity. A pending or unreadable candidate is never
-overwritten and normally blocks another POST. It may be atomically retired only
-as part of the retry reservation directly authorized by candidate-first
-reconciliation completing a valid full-tree pass with no complete match. A
-definitively committed-failure candidate is atomically cleared without
-requiring that pass, but another valid no-match pass is still required before
-retry reservation. Either operation clears only the polling handle: the row
-remains `Recovering`, the original ambiguity remains durable, and tree recovery
-remains available.
+Other local recovery observations do not transition to `Tracking` or
+`Rejected`. In particular, a rejection, committed-failure candidate,
+cancellation, or empty scan cannot erase ambiguity. A hashless `Recovering` row
+may reserve the next bounded POST directly. A pending or unreadable candidate
+is never overwritten and blocks another POST until it is atomically retired by
+the existing candidate-first reconciliation and valid full-tree no-match
+authorization. A definitively committed-failure candidate is atomically
+cleared without requiring that pass. Either candidate-clearing operation
+leaves the row `Recovering` and tree recovery available.
 
 Terminal rows are immutable except for idempotent replay of identical
 confirmation data and explicit round or account deletion. Conflicting terminal
@@ -439,12 +455,13 @@ marker remains clear; once marked, interruption is possibly dispatched even if
 the request future is then cancelled.
 
 For a first attempt, definitely-unsent failure removes the fresh `Submitting`
-reservation; it does not create chain rejection or ambiguity. For a retry from
-`Recovering`, it leaves the row hashless and `Recovering`, retains the
-reservation in the monotonic attempt count, and does not restore either the
-retired candidate or the consumed no-match authorization. Another retry
-requires another valid no-match pass. Attempt count is diagnostic and is never
-decremented, refunded, or used as a permanent retry gate.
+reservation; it does not create chain rejection or ambiguity. For a retry after
+dispatch ambiguity, it leaves the row hashless and `Recovering` and retains the
+reservation in the monotonic attempt count. If the invocation budget permits,
+the next retry needs only the configured backoff and another durable
+reservation; it does not require a no-match tree pass. Attempt count is
+diagnostic and is never decremented, refunded, or used as a permanent retry
+gate.
 When bounded endpoint failover follows a definitely-unsent fresh attempt in
 the same invocation, the next committed reservation carries the next ordinal;
 removing the definitely-unsent row does not cause a later committed
@@ -461,42 +478,31 @@ Everything after the dispatch boundary is `PossiblyDispatched`, including:
 - a process crash while a `Submitting` reservation exists.
 
 Possible dispatch without a usable hash must durably transition `Submitting` to
-`Recovering` before any scan or retry. On restart, an abandoned `Submitting`
-row is conservatively changed to `Recovering`; the new process cannot prove
-that request bytes were never released.
+`Recovering` before any retry. On restart, an abandoned `Submitting` row is
+conservatively changed to `Recovering`; the new process cannot prove that
+request bytes were never released. After backoff, every retry is reserved
+durably and uses reservation ordinal modulo endpoint count.
 
-A canonical success hash transitions the first attempt to `Tracking`. If the
-row was already `Recovering`, the hash becomes its candidate and the state
-remains `Recovering`.
+A canonical success hash transitions either a first attempt or hashless
+dispatch-ambiguity retry to ordinary `Tracking`.
 An atomic batch response must also contain the canonical lowercase batch digest
 matching the submission identity, for both acceptance and rejection. A missing,
 malformed, noncanonical, or mismatched response digest is not evidence and is
 classified as possibly dispatched without accepting the response hash.
 
-A chain rejection code transitions `Submitting` to bound hashless
-`Recovering`. Numeric rejection codes are diagnostic rather than proof that a
-generation can never succeed: validation can depend on the receiving node's
-local anchor state or on chain time. A rejection while already `Recovering`
-likewise cannot settle the earlier possible dispatch. Because the protocol does
-not specify that an error hash identifies an earlier accepted transaction, a
-hash in an error response is not confirmation evidence.
-Until the release prerequisite above is implemented, this row blocks later
-submissions that consume its unknown successor VAN. Same-generation retry alone
-does not resolve a generation whose anchor has become permanently stale.
+A rejection with numeric module code 2 after an earlier ambiguous dispatch
+transitions to `SubmittedWithoutHash`; classification never inspects or retains
+the untrusted response log. Other deterministic rejections surface an
+operational error while preserving earlier durable ambiguity. A definite
+rejection with no earlier ambiguity may retain the compatibility `Recovering`
+behavior. A hash in an error response is never confirmation evidence.
 
-Within each lifecycle invocation, POST attempts, endpoints, body sizes, request
+Within each lifecycle invocation, POST attempts, body sizes, request
 durations, and backoffs are bounded by configuration with safe finite maxima.
-Redirects are not followed. A later invocation may reconcile and retry after
-another valid no-match pass regardless of the monotonic historical attempt
-count. A no-match recovery retry shares the current invocation's POST-attempt
-budget: if an earlier POST in that invocation consumed the last attempt, the
-scan leaves the row `Recovering` without another reservation or POST. If
-another attempt remains, the coordinator waits the configured backoff for the
-preceding invocation-local attempt before consuming the recovery authorization
-and reserving the retry. A pre-existing `Recovering` row begins a later
-invocation with a fresh bounded budget and needs no backoff before that
-invocation's first POST. Retries are allowed only for the same semantic
-generation.
+Redirects are not followed. Attempt limits may exceed endpoint count; endpoints
+cycle by reservation ordinal. A pre-existing hashless dispatch ambiguity begins
+a later invocation with a fresh bounded budget and a newly committed
+reservation. Retries are allowed only for the same semantic generation.
 
 ## Reconciliation and retry
 
@@ -536,8 +542,8 @@ transaction that validates the same `Recovering` row, atomically clears
 any remaining inconclusive candidate, and increments the attempt count to
 reserve one same-generation retry. The transaction consumes the no-match
 authorization. The authorization expires on cancellation, error, return, lock
-release, or process exit. A later usable hash fills the empty candidate slot,
-but sticky recovery remains in force.
+release, or process exit. A canonical accepted hash returned by that hashless
+retry transitions the row to `Tracking` and resumes normal candidate polling.
 
 A pending or unreadable candidate is never treated as committed failure.
 Retirement during the authorized retry reservation likewise does not classify
@@ -563,6 +569,7 @@ Restart plans are derived from the authoritative row:
 - `Tracking` schedules hash polling;
 - `Recovering` schedules candidate-first reconciliation and tree
   recovery, then same-generation retry when permitted;
+- `SubmittedWithoutHash` schedules no polling, recovery, or retry;
 - `Confirmed` enables dependent domain and helper work;
 - a `Rejected` row schedules no reconciliation;
 - absent rows permit fresh work if bundle causality allows it.
@@ -733,6 +740,7 @@ Public lifecycle results are intentionally small:
 Confirmed
 Pending(Tracking)
 Pending(Recovering)
+SubmittedWithoutHash
 Rejected
 Cancelled
 ```
@@ -746,6 +754,9 @@ confirmation is never presented as the confirming transaction.
 recovery remains authorized. It may carry no candidate after an atomic
 retirement-and-reservation or committed-failure clearing, without implying that
 a retired transaction failed or that another retry is already authorized.
+`SubmittedWithoutHash` means bounded dispatch is durably complete without a
+usable hash. It is idempotent and terminal for SDK advancement, but it is not
+`Confirmed` and exposes no hash or positions.
 `Rejected` means the row is terminally rejected. Local HTTP rejection and
 committed-failure observations return `Pending(Recovering)`, preserving the
 bound generation for exact-tree recovery and same-generation retry. An
@@ -838,7 +849,7 @@ The captured host operation epoch is checked at the same pre-commit boundaries.
 
 Ordinary cleanup and reset use the authoritative state under the same operation
 and bundle locks. They preserve every `Submitting`, `Tracking`, `Recovering`,
-and `Confirmed` row. For bound generations they preserve
+`SubmittedWithoutHash`, and `Confirmed` row. For bound generations they preserve
 all domain material required to reconcile, retry, prove, or apply that
 generation, including:
 
@@ -878,15 +889,13 @@ Version-17 round ids that cannot form a canonical native lifecycle identity
 have no possible in-process lifecycle holder; pruning and explicit round
 deletion skip that impossible gate and remain available.
 
-## Version 17 to version 18
+## Version 18 to version 19
 
-Version 17 is the released migration source. Version 18 is unreleased, so its
-schema is replaced in place:
-
-- the final `chain_submissions` definition is part of `17 -> 18`;
-- `001_init.sql` creates the same schema;
-- `CURRENT_VERSION` remains 18; and
-- there is no `18 -> 19` migration.
+Version 19 adds the `submitted_without_hash` durable state. Existing version-18
+databases are upgraded incrementally by rebuilding `chain_submissions` inside
+the migration transaction while preserving every row and reinstalling its
+indexes and triggers. `002_chain_submissions.sql` and `001_init.sql` create the
+same final schema for fresh databases.
 
 The `17 -> 18` step is schema only. It creates `chain_submissions` and imports
 nothing: every version-17 row of `votes`, `bundles`, and `rounds` is preserved
@@ -915,13 +924,12 @@ Version-17 round ids that cannot form a canonical lifecycle identity remain
 domain data that is prunable and explicitly deletable.
 
 The migration changes `user_version` in the same transaction as the DDL, so a
-process killed during migration leaves either the untouched version-17
-database or a complete version 18. Fresh and migrated version-18 schemas must
-match. A database created with an older unreleased version-18 shape is rejected
-by schema fingerprint with an explicit recreation error; it is not silently
-upgraded. The fingerprint compares the complete canonical `chain_submissions`
-table, every owned uniqueness index, and every immutability/monotonicity
-trigger.
+process killed during migration leaves either the untouched source database or
+a complete version 19. Fresh and incrementally migrated version-19 schemas must
+match. A database claiming version 19 with another shape is rejected by schema
+fingerprint. The fingerprint compares the complete canonical
+`chain_submissions` table, every owned uniqueness index, and every
+immutability/monotonicity trigger.
 
 A vote's authoritative row is its own singleton row or the `vote_batch` row that
 contains it. Because a batch binds once and owns no per-member rows, membership
@@ -981,13 +989,17 @@ Tests cover:
   `Tracking` with zero POST reservations and no signer;
 - imported `Tracking` and `Recovering` never dispatch, scan, or retry, and a
   committed failure becomes terminal `Rejected` without becoming hashless;
-- a chain rejection code produces bound hashless `Recovering` with a redacted
-  diagnostic;
+- rejection code 2 after durable ambiguity produces terminal
+  `SubmittedWithoutHash` by numeric code alone, while other deterministic
+  rejections surface an error and preserve earlier ambiguity;
 - local committed failure clears the tracked candidate into `Recovering`;
 - definite pre-dispatch failure does not create ambiguity;
-- every possibly-dispatched class produces `Recovering`;
+- every possibly-dispatched class is durably recorded before retry, and final
+  ambiguous-attempt exhaustion produces `SubmittedWithoutHash`;
 - restart from `Submitting` produces `Recovering`;
-- retry limits and endpoint failover are bounded per lifecycle invocation; and
+- retry limits and endpoint failover are bounded per lifecycle invocation,
+  attempts may exceed endpoint count, and endpoint selection cycles by ordinal;
+  and
 - retries cannot change semantic generation.
 
 ### Recovery
@@ -996,7 +1008,7 @@ Tests cover:
 
 - `Tracking` never invokes the tree client;
 - `Recovering` polls its candidate before scanning;
-- a later candidate hash does not remove sticky recovery;
+- a canonical accepted hash from a hashless retry resumes `Tracking`;
 - a pending or unreadable candidate blocks redispatch and cannot be
   overwritten before a completed valid no-match pass;
 - a completed valid no-match pass produces one private single-use
@@ -1104,10 +1116,11 @@ Tests cover:
   row and remains fresh delegate work;
 - a version-17 round id that cannot form a canonical identity creates no
   submission row and leaves its domain evidence untouched;
-- a hashless `Recovering` row remains `Recovering` after a retry receives
-  a definite rejection, leaving exact tree recovery available;
-- fresh and migrated v18 schema equivalence and stale-v18 fingerprint
-  rejection, including missing columns, indexes, and triggers;
+- a hashless `Recovering` row becomes `SubmittedWithoutHash` only for code 2,
+  while another deterministic rejection preserves the ambiguity and errors;
+- version-18 rows migrate incrementally to version 19, fresh and migrated
+  schemas are equivalent, and current-schema fingerprint rejection covers
+  missing columns, indexes, and triggers;
 - ordinary cleanup and reset preserve every unresolved generation, its
   retry/recovery data, helper plan, and complete delivery history;
 - round reset preserves a protected bundle while clearing an independent
@@ -1132,7 +1145,7 @@ These tests are the review contract for changes to chain submission behavior.
 
 Phase 6 recovery coverage is anchored by
 `exact_recovery_confirms_without_a_hash_and_clamps_timestamp`,
-`no_match_recovery_waits_for_backoff_and_clamps_reservation_timestamp`,
+`preexisting_tree_recovery_reserves_without_invocation_backoff`,
 `recovering_candidate_is_polled_before_no_match_retry_reservation`,
 `definitely_unsent_recovery_retry_keeps_reservation_and_requires_a_new_scan`,
 `malformed_tree_after_candidate_first_poll_retains_candidate_and_never_retries`,
@@ -1180,8 +1193,12 @@ Public-lifecycle engine coverage is anchored by
 `reservation_commits_before_post_and_accepted_hash_is_tracking`,
 `delegation_uses_the_same_lifecycle_and_atomic_confirmation_path`,
 `reservation_failure_dispatches_nothing_and_writes_nothing`,
-`definitely_unsent_failover_is_bounded_and_ambiguity_stops_it`,
-`possible_dispatch_is_sticky_recovery_and_never_redispatches`,
+`attempts_cycle_endpoints_and_exhaust_to_hashless_submission`,
+`ambiguous_retry_waits_for_configured_backoff`,
+`accepted_retry_short_circuits_to_normal_hash_tracking`,
+`nullifier_spent_after_ambiguity_is_terminal_and_idempotent`,
+`other_rejection_after_ambiguity_surfaces_error_and_preserves_ambiguity`,
+`single_ambiguous_attempt_is_terminal_and_idempotent`,
 `failed_post_classification_reports_known_possible_dispatch`,
 `failed_tracking_reconciliation_reports_the_durable_state`,
 `tracking_deadline_survives_polling_and_coordinator_restart`,
@@ -1233,9 +1250,13 @@ Public-lifecycle engine coverage is anchored by
 `v17_projectionless_proved_delegation_remains_fresh_work`,
 `v17_domain_evidence_is_preserved_and_creates_no_submission_rows`,
 `migrated_v17_votes_project_domain_phases`,
-`fresh_v18_schema_requires_a_bound_generation`,
+`fresh_current_schema_requires_a_bound_generation`,
+`v18_submission_rows_migrate_incrementally_to_v19`,
 `noncanonical_v17_round_ids_create_no_submission`,
-`v18_fingerprint_rejects_missing_columns_indexes_and_triggers`,
+`current_fingerprint_rejects_missing_columns_indexes_and_triggers`,
+`submitted_without_hash_survives_reopen_without_domain_confirmation`,
+`hashless_submission_blocks_same_bundle_but_not_unrelated_bundles`,
+`submitted_without_hash_schedules_no_chain_recovery_step`,
 `reset_voting_session_state_scopes_submission_protection_to_its_bundle`,
 `reset_voting_session_state_preserves_proved_bundle_setup_fields`,
 `noncanonical_legacy_round_ids_remain_deletable`,

@@ -53,9 +53,10 @@ pub struct ChainSubmissionClientConfig {
     pub tracking_window: Duration,
     /// Maximum POST attempts made by one advancement call.
     ///
-    /// This must be between one and eight and must not exceed the number of
-    /// distinct configured endpoints. Historical durable attempt count does
-    /// not reduce a later call's independent bounded budget.
+    /// This must be between one and eight. Attempts cycle through the ordered
+    /// endpoints when the budget exceeds the number of distinct endpoints.
+    /// Historical durable attempt count does not reduce a later call's
+    /// independent bounded budget.
     pub maximum_post_attempts: usize,
     /// Delays between consecutive POST attempts in one advancement call.
     ///

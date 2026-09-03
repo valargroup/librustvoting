@@ -13,6 +13,7 @@ pub enum ChainSubmissionState {
     Submitting,
     Tracking,
     Recovering,
+    SubmittedWithoutHash,
     Confirmed,
     Rejected,
 }
@@ -21,6 +22,8 @@ pub enum ChainSubmissionState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChainSubmissionDiagnosticKind {
     AmbiguousDispatch,
+    AmbiguousAttemptsExhausted,
+    NullifierAlreadySpent,
     TrackingWindowExpired,
     ChainRejected,
     ReconciliationPending,
@@ -209,6 +212,9 @@ pub enum ChainSubmissionPending {
 pub enum ChainSubmissionResult {
     Confirmed(ChainSubmissionConfirmation),
     Pending(ChainSubmissionPending),
+    /// POST dispatch is durably treated as submitted, but no hash or
+    /// confirmation positions are available.
+    SubmittedWithoutHash(ChainSubmissionDiagnostic),
     Rejected(ChainSubmissionDiagnostic),
     Cancelled,
 }
@@ -228,6 +234,7 @@ impl ChainSubmissionResult {
             Self::Pending(ChainSubmissionPending::Recovering { .. }) => {
                 Some(ChainSubmissionState::Recovering)
             }
+            Self::SubmittedWithoutHash(_) => Some(ChainSubmissionState::SubmittedWithoutHash),
             Self::Rejected(_) => Some(ChainSubmissionState::Rejected),
             Self::Cancelled => None,
         }
@@ -450,6 +457,10 @@ mod tests {
                     diagnostic: diagnostic.clone(),
                 }),
                 Some(ChainSubmissionState::Recovering),
+            ),
+            (
+                ChainSubmissionResult::SubmittedWithoutHash(diagnostic.clone()),
+                Some(ChainSubmissionState::SubmittedWithoutHash),
             ),
             (
                 ChainSubmissionResult::Rejected(diagnostic),

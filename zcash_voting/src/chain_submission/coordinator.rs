@@ -7,7 +7,8 @@ use super::{
     coordination::{CapturedSubmissionOperation, SubmissionOperationLease},
     generation::{ChainSubmissionRequest, DerivedChainSubmission},
     protocol::{
-        ChainProtocolClient, LookupFailure, PostAttemptOutcome, TransactionStatusObservation,
+        ChainProtocolClient, ChainRejectionKind, LookupFailure, PostAttemptOutcome,
+        TransactionStatusObservation,
     },
     recovery::{scan_exact_layout, RecoveryScanFailure, RecoveryScanOutcome},
     state::{SubmissionObservation, SubmissionRecordState},
@@ -118,12 +119,6 @@ where
         clock: C,
         policy: CoordinatorPolicy,
     ) -> Result<Self, ChainSubmissionFailure> {
-        if policy.maximum_post_attempts > protocol.endpoint_count() {
-            return Err(ChainSubmissionFailure::without_state(
-                ChainSubmissionFailureKind::InvalidInput,
-                "maximum POST attempts exceeds the distinct endpoint count",
-            ));
-        }
         Ok(Self {
             protocol,
             store,
@@ -176,15 +171,48 @@ where
             StoreAdmission::Authoritative(record) => record.public_result(),
             StoreAdmission::Ready {
                 derived,
-                record: _,
+                record,
                 fresh_reservation,
             } if fresh_reservation => {
-                self.submit_fresh(request, operation, &lease, *derived, recovery, control)
-                    .await
+                self.submit_reserved_attempts(
+                    request, operation, &lease, *derived, record, recovery, control,
+                )
+                .await
             }
             StoreAdmission::Ready {
                 derived, record, ..
             } => {
+                if is_retryable_dispatch_ambiguity(&record)
+                    && !request.is_imported_delegation()
+                    && interruption(&operation, control).is_none()
+                {
+                    let now = self.clock.now_seconds().map_err(|error| {
+                        ChainSubmissionFailure::with_durable_state(
+                            error.kind(),
+                            record.durable_state(),
+                            error.message(),
+                        )
+                    })?;
+                    let reserved = self
+                        .store
+                        .reserve_ambiguous_retry(derived.generation(), now)
+                        .map_err(|error| {
+                            if error.strongest_state().is_some() {
+                                error
+                            } else {
+                                ChainSubmissionFailure::with_durable_state(
+                                    error.kind(),
+                                    record.durable_state(),
+                                    error.message(),
+                                )
+                            }
+                        })?;
+                    return self
+                        .submit_reserved_attempts(
+                            request, operation, &lease, *derived, reserved, recovery, control,
+                        )
+                        .await;
+                }
                 self.reconcile_existing(
                     &request, &operation, &lease, *derived, record, recovery, 0, control,
                 )
@@ -193,17 +221,22 @@ where
         }
     }
 
-    async fn submit_fresh(
+    async fn submit_reserved_attempts(
         &self,
         request: StoreAdvancementRequest,
         operation: CapturedSubmissionOperation,
         lease: &SubmissionOperationLease,
         mut derived: DerivedChainSubmission,
+        mut reserved: StoredChainSubmission,
         recovery: ChainRecoveryMode,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let mut ambiguity_seen = is_retryable_dispatch_ambiguity(&reserved);
         for attempt_index in 0..self.policy.maximum_post_attempts {
             if let Some(reason) = interruption(&operation, control) {
+                if ambiguity_seen {
+                    return reserved.public_result();
+                }
                 self.remove_fresh_reservation(derived.generation())?;
                 return interrupted_without_state(reason);
             }
@@ -215,18 +248,26 @@ where
             {
                 Ok(in_flight) => in_flight,
                 Err(error) => {
-                    self.remove_fresh_reservation(derived.generation())?;
+                    if !ambiguity_seen {
+                        self.remove_fresh_reservation(derived.generation())?;
+                    }
                     return Err(error);
                 }
             };
+            let ordinal =
+                usize::try_from(reserved.committed_post_reservations()).unwrap_or(usize::MAX);
+            let endpoint_index = ordinal.saturating_sub(1) % self.protocol.endpoint_count();
             let outcome = {
                 let dispatch = ChainPostDispatch::default();
-                let post = self.submit_to_endpoint(attempt_index, &derived, dispatch.clone());
+                let post = self.submit_to_endpoint(endpoint_index, &derived, dispatch.clone());
                 tokio::pin!(post);
                 tokio::select! {
                     biased;
                     reason = wait_for_interruption(&operation, control) => {
                         if !dispatch.is_possible() {
+                            if ambiguity_seen {
+                                return reserved.public_result();
+                            }
                             self.remove_fresh_reservation(derived.generation())?;
                             return interrupted_without_state(reason);
                         }
@@ -259,80 +300,153 @@ where
                         )
                         .await;
                 }
-                PostAttemptOutcome::Rejected { diagnostic, .. } => {
+                PostAttemptOutcome::Rejected {
+                    kind, diagnostic, ..
+                } => {
+                    if ambiguity_seen && kind == ChainRejectionKind::NullifierAlreadySpent {
+                        let submitted = ChainSubmissionDiagnostic::from_redacted_message(
+                            ChainSubmissionDiagnosticKind::NullifierAlreadySpent,
+                            "vote chain reported nullifier already spent after ambiguous dispatch",
+                        );
+                        return self
+                            .classify_dispatched_post(
+                                derived.generation(),
+                                SubmissionObservation::SubmittedWithoutHash(submitted),
+                            )?
+                            .public_result();
+                    }
                     let record = self.classify_dispatched_post(
                         derived.generation(),
-                        SubmissionObservation::DefiniteRejection(diagnostic),
+                        SubmissionObservation::DefiniteRejection(diagnostic.clone()),
                     )?;
+                    if ambiguity_seen {
+                        return Err(ChainSubmissionFailure::with_durable_state(
+                            ChainSubmissionFailureKind::Protocol,
+                            record.durable_state(),
+                            diagnostic.message(),
+                        ));
+                    }
                     return record.public_result();
                 }
                 PostAttemptOutcome::PossiblyDispatched(diagnostic) => {
-                    let record = self.classify_dispatched_post(
+                    if attempt_index + 1 == self.policy.maximum_post_attempts {
+                        let exhausted = ChainSubmissionDiagnostic::from_redacted_message(
+                            ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
+                            "configured POST attempts exhausted after ambiguous dispatch",
+                        );
+                        return self
+                            .classify_dispatched_post(
+                                derived.generation(),
+                                SubmissionObservation::SubmittedWithoutHash(exhausted),
+                            )?
+                            .public_result();
+                    }
+                    reserved = self.classify_dispatched_post(
                         derived.generation(),
                         SubmissionObservation::PossiblyDispatched(diagnostic),
                     )?;
-                    return self
-                        .reconcile_existing(
-                            &request,
-                            &operation,
-                            lease,
-                            derived,
-                            record,
-                            recovery,
-                            attempt_index + 1,
-                            control,
-                        )
-                        .await;
+                    ambiguity_seen = true;
+                    if interruption(&operation, control).is_some() {
+                        return reserved.public_result();
+                    }
                 }
                 PostAttemptOutcome::LocalFailure(diagnostic) => {
-                    self.remove_fresh_reservation(derived.generation())?;
-                    return Err(ChainSubmissionFailure::without_state(
+                    if !ambiguity_seen {
+                        self.remove_fresh_reservation(derived.generation())?;
+                        return Err(ChainSubmissionFailure::without_state(
+                            ChainSubmissionFailureKind::Protocol,
+                            diagnostic.message(),
+                        ));
+                    }
+                    return Err(ChainSubmissionFailure::with_durable_state(
                         ChainSubmissionFailureKind::Protocol,
+                        ChainSubmissionState::Recovering,
                         diagnostic.message(),
                     ));
                 }
                 PostAttemptOutcome::DefinitelyUnsent(error) => {
-                    self.remove_fresh_reservation(derived.generation())?;
+                    if ambiguity_seen {
+                        reserved = self.reconcile_with_durable_state(
+                            derived.generation(),
+                            SubmissionObservation::DefinitelyUnsent,
+                            Some(ChainSubmissionDiagnostic::from_redacted_message(
+                                ChainSubmissionDiagnosticKind::ReconciliationPending,
+                                error.message(),
+                            )),
+                            ChainSubmissionState::Recovering,
+                        )?;
+                    } else {
+                        self.remove_fresh_reservation(derived.generation())?;
+                    }
                     if attempt_index + 1 == self.policy.maximum_post_attempts {
+                        return Err(if ambiguity_seen {
+                            ChainSubmissionFailure::with_durable_state(
+                                ChainSubmissionFailureKind::Transport,
+                                ChainSubmissionState::Recovering,
+                                error.message(),
+                            )
+                        } else {
+                            ChainSubmissionFailure::without_state(
+                                ChainSubmissionFailureKind::Transport,
+                                error.message(),
+                            )
+                        });
+                    }
+                }
+            }
+
+            if let Some(reason) = self
+                .wait_backoff_or_interruption(
+                    self.policy.retry_backoffs[attempt_index],
+                    &operation,
+                    control,
+                )
+                .await
+            {
+                return if ambiguity_seen {
+                    reserved.public_result()
+                } else {
+                    interrupted_without_state(reason)
+                };
+            }
+            if ambiguity_seen {
+                let durable_state = reserved.durable_state();
+                reserved = self
+                    .store
+                    .reserve_ambiguous_retry(derived.generation(), self.clock.now_seconds()?)
+                    .map_err(|error| {
+                        if error.strongest_state().is_some() {
+                            error
+                        } else {
+                            ChainSubmissionFailure::with_durable_state(
+                                error.kind(),
+                                durable_state,
+                                error.message(),
+                            )
+                        }
+                    })?;
+            } else {
+                match self.store.admit(
+                    &request,
+                    true,
+                    u64::try_from(attempt_index + 2).expect("bounded attempt index fits u64"),
+                    self.clock.now_seconds()?,
+                )? {
+                    StoreAdmission::Ready {
+                        derived: retry,
+                        record,
+                        fresh_reservation: true,
+                    } if retry.generation() == derived.generation() => {
+                        derived = *retry;
+                        reserved = record;
+                    }
+                    StoreAdmission::Ready { record, .. }
+                    | StoreAdmission::Authoritative(record) => return record.public_result(),
+                    _ => {
                         return Err(ChainSubmissionFailure::without_state(
-                            ChainSubmissionFailureKind::Transport,
-                            error.message(),
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            "definitely-unsent retry did not reserve the same generation",
                         ));
-                    }
-                    if let Some(reason) = self
-                        .wait_backoff_or_interruption(
-                            self.policy.retry_backoffs[attempt_index],
-                            &operation,
-                            control,
-                        )
-                        .await
-                    {
-                        return interrupted_without_state(reason);
-                    }
-                    if let Some(reason) = interruption(&operation, control) {
-                        return interrupted_without_state(reason);
-                    }
-                    match self.store.admit(
-                        &request,
-                        true,
-                        u64::try_from(attempt_index + 2).expect("bounded attempt index fits u64"),
-                        self.clock.now_seconds()?,
-                    )? {
-                        StoreAdmission::Ready {
-                            derived: retry,
-                            fresh_reservation: true,
-                            ..
-                        } if retry.generation() == derived.generation() => derived = *retry,
-                        StoreAdmission::Ready { record, .. }
-                        | StoreAdmission::Authoritative(record) => {
-                            return record.public_result();
-                        }
-                        _ => {
-                            return Err(ChainSubmissionFailure::without_state(
-                                ChainSubmissionFailureKind::InvariantViolation,
-                                "definitely-unsent retry did not reserve the same generation",
-                            ));
-                        }
                     }
                 }
             }
@@ -799,8 +913,14 @@ where
                             )
                         }
                     })?;
-                self.submit_recovery_retry(operation, derived, reserved, control)
-                    .await
+                self.submit_recovery_retry(
+                    operation,
+                    derived,
+                    reserved,
+                    post_attempts_used + 1 == self.policy.maximum_post_attempts,
+                    control,
+                )
+                .await
             }
             Err(RecoveryScanFailure::Interrupted) => record.public_result(),
             Err(RecoveryScanFailure::Invalid(diagnostic)) => {
@@ -841,6 +961,7 @@ where
         operation: &CapturedSubmissionOperation,
         derived: DerivedChainSubmission,
         reserved: StoredChainSubmission,
+        is_final_attempt: bool,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         if interruption(operation, control).is_some() {
@@ -884,18 +1005,45 @@ where
                     SubmissionObservation::UsableCandidateHash(candidate),
                 )?
                 .public_result(),
-            PostAttemptOutcome::Rejected { diagnostic, .. } => self
-                .classify_dispatched_post(
+            PostAttemptOutcome::Rejected {
+                kind, diagnostic, ..
+            } => {
+                if kind == ChainRejectionKind::NullifierAlreadySpent {
+                    let submitted = ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::NullifierAlreadySpent,
+                        "vote chain reported nullifier already spent after ambiguous dispatch",
+                    );
+                    return self
+                        .classify_dispatched_post(
+                            derived.generation(),
+                            SubmissionObservation::SubmittedWithoutHash(submitted),
+                        )?
+                        .public_result();
+                }
+                let record = self.classify_dispatched_post(
                     derived.generation(),
-                    SubmissionObservation::DefiniteRejection(diagnostic),
-                )?
-                .public_result(),
-            PostAttemptOutcome::PossiblyDispatched(diagnostic) => self
-                .classify_dispatched_post(
-                    derived.generation(),
-                    SubmissionObservation::PossiblyDispatched(diagnostic),
-                )?
-                .public_result(),
+                    SubmissionObservation::DefiniteRejection(diagnostic.clone()),
+                )?;
+                Err(ChainSubmissionFailure::with_durable_state(
+                    ChainSubmissionFailureKind::Protocol,
+                    record.durable_state(),
+                    diagnostic.message(),
+                ))
+            }
+            PostAttemptOutcome::PossiblyDispatched(diagnostic) => {
+                let observation = if is_final_attempt {
+                    SubmissionObservation::SubmittedWithoutHash(
+                        ChainSubmissionDiagnostic::from_redacted_message(
+                            ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
+                            "configured POST attempts exhausted after ambiguous dispatch",
+                        ),
+                    )
+                } else {
+                    SubmissionObservation::PossiblyDispatched(diagnostic)
+                };
+                self.classify_dispatched_post(derived.generation(), observation)?
+                    .public_result()
+            }
             PostAttemptOutcome::DefinitelyUnsent(error) => {
                 self.reconcile_with_durable_state(
                     derived.generation(),
@@ -1129,6 +1277,16 @@ fn interrupted_without_state(
             "host operation epoch changed before request dispatch",
         )),
     }
+}
+
+fn is_retryable_dispatch_ambiguity(record: &StoredChainSubmission) -> bool {
+    matches!(
+        record.state(),
+        SubmissionRecordState::Recovering {
+            candidate_transaction_hash: None,
+            ambiguity_diagnostic,
+        } if ambiguity_diagnostic.kind() == ChainSubmissionDiagnosticKind::AmbiguousDispatch
+    )
 }
 
 fn lookup_diagnostic(failure: &LookupFailure) -> ChainSubmissionDiagnostic {

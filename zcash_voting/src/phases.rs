@@ -26,6 +26,8 @@ pub enum DelegationPhase {
     Submitted,
     /// Submission or reconciliation is owned by the chain lifecycle facade.
     SubmissionManaged,
+    /// Dispatch is durably submitted without a usable transaction hash.
+    SubmittedWithoutHash,
     /// The authoritative lifecycle row is terminally rejected.
     SubmissionRejected,
     /// The vote authority note leaf position has been recovered from chain.
@@ -63,6 +65,8 @@ pub enum VotePhase {
     Submitted,
     /// Submission or reconciliation is owned by the chain lifecycle facade.
     SubmissionManaged,
+    /// Dispatch is durably submitted without a usable transaction hash.
+    SubmittedWithoutHash,
     /// The authoritative lifecycle row is terminally rejected.
     SubmissionRejected,
     /// The vote commitment tree position has been recorded.
@@ -77,6 +81,7 @@ impl VotePhase {
             Self::Committed => "committed",
             Self::Submitted => "submitted",
             Self::SubmissionManaged => "submission_managed",
+            Self::SubmittedWithoutHash => "submitted_without_hash",
             Self::SubmissionRejected => "submission_rejected",
             Self::Confirmed => "confirmed",
         }
@@ -112,6 +117,7 @@ impl DelegationPhase {
             Self::Proved => "proved",
             Self::Submitted => "submitted",
             Self::SubmissionManaged => "submission_managed",
+            Self::SubmittedWithoutHash => "submitted_without_hash",
             Self::SubmissionRejected => "submission_rejected",
             Self::Confirmed => "confirmed",
         }
@@ -140,6 +146,7 @@ impl WorkflowPhase {
             DelegationPhase::PcztBuilt | DelegationPhase::Proved => Self::Signed,
             DelegationPhase::Submitted => Self::SubmittedDelegation,
             DelegationPhase::SubmissionManaged => Self::SubmissionManaged,
+            DelegationPhase::SubmittedWithoutHash => Self::SubmittedDelegation,
             DelegationPhase::SubmissionRejected => Self::SubmissionRejected,
             DelegationPhase::Confirmed => Self::Confirmed,
         }
@@ -152,6 +159,7 @@ impl WorkflowPhase {
             VotePhase::Committed => Self::Signed,
             VotePhase::Submitted => Self::SubmittedVote,
             VotePhase::SubmissionManaged => Self::SubmissionManaged,
+            VotePhase::SubmittedWithoutHash => Self::SubmittedVote,
             VotePhase::SubmissionRejected => Self::SubmissionRejected,
             VotePhase::Confirmed => Self::Confirmed,
         }
@@ -510,6 +518,7 @@ fn load_vote_phases(
 fn authoritative_submission_phase(state: Option<&str>) -> Option<VotePhase> {
     match state {
         Some("submitting" | "tracking" | "recovering") => Some(VotePhase::SubmissionManaged),
+        Some("submitted_without_hash") => Some(VotePhase::SubmittedWithoutHash),
         Some("rejected") => Some(VotePhase::SubmissionRejected),
         Some("confirmed") => Some(VotePhase::Confirmed),
         _ => None,
@@ -770,6 +779,7 @@ fn phase_from_columns(
 ) -> DelegationPhase {
     match authoritative_state {
         Some("submitting" | "tracking" | "recovering") => DelegationPhase::SubmissionManaged,
+        Some("submitted_without_hash") => DelegationPhase::SubmittedWithoutHash,
         Some("rejected") => DelegationPhase::SubmissionRejected,
         Some("confirmed") => DelegationPhase::Confirmed,
         _ if has_van_position => DelegationPhase::Confirmed,

@@ -16,6 +16,7 @@ pub(super) enum SubmissionRecordState {
         candidate_transaction_hash: Option<CandidateTransactionHash>,
         ambiguity_diagnostic: ChainSubmissionDiagnostic,
     },
+    SubmittedWithoutHash(ChainSubmissionDiagnostic),
     Confirmed(ValidatedChainSubmissionConfirmation),
     Rejected(ChainSubmissionDiagnostic),
 }
@@ -26,6 +27,7 @@ impl SubmissionRecordState {
             Self::Submitting => ChainSubmissionState::Submitting,
             Self::Tracking { .. } => ChainSubmissionState::Tracking,
             Self::Recovering { .. } => ChainSubmissionState::Recovering,
+            Self::SubmittedWithoutHash(_) => ChainSubmissionState::SubmittedWithoutHash,
             Self::Confirmed(_) => ChainSubmissionState::Confirmed,
             Self::Rejected(_) => ChainSubmissionState::Rejected,
         }
@@ -40,6 +42,7 @@ pub(super) enum SubmissionObservation {
     UsableCandidateHash(CandidateTransactionHash),
     PossiblyDispatched(ChainSubmissionDiagnostic),
     DefiniteRejection(ChainSubmissionDiagnostic),
+    SubmittedWithoutHash(ChainSubmissionDiagnostic),
     CandidatePending,
     TrackingWindowExpired(ChainSubmissionDiagnostic),
     CandidateCommittedFailure(ChainSubmissionDiagnostic),
@@ -82,6 +85,10 @@ pub(super) fn apply_submission_observation(
                 ambiguity_diagnostic: diagnostic,
             }))
         }
+        (Some(State::Submitting), Observation::SubmittedWithoutHash(diagnostic))
+        | (Some(State::Recovering { .. }), Observation::SubmittedWithoutHash(diagnostic)) => {
+            Ok(Some(State::SubmittedWithoutHash(diagnostic)))
+        }
 
         (Some(state @ State::Tracking { .. }), Observation::CandidatePending) => Ok(Some(state)),
         (
@@ -118,16 +125,25 @@ pub(super) fn apply_submission_observation(
 
         (
             Some(State::Recovering {
-                candidate_transaction_hash,
+                candidate_transaction_hash: None,
+                ..
+            }),
+            Observation::UsableCandidateHash(candidate),
+        ) => Ok(Some(State::Tracking {
+            candidate_transaction_hash: candidate,
+        })),
+        (
+            Some(State::Recovering {
+                candidate_transaction_hash: Some(existing),
                 ambiguity_diagnostic,
             }),
             Observation::UsableCandidateHash(candidate),
         ) => {
-            if candidate_transaction_hash.is_some_and(|existing| existing != candidate) {
+            if existing != candidate {
                 return Err(SubmissionTransitionError::ConflictingCandidateHash);
             }
             Ok(Some(State::Recovering {
-                candidate_transaction_hash: Some(candidate),
+                candidate_transaction_hash: Some(existing),
                 ambiguity_diagnostic,
             }))
         }
@@ -219,6 +235,7 @@ impl SubmissionObservation {
             Self::UsableCandidateHash(_) => "usable_candidate_hash",
             Self::PossiblyDispatched(_) => "possibly_dispatched",
             Self::DefiniteRejection(_) => "definite_rejection",
+            Self::SubmittedWithoutHash(_) => "submitted_without_hash",
             Self::CandidatePending => "candidate_pending",
             Self::TrackingWindowExpired(_) => "tracking_window_expired",
             Self::CandidateCommittedFailure(_) => "candidate_committed_failure",
@@ -319,21 +336,10 @@ mod tests {
             SubmissionObservation::UsableCandidateHash(candidate(2)),
         );
 
-        for observation in [
-            SubmissionObservation::CandidatePending,
-            SubmissionObservation::DefiniteRejection(diagnostic("later rejection")),
-            SubmissionObservation::PossiblyDispatched(diagnostic("second ambiguity")),
-            SubmissionObservation::DefinitelyUnsent,
-            SubmissionObservation::ContinueRecovery,
-        ] {
-            assert_eq!(apply(with_candidate.clone(), observation), with_candidate);
-        }
-
         assert_eq!(
             with_candidate,
-            Some(SubmissionRecordState::Recovering {
-                candidate_transaction_hash: Some(candidate(2)),
-                ambiguity_diagnostic: first_ambiguity,
+            Some(SubmissionRecordState::Tracking {
+                candidate_transaction_hash: candidate(2),
             })
         );
     }
@@ -511,10 +517,11 @@ mod tests {
         ConfirmedByHash,
         ConfirmedByTree,
         Rejected,
+        SubmittedWithoutHash,
     }
 
     impl StateCase {
-        const ALL: [Self; 8] = [
+        const ALL: [Self; 9] = [
             Self::Absent,
             Self::Submitting,
             Self::Tracking,
@@ -523,6 +530,7 @@ mod tests {
             Self::ConfirmedByHash,
             Self::ConfirmedByTree,
             Self::Rejected,
+            Self::SubmittedWithoutHash,
         ];
 
         fn state(self) -> Option<SubmissionRecordState> {
@@ -547,6 +555,9 @@ mod tests {
                     Some(SubmissionRecordState::Confirmed(tree_confirmation()))
                 }
                 Self::Rejected => Some(SubmissionRecordState::Rejected(diagnostic("rejected"))),
+                Self::SubmittedWithoutHash => Some(SubmissionRecordState::SubmittedWithoutHash(
+                    diagnostic("submitted"),
+                )),
             }
         }
     }
@@ -566,10 +577,11 @@ mod tests {
         ConfirmedByTree,
         ContinueRecovery,
         AbandonedSubmitting,
+        SubmittedWithoutHash,
     }
 
     impl ObservationKind {
-        const ALL: [Self; 13] = [
+        const ALL: [Self; 14] = [
             Self::ReserveFreshSubmission,
             Self::DefinitelyUnsent,
             Self::UsableCandidateHash,
@@ -583,6 +595,7 @@ mod tests {
             Self::ConfirmedByTree,
             Self::ContinueRecovery,
             Self::AbandonedSubmitting,
+            Self::SubmittedWithoutHash,
         ];
 
         fn observation(self) -> SubmissionObservation {
@@ -616,6 +629,9 @@ mod tests {
                 Self::AbandonedSubmitting => {
                     SubmissionObservation::AbandonedSubmitting(diagnostic("abandoned"))
                 }
+                Self::SubmittedWithoutHash => {
+                    SubmissionObservation::SubmittedWithoutHash(diagnostic("submitted"))
+                }
             }
         }
     }
@@ -632,6 +648,7 @@ mod tests {
                     | Observation::UsableCandidateHash
                     | Observation::PossiblyDispatched
                     | Observation::DefiniteRejection
+                    | Observation::SubmittedWithoutHash
                     | Observation::AbandonedSubmitting
             ),
             State::Tracking => matches!(
@@ -651,6 +668,7 @@ mod tests {
                     | Observation::TerminalCandidateFailure
                     | Observation::ConfirmedByTree
                     | Observation::ContinueRecovery
+                    | Observation::SubmittedWithoutHash
             ),
             State::RecoveringWithCandidate => matches!(
                 observation,
@@ -664,10 +682,12 @@ mod tests {
                     | Observation::ConfirmedByHash
                     | Observation::ConfirmedByTree
                     | Observation::ContinueRecovery
+                    | Observation::SubmittedWithoutHash
             ),
             State::ConfirmedByHash => matches!(observation, Observation::ConfirmedByHash),
             State::ConfirmedByTree => matches!(observation, Observation::ConfirmedByTree),
             State::Rejected => false,
+            State::SubmittedWithoutHash => false,
         }
     }
 

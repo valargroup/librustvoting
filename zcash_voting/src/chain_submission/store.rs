@@ -337,6 +337,9 @@ impl StoredChainSubmission {
                     diagnostic: ambiguity_diagnostic,
                 },
             )),
+            SubmissionRecordState::SubmittedWithoutHash(diagnostic) => {
+                Ok(ChainSubmissionResult::SubmittedWithoutHash(diagnostic))
+            }
             SubmissionRecordState::Confirmed(confirmation) => {
                 Ok(ChainSubmissionResult::Confirmed(confirmation.into_public()))
             }
@@ -390,6 +393,16 @@ pub(super) trait ChainSubmissionStore: Send + Sync {
         &self,
         generation: &ChainSubmissionGeneration,
         observation: SubmissionObservation,
+        now: u64,
+    ) -> Result<StoredChainSubmission, ChainSubmissionFailure>;
+
+    /// Reserves another same-generation POST after durable dispatch ambiguity.
+    ///
+    /// The reservation count is monotonic and is diagnostic only; invocation
+    /// attempt budgets remain coordinator-local.
+    fn reserve_ambiguous_retry(
+        &self,
+        generation: &ChainSubmissionGeneration,
         now: u64,
     ) -> Result<StoredChainSubmission, ChainSubmissionFailure>;
 
@@ -520,6 +533,7 @@ pub(super) mod memory {
         state: Mutex<MemoryState>,
         coordination: SubmissionCoordination,
         fail_confirmation: AtomicBool,
+        fail_ambiguous_retry: AtomicBool,
         batch_roster_reads: AtomicUsize,
         confirmation_validated_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         required_admission_locks: Mutex<Option<Vec<ChainSubmissionIdentity>>>,
@@ -531,6 +545,7 @@ pub(super) mod memory {
                 state: Mutex::new(MemoryState::default()),
                 coordination: SubmissionCoordination::default(),
                 fail_confirmation: AtomicBool::new(false),
+                fail_ambiguous_retry: AtomicBool::new(false),
                 batch_roster_reads: AtomicUsize::new(0),
                 confirmation_validated_hook: Mutex::new(None),
                 required_admission_locks: Mutex::new(None),
@@ -617,6 +632,10 @@ pub(super) mod memory {
             self.fail_confirmation.store(true, Ordering::SeqCst);
         }
 
+        pub(in crate::chain_submission) fn fail_next_ambiguous_retry(&self) {
+            self.fail_ambiguous_retry.store(true, Ordering::SeqCst);
+        }
+
         pub(in crate::chain_submission) fn after_next_confirmation_validation(
             &self,
             hook: impl FnOnce() + Send + 'static,
@@ -701,7 +720,8 @@ pub(super) mod memory {
                         }
                         SubmissionRecordState::Submitting
                         | SubmissionRecordState::Tracking { .. }
-                        | SubmissionRecordState::Recovering { .. } => true,
+                        | SubmissionRecordState::Recovering { .. }
+                        | SubmissionRecordState::SubmittedWithoutHash(_) => true,
                     }
             })
         }
@@ -875,7 +895,9 @@ pub(super) mod memory {
                     ensure_generation(&record, derived.generation())?;
                     if matches!(
                         record.state,
-                        SubmissionRecordState::Confirmed(_) | SubmissionRecordState::Rejected(_)
+                        SubmissionRecordState::Confirmed(_)
+                            | SubmissionRecordState::Rejected(_)
+                            | SubmissionRecordState::SubmittedWithoutHash(_)
                     ) {
                         return Ok(StoreAdmission::Authoritative(record));
                     }
@@ -1029,12 +1051,69 @@ pub(super) mod memory {
                         ambiguity_diagnostic,
                         ..
                     }
+                    | SubmissionRecordState::SubmittedWithoutHash(ambiguity_diagnostic)
                     | SubmissionRecordState::Rejected(ambiguity_diagnostic) => {
                         Some(ambiguity_diagnostic.clone())
                     }
                     _ => record.diagnostic,
                 };
                 record.updated_at = now;
+                state
+                    .records
+                    .insert(generation.identity().clone(), record.clone());
+                Ok(record)
+            })
+        }
+
+        fn reserve_ambiguous_retry(
+            &self,
+            generation: &ChainSubmissionGeneration,
+            now: u64,
+        ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
+            if self.fail_ambiguous_retry.swap(false, Ordering::SeqCst) {
+                return Err(ChainSubmissionFailure::without_state(
+                    ChainSubmissionFailureKind::Storage,
+                    "injected ambiguous retry reservation failure",
+                ));
+            }
+            self.transact(Some(generation.identity()), |state| {
+                let mut record = state
+                    .records
+                    .get(generation.identity())
+                    .cloned()
+                    .ok_or_else(|| {
+                        ChainSubmissionFailure::without_state(
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            "submission disappeared before ambiguous retry reservation",
+                        )
+                    })?;
+                ensure_generation(&record, generation)?;
+                if !matches!(
+                    record.state(),
+                    SubmissionRecordState::Recovering {
+                        candidate_transaction_hash: None,
+                        ambiguity_diagnostic,
+                    } if ambiguity_diagnostic.kind()
+                        == ChainSubmissionDiagnosticKind::AmbiguousDispatch
+                ) {
+                    return Err(ChainSubmissionFailure::with_durable_state(
+                        ChainSubmissionFailureKind::InvariantViolation,
+                        record.durable_state(),
+                        "ambiguous retry requires hashless durable dispatch ambiguity",
+                    ));
+                }
+                record.committed_post_reservations = record
+                    .committed_post_reservations
+                    .checked_add(1)
+                    .filter(|count| *count <= i64::MAX as u64)
+                    .ok_or_else(|| {
+                        ChainSubmissionFailure::with_durable_state(
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            ChainSubmissionState::Recovering,
+                            "submission reservation counter overflowed",
+                        )
+                    })?;
+                record.updated_at = now.max(record.updated_at);
                 state
                     .records
                     .insert(generation.identity().clone(), record.clone());
