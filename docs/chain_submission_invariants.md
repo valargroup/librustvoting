@@ -1017,6 +1017,9 @@ Tests cover:
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class is durably recorded before retry, and final
   ambiguous-attempt exhaustion produces `SubmittedWithoutHash`;
+- `ambiguous_retry_clock_failure_reports_the_durable_recovery_state` proves
+  that a clock failure between a durable ambiguity and its retry reservation
+  reports durable `Recovering` rather than a stateless failure;
 - `nonfinal_candidate_hash_collision_uses_the_remaining_bounded_retry` proves
   that a collision before the final attempt continues through the same
   invocation's remaining retry budget;

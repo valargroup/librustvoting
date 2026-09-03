@@ -417,9 +417,16 @@ where
             }
             if ambiguity_seen {
                 let durable_state = reserved.durable_state();
+                let now = self.clock.now_seconds().map_err(|error| {
+                    ChainSubmissionFailure::with_durable_state(
+                        error.kind(),
+                        durable_state,
+                        error.message(),
+                    )
+                })?;
                 reserved = self
                     .store
-                    .reserve_ambiguous_retry(derived.generation(), self.clock.now_seconds()?)
+                    .reserve_ambiguous_retry(derived.generation(), now)
                     .map_err(|error| {
                         if error.strongest_state().is_some() {
                             error

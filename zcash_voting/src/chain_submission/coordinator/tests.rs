@@ -498,6 +498,50 @@ async fn ambiguous_retry_reservation_failure_reports_durable_recovery() {
 }
 
 #[tokio::test]
+async fn ambiguous_retry_clock_failure_reports_the_durable_recovery_state() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    let protocol = ChainProtocolClient::new(
+        Arc::clone(&transport),
+        Network::Testnet,
+        &["https://chain.example".to_string()],
+    )
+    .unwrap();
+    // Reads: admission, ambiguity classification, then the retry reservation
+    // that must fail after the ambiguity is already durable.
+    let coordinator = ChainSubmissionCoordinator::new(
+        protocol,
+        Arc::clone(&store),
+        FailingClock::failing_after(100, 2),
+        CoordinatorPolicy::new(Duration::from_secs(10), 2, vec![Duration::from_millis(1)]).unwrap(),
+    )
+    .unwrap();
+
+    let failure = coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Storage);
+    let strongest_state = failure.strongest_state().unwrap();
+    assert_eq!(strongest_state.state(), ChainSubmissionState::Recovering);
+    assert_eq!(
+        strongest_state.evidence(),
+        ChainSubmissionStateEvidence::Durable
+    );
+    assert_eq!(transport.methods(), vec!["POST"]);
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+    assert_eq!(record.committed_post_reservations(), 1);
+}
+
+#[tokio::test]
 async fn atomic_vote_batch_uses_shared_lifecycle_and_confirms_ordered_positions() {
     let identity = batch_identity(0);
     let proposals = vec![1, 2, 5];
@@ -832,6 +876,36 @@ async fn malformed_tree_after_candidate_first_poll_retains_candidate_and_never_r
 impl ChainSubmissionClock for ManualClock {
     fn now_seconds(&self) -> Result<u64, ChainSubmissionFailure> {
         Ok(self.0.load(Ordering::SeqCst))
+    }
+}
+
+/// Manual clock whose read fails once a configured number of reads succeeded.
+struct FailingClock {
+    inner: ManualClock,
+    successful_reads_remaining: AtomicUsize,
+}
+
+impl FailingClock {
+    fn failing_after(now: u64, successful_reads: usize) -> Self {
+        Self {
+            inner: ManualClock::new(now),
+            successful_reads_remaining: AtomicUsize::new(successful_reads),
+        }
+    }
+}
+
+impl ChainSubmissionClock for FailingClock {
+    fn now_seconds(&self) -> Result<u64, ChainSubmissionFailure> {
+        let remaining = self.successful_reads_remaining.load(Ordering::SeqCst);
+        if remaining == 0 {
+            return Err(ChainSubmissionFailure::without_state(
+                ChainSubmissionFailureKind::Storage,
+                "system clock is before the Unix epoch",
+            ));
+        }
+        self.successful_reads_remaining
+            .store(remaining - 1, Ordering::SeqCst);
+        self.inner.now_seconds()
     }
 }
 
