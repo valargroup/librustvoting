@@ -18,10 +18,10 @@ use crate::{
         generation::{ChainSubmissionRequest, ExpectedTreeLayout},
         protocol::ChainProtocolClient,
         store::memory::InMemoryChainSubmissionStore,
-        CandidateTransactionHash, ChainHttpRequest, ChainHttpResponse, ChainSubmissionGeneration,
-        ChainSubmissionGenerationDigest, ChainSubmissionIdentity, ChainSubmissionPending,
-        ChainSubmissionStateEvidence, ChainSubmissionTarget, ChainTransportError,
-        ChainTransportFuture,
+        CandidateTransactionHash, ChainHttpRequest, ChainHttpResponse, ChainPostDispatch,
+        ChainSubmissionGeneration, ChainSubmissionGenerationDigest, ChainSubmissionIdentity,
+        ChainSubmissionPending, ChainSubmissionStateEvidence, ChainSubmissionTarget,
+        ChainTransportError, ChainTransportFuture,
     },
     confirmation::{TxEvent, TxEventAttribute},
     types::Network,
@@ -306,7 +306,10 @@ async fn other_recovery_retry_rejection_is_an_error_without_candidate_evidence()
 }
 
 #[tokio::test]
-async fn nullifier_spent_recovery_retry_is_terminal_hashless_submission() {
+async fn nullifier_spent_after_definite_committed_failure_stays_recoverable() {
+    // The seed is a candidate that committed unsuccessfully: a definite
+    // outcome that spent nothing. A later code 2 is therefore not evidence
+    // that this generation was submitted and must not end it hashless.
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived(identity.clone(), 1));
@@ -319,20 +322,164 @@ async fn nullifier_spent_recovery_retry_is_terminal_hashless_submission() {
         422,
         br#"{"code":2,"log":"must not be retained"}"#.to_vec(),
     )));
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    );
 
-    let result = coordinator(
+    let failure = coordinator
+        .advance_with_recovery(
+            StoreAdvancementRequest::vote(identity.clone()),
+            ChainRecoveryMode::ExactTree,
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Protocol);
+    assert!(!failure.message().contains("must not be retained"));
+    assert_eq!(
+        failure.strongest_state().unwrap().state(),
+        ChainSubmissionState::Recovering
+    );
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.committed_post_reservations(), 2);
+    assert!(matches!(
+        record.state(),
+        SubmissionRecordState::Recovering {
+            candidate_transaction_hash: None,
+            ambiguity_diagnostic,
+        } if ambiguity_diagnostic.kind() == ChainSubmissionDiagnosticKind::ChainRejected
+    ));
+    assert_eq!(transport.methods(), vec!["GET", "GET", "POST"]);
+
+    // The row stays recoverable: a later pass scans again and may confirm.
+    for response in tree_responses(&[[8; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.queue(Ok(accepted()));
+    let result = coordinator
+        .advance_with_recovery(
+            StoreAdvancementRequest::vote(identity.clone()),
+            ChainRecoveryMode::ExactTree,
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Tracking { .. })
+    ));
+    assert_eq!(
+        transport.methods(),
+        vec!["GET", "GET", "POST", "GET", "GET", "POST"]
+    );
+}
+
+#[tokio::test]
+async fn nullifier_spent_after_definite_rejection_stays_recoverable() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let request = StoreAdvancementRequest::vote(identity.clone());
+    let StoreAdmission::Ready { derived, .. } = store.admit(&request, true, 1, 90).unwrap() else {
+        panic!("fresh reservation")
+    };
+    store
+        .classify_post(
+            derived.generation(),
+            SubmissionObservation::DefiniteRejection(
+                ChainSubmissionDiagnostic::from_redacted_message(
+                    ChainSubmissionDiagnosticKind::ChainRejected,
+                    "vote chain rejected the first attempt with code 7",
+                ),
+            ),
+            91,
+        )
+        .unwrap();
+    let transport = Arc::new(ScriptedTransport::default());
+    for response in tree_responses(&[[8; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.queue(Ok(ChainHttpResponse::json(
+        422,
+        br#"{"code":2,"log":"nullifier already spent"}"#.to_vec(),
+    )));
+
+    let failure = coordinator(
         Arc::clone(&transport),
         Arc::clone(&store),
         ManualClock::new(100),
         10,
     )
     .advance_with_recovery(
-        StoreAdvancementRequest::vote(identity.clone()),
+        request,
         ChainRecoveryMode::ExactTree,
         &ManualControl::default(),
     )
     .await
-    .unwrap();
+    .unwrap_err();
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Protocol);
+    assert_eq!(
+        failure.strongest_state().unwrap().state(),
+        ChainSubmissionState::Recovering
+    );
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+    assert_eq!(record.committed_post_reservations(), 2);
+    assert_eq!(
+        record.diagnostic().unwrap().kind(),
+        ChainSubmissionDiagnosticKind::ChainRejected
+    );
+    assert_eq!(transport.methods(), vec!["GET", "GET", "POST"]);
+}
+
+#[tokio::test]
+async fn nullifier_spent_recovery_retry_after_unresolved_dispatch_is_terminal() {
+    // An accepted hash whose tracking window expired is unresolved dispatch:
+    // the transaction definitely left the wallet and never resolved. Code 2
+    // on the authorized retry is then evidence the earlier dispatch landed.
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Ok(accepted()));
+    transport.queue(Ok(pending()));
+    let clock = ManualClock::new(100);
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        clock.clone(),
+        10,
+    );
+    coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    clock.set(111);
+    transport.queue(Ok(pending()));
+    for response in tree_responses(&[[8; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.queue(Ok(ChainHttpResponse::json(
+        422,
+        br#"{"code":2,"log":"must not be retained"}"#.to_vec(),
+    )));
+    let result = coordinator
+        .advance_with_recovery(
+            StoreAdvancementRequest::vote(identity.clone()),
+            ChainRecoveryMode::ExactTree,
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
 
     assert!(matches!(
         result,
@@ -345,7 +492,10 @@ async fn nullifier_spent_recovery_retry_is_terminal_hashless_submission() {
         ChainSubmissionState::SubmittedWithoutHash
     );
     assert!(store.projection(&identity).is_none());
-    assert_eq!(transport.methods(), vec!["GET", "GET", "POST"]);
+    assert_eq!(
+        transport.methods(),
+        vec!["POST", "GET", "GET", "GET", "GET", "POST"]
+    );
 }
 
 #[tokio::test]
@@ -3556,5 +3706,249 @@ async fn failed_tracking_reconciliation_reports_the_durable_state() {
     assert_eq!(
         store.record(&identity).unwrap().durable_state(),
         ChainSubmissionState::Tracking
+    );
+}
+
+#[tokio::test]
+async fn nonfinal_ambiguous_recovery_retry_continues_bounded_retries() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    seed_hashless_tree_recovery(&store, &StoreAdvancementRequest::vote(identity.clone()));
+    let transport = Arc::new(ScriptedTransport::default());
+    for response in tree_responses(&[[8; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    transport.queue(Ok(accepted()));
+    transport.queue(Ok(pending()));
+    let protocol = ChainProtocolClient::new(
+        Arc::clone(&transport),
+        Network::Testnet,
+        &["https://chain.example".to_string()],
+    )
+    .unwrap();
+    let coordinator = ChainSubmissionCoordinator::new(
+        protocol,
+        Arc::clone(&store),
+        ManualClock::new(100),
+        CoordinatorPolicy::new(Duration::from_secs(10), 2, vec![Duration::from_millis(1)]).unwrap(),
+    )
+    .unwrap();
+
+    let result = coordinator
+        .advance_with_recovery(
+            StoreAdvancementRequest::vote(identity.clone()),
+            ChainRecoveryMode::ExactTree,
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Tracking { .. })
+    ));
+    // One scan authorizes the first retry; the second retry needs only the
+    // configured backoff and a durable ambiguous-retry reservation.
+    assert_eq!(
+        transport.methods(),
+        vec!["GET", "GET", "POST", "POST", "GET"]
+    );
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.durable_state(), ChainSubmissionState::Tracking);
+    assert_eq!(record.committed_post_reservations(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguous_recovery_retry_qualifies_for_a_direct_retry_on_the_next_advance() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    seed_hashless_tree_recovery(&store, &StoreAdvancementRequest::vote(identity.clone()));
+    let transport = Arc::new(ScriptedTransport::default());
+    for response in tree_responses(&[[8; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    let protocol = ChainProtocolClient::new(
+        Arc::clone(&transport),
+        Network::Testnet,
+        &["https://chain.example".to_string()],
+    )
+    .unwrap();
+    let coordinator = Arc::new(
+        ChainSubmissionCoordinator::new(
+            protocol,
+            Arc::clone(&store),
+            ManualClock::new(100),
+            CoordinatorPolicy::new(Duration::from_secs(10), 2, vec![Duration::from_secs(5)])
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+    let control = Arc::new(ManualControl::default());
+    let task = {
+        let coordinator = Arc::clone(&coordinator);
+        let control = Arc::clone(&control);
+        let identity = identity.clone();
+        tokio::spawn(async move {
+            coordinator
+                .advance_with_recovery(
+                    StoreAdvancementRequest::vote(identity),
+                    ChainRecoveryMode::ExactTree,
+                    &*control,
+                )
+                .await
+        })
+    };
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+        if transport.methods().len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(transport.methods(), vec!["GET", "GET", "POST"]);
+
+    // Cancel during the backoff: the ambiguity is already durable.
+    control.cancelled.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let result = task.await.unwrap().unwrap();
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ref diagnostic,
+        }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::AmbiguousDispatch
+    ));
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.committed_post_reservations(), 2);
+    assert!(record.state().permits_ambiguous_retry());
+
+    // The next invocation reserves directly; no tree pass precedes the POST.
+    transport.queue(Ok(accepted()));
+    transport.queue(Ok(pending()));
+    let result = coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Tracking { .. })
+    ));
+    assert_eq!(
+        transport.methods(),
+        vec!["GET", "GET", "POST", "POST", "GET"]
+    );
+    assert_eq!(
+        store
+            .record(&identity)
+            .unwrap()
+            .committed_post_reservations(),
+        3
+    );
+}
+
+/// Transport whose POST never completes. `marks_dispatch` decides whether it
+/// crosses the handoff boundary before hanging.
+struct HangingPostTransport {
+    marks_dispatch: bool,
+}
+
+impl ChainTransport for HangingPostTransport {
+    fn chain_get<'a>(&'a self, _request: ChainHttpRequest) -> ChainTransportFuture<'a> {
+        Box::pin(async { unreachable!("no lookup is expected") })
+    }
+
+    fn chain_post_json<'a>(
+        &'a self,
+        _request: ChainHttpRequest,
+        _json: Vec<u8>,
+    ) -> ChainTransportFuture<'a> {
+        Box::pin(async { unreachable!("the dispatch-aware POST is used") })
+    }
+
+    fn chain_post_json_with_dispatch<'a>(
+        &'a self,
+        _request: ChainHttpRequest,
+        _json: Vec<u8>,
+        dispatch: ChainPostDispatch,
+    ) -> ChainTransportFuture<'a> {
+        let marks_dispatch = self.marks_dispatch;
+        Box::pin(async move {
+            if marks_dispatch {
+                dispatch.mark_possible();
+            }
+            std::future::pending().await
+        })
+    }
+}
+
+fn coordinator_over_hanging_post(
+    marks_dispatch: bool,
+    store: Arc<InMemoryChainSubmissionStore>,
+) -> ChainSubmissionCoordinator<Arc<HangingPostTransport>, InMemoryChainSubmissionStore, ManualClock>
+{
+    let protocol = ChainProtocolClient::new(
+        Arc::new(HangingPostTransport { marks_dispatch }),
+        Network::Testnet,
+        &["https://chain.example".to_string()],
+    )
+    .unwrap();
+    ChainSubmissionCoordinator::new(
+        protocol,
+        store,
+        ManualClock::new(100),
+        CoordinatorPolicy::new(Duration::from_secs(10), 1, vec![]).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_timeout_before_the_dispatch_marker_is_definitely_unsent() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let coordinator = coordinator_over_hanging_post(false, Arc::clone(&store));
+
+    let failure = coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Transport);
+    assert!(failure.strongest_state().is_none());
+    assert!(store.record(&identity).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_timeout_after_the_dispatch_marker_is_ambiguous() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let coordinator = coordinator_over_hanging_post(true, Arc::clone(&store));
+
+    let result = coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::SubmittedWithoutHash(ref diagnostic)
+            if diagnostic.kind() == ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted
+    ));
+    assert_eq!(
+        store.record(&identity).unwrap().durable_state(),
+        ChainSubmissionState::SubmittedWithoutHash
     );
 }

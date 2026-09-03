@@ -132,6 +132,18 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- A vote-chain POST that hits the SDK's own deadline before the transport
+  marks dispatch is now classified as definitely unsent, so the fresh
+  reservation is removed and bounded failover continues instead of persisting
+  terminal `SubmittedWithoutHash` for a request that never left the wallet.
+- Rejection code 2 on an exact-tree recovery retry ends a generation as
+  `SubmittedWithoutHash` only when the durable row still carries unresolved
+  dispatch evidence. A retry after a rejected POST or a committed failure now
+  surfaces an error and leaves the row recoverable.
+- A possibly-dispatched recovery retry now durably records the new dispatch
+  ambiguity and continues through the invocation's remaining bounded attempts;
+  a later invocation may reserve the next POST directly instead of repeating
+  a full tree pass.
 - Local delegation, singleton-vote, and vote-batch `resume_plan` advance steps
   now direct hosts through exact-tree recovery. Following the documented
   pending loop can therefore resolve a hashless `Recovering` generation instead

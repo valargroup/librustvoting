@@ -31,9 +31,9 @@ An accepted hash that is usable for this generation returns to ordinary
 `Tracking`. A hash already owned by another generation is not usable and is
 classified as possible dispatch without a hash. Exhausting the budget with
 that collision or any other ambiguous final attempt, or receiving chain
-rejection code 2 after an ambiguous dispatch, produces terminal
-`SubmittedWithoutHash`. This outcome is not confirmation and carries no hash
-or positions. `Recovering` remains available for tracking-window expiry and
+rejection code 2 while the durable row still carries unresolved dispatch
+evidence, produces terminal `SubmittedWithoutHash`. This outcome is not
+confirmation and carries no hash or positions. `Recovering` remains available for tracking-window expiry and
 exact-tree recovery; tree recovery never runs for `SubmittedWithoutHash`.
 
 ## Scope and authority
@@ -462,7 +462,12 @@ Cancellation before that boundary is also definitely unsent.
 The transport exposes that handoff through a one-way dispatch marker. The
 coordinator may remove a fresh reservation on interruption only while the
 marker remains clear; once marked, interruption is possibly dispatched even if
-the request future is then cancelled.
+the request future is then cancelled. The SDK's own POST deadline is classified
+against the same marker: a timeout that expires while the marker is still clear
+is definitely unsent, because the transport never released the request, and a
+timeout after the marker is possibly dispatched. A transport that reports its
+own failure kind is trusted as reported; the marker only decides timeouts the
+SDK imposed itself.
 
 For a first attempt, definitely-unsent failure removes the fresh `Submitting`
 reservation; it does not create chain rejection or ambiguity. For a retry after
@@ -479,7 +484,7 @@ reservation in that invocation to be counted as attempt one again.
 
 Everything after the dispatch boundary is `PossiblyDispatched`, including:
 
-- timeout or interruption;
+- timeout or interruption once the dispatch marker is set;
 - cancellation after dispatch;
 - response-body or decoding failure;
 - unusable or hashless success;
@@ -500,12 +505,21 @@ matching the submission identity, for both acceptance and rejection. A missing,
 malformed, noncanonical, or mismatched response digest is not evidence and is
 classified as possibly dispatched without accepting the response hash.
 
-A rejection with numeric module code 2 after an earlier ambiguous dispatch
-transitions to `SubmittedWithoutHash`; classification never inspects or retains
-the untrusted response log. Other deterministic rejections surface an
-operational error while preserving earlier durable ambiguity. A definite
-rejection with no earlier ambiguity may retain the compatibility `Recovering`
-behavior. A hash in an error response is never confirmation evidence.
+A rejection with numeric module code 2 transitions to `SubmittedWithoutHash`
+only when dispatch ambiguity actually preceded it; classification never
+inspects or retains the untrusted response log. Within one invocation the
+coordinator knows whether an earlier attempt was possibly dispatched. Across
+invocations the durable row is the carrier: a `Recovering` row whose stored
+diagnostic kind is `AmbiguousDispatch`, `InvalidProtocolResponse`, or
+`TrackingWindowExpired` carries unresolved dispatch evidence, because each of
+those records a POST that left the wallet and never resolved. A diagnostic of
+`ChainRejected` records a definite outcome, a rejected POST or a candidate that
+committed unsuccessfully, which spent nothing; code 2 after such a row is
+handled like any other definite rejection. Other deterministic rejections
+surface an operational error while preserving earlier durable ambiguity. A
+definite rejection with no earlier ambiguity may retain the compatibility
+`Recovering` behavior. A hash in an error response is never confirmation
+evidence.
 
 Within each lifecycle invocation, POST attempts, body sizes, request
 durations, and backoffs are bounded by configuration with safe finite maxima.
@@ -541,7 +555,8 @@ completed valid no-match tree pass. A committed-success candidate proceeds to
 confirmation. A `Tracking` candidate that is committed unsuccessfully becomes
 hashless `Recovering` with the committed-failure diagnostic; a `Recovering`
 candidate that is committed unsuccessfully is atomically cleared while the row
-remains `Recovering`.
+remains `Recovering` and likewise adopts the committed-failure diagnostic, so
+the row no longer carries unresolved dispatch evidence.
 
 After candidate polling and a bounded no-match tree pass, the lifecycle
 receives one private process-local authorization for the captured identity,
@@ -554,6 +569,14 @@ reserve one same-generation retry. The transaction consumes the no-match
 authorization. The authorization expires on cancellation, error, return, lock
 release, or process exit. A canonical accepted hash returned by that hashless
 retry transitions the row to `Tracking` and resumes normal candidate polling.
+An authorized retry that is itself possibly dispatched durably replaces the
+row's diagnostic with the new dispatch ambiguity before anything else happens.
+If the invocation budget permits, the remaining attempts continue through the
+same backoff and durable ambiguous-retry reservation as any other ambiguous
+retry, without another tree pass; if the budget is exhausted, the attempt is
+final and produces `SubmittedWithoutHash`. A later invocation that finds the
+row hashless with that dispatch-ambiguity diagnostic may reserve the next
+same-generation POST directly.
 
 A pending or unreadable candidate is never treated as committed failure.
 Retirement during the authorized retry reservation likewise does not classify
@@ -1015,6 +1038,18 @@ Tests cover:
 - rejection code 2 after durable ambiguity produces terminal
   `SubmittedWithoutHash` by numeric code alone, while other deterministic
   rejections surface an error and preserve earlier ambiguity;
+- `nullifier_spent_recovery_retry_after_unresolved_dispatch_is_terminal`,
+  `nullifier_spent_after_definite_rejection_stays_recoverable`, and
+  `nullifier_spent_after_definite_committed_failure_stays_recoverable` prove
+  that the code-2 terminal rule follows the durable dispatch evidence: an
+  authorized retry after an expired tracking window ends hashless, while one
+  after a rejected POST or a committed failure surfaces an error and leaves the
+  row recoverable;
+- `post_timeout_before_the_dispatch_marker_is_definitely_unsent` and
+  `post_timeout_after_the_dispatch_marker_is_ambiguous` prove that the SDK's
+  POST deadline is classified against the dispatch marker: a transport that
+  never released the request removes the fresh reservation and reports a
+  stateless transport failure, while one that did produces durable ambiguity;
 - a tracked generation can complete as `SubmittedWithoutHash` while retaining
   its immutable first-tracking timestamp;
 - local committed failure clears the tracked candidate into `Recovering`;
@@ -1067,6 +1102,13 @@ Tests cover:
 - cancellation or definitely-unsent failure after the combined transaction
   leaves the monotonic reservation count unchanged, leaves hashless sticky
   recovery, and requires a new completed valid no-match pass before retry;
+- `nonfinal_ambiguous_recovery_retry_continues_bounded_retries` proves that a
+  possibly-dispatched authorized retry uses the invocation's remaining budget
+  through the ordinary backoff and ambiguous-retry reservation instead of
+  returning, and
+  `ambiguous_recovery_retry_qualifies_for_a_direct_retry_on_the_next_advance`
+  proves that the new dispatch ambiguity is durable, so a later invocation
+  reserves the next POST without another tree pass;
 - attempt count never decreases, is diagnostic rather than a permanent retry
   gate, and cannot underflow or be reopened by callback ordering;
 - each lifecycle invocation enforces independent finite attempt and backoff
@@ -1152,8 +1194,9 @@ Tests cover:
   row and remains fresh delegate work;
 - a version-17 round id that cannot form a canonical identity creates no
   submission row and leaves its domain evidence untouched;
-- a hashless `Recovering` row becomes `SubmittedWithoutHash` only for code 2,
-  while another deterministic rejection preserves the ambiguity and errors;
+- a hashless `Recovering` row becomes `SubmittedWithoutHash` only for code 2
+  after unresolved dispatch, while another deterministic rejection preserves
+  the ambiguity and errors;
 - version-18 rows migrate incrementally to version 19, fresh and migrated
   schemas are equivalent, and current-schema fingerprint rejection covers
   missing columns, indexes, and triggers;

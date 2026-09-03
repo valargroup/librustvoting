@@ -175,7 +175,7 @@ where
                 fresh_reservation,
             } if fresh_reservation => {
                 self.submit_reserved_attempts(
-                    request, operation, &lease, *derived, record, recovery, control,
+                    &request, &operation, &lease, *derived, record, recovery, 0, control,
                 )
                 .await
             }
@@ -209,7 +209,7 @@ where
                         })?;
                     return self
                         .submit_reserved_attempts(
-                            request, operation, &lease, *derived, reserved, recovery, control,
+                            &request, &operation, &lease, *derived, reserved, recovery, 0, control,
                         )
                         .await;
                 }
@@ -221,19 +221,33 @@ where
         }
     }
 
+    /// Runs the bounded POST loop for a generation whose next attempt is
+    /// already durably reserved.
+    ///
+    /// `first_attempt_index` is the number of POST attempts this invocation
+    /// has already consumed; the loop runs the remaining budget. A fresh
+    /// `Submitting` reservation enters with index 0. A hashless `Recovering`
+    /// row that already carries dispatch ambiguity may enter later, after a
+    /// recovery retry was itself possibly dispatched, and continues with the
+    /// same backoff and reservation discipline as any other ambiguous retry.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the attempt loop keeps each captured authority explicit"
+    )]
     async fn submit_reserved_attempts(
         &self,
-        request: StoreAdvancementRequest,
-        operation: CapturedSubmissionOperation,
+        request: &StoreAdvancementRequest,
+        operation: &CapturedSubmissionOperation,
         lease: &SubmissionOperationLease,
         mut derived: DerivedChainSubmission,
         mut reserved: StoredChainSubmission,
         recovery: ChainRecoveryMode,
+        first_attempt_index: usize,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         let mut ambiguity_seen = is_retryable_dispatch_ambiguity(&reserved);
-        for attempt_index in 0..self.policy.maximum_post_attempts {
-            if let Some(reason) = interruption(&operation, control) {
+        for attempt_index in first_attempt_index..self.policy.maximum_post_attempts {
+            if let Some(reason) = interruption(operation, control) {
                 if ambiguity_seen {
                     return reserved.public_result();
                 }
@@ -263,7 +277,7 @@ where
                 tokio::pin!(post);
                 tokio::select! {
                     biased;
-                    reason = wait_for_interruption(&operation, control) => {
+                    reason = wait_for_interruption(operation, control) => {
                         if !dispatch.is_possible() {
                             if ambiguity_seen {
                                 return reserved.public_result();
@@ -294,8 +308,8 @@ where
                     } else {
                         return self
                             .reconcile_existing(
-                                &request,
-                                &operation,
+                                request,
+                                operation,
                                 lease,
                                 derived,
                                 record,
@@ -352,7 +366,7 @@ where
                         SubmissionObservation::PossiblyDispatched(diagnostic),
                     )?;
                     ambiguity_seen = true;
-                    if interruption(&operation, control).is_some() {
+                    if interruption(operation, control).is_some() {
                         return reserved.public_result();
                     }
                 }
@@ -401,46 +415,35 @@ where
                 }
             }
 
-            if let Some(reason) = self
-                .wait_backoff_or_interruption(
-                    self.policy.retry_backoffs[attempt_index],
-                    &operation,
-                    control,
-                )
-                .await
-            {
-                return if ambiguity_seen {
-                    reserved.public_result()
-                } else {
-                    interrupted_without_state(reason)
-                };
-            }
             if ambiguity_seen {
-                let durable_state = reserved.durable_state();
-                let now = self.clock.now_seconds().map_err(|error| {
-                    ChainSubmissionFailure::with_durable_state(
-                        error.kind(),
-                        durable_state,
-                        error.message(),
+                reserved = match self
+                    .reserve_ambiguous_retry_after_backoff(
+                        attempt_index,
+                        derived.generation(),
+                        reserved,
+                        operation,
+                        control,
                     )
-                })?;
-                reserved = self
-                    .store
-                    .reserve_ambiguous_retry(derived.generation(), now)
-                    .map_err(|error| {
-                        if error.strongest_state().is_some() {
-                            error
-                        } else {
-                            ChainSubmissionFailure::with_durable_state(
-                                error.kind(),
-                                durable_state,
-                                error.message(),
-                            )
-                        }
-                    })?;
+                    .await?
+                {
+                    AmbiguousRetryReservation::Reserved(reserved) => reserved,
+                    AmbiguousRetryReservation::Interrupted(reserved) => {
+                        return reserved.public_result()
+                    }
+                };
             } else {
+                if let Some(reason) = self
+                    .wait_backoff_or_interruption(
+                        self.policy.retry_backoffs[attempt_index],
+                        operation,
+                        control,
+                    )
+                    .await
+                {
+                    return interrupted_without_state(reason);
+                }
                 match self.store.admit(
-                    &request,
+                    request,
                     true,
                     u64::try_from(attempt_index + 2).expect("bounded attempt index fits u64"),
                     self.clock.now_seconds()?,
@@ -465,6 +468,50 @@ where
             }
         }
         unreachable!("validated attempt bound is nonzero")
+    }
+
+    /// Waits the configured backoff that follows attempt `attempt_index`, then
+    /// durably reserves the next same-generation POST for a hashless row that
+    /// already carries dispatch ambiguity.
+    ///
+    /// Interruption during the backoff leaves the row as it is; the durable
+    /// ambiguity is returned so the caller can report it.
+    async fn reserve_ambiguous_retry_after_backoff(
+        &self,
+        attempt_index: usize,
+        generation: &super::ChainSubmissionGeneration,
+        reserved: StoredChainSubmission,
+        operation: &CapturedSubmissionOperation,
+        control: &dyn SubmissionControl,
+    ) -> Result<AmbiguousRetryReservation, ChainSubmissionFailure> {
+        if self
+            .wait_backoff_or_interruption(
+                self.policy.retry_backoffs[attempt_index],
+                operation,
+                control,
+            )
+            .await
+            .is_some()
+        {
+            return Ok(AmbiguousRetryReservation::Interrupted(reserved));
+        }
+        let durable_state = reserved.durable_state();
+        let attach_state = |error: ChainSubmissionFailure| {
+            if error.strongest_state().is_some() {
+                error
+            } else {
+                ChainSubmissionFailure::with_durable_state(
+                    error.kind(),
+                    durable_state,
+                    error.message(),
+                )
+            }
+        };
+        let now = self.clock.now_seconds().map_err(attach_state)?;
+        self.store
+            .reserve_ambiguous_retry(generation, now)
+            .map(AmbiguousRetryReservation::Reserved)
+            .map_err(attach_state)
     }
 
     async fn submit_to_endpoint(
@@ -955,10 +1002,13 @@ where
                         }
                     })?;
                 self.submit_recovery_retry(
+                    request,
                     operation,
+                    lease,
                     derived,
                     reserved,
-                    post_attempts_used + 1 == self.policy.maximum_post_attempts,
+                    recovery,
+                    post_attempts_used,
                     control,
                 )
                 .await
@@ -997,18 +1047,37 @@ where
         }
     }
 
+    /// Dispatches the one POST authorized by a completed valid no-match tree
+    /// pass.
+    ///
+    /// `post_attempts_used` counts this invocation's earlier POSTs; this
+    /// attempt is final when it exhausts the configured budget. Whether a
+    /// "nullifier already spent" rejection may end the generation as
+    /// `SubmittedWithoutHash` is decided by the durable row, not by the fact
+    /// that a retry was authorized: only a row still carrying unresolved
+    /// dispatch evidence treats that rejection as proof of an earlier
+    /// submission.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the recovery retry keeps each captured authority explicit"
+    )]
     async fn submit_recovery_retry(
         &self,
+        request: &StoreAdvancementRequest,
         operation: &CapturedSubmissionOperation,
+        lease: &SubmissionOperationLease,
         derived: DerivedChainSubmission,
         reserved: StoredChainSubmission,
-        is_final_attempt: bool,
+        recovery: ChainRecoveryMode,
+        post_attempts_used: usize,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         if interruption(operation, control).is_some() {
             return reserved.public_result();
         }
-        let _in_flight = self
+        let is_final_attempt = post_attempts_used + 1 == self.policy.maximum_post_attempts;
+        let ambiguity_preceded = reserved.state().has_unresolved_dispatch();
+        let in_flight = self
             .store
             .coordination()
             .register_in_flight(derived.generation().identity())
@@ -1021,23 +1090,25 @@ where
             })?;
         let ordinal = usize::try_from(reserved.committed_post_reservations()).unwrap_or(usize::MAX);
         let endpoint_index = ordinal.saturating_sub(1) % self.protocol.endpoint_count();
-        let dispatch = ChainPostDispatch::default();
-        let post = self.submit_to_endpoint(endpoint_index, &derived, dispatch.clone());
-        tokio::pin!(post);
-        let outcome = tokio::select! {
-            biased;
-            reason = wait_for_interruption(operation, control) => {
-                if !dispatch.is_possible() {
-                    return reserved.public_result();
+        let outcome = {
+            let dispatch = ChainPostDispatch::default();
+            let post = self.submit_to_endpoint(endpoint_index, &derived, dispatch.clone());
+            tokio::pin!(post);
+            tokio::select! {
+                biased;
+                reason = wait_for_interruption(operation, control) => {
+                    if !dispatch.is_possible() {
+                        return reserved.public_result();
+                    }
+                    PostAttemptOutcome::PossiblyDispatched(
+                        ChainSubmissionDiagnostic::from_redacted_message(
+                            ChainSubmissionDiagnosticKind::AmbiguousDispatch,
+                            reason.after_dispatch_message(),
+                        ),
+                    )
                 }
-                PostAttemptOutcome::PossiblyDispatched(
-                    ChainSubmissionDiagnostic::from_redacted_message(
-                        ChainSubmissionDiagnosticKind::AmbiguousDispatch,
-                        reason.after_dispatch_message(),
-                    ),
-                )
+                outcome = &mut post => outcome,
             }
-            outcome = &mut post => outcome,
         };
         match outcome {
             PostAttemptOutcome::Accepted(candidate) => self
@@ -1046,7 +1117,7 @@ where
             PostAttemptOutcome::Rejected {
                 kind, diagnostic, ..
             } => {
-                if kind == ChainRejectionKind::NullifierAlreadySpent {
+                if ambiguity_preceded && kind == ChainRejectionKind::NullifierAlreadySpent {
                     let submitted = ChainSubmissionDiagnostic::from_redacted_message(
                         ChainSubmissionDiagnosticKind::NullifierAlreadySpent,
                         "vote chain reported nullifier already spent after ambiguous dispatch",
@@ -1058,6 +1129,11 @@ where
                         )?
                         .public_result();
                 }
+                // Without unresolved dispatch evidence a code-2 rejection is
+                // handled like any other definite rejection: the row stays
+                // `Recovering`, keeps its stored diagnostic, and the next
+                // advance may scan the tree again and confirm if the
+                // generation did land.
                 let record = self.classify_dispatched_post(
                     derived.generation(),
                     SubmissionObservation::DefiniteRejection(diagnostic.clone()),
@@ -1069,18 +1145,57 @@ where
                 ))
             }
             PostAttemptOutcome::PossiblyDispatched(diagnostic) => {
-                let observation = if is_final_attempt {
-                    SubmissionObservation::SubmittedWithoutHash(
-                        ChainSubmissionDiagnostic::from_redacted_message(
-                            ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
-                            "configured POST attempts exhausted after ambiguous dispatch",
-                        ),
+                if is_final_attempt {
+                    let exhausted = ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
+                        "configured POST attempts exhausted after ambiguous dispatch",
+                    );
+                    return self
+                        .classify_dispatched_post(
+                            derived.generation(),
+                            SubmissionObservation::SubmittedWithoutHash(exhausted),
+                        )?
+                        .public_result();
+                }
+                // The row now durably carries this attempt's dispatch
+                // ambiguity, so the remaining budget continues through the
+                // ordinary ambiguous-retry loop rather than ending here.
+                let reserved = self.classify_dispatched_post(
+                    derived.generation(),
+                    SubmissionObservation::PossiblyDispatched(diagnostic),
+                )?;
+                drop(in_flight);
+                if interruption(operation, control).is_some() {
+                    return reserved.public_result();
+                }
+                let reserved = match self
+                    .reserve_ambiguous_retry_after_backoff(
+                        post_attempts_used,
+                        derived.generation(),
+                        reserved,
+                        operation,
+                        control,
                     )
-                } else {
-                    SubmissionObservation::PossiblyDispatched(diagnostic)
+                    .await?
+                {
+                    AmbiguousRetryReservation::Reserved(reserved) => reserved,
+                    AmbiguousRetryReservation::Interrupted(reserved) => {
+                        return reserved.public_result()
+                    }
                 };
-                self.classify_dispatched_post(derived.generation(), observation)?
-                    .public_result()
+                // Boxed: the attempt loop can reach recovery again through
+                // reconciliation, so this edge closes an async cycle.
+                Box::pin(self.submit_reserved_attempts(
+                    request,
+                    operation,
+                    lease,
+                    derived,
+                    reserved,
+                    recovery,
+                    post_attempts_used + 1,
+                    control,
+                ))
+                .await
             }
             PostAttemptOutcome::DefinitelyUnsent(error) => {
                 self.reconcile_with_durable_state(
@@ -1315,6 +1430,14 @@ fn interrupted_without_state(
             "host operation epoch changed before request dispatch",
         )),
     }
+}
+
+/// Outcome of waiting out a backoff and reserving the next ambiguous retry.
+enum AmbiguousRetryReservation {
+    /// The next same-generation POST is durably reserved.
+    Reserved(StoredChainSubmission),
+    /// The host interrupted the backoff; the row is unchanged.
+    Interrupted(StoredChainSubmission),
 }
 
 fn is_retryable_dispatch_ambiguity(record: &StoredChainSubmission) -> bool {

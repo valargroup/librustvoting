@@ -45,6 +45,37 @@ impl SubmissionRecordState {
         )
     }
 
+    /// True while the durable row still carries evidence that this generation
+    /// may already be on chain with an unknown outcome.
+    ///
+    /// The stored diagnostic is the durable carrier. It is set when the row
+    /// enters `Recovering` and replaced only by a later observation that is
+    /// itself dispatch evidence, so it survives restarts:
+    ///
+    /// - `AmbiguousDispatch` and `InvalidProtocolResponse` record a POST whose
+    ///   delivery or response was lost;
+    /// - `TrackingWindowExpired` records an accepted hash that never resolved.
+    ///
+    /// `ChainRejected` records a definite outcome: a rejected POST or a
+    /// candidate that committed unsuccessfully. Neither spent this
+    /// generation's nullifiers, so a later "nullifier already spent" rejection
+    /// is not evidence that this generation was submitted and must not become
+    /// terminal `SubmittedWithoutHash`.
+    pub(super) fn has_unresolved_dispatch(&self) -> bool {
+        matches!(
+            self,
+            Self::Recovering {
+                ambiguity_diagnostic,
+                ..
+            } if matches!(
+                ambiguity_diagnostic.kind(),
+                ChainSubmissionDiagnosticKind::AmbiguousDispatch
+                    | ChainSubmissionDiagnosticKind::InvalidProtocolResponse
+                    | ChainSubmissionDiagnosticKind::TrackingWindowExpired
+            )
+        )
+    }
+
     pub(super) fn durable_state(&self) -> ChainSubmissionState {
         match self {
             Self::Submitting => ChainSubmissionState::Submitting,
@@ -170,6 +201,22 @@ pub(super) fn apply_submission_observation(
                 ambiguity_diagnostic,
             }))
         }
+        // A retry that is itself possibly dispatched replaces the stored
+        // diagnostic: the row now carries fresh dispatch ambiguity, which
+        // qualifies the next same-generation POST for a direct ambiguous
+        // retry instead of another full tree pass.
+        (
+            Some(State::Recovering {
+                candidate_transaction_hash: None,
+                ..
+            }),
+            Observation::PossiblyDispatched(diagnostic),
+        ) => Ok(Some(State::Recovering {
+            candidate_transaction_hash: None,
+            ambiguity_diagnostic: diagnostic,
+        })),
+        // A definite rejection after earlier ambiguity preserves that
+        // ambiguity; the rejection is surfaced to the caller, not stored.
         (
             Some(state @ State::Recovering { .. }),
             Observation::ContinueRecovery
@@ -186,15 +233,18 @@ pub(super) fn apply_submission_observation(
             ),
             Observation::CandidatePending,
         ) => Ok(Some(state)),
+        // The candidate resolved definitively, so the row no longer carries
+        // unresolved dispatch evidence; the committed-failure diagnostic
+        // replaces the earlier ambiguity exactly as it does from `Tracking`.
         (
             Some(State::Recovering {
                 candidate_transaction_hash: Some(_),
-                ambiguity_diagnostic,
+                ..
             }),
-            Observation::CandidateCommittedFailure(_),
+            Observation::CandidateCommittedFailure(diagnostic),
         ) => Ok(Some(State::Recovering {
             candidate_transaction_hash: None,
-            ambiguity_diagnostic,
+            ambiguity_diagnostic: diagnostic,
         })),
         (
             Some(State::Recovering {
@@ -294,10 +344,14 @@ mod tests {
     }
 
     fn diagnostic(message: &str) -> ChainSubmissionDiagnostic {
-        ChainSubmissionDiagnostic::from_redacted_message(
-            ChainSubmissionDiagnosticKind::AmbiguousDispatch,
-            message,
-        )
+        diagnostic_of(ChainSubmissionDiagnosticKind::AmbiguousDispatch, message)
+    }
+
+    fn diagnostic_of(
+        kind: ChainSubmissionDiagnosticKind,
+        message: &str,
+    ) -> ChainSubmissionDiagnostic {
+        ChainSubmissionDiagnostic::from_redacted_message(kind, message)
     }
 
     fn hash_confirmation(hash: CandidateTransactionHash) -> ValidatedChainSubmissionConfirmation {
@@ -403,7 +457,10 @@ mod tests {
 
     #[test]
     fn committed_failure_moves_tracking_to_recovery_and_clears_recovery_candidates() {
-        let committed_failure = diagnostic("transaction committed unsuccessfully");
+        let committed_failure = diagnostic_of(
+            ChainSubmissionDiagnosticKind::ChainRejected,
+            "transaction committed unsuccessfully",
+        );
         let tracking = Some(SubmissionRecordState::Tracking {
             candidate_transaction_hash: candidate(4),
         });
@@ -422,17 +479,84 @@ mod tests {
             candidate_transaction_hash: Some(candidate(4)),
             ambiguity_diagnostic: diagnostic("original ambiguity"),
         });
-        let original_ambiguity = diagnostic("original ambiguity");
+        let cleared = apply(
+            recovering,
+            SubmissionObservation::CandidateCommittedFailure(committed_failure.clone()),
+        );
         assert_eq!(
-            apply(
-                recovering,
-                SubmissionObservation::CandidateCommittedFailure(committed_failure)
-            ),
+            cleared,
             Some(SubmissionRecordState::Recovering {
                 candidate_transaction_hash: None,
-                ambiguity_diagnostic: original_ambiguity,
+                ambiguity_diagnostic: committed_failure,
             })
         );
+        assert!(!cleared.unwrap().has_unresolved_dispatch());
+    }
+
+    #[test]
+    fn possible_dispatch_on_hashless_recovery_carries_the_new_ambiguity() {
+        let expired = diagnostic_of(
+            ChainSubmissionDiagnosticKind::TrackingWindowExpired,
+            "tracking window expired",
+        );
+        let retried = diagnostic("retry response was lost");
+        let hashless = Some(SubmissionRecordState::Recovering {
+            candidate_transaction_hash: None,
+            ambiguity_diagnostic: expired.clone(),
+        });
+        assert!(!hashless.as_ref().unwrap().permits_ambiguous_retry());
+
+        let after_retry = apply(
+            hashless,
+            SubmissionObservation::PossiblyDispatched(retried.clone()),
+        );
+        assert_eq!(
+            after_retry,
+            Some(SubmissionRecordState::Recovering {
+                candidate_transaction_hash: None,
+                ambiguity_diagnostic: retried.clone(),
+            })
+        );
+        assert!(after_retry.unwrap().permits_ambiguous_retry());
+
+        let with_candidate = Some(SubmissionRecordState::Recovering {
+            candidate_transaction_hash: Some(candidate(5)),
+            ambiguity_diagnostic: expired.clone(),
+        });
+        assert_eq!(
+            apply(
+                with_candidate.clone(),
+                SubmissionObservation::PossiblyDispatched(retried)
+            ),
+            with_candidate
+        );
+    }
+
+    #[test]
+    fn unresolved_dispatch_follows_the_stored_diagnostic_kind() {
+        let recovering = |kind| SubmissionRecordState::Recovering {
+            candidate_transaction_hash: None,
+            ambiguity_diagnostic: diagnostic_of(kind, "stored"),
+        };
+        for kind in [
+            ChainSubmissionDiagnosticKind::AmbiguousDispatch,
+            ChainSubmissionDiagnosticKind::InvalidProtocolResponse,
+            ChainSubmissionDiagnosticKind::TrackingWindowExpired,
+        ] {
+            assert!(recovering(kind).has_unresolved_dispatch(), "{kind:?}");
+        }
+        for kind in [
+            ChainSubmissionDiagnosticKind::ChainRejected,
+            ChainSubmissionDiagnosticKind::ReconciliationPending,
+            ChainSubmissionDiagnosticKind::StorageFailure,
+        ] {
+            assert!(!recovering(kind).has_unresolved_dispatch(), "{kind:?}");
+        }
+        assert!(!SubmissionRecordState::Submitting.has_unresolved_dispatch());
+        assert!(!SubmissionRecordState::Tracking {
+            candidate_transaction_hash: candidate(1),
+        }
+        .has_unresolved_dispatch());
     }
 
     #[test]

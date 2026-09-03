@@ -285,6 +285,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             self.timing.post_timeout,
         );
 
+        let dispatch_marker = dispatch.clone();
         let response = tokio::time::timeout(
             self.timing.post_timeout,
             self.transport
@@ -292,6 +293,14 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         )
         .await;
         match response {
+            // This deadline is enforced here, not by the transport. While the
+            // dispatch marker is clear no request bytes reached a network
+            // stack, so the attempt is definitely unsent rather than ambiguous.
+            Err(_) if !dispatch_marker.is_possible() => {
+                PostAttemptOutcome::DefinitelyUnsent(ChainTransportError::definitely_unsent(
+                    "vote-chain submission timed out before the transport released the request",
+                ))
+            }
             Err(_) => PostAttemptOutcome::PossiblyDispatched(
                 ChainSubmissionDiagnostic::from_redacted_message(
                     ChainSubmissionDiagnosticKind::AmbiguousDispatch,
