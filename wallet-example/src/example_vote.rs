@@ -3,12 +3,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use zcash_voting::prelude::{
     commit_atomic_vote_batch, commit_batch, sync_vote_tree, track_pending_shares, van_witness,
-    AdvanceVote, ChainSubmissionClient, ChainSubmissionClientConfig, ChainSubmissionControl,
-    ChainSubmissionResult, CommittedVote, DraftVote, HelperClient, HelperFleetPreflight,
-    NoopProgressReporter, ShareBatchDeliveryReport, ShareDeliveryPlan, ShareDeliveryPlanningParams,
-    ShareDeliverySubmissionParams, ShareTimingPolicy, ShareTrackingParams, ShareTrackingReport,
-    SignedVoteBatch, SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteSigner, VotingDb,
-    VotingHotkey,
+    AdvanceVote, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
+    ChainSubmissionControl, ChainSubmissionResult, CommittedVote, DraftVote, HelperClient,
+    HelperFleetPreflight, NoopProgressReporter, ShareBatchDeliveryReport, ShareDeliveryPlan,
+    ShareDeliveryPlanningParams, ShareDeliverySubmissionParams, ShareTimingPolicy,
+    ShareTrackingParams, ShareTrackingReport, SignedVoteBatch, SignedVoteCommitment,
+    SignedVoteCommitments, VanWitness, VoteSigner, VotingDb, VotingHotkey,
 };
 
 /// Inputs for deriving a Merkle witness for one confirmed delegation bundle.
@@ -308,8 +308,11 @@ pub async fn track_committed_vote_shares(
 /// - [`ChainSubmissionResult::Rejected`] for a deterministic chain rejection, or
 /// - [`ChainSubmissionResult::Cancelled`] when cancellation preceded dispatch.
 ///
-/// Call this in a loop that re-invokes on `Pending`. Helper-share delivery is
-/// separate: plan with [`prepare_committed_vote_shares`] and send through
+/// Call this in a loop that re-invokes on `Pending`. Exact-tree recovery is
+/// harmless before the lifecycle reaches `Recovering` and lets the same loop
+/// resolve a hashless recovery instead of returning it unchanged forever.
+/// Helper-share delivery is separate: plan with
+/// [`prepare_committed_vote_shares`] and send through
 /// [`submit_committed_vote_shares`] after the vote confirms.
 pub async fn advance_committed_vote(
     voting_db: Arc<VotingDb>,
@@ -320,12 +323,13 @@ pub async fn advance_committed_vote(
     let client = ChainSubmissionClient::new(voting_db, config)
         .map_err(|failure| anyhow::anyhow!("build chain submission client: {failure}"))?;
     client
-        .advance_vote(
+        .advance_vote_with_recovery(
             AdvanceVote {
                 vote_round_id: request.vote_round_id,
                 bundle_index: request.bundle_index,
                 proposal_id: request.proposal_id,
             },
+            ChainRecoveryMode::ExactTree,
             control,
         )
         .await

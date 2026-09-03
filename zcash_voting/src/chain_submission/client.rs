@@ -295,6 +295,11 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// A non-cancelled result represents the authoritative durable outcome
     /// reported by [`ChainSubmissionResult::durable_state`].
     ///
+    /// This status-only entry point cannot resolve a hashless `Recovering`
+    /// generation. Execute a local `NextStep::AdvanceDelegation` through
+    /// [`Self::advance_delegation_with_recovery`] with
+    /// [`ChainRecoveryMode::ExactTree`].
+    ///
     /// # Errors
     ///
     /// Returns a failure for invalid identity or prepared state, invariant or
@@ -360,6 +365,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// after candidate-first reconciliation is inconclusive, scan one fixed
     /// complete tree snapshot and atomically confirm an exact unique layout or
     /// authorize one same-generation retry within this call's attempt budget.
+    /// Use that mode when executing a local `NextStep::AdvanceDelegation`.
     ///
     /// # Errors
     ///
@@ -395,6 +401,11 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// commitment tree. A non-cancelled result represents the authoritative
     /// durable outcome reported by [`ChainSubmissionResult::durable_state`].
     ///
+    /// This status-only entry point cannot resolve a hashless `Recovering`
+    /// generation. Execute `NextStep::AdvanceVote` through
+    /// [`Self::advance_vote_with_recovery`] with
+    /// [`ChainRecoveryMode::ExactTree`].
+    ///
     /// # Errors
     ///
     /// Returns a failure for invalid identity or prepared state, invariant or
@@ -425,6 +436,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// candidate-first reconciliation is inconclusive, scan one fixed complete
     /// tree snapshot and atomically confirm an exact unique layout or authorize
     /// one same-generation retry within this call's attempt budget.
+    /// Use that mode when executing `NextStep::AdvanceVote`.
     ///
     /// # Errors
     ///
@@ -460,6 +472,11 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// the authoritative durable outcome reported by
     /// [`ChainSubmissionResult::durable_state`].
     ///
+    /// This status-only entry point cannot resolve a hashless `Recovering`
+    /// generation. Execute `NextStep::AdvanceVoteBatch` through
+    /// [`Self::advance_vote_batch_with_recovery`] with
+    /// [`ChainRecoveryMode::ExactTree`].
+    ///
     /// # Errors
     ///
     /// Returns a failure for invalid identity, roster, digest, or prepared
@@ -486,6 +503,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// tree snapshot and atomically confirm only the unique exact ordered batch
     /// layout or authorize one same-generation retry within this call's attempt
     /// budget.
+    /// Use `ExactTree` when executing `NextStep::AdvanceVoteBatch`.
     ///
     /// # Errors
     ///

@@ -102,11 +102,14 @@ stage-oriented API:
   after restart to decide whether to delegate, poll delegation/vote
   transactions, cast remaining votes, or confirm helper shares.
   `CastVote` steps include the recorded choice. `AdvanceVote` resumes one
-  singleton through `ChainSubmissionClient::advance_vote`, and
+  singleton through `ChainSubmissionClient::advance_vote_with_recovery` with
+  `ChainRecoveryMode::ExactTree`, and
   `AdvanceVoteBatch` identifies the first ordered action as a recovery anchor
-  for `ChainSubmissionClient::advance_vote_batch`. The lifecycle owns dispatch,
-  polling, recovery, and confirmation, so submitting and polling are one step
-  and one host call. Steps derive from the authoritative `chain_submissions`
+  for `ChainSubmissionClient::advance_vote_batch_with_recovery` in the same
+  mode. `AdvanceDelegation` likewise uses
+  `advance_delegation_with_recovery(..., ExactTree, ...)`. The lifecycle owns
+  dispatch, polling, recovery, and confirmation, so submitting and polling are
+  one step and one host call. Steps derive from the authoritative `chain_submissions`
   row, so a generation that is `Submitting`, `Tracking`, or `Recovering` yields
   an advance step and never a second submission. Read the plan's derived
   booleans (`needs_delegation_signing`, `has_in_flight_delegation`,
@@ -170,10 +173,12 @@ custody provider integrations.
 - Replace wallet-local chain submission with `ChainSubmissionClient`. The SDK
   owns endpoint construction, request encoding, timeouts, retry eligibility,
   polling, exact commitment-tree recovery, and confirmation; hosts supply a
-  `ChainTransport`, scheduling, and cancellation. Each `advance_delegation`,
-  `advance_imported_delegation`, `advance_vote`, or `advance_vote_batch` call
-  performs one bounded pass and returns `Confirmed`, `Pending`, `Rejected`, or
-  `Cancelled`. The version-17
+  `ChainTransport`, scheduling, and cancellation. Plain `advance_delegation`,
+  `advance_vote`, and `advance_vote_batch` calls are status-only; execute the
+  matching local `resume_plan` steps through their `*_with_recovery` methods
+  with `ChainRecoveryMode::ExactTree`. Imported delegation advancement remains
+  poll-only. Each call performs one bounded pass and returns `Confirmed`,
+  `Pending`, `Rejected`, or `Cancelled`. The version-17
   APIs that let callers record transaction hashes, VAN or vote-commitment
   positions, or apply their own parsed chain events have been removed.
 - Use `vote::commit` for one singleton. The existing `vote::commit_batch`
@@ -182,7 +187,8 @@ custody provider integrations.
   transaction. The distinct `SignedVoteCommitments` and `SignedVoteBatch`
   result types keep the singleton and atomic submission endpoints separate.
   Use `vote::CommittedVote::recover` to reload a committed vote and
-  `ChainSubmissionClient::advance_vote` for the singleton chain lifecycle.
+  `ChainSubmissionClient::advance_vote_with_recovery` with
+  `ChainRecoveryMode::ExactTree` for its resumable chain lifecycle.
   Wallets should not write recovery JSON, submission flags, or vote commitment
   positions directly.
 
