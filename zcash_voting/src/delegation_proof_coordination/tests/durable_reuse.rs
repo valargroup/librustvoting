@@ -1,0 +1,142 @@
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier, Condvar, Mutex,
+    },
+    thread,
+};
+
+use crate::{
+    delegate::{ensure_proof, DelegationProgress, DelegationProofStatus},
+    types::DelegationProgressBridge,
+    Network, VotingError,
+};
+
+use super::{
+    super::{coordinate, DelegationProofIdentity},
+    fixtures::{
+        db_with_persisted_proofs, keys, note, pir_client, ROUND_ID, WALLET_A, WALLET_A_PROOF_BYTE,
+        WALLET_B,
+    },
+};
+
+#[test]
+fn reused_proof_rejects_mismatched_notes() {
+    let db = db_with_persisted_proofs();
+    let mut mismatched_note = note();
+    mismatched_note.commitment[0] ^= 1;
+
+    let error = ensure_proof(
+        &db,
+        ROUND_ID,
+        0,
+        &[mismatched_note],
+        &keys(Network::Testnet, 1),
+        &pir_client(),
+        &crate::types::NoopProgressReporter,
+    )
+    .expect_err("a persisted proof must not bypass bundle-note validation");
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("note identity mismatch at index 0"),
+        "{error}"
+    );
+}
+
+#[test]
+fn reused_proof_rejects_mismatched_keys() {
+    let db = db_with_persisted_proofs();
+    let selected_note = note();
+
+    for (mismatched_keys, expected_message) in [
+        (
+            keys(Network::Mainnet, 1),
+            "delegation keys network Mainnet does not match stored round network Testnet",
+        ),
+        (
+            keys(Network::Testnet, 2),
+            "voting target round does not match delegation round",
+        ),
+    ] {
+        let error = ensure_proof(
+            &db,
+            ROUND_ID,
+            0,
+            std::slice::from_ref(&selected_note),
+            &mismatched_keys,
+            &pir_client(),
+            &crate::types::NoopProgressReporter,
+        )
+        .expect_err("a persisted proof must not bypass delegation-key validation");
+
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(expected_message), "{error}");
+    }
+}
+
+#[test]
+fn wallet_switch_does_not_retarget_waiting_proof() {
+    let db = Arc::new(db_with_persisted_proofs());
+    let leader_started = Arc::new(Barrier::new(2));
+    let release_leader = Arc::new((Mutex::new(false), Condvar::new()));
+
+    let leader = {
+        let leader_started = Arc::clone(&leader_started);
+        let release_leader = Arc::clone(&release_leader);
+        thread::spawn(move || {
+            coordinate(
+                DelegationProofIdentity::new(WALLET_A.to_string(), ROUND_ID, 0),
+                || {},
+                |_| {
+                    leader_started.wait();
+                    let (released, wake) = &*release_leader;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                },
+            );
+        })
+    };
+    leader_started.wait();
+
+    let wallet_switched = Arc::new(AtomicBool::new(false));
+    let follower = {
+        let db = Arc::clone(&db);
+        let wallet_switched = Arc::clone(&wallet_switched);
+        thread::spawn(move || {
+            let progress_db = Arc::clone(&db);
+            let progress = DelegationProgressBridge::new(move |event| {
+                if event == DelegationProgress::WaitingForExistingProof {
+                    progress_db.set_wallet_id(WALLET_B);
+                    wallet_switched.store(true, Ordering::SeqCst);
+                }
+            });
+            ensure_proof(
+                &db,
+                ROUND_ID,
+                0,
+                &[note()],
+                &keys(Network::Testnet, 1),
+                &pir_client(),
+                &progress,
+            )
+        })
+    };
+
+    while !wallet_switched.load(Ordering::SeqCst) {
+        thread::yield_now();
+    }
+    let (released, wake) = &*release_leader;
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+
+    leader.join().unwrap();
+    let completion = follower.join().unwrap().unwrap();
+    assert_eq!(completion.status, DelegationProofStatus::Reused);
+    assert_eq!(completion.proof.bytes, vec![WALLET_A_PROOF_BYTE; 96]);
+    assert_eq!(db.wallet_id(), WALLET_B);
+}

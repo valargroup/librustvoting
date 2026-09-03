@@ -113,6 +113,14 @@ may retry from durable state. Different bundle identities remain independent
 and may prove or advance concurrently. This coordination changes neither the
 submission identity nor its generation digest, and it creates no durable
 in-flight state of its own.
+The delegation facade is the only public durable proof-generation workflow;
+the database-level generator is crate-private and cannot bypass coordination.
+The wallet is captured before lock admission and remains authoritative for
+input validation, persisted-proof loading, PIR cache access, generation, and
+proof persistence even if the host changes the database's selected wallet
+while the operation is waiting or running. Supplied bundle notes and delegation
+keys are validated against that captured wallet before any persisted proof is
+accepted for reuse.
 
 ## Identity and semantic generation
 
@@ -1239,6 +1247,8 @@ Tests cover:
 - concurrent work cannot reserve two generations for one identity;
 - concurrent producers generate at most one delegation proof for one
   wallet/round/bundle while distinct bundles remain parallel;
+- reused delegation proofs still reject mismatched notes or keys, and an
+  account switch cannot retarget a waiting proof operation or its PIR cache;
 - bundle locking prevents two successors from consuming the same VAN;
 - a confirmed vote or batch refuses a later delegation reservation for its
   bundle before derivation or dispatch;
@@ -1324,7 +1334,11 @@ chain-event vocabulary, and the raw storage writers.
 Delegation proof coordination is anchored by
 `identical_proof_work_waits_and_reuses_durable_completion`,
 `different_bundles_enter_proof_work_concurrently`, and
-`failed_leader_releases_the_waiting_retry`.
+`failed_leader_releases_the_waiting_retry`. Durable reuse and wallet capture
+are anchored by `reused_proof_rejects_mismatched_notes`,
+`reused_proof_rejects_mismatched_keys`,
+`wallet_switch_does_not_retarget_waiting_proof`, and
+`pir_fetch_persists_under_captured_wallet`.
 
 These tests are the review contract for changes to chain submission behavior.
 

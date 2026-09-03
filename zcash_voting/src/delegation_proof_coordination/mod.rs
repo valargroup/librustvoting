@@ -24,6 +24,18 @@ impl DelegationProofIdentity {
             bundle_index,
         }
     }
+
+    pub(super) fn wallet_id(&self) -> &str {
+        &self.wallet_id
+    }
+
+    pub(super) fn round_id(&self) -> &str {
+        &self.round_id
+    }
+
+    pub(super) fn bundle_index(&self) -> u32 {
+        self.bundle_index
+    }
 }
 
 type ProofLockRegistry = Mutex<HashMap<DelegationProofIdentity, Weak<Mutex<()>>>>;
@@ -38,7 +50,7 @@ static DELEGATION_PROOF_LOCKS: OnceLock<ProofLockRegistry> = OnceLock::new();
 pub(super) fn coordinate<T>(
     identity: DelegationProofIdentity,
     on_wait: impl FnOnce(),
-    operation: impl FnOnce() -> T,
+    operation: impl FnOnce(&DelegationProofIdentity) -> T,
 ) -> T {
     let proof_lock = proof_lock_for(&identity);
     let proof_guard = match proof_lock.try_lock() {
@@ -52,7 +64,7 @@ pub(super) fn coordinate<T>(
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
     };
 
-    let output = operation();
+    let output = operation(&identity);
     drop(proof_guard);
     remove_unused_lock(&identity, &proof_lock);
     output

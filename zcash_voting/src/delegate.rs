@@ -3,6 +3,15 @@
 //! The functions in this module are the stable wallet-facing delegation flow:
 //! build a governance PCZT, precompute proof inputs, prove delegation, assemble
 //! chain submission data, and record chain recovery data.
+//!
+//! Proof generation must pass through [`ensure_proof`] (or a prepared bundle's
+//! equivalent) so process-local coordination, input validation, and wallet
+//! capture cannot be bypassed. The former database-level prover is therefore
+//! not part of the public surface:
+//!
+//! ```compile_fail
+//! let _ = zcash_voting::round::VotingDb::build_and_prove_delegation;
+//! ```
 
 #[allow(unused_imports)]
 pub(crate) use crate::backend::{
@@ -25,6 +34,7 @@ use crate::selection::{
     GatherDelegationWalletForTargetParams,
 };
 use crate::{
+    delegation_proof_coordination::DelegationProofIdentity,
     governance::BUNDLE_NOTE_SLOTS,
     precompute::PirPrecomputeReport,
     round::{BundleLayout, RoundParams, VotingDb},
@@ -1162,7 +1172,7 @@ pub fn signing_request(
     db.get_delegation_signing_request(round_id, bundle_index, keys)
 }
 
-/// Generates and persists the delegation proof for one bundle.
+/// Generates or reuses the durable delegation proof for one bundle.
 ///
 /// Witnesses and PIR proof precompute data must already be present. The proof
 /// result is checked against PCZT-derived public fields before persistence.
@@ -1198,16 +1208,14 @@ pub fn ensure_proof(
     pir_client: &pir_client::PirClientBlocking,
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProofCompletion, VotingError> {
-    let identity = crate::delegation_proof_coordination::DelegationProofIdentity::new(
-        db.wallet_id(),
-        round_id,
-        bundle_index,
-    );
+    let identity = DelegationProofIdentity::new(db.wallet_id(), round_id, bundle_index);
     crate::delegation_proof_coordination::coordinate(
         identity,
         || stages.on_progress(DelegationProgress::WaitingForExistingProof),
-        || {
-            if let Some(proof) = load_persisted_proof(db, round_id, bundle_index)? {
+        |identity| {
+            db.validate_delegation_proof_inputs(identity, notes, keys)?;
+
+            if let Some(proof) = load_persisted_proof(db, identity)? {
                 stages.on_progress(DelegationProgress::ProofComplete);
                 return Ok(DelegationProofCompletion {
                     proof,
@@ -1215,19 +1223,19 @@ pub fn ensure_proof(
                 });
             }
 
-            generate_and_persist_proof(db, round_id, bundle_index, notes, keys, pir_client, stages)
-                .map(|proof| DelegationProofCompletion {
+            generate_and_persist_proof(db, identity, notes, keys, pir_client, stages).map(|proof| {
+                DelegationProofCompletion {
                     proof,
                     status: DelegationProofStatus::Generated,
-                })
+                }
+            })
         },
     )
 }
 
 fn generate_and_persist_proof(
     db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
+    identity: &DelegationProofIdentity,
     notes: &[NoteInfo],
     keys: &DelegationKeys,
     pir_client: &pir_client::PirClientBlocking,
@@ -1235,7 +1243,7 @@ fn generate_and_persist_proof(
 ) -> Result<DelegationProof, VotingError> {
     stages.on_progress(DelegationProgress::ProofStarting);
     let proof =
-        db.build_and_prove_delegation(round_id, bundle_index, notes, keys, pir_client, stages)?;
+        db.generate_and_persist_delegation_proof(identity, notes, keys, pir_client, stages)?;
     stages.on_progress(DelegationProgress::ProofComplete);
 
     Ok(DelegationProof {
@@ -1250,11 +1258,14 @@ fn generate_and_persist_proof(
 
 fn load_persisted_proof(
     db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
+    identity: &DelegationProofIdentity,
 ) -> Result<Option<DelegationProof>, VotingError> {
     if !matches!(
-        db.delegation_phase(round_id, bundle_index)?,
+        db.delegation_phase_for_wallet(
+            identity.wallet_id(),
+            identity.round_id(),
+            identity.bundle_index(),
+        )?,
         DelegationPhase::Proved
             | DelegationPhase::Submitted
             | DelegationPhase::SubmissionManaged
@@ -1264,13 +1275,12 @@ fn load_persisted_proof(
         return Ok(None);
     }
 
-    let wallet_id = db.wallet_id();
     let conn = db.conn();
     let stored = crate::storage::queries::load_delegation_submission_data(
         &conn,
-        round_id,
-        &wallet_id,
-        bundle_index,
+        identity.round_id(),
+        identity.wallet_id(),
+        identity.bundle_index(),
     )?;
     Ok(Some(DelegationProof {
         bytes: stored.proof,
