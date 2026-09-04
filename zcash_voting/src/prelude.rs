@@ -4,20 +4,30 @@
 //! prelude intentionally contains the setup, precompute, and delegation types
 //! needed by mobile SDK boundaries without exposing proof-circuit internals.
 
-pub use crate::confirmation::{
-    confirm_delegation_submission, confirm_vote_batch_submission, confirm_vote_submission,
-    DelegationConfirmation, TxEvent, TxEventAttribute, VoteBatchConfirmation, VoteConfirmation,
+pub use crate::chain_submission::{
+    AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainAdvanceOutcome,
+    ChainAdvancePolicy, ChainAdvanceRequest, ChainHttpRequest, ChainHttpResponse,
+    ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
+    ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
+    ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
+    ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,
+    ChainSubmissionFailureState, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
+    ChainSubmissionIdentity, ChainSubmissionIdentityError, ChainSubmissionPending,
+    ChainSubmissionResult, ChainSubmissionState, ChainSubmissionStateEvidence,
+    ChainSubmissionTarget, ChainTransport, ChainTransportError, ChainTransportFailureKind,
+    ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
+
 pub use crate::delegate::gather_delegation_lwd_inputs;
 pub use crate::delegate::LightwalletdBranchIdProvider;
 pub use crate::delegate::{
-    branch_id_for_height, display_memo, load_account_keys, pczt_sighash, record_submission,
-    record_van_position, setup as setup_delegation, signing_request as delegation_signing_request,
-    spend_auth_signature, submission as delegation_submission, BranchIdProvider,
+    branch_id_for_height, display_memo, load_account_keys, pczt_sighash, setup as setup_delegation,
+    signing_request as delegation_signing_request, spend_auth_signature, BranchIdProvider,
     DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProgress, DelegationProof,
-    DelegationProofOutcome, DelegationSetup, DelegationSetupOutcome, DelegationSigner,
-    DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
-    PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
+    DelegationProofCompletion, DelegationProofStatus, DelegationSetup, DelegationSigningRequest,
+    DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, PreparedSigner,
+    SignedDelegationBundle,
 };
 pub use crate::delegate::{
     prepare_delegation_bundle, prepare_delegation_bundle_for_target,
@@ -30,7 +40,14 @@ pub use crate::delegation_capability::{
     ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
-pub use crate::error::VotingError;
+pub use crate::delegation_pipeline::{
+    start_proving_cache_warmup, DelegationDriver, DelegationPipeline, DelegationSigner,
+    KeystoneSignatureSource, SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport,
+    WalletDbOpener,
+};
+pub use crate::error::{
+    DelegationSetupField, VotingError, VotingErrorKind, VotingErrorKindView, VotingErrorView,
+};
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
@@ -56,6 +73,7 @@ pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
 pub use crate::pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, select_pir_endpoint, PirEndpoint,
 };
+pub use crate::pir::{PirFleet, PirProofSource, PirSession};
 pub use crate::precompute::{
     note_witnesses, precompute_pir_proofs, precompute_snapshot_bundles, stored_note_witnesses,
     validate_cached_pir_proofs, verify_witness, PirPrecomputeReport,
@@ -104,15 +122,23 @@ pub use crate::types::{
 pub use crate::vote::{
     commit as commit_vote, commit_atomic_vote_batch, commit_batch, parse_recovery,
     persist_prepared_atomic_vote_batch, persist_prepared_commit, persist_prepared_commit_batch,
-    prepare_atomic_vote_batch, prepare_commit, prepare_commit_batch,
-    record_batch_submission as record_vote_batch_submission,
-    record_submission as record_vote_submission, record_vc_position, recover_atomic_vote_batch,
-    recover_signed_commitments, recovery_bundle, serialize_recovery, submission as vote_submission,
-    validate_draft_vote, validate_draft_votes, AtomicVoteBatch, CommittedVote, DraftVote,
-    PreparedAtomicVoteBatch, PreparedVoteCommit, PreparedVoteCommitments, SignedVoteBatch,
-    SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteBatchRecovery, VoteCommit,
-    VoteCommitBatch, VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
+    prepare_atomic_vote_batch, prepare_commit, prepare_commit_batch, recover_atomic_vote_batch,
+    recover_signed_commitments, recovery_bundle, serialize_recovery, validate_draft_vote,
+    validate_draft_votes, AtomicVoteBatch, CommittedVote, DraftVote, PreparedAtomicVoteBatch,
+    PreparedVoteCommit, PreparedVoteCommitments, SignedVoteBatch, SignedVoteCommitment,
+    SignedVoteCommitments, VanWitness, VoteBatchRecovery, VoteCommit, VoteCommitBatch,
+    VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
     DEFAULT_BATCH_PROOF_CONCURRENCY, MAX_VOTE_BATCH_ACTIONS,
+};
+pub use crate::vote::{
+    persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
+    PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
+};
+pub use crate::vote_work::{
+    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter, ProposalRosterEntry,
+    RoundBinding, RoundExecutor, RoundHostContext, RoundStepDisposition, RoundStepFailure,
+    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge,
+    RoundStepProgressReporter, VoteRecoveryKey, VoteShareDeliveryReport,
 };
 pub use crate::wire::{
     DelegationSubmissionWire, SignedVoteBatchView, VoteCommitmentBatchWire, VoteCommitmentWire,

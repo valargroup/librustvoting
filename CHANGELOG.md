@@ -6,28 +6,677 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+This release is `zcash_voting` 4.0.0.
+
 ### Added
 
-- Added crate-owned delegation proof reuse through
-  `DelegationPhase::has_persisted_proof`,
-  `VotingDb::has_persisted_delegation_proof`, and
-  `PreparedDelegationBundle::{ensure_setup, ensure_proof}`. The lifecycle also
-  persists the exact finalized PCZT with its write-once signing fields, so a
-  Keystone request can be reloaded after background proving or process restart.
-  Wallets retain PIR transport and retry ownership without recreating the
-  durable phase state machine.
+- Persist exact delegation PCZTs for Keystone ZKP1 warmup and signing after
+  restart. Repeated signing requests reuse the original transaction and
+  validate its notes, target, sighash, and randomized key. Schema 21 adds
+  nullable PCZT storage without changing existing state; legacy requests
+  without the original PCZT return `DelegationReconciliationRequired`.
+  Target validation reconstructs the output note with the action spend
+  nullifier, matching the transaction builder. Schema 22 reconciles legacy
+  local setup without an original PCZT. It preserves submission records,
+  downstream vote evidence, proof bytes, and valid signatures; only unbound
+  proofless setup is cleared for rebuilding.
+
+- `RoundExecutor` executes any planner `NextStep` for a bound round: it
+  proves and signs delegations through a `DelegationDriver`, re-signs and
+  advances in-flight delegations, casts every draft of a bundle (tree sync,
+  VAN witness, proofs off the async runtime, persistence, helper plans, chain
+  advancement, and share delivery once confirmed), resumes persisted vote
+  work, and runs focused share confirmation. Delegation steps lock per
+  bundle; chain and share steps lock per round. `RoundHostContext` carries
+  the per-call host inputs, an ordered list of vote-tree node URLs that
+  `CastVote` fails over across (dropping the cached tree after every failed
+  node), and
+  derives last-moment timing from the shared share policy; `set_ballot_intents` records decisions against the bound
+  roster.
+- `DelegationPipeline` binds the sidecar, a `WalletDbOpener`, the round's
+  lightwalletd inputs, account, hotkey, and bundle policy once and runs bundle
+  setup, eligibility, PIR precompute, proof generation, Keystone requests, and
+  prove-and-sign. `DelegationSigner` carries a host `SpendAuthSigner` callback
+  or a stored or provided Keystone signature, so seed material never enters
+  the crate. `start_proving_cache_warmup` starts the process-lifetime key
+  warm-up once.
+- `DelegationStatus::terminal` (and its wire view) states outright that a
+  bundle's delegation ended without a confirmation and no further step will
+  be planned for it; a confirmed bundle is a success, not terminal.
+  A host cannot derive this from the phase: the wallet-facing
+  `WorkflowPhaseView` reports a dispatch that reached the chain without a
+  usable transaction hash the same way it reports a healthy submission, and
+  retrying that would resubmit. `submission_diagnostic` says which terminal
+  outcome it was.
+- `RoundPlan::has_unconfirmed_shares` and
+  `share::next_tracking_delay_for_round` let a host schedule background share
+  tracking without holding durable share rows: the plan says whether any share
+  is still unconfirmed, and the delay is computed from the round's own records.
+- `PirFleet`, `PirSession`, and `PirProofSource`: ordered PIR endpoints with
+  failover on typed retryable failures, serviced from a dedicated thread so
+  proving can run inside another runtime's blocking pool.
+- `RouteHttp`: a request-level executor a host implements once to route every
+  SDK transport (PIR, tree sync, helper, vote chain) through Tor or a proxy.
+  `HyperTransport` is generic over it; `DirectRoute` is the SDK default.
+  Classification of definite versus ambiguous failures is derived from the
+  executor's dispatch hook in one place.
+- `ChainSubmissionClient::advance_until_terminal` runs bounded passes as one
+  episode under a `ChainAdvancePolicy`; `ChainSubmissionClientConfig::for_network`
+  and `Network::default_vote_chain_id` replace host-side literals.
+- `VotingError::kind`, `VotingError::retryable`, and the new variants
+  `InsufficientEligibility`, `NoSpendableNotes`, `SetupAlreadyPersisted`,
+  `DbBusy`, and `PirUnavailable`, with `wire::VotingErrorView` for hosts.
+- Schema version 20: `round_immediate_share` holds the round's immediate
+  helper-share designation as a row of its own, written once in the same
+  transaction as the designated vote's helper plan, immutable, and voided
+  only with the undispatched generation it was made for. Version-19
+  databases adopt the marker their persisted plans carried. The planner and
+  helper-plan preparation read the row and never re-derive a designation
+  once it exists, so a designated proposal that leaves the roster, or a lower
+  choice recorded afterwards, cannot move it or name a second share.
+- `VotingDb::open_wallet_sidecar` shares one connection per sidecar path and
+  returns `Arc<VotingDb>`; `VotingDb::scoped` reads another wallet through the
+  same connection; `share::pending_rounds_for_accounts` lists pending share
+  rounds for several wallets.
+- `vote::recover_vote_commitment`, `prepare_vote_work`, and
+  `persist_prepared_vote_work` choose the singleton or atomic shape
+  internally. `ConfirmedVote`, produced only by `CommittedVote::confirmed`,
+  owns helper-share submission.
+- Wire views for hosts: typed `NextStepKind`, `RoundPlanActionKind`,
+  recovery-work kinds, `WorkflowPhaseView`, chain outcome and failure views,
+  round step outcome, failure, and progress views, and `PendingShareRoundView`.
+
+### Changed
+
+- **Breaking:** `RoundStepFailureKind` (and its wire view) gains
+  `InsufficientEligibility` and `NoSpendableNotes` so hosts can tell an
+  eligibility problem from malformed input without parsing messages.
+- **Breaking:** `VotingError::InsufficientEligibility::required_notes` and
+  the matching view field are renamed `bundle_note_slots`; the value is the
+  bundle's note capacity, not a required note count.
+- `session::resume_plan` reads the round once, as one snapshot taken in a
+  single deferred read transaction, and derives the plan from that snapshot
+  alone. It previously assembled the plan from more than a dozen separate
+  reads, so a concurrent write (a tracking pass, an intent write from
+  another handle, a chain confirmation) could land between two of them and
+  the plan could describe a round state that never existed. The plan is now
+  derived by one classifier over that snapshot: votes are grouped into the
+  units the chain dispatches (a singleton or one atomic batch), each unit is
+  placed by its lifecycle position, roster relation and ballot relation, and
+  the resulting obligations are projected into `next_steps` and the plan's
+  flags. The rule is specified in `docs/round_orchestration_invariants.md`.
+- `RoundExecutor` dispatches on the obligation a fresh plan resolves the
+  requested step to, under the round or bundle lock, instead of
+  reinterpreting the step: a `CastVote` runs the bundle's whole draft set
+  from that obligation rather than rescanning the plan for sibling steps, an
+  `AdvanceVoteBatch` recovers the members the obligation names rather than
+  re-deriving them from its anchor, and a `ConfirmShare` for a share no
+  helper accepted runs delivery from the obligation's own state. Each step
+  captures its wallet, round, roster, network, hotkey material and entry
+  epoch once, and records its chain outcome and delivery reports in one
+  ledger that every outcome, cancellation and failure is built from, so a
+  later error cannot drop an earlier confirmation or an accepted delivery.
+  Fresh casts and resumed units complete through one path.
+- `RoundExecutor::plan` revalidates the stored round's network on every call,
+  and `CastVote` checks that the bound hotkey is the bundle's confirmed
+  delegation target before the first tree request.
+- The wallet example builds one `HyperTransport` for helpers, the chain, and
+  the vote tree.
+
+- `advance_until_terminal` escalates to the exact tree immediately after a
+  `Recovering` result; `pending_repoll` paces only `Tracking` polls.
+- `RoundExecutor::with_binding` validates every roster entry's proposal id
+  and option count.
+- `PirFleet::new` also normalizes unreserved percent escapes in endpoint
+  paths before dropping duplicates.
+- The wallet example's `advance_round_until_idle` obtains a fresh host
+  context before each step and continues past a raced `NoWork` whose plan
+  still lists steps.
+
+- A plan refresh that fails after a step or recovery pass produced a chain
+  outcome keeps that outcome on the failure.
+- `RoundExecutor::with_binding` rejects a hotkey secret that does not
+  reconstruct, before any tree sync.
+- `PirFleet::new` canonicalizes endpoint URLs (scheme and host case, default
+  port, trailing slashes) before dropping duplicates.
+
+- Delegation proof coordination keys its process-local lock by sidecar
+  connection as well as wallet, round, and bundle.
+- `CastVote` canonicalizes vote-tree node URLs: trailing slashes are removed
+  and a query or fragment is rejected, since the tree client appends its API
+  path to the base verbatim.
+
+- The in-memory vote-tree cache prunes entries whose sidecar connection has
+  been dropped, so reopening a sidecar does not accumulate retained trees.
+- `AdvanceDelegation` keeps the bundle lock inside its re-signing task, so an
+  aborted step cannot let a new pass prompt the host signer concurrently.
+- Round and bundle locks are keyed by sidecar connection as well as wallet
+  and round, so two sidecars sharing a wallet id do not serialize.
+
+- The wallet example's `advance_round_until_idle` takes a `RouteHttp`
+  executor and routes helper, vote-chain, and vote-tree traffic through it.
+- The wallet example's `advance_round_until_idle` takes the caller's
+  `HelperHealth`, so helper failures and cooldowns observed in one call steer
+  helper selection in the next instead of resetting per call.
+- `VotingDb::open_wallet_sidecar` refuses an empty wallet id with
+  `InvalidInput` before opening the sidecar.
+- Chain-submission coordination (in-flight, identity, bundle, and round
+  locks) is held per open sidecar file, not per SQLite connection, so two
+  `VotingDb::open` calls on one path cannot mistake each other's live
+  `Submitting` reservation for an abandoned one and dispatch twice.
+- The process keeps one vote-tree client per wallet and transport instead
+  of one per wallet. A sync over another transport no longer replaces the
+  wallet's client and discards its synced state; `sync_vote_tree`,
+  `van_witness`, and a round-scoped `reset_vote_tree` are served by the
+  client that holds the round, so the standalone sync-then-witness path lands
+  on the same state even when another executor synced in between. A routed
+  client is kept while a caller holds its transport or while it holds any
+  round's tree state, so a host that moves its only transport clone into
+  `sync_vote_tree_with` still gets that sync's state from `van_witness`.
+- PIR endpoint canonicalization resolves `.` and `..` path segments, so
+  `https://pir.example/a/../api` and `https://pir.example/api` dedupe to one
+  fleet member and failover never repeats a request against the same
+  resource.
+- `DelegationPipeline::new` refuses anchor tree state bytes that do not
+  decode with `InvalidInput`; a decode failure was previously reported as
+  `Internal` and, through the executor, as an invariant violation.
+- `RoundStepFailure` carries `share_deliveries`, the
+  helper delivery reports accumulated before the failure, so a
+  `HelperDeliveryIncomplete` failure or a later error keeps the accepted,
+  ambiguous, and pending share results. `RoundStepFailureView` gains the
+  matching optional `share_deliveries` field.
+- A sidecar's identity is now its file, not its connection: every
+  `VotingDb::open` of one path shares one sidecar id within the process, so
+  delegation-proof single-flighting, round locks, and vote-tree caches keyed
+  by it coordinate across separately opened handles. In-memory databases keep
+  distinct ids.
+- `VotingDb::scoped` returns `Result` and refuses an empty wallet id with
+  `InvalidInput` instead of building a handle whose first wallet-scoped call
+  panics.
+- Step and recovery failures raised by the final plan refresh (after a step
+  advanced, was cancelled, or a recovery pass completed) also carry the
+  accumulated helper delivery reports.
+- SQLite failures while writing ballot intents or clearing stale share
+  delegations are reported as `Storage` (or `DbBusy`) instead of `Internal`.
+- `VotingErrorView` carries `setup_field` for `SetupAlreadyPersisted`, so a
+  wire consumer can tell a reusable sighash or effects conflict from a fatal
+  padded-note-secrets conflict without parsing the message.
+- A wallet's vote-tree cache entry lives while any connection to its
+  sidecar file is open, not only the handle that populated it, so a second
+  `VotingDb::open` handle on the same file still finds a round the first one
+  synced after the first is dropped.
+- A ballot intent for a proposal that left the roster after its vote reached
+  the chain lifecycle (submitted, managed, hashless, rejected, or confirmed)
+  no longer withholds `CastVote` or fails helper-plan derivation, and is
+  omitted from `RoundPlan::unrostered_intents`: it cannot be cleared, so the
+  host could not otherwise unblock the round.
+- `VotingDb::set_ballot_intents` takes the expected network and checks the
+  stored round's network inside its write transaction, so a mismatch writes
+  nothing.
+- A sidecar's identity canonicalizes the full path when the file exists, so a
+  symlink to a sidecar and its real path share one sidecar id.
+- The wallet example's `advance_round_until_idle` returns a structured
+  `RoundAdvanceError` that keeps the executor's `RoundStepFailure` (chain
+  outcome, strongest state, delivery reports, refreshed plan) instead of only
+  its message, and gains `routed_pir_fleet` for building the host's PIR fleet
+  over the same route.
+- `VotingDb::ensure_round` refuses an existing round whose stored parameters
+  (snapshot height, election key, roots) differ from the supplied ones, not
+  only one stored for another network, so bundles are never set up under
+  parameters a later witness cannot validate.
+- Closing the last connection to a sidecar and reopening the same path starts
+  a new open span: vote-tree cache entries from before the close are dropped
+  instead of being inherited by the reopened, possibly replaced, file.
+- A custom `RouteHttp` executor that called the dispatch hook and then
+  reported a `BeforeDispatch` failure is now classified as possibly
+  dispatched, per the hook contract; only an executor that declares the new
+  `RouteHttp::hook_precedes_connection_setup` (the SDK's `DirectRoute`) has
+  that phase honored after the hook.
+- When helper-share delivery fails partway through a vote, the executor's
+  failure and progress reporter now carry the report over the sibling shares
+  that were already accepted or ambiguously dispatched, with the failed and
+  unattempted shares pending.
+- The planner's advancement pass now schedules `AdvanceVote` /
+  `AdvanceVoteBatch` for a submitted or managed vote whose proposal left the
+  roster while its intent survives, so the on-chain submission is driven to
+  resolution instead of being stranded.
+- `CastVote` is refused with the new `RoundStepFailureKind::VoteEnded` (wire:
+  `vote_ended`) when the host's clock is at or past the authenticated vote
+  end, before any tree I/O; advancement and recovery steps are unaffected.
+- The wallet example's `advance_round_until_idle` returns the final step's
+  own `Advanced` outcome when it leaves the plan idle instead of polling once
+  more and returning an empty `NoWork`.
+- A committed but undispatched vote for a proposal that left the roster no
+  longer holds its bundle: the planner does not count it as a pending vote
+  chain, and `CastVote` retires it (new
+  `VotingDb::retire_undispatched_votes_outside_roster`) before any tree I/O,
+  so a bundle whose sibling vote confirmed is not stranded.
+- A vote-tree client is kept in the registry while any caller holds it, so a
+  sync in flight cannot be evicted before it creates its round state.
+- When a member of a committed, undispatched atomic batch leaves the roster,
+  the planner retires the whole batch: no `AdvanceVoteBatch` is planned for
+  it and its rostered members are cast again after `CastVote` clears it.
+- Planner reads of ballot intents and delegation and share phases classify
+  SQLite failures through `from_sqlite`, so external lock contention surfaces
+  as `Busy` (`DbBusy`) rather than an invariant violation.
+- The planner schedules `SubmitShares` for a confirmed vote whose proposal
+  left the roster, so its missing helper shares are still delivered.
+- `RoundExecutor::advance_step` runs a `ConfirmShare` step whose share no
+  helper has accepted yet as share delivery from the durable plan instead of
+  polling for a confirmation no helper can give.
+- Helper-plan derivation keeps a persisted round-immediate designation when
+  the designated proposal leaves the roster after its vote reached the chain
+  lifecycle, instead of recomputing it from the reduced roster and rejecting
+  the plans that carry it.
+- `RoundPlan::immediate_share_key` reports the round's durable designation
+  whenever one exists, so it matches what delivery executes after a roster
+  change; it is derived from the ballot only while no designation exists.
+- Resumed vote work reconciles the chain before any helper-plan preparation;
+  plans are loaded or created after confirmation, right before delivery, so
+  an open ballot no longer blocks polling or recovery of a dispatched vote.
+  A fresh `CastVote` still prepares its plans before the broadcast.
+- `RoundExecutor::advance` validates the recovery request's round id up
+  front; a malformed id is `InvalidInput` instead of an idle `NoWork`.
+- Retiring undispatched votes propagates a storage failure from the
+  lifecycle-ownership check instead of treating it as lifecycle-owned.
+- `DelegationPipeline` checks a persisted delegation setup against the
+  pipeline's notes and target-bound hotkey before reusing it for signing, the
+  same check a persisted proof already gets.
+- `RoundExecutor::advance` rejects a round the wallet stores under a network
+  other than the chain client's before helper preflight or any plan write.
+- A caller queued for a round lock stops waiting when the host moves to
+  another operation epoch, not only on cancellation.
+- `VotingDb::clear_ballot_intent` evaluates the vote phase inside its write
+  transaction.
+- `wire::VotingErrorView` accepts unknown fields so the `Other` category
+  fallback also survives new structured fields.
+- The in-memory vote-tree cache is keyed by sidecar connection as well as
+  wallet id, so two sidecars sharing a wallet id keep separate tree state and
+  transports.
+
+- A failed vote-tree sync resets the round's cached tree inside the detached
+  blocking work, holding the round lock, so cleanup happens even when the
+  step future is dropped mid-sync.
+- The recovery driver keeps the chain confirmation on a failure raised during
+  helper delivery, as the step API does.
+
+- `RoundExecutor` proving threads keep the step's round or bundle lock until
+  they finish persisting, so dropping a step future mid-proof cannot let a
+  new pass start a competing proof.
+- `RoundExecutor::with_binding` also rejects a binding whose network differs
+  from the network the wallet already stores the round under.
+- A helper-delivery error raised after the chain confirmed a vote keeps the
+  confirmation in `RoundStepFailure::chain_outcome`.
+- `PirFleet` fails over only on retryable `PirUnavailable` errors; local
+  `Busy` and `DbBusy` contention is returned to the caller for an
+  operation-level retry instead of being repeated against every endpoint.
+
+- `ChainSubmissionClient` captures its wallet at construction and works on
+  a private scoped handle; `ChainSubmissionClient::wallet_id` reports it. A
+  host re-scoping the handle it passed no longer moves a later pass of an
+  in-flight episode to another wallet.
+- `RoundExecutor::advance_next` captures the operation epoch before planning.
+- `VoteTreeSync::cached_rounds` and `precompute::cached_vote_tree_rounds`
+  report which rounds hold in-memory tree state; they replace a test-only
+  probe.
+
+- `VotingDb::clear_ballot_intent` decides from the canonical vote phase: an
+  intent whose vote the chain lifecycle owns or has finished cannot be
+  cleared, and a signed but undispatched vote has its recovery invalidated.
+- `CastVote` validates the complete vote-tree node list before any sync:
+  every URL must be an http or https URL with a host, and on Mainnet every
+  URL must use HTTPS.
+
+- Every bounded chain pass started by `advance_until_terminal_in_epoch`, and
+  by the round executor's recovery driver, captures its operation under the
+  caller's entry epoch, so an epoch change between the caller's check and
+  the pass is refused by the coordinator instead of being adopted.
+- **Breaking:** `DelegationPipeline::voting_db` returns a fresh wallet-scoped
+  `Arc<VotingDb>` instead of a reference to the pipeline's handle.
+- **Breaking:** `DelegationDriver` gains `delegation_target`; the executor
+  refuses a driver whose hotkey target differs from the one derived from
+  `RoundBinding::hotkey_secret` before proving.
+- `RoundPlan::unrostered_intents` (and its wire view) lists durable ballot
+  intents for proposals outside the authenticated roster; `CastVote` is
+  withheld while any exist, and `VotingDb::clear_ballot_intent` removes one.
+- The `RouteHttp` contract now states that implementations must not follow
+  redirects.
+
+- **Breaking:** `RoundExecutor::database` returns a fresh wallet-scoped
+  `Arc<VotingDb>` over the executor's connection instead of a reference to
+  its internal handle, so re-scoping the returned handle cannot move a
+  running step's persistence to another wallet.
+- **Breaking:** `DelegationDriver` gains `network`; `RoundExecutor` refuses a
+  driver whose network differs from its binding before proving.
+- `ChainSubmissionClient::advance_until_terminal_in_epoch` runs an episode
+  that belongs to work begun earlier under a given epoch; the round executor
+  uses it so an epoch change during proving or re-signing ends the step as
+  `Cancelled` instead of being recaptured by the chain episode.
+- Reusing a persisted delegation proof through `DelegationPipeline` first
+  validates the bundle notes and the target-bound hotkey
+  (`PreparedDelegationBundle::validate_persisted_proof`), without touching
+  PIR.
+
+- `ChainSubmissionClient::advance_until_terminal` and the persisted-vote
+  recovery driver `RoundExecutor::advance` capture the operation epoch on
+  entry; an epoch change is observed like cancellation between passes,
+  during the repoll wait, and at every recovery boundary.
+- `RoundExecutor::with_binding` rejects a binding whose network differs from
+  the chain client's before any proof or helper-plan work can run.
+- A `CastVote` whose tree sync fails after the host cancelled returns a
+  `Cancelled` outcome instead of the transport failure the cancellation
+  produced; the poisoned tree is still reset first.
+- The wallet example's `advance_round_until_idle` returns the last
+  `RoundStepOutcome` so a terminal chain diagnostic is not lost with the plan.
+
+- `HyperTransport` derives one absolute deadline per request before polling
+  the route; the direct route abandons connection setup a bounded lead ahead
+  of that backstop, so a stalled TCP or TLS connect is reported as a definite
+  pre-dispatch failure instead of an ambiguous timeout.
+- `CastVote` syncs, resets, and generates the VAN witness on one retained
+  tree handle, so another executor rebinding the wallet's tree transport
+  between those calls cannot hand the witness a client missing the synced
+  round state.
+
+- `RoundExecutor` steps capture the host's operation epoch on entry and treat
+  an epoch change like cancellation at every boundary where a step decides to
+  continue, including before helper preflight; a session or account switch
+  can no longer dispatch a vote or helper share from a stale invocation.
+- Every `DelegationPipeline` stage verifies that the pipeline's own database
+  handle still selects the wallet captured at construction and fails with
+  `InvalidInput` otherwise.
+
+- **Breaking:** `DelegationDriver` gains `wallet_id` and
+  `shares_database_with`. `RoundExecutor` refuses a driver whose wallet or
+  sidecar connection differs from its own frozen scope before invoking any
+  delegation stage. `DelegationPipeline` captures its wallet at construction
+  the same way and exposes it through `wallet_id`.
+- `RoundExecutor::with_binding` rejects an empty or repeated proposal roster
+  with `InvalidInput`; an empty roster previously planned as vacuously
+  decided and skipped the round.
+- `VotingDb::open_wallet_sidecar` keys a bare relative file name through the
+  current directory, so `wallet.db`, `./wallet.db`, and the absolute path share
+  one connection.
+- A PIR URL the transport cannot build is classified as a non-retryable
+  `PirHttpFailurePhase::Build` failure instead of a retryable connect error.
+
+- `wire::VotingErrorKindView::Other` is a Serde catch-all: an error category
+  added by a newer crate deserializes into it instead of failing an older
+  host's `VotingErrorView` parse.
+- PIR connect failures that carry a typed `PirHttpFailure` keep its
+  retryability even when the response body echoes a layout or poly_len
+  mismatch message, so `PirFleet` still fails over on a retryable status.
+  Text matching applies only to errors without typed transport metadata.
+
+- `ChainSubmissionClient::advance_until_terminal` observes cancellation
+  during the `pending_repoll` wait between passes, within 25 ms, instead of
+  only at the start of the next pass.
+
+- `VotingDb::open_wallet_sidecar` serializes concurrent opens per sidecar
+  path only. A slow open of one sidecar (busy timeout, migrations, busy
+  retries) no longer delays opening a different sidecar.
+
+- `CastVote` drops the round's cached vote tree after every failed node
+  sync, including the last node's and a cancelled attempt's, so a partially
+  appended or root-mismatched tree cannot poison the next node or the next
+  pass.
+
+- `RoundExecutor::advance_step` rejects a step whose bundle still has a
+  `Delegate`, `AdvanceDelegation`, or `AdvanceImportedDelegation` step ahead
+  of it in the plan with `InvalidInput`, before any lock-scoped work or
+  network I/O. `advance_next` is unaffected: it always runs the plan head.
+
+- `RoundExecutor` freezes the wallet it is constructed for: it works on its
+  own handle over the shared sidecar connection, so a host `set_wallet_id`
+  cannot retarget a waiting or running step, and every operation fails with
+  `InvalidInput` if the executor's own handle is re-scoped.
+
+- A host-provided Keystone signature (`KeystoneSignatureSource::Provided`) is
+  persisted under its bundle as soon as the signed payload verifies, so a
+  `Delegate` step cancelled before chain dispatch, or a restart, resumes
+  through `KeystoneSignatureSource::Stored` without asking the device to sign
+  again. A cancelled `Delegate` outcome now also carries the signed bundle in
+  `RoundStepOutcome::delegation`.
+
+- **Breaking:** `NextStepView.kind`, `RoundPlanView.primary_action`, the
+  recovery-work `kind` fields, and every wire `phase` field are enums instead
+  of strings. Serde labels are unchanged. The crate-side `as_str` and
+  `NextStep::kind` string tables are removed.
+- **Breaking:** `VotingDb::open_wallet_sidecar` returns `Arc<VotingDb>`.
+- **Breaking:** functions that took `&PirClientBlocking` take
+  `&dyn PirProofSource`; existing callers coerce.
+- **Breaking:** `HyperTransport` is `HyperTransport<R: RouteHttp = DirectRoute>`.
+  `new`, `with_http_connector`, and `with_connector` keep their shapes.
+- Transaction begin and commit failures classify SQLite busy and locked
+  errors as `VotingError::DbBusy`.
+- Eligibility, no-spendable-note, write-once setup, and PIR failures carry
+  structured fields. Their display text keeps the earlier wording.
+
+### Removed
+
+- **Breaking:** removed the persisted-vote recovery driver
+  `VoteRecoveryExecutor::advance` with `VoteRecoveryRequest`,
+  `VoteRecoveryAdvance`, `VoteRecoveryDisposition`, `VoteRecoveryFailure`,
+  `VoteRecoveryFailureKind`, `VoteRecoveryProgress`,
+  `VoteRecoveryProgressReporter`, `VoteRecoveryProgressBridge`,
+  `NoopVoteRecoveryProgressReporter`, and the `VoteRecoveryExecutor` alias.
+  It duplicated the step path with a second failure ladder; `RoundExecutor`
+  resumes persisted vote work through `advance_next` and `advance_step`.
+  `VoteRecoveryKey` and `VoteShareDeliveryReport` remain as the identity a
+  step's progress and delivery reports carry.
+- **Breaking:** removed `VotingDb::build_and_prove_delegation` so durable
+  delegation proofs cannot bypass process-local single-flight coordination.
+  Use `delegate::ensure_proof` or
+  `PreparedDelegationBundle::ensure_proof`; both validate the supplied notes
+  and target-bound keys before returning a generated or reused proof. Proof
+  progress is delivered live from a delivery thread the producer never waits
+  on, so reporters may reenter or dispatch proof work without deadlocking, and
+  terminally rejected submissions retain their generation-bound proof.
+- **Breaking:** removed `CommittedVote::submit_prepared_shares`; submit
+  through `ConfirmedVote::submit_prepared_shares`.
+- **Breaking:** removed `delegate::DelegationSigner` and replaced
+  `AdvanceDelegation::signer` with `spend_auth_signature`. Delegation chain
+  submission now accepts only the external SpendAuth signature and loads the
+  authoritative PCZT sighash and randomized verification key from durable SDK
+  state.
+- **Breaking:** collapsed the session planner's submit/poll step duality now
+  that one bounded `advance_*` call both dispatches and reconciles.
+  `NextStep::{SubmitVote, PollVote}` become `AdvanceVote`,
+  `NextStep::{SubmitVoteBatch, PollVoteBatch}` become `AdvanceVoteBatch`, and
+  `NextStep::PollDelegation` becomes `AdvanceDelegation`; `Delegate` still
+  means "this bundle needs a signed delegation from the wallet" and stays
+  distinct. `VoteRecoveryWorkKind` and `DelegationRecoveryWorkKind` collapse the
+  same way. Stable FFI `kind` strings change to `advance_delegation`,
+  `advance_vote`, and `advance_vote_batch`.
+- **Breaking:** removed the version-17 chain-submission and confirmation
+  mutation APIs. `ChainSubmissionClient` is now the only public route to
+  submission, polling, recovery, and confirmation. Deleted
+  `confirmation::{confirm_delegation_submission, confirm_vote_submission,
+  confirm_vote_batch_submission}`, `delegate::{record_submission,
+  record_van_position}`, `vote::{record_submission, record_batch_submission,
+  record_vc_position}`, and `CommittedVote::{record_submission,
+  record_vc_position}`. The `confirmation` module is now private, so the
+  host-supplied chain-event vocabulary `TxEvent`/`TxEventAttribute` and the
+  `DelegationConfirmation`/`VoteConfirmation`/`VoteBatchConfirmation` result
+  types are no longer public; event parsing is a private lifecycle mechanism.
+- **Breaking:** removed the chain-ready payload builders `vote::submission`,
+  `CommittedVote::submission`, and `delegate::submission`. The lifecycle
+  constructs and dispatches the transaction itself.
+  `PreparedDelegationBundle::{submission, signed_bundle}` remain for the
+  delegation capability-handoff export flow.
+- **Breaking:** the raw storage writers behind those APIs are no longer public
+  API. `storage::queries::{store_van_position, store_delegation_tx_hash,
+  record_vote_submission}`,
+  `VotingDb::{store_van_position, store_delegation_tx_hash,
+  record_vote_submission, mark_delegation_submitted, mark_vote_submitted}`, and
+  `vote::{record_submission, record_batch_submission, record_vc_position}` are
+  crate-private test helpers that no Cargo feature, including `test-fixtures`,
+  exposes. Read-only projections are unchanged.
+
+### Added
+
+- Added the public bounded `ChainSubmissionClient` for delegation and
+  singleton-vote and atomic vote-batch submission, status advancement, and opt-in exact
+  commitment-tree recovery. Its internal coordinator and store provide durable
+  pre-POST reservation, bounded failover, candidate-first reconciliation,
+  restart-stable tracking deadlines, sticky recovery, atomic confirmation,
+  canonical lifecycle serialization, store-owned lock authority, causal bundle
+  admission, strict confirmation-event validation, unique candidate ownership,
+  and exact committed-reservation accounting.
+- Added `AdvanceImportedDelegation`,
+  `ChainSubmissionClient::advance_imported_delegation`, and the matching
+  planner/recovery-work variants for capability imports. The lifecycle lazily
+  adopts the stored package hash, polls without a signer, POST, tree scan, or
+  retry, confirms atomically, and terminally rejects a committed failure.
+- `RoundPlan::delegation_statuses`, `RoundRecoverySnapshot::{delegation,
+  votes}`, and their wire views carry `submission_diagnostic`, the diagnostic
+  stored on the authoritative lifecycle row. It is always present for the
+  terminal `SubmittedWithoutHash` and `SubmissionRejected` phases, which
+  schedule no further lifecycle call, so a host can show why manual handling
+  is needed after a restart without re-driving the lifecycle.
+  `ChainSubmissionDiagnosticKind::as_str` exposes the stable discriminator
+  used by storage and the views.
+- `RoundPlan` and `RoundPlanView` expose derived work predicates:
+  `needs_delegation_signing`, `has_in_flight_delegation`, `needs_vote_polling`,
+  `has_remaining_vote_or_share_work`, and `has_recoverable_vote_or_share_work`.
+  Hosts should read these instead of matching `NextStepView::kind` strings.
+  They are computed from an exhaustive match over `NextStep`, so adding a step
+  variant is a compile error in the SDK rather than an unrecognised kind that a
+  downstream allowlist silently reads as "no work" — a failure mode that
+  strands a round with no symptom.
+- `chain_submission` carries `compile_fail` doctests asserting that every
+  removed mutation API and raw writer stays off the public surface, satisfying
+  the compile-time surface check in `chain_submission_invariants.md`.
+
+### Changed
+
+- **Breaking:** the configured vote-chain id no longer binds a chain-submission
+  identity or its generation digest. It selects where a request is dispatched,
+  not what the request means, so one identity now covers a wallet's round,
+  bundle, and target across every configured vote chain. The version-1
+  generation digest vectors change accordingly, and `chain_submissions` drops
+  its `vote_chain_id` column and its partial identity indexes in favour of one
+  identity key.
+- **Breaking:** the `VotePhase::LegacyConfirmed` workflow phase and the
+  `legacy_import` / `legacy_projection` confirmation sources are removed, and
+  `ChainSubmissionDiagnosticKind` drops `RecoveryUnavailable`,
+  `GenerationDerivationFailed`, and `LegacyEvidenceInvalid`. Every
+  `chain_submissions` row now carries a non-null generation digest; there is
+  no unbound or migration-only row class.
+- The version 17 to 18 migration only adds the `chain_submissions` schema.
+  Version-17 domain columns are preserved untouched so completed rounds keep
+  displaying through the existing domain-column phase projection; no
+  version-17 evidence is imported and the lifecycle never owns a pre-upgrade
+  submission. Upgrading a database that holds an in-flight version-17
+  submission is unsupported.
+- **Breaking:** delegation recovery views now expose VAN positions as `u64`,
+  matching lifecycle confirmation and SQLite's supported non-negative range.
+- Expanded the supported proposal-ID and atomic vote-batch ranges from 1–15 to
+  1–50 while retaining 16 encrypted shares per vote commitment. This consumes
+  the breaking circuit and verification-key change from `voting-circuits
+  0.12.0-rc.1`.
+- **Breaking:** `session::resume_plan`, `recovery::round_snapshot`, and
+  `VotingDb::{delegation_phase, delegation_phases, vote_phase, vote_phases}`
+  now derive submission state from the authoritative `chain_submissions` row
+  instead of the version-17 projection columns. A generation that is
+  `Submitting`, `Tracking`, or `Recovering` reports as submission-managed and
+  yields an advance step, so a transaction that may already be on the wire is never
+  dispatched a second time. Those columns record a hash only on confirmation,
+  so the previous behavior reported an in-flight transaction as never
+  submitted. Poll steps now carry `tx_hash: None` while a reserved generation
+  has not yet produced a candidate hash, instead of failing the plan.
+- **Breaking:** rejected authoritative rows now project as the distinct
+  `SubmissionRejected` phase instead of `SubmissionManaged`, and schedule no
+  advance work. `needs_delegation_signing` is now true for local
+  `AdvanceDelegation` retries; imported capability polling is represented by
+  its signer-free step instead.
+- The planner's step-consuming derivations no longer use wildcard match arms, so
+  an unclassified `NextStep` cannot be silently dropped inside the SDK either.
+  As a result a blocking `ConfirmShare` is now withheld from recovered vote work
+  while its vote still has any outstanding chain work, not only while it is
+  awaiting confirmation; such a share is not actionable until the vote confirms.
 
 ### Fixed
 
-- Schema version 18 adds durable delegation PCZT storage without changing
-  existing setup or proof rows. Keystone requests fail with a typed
-  reconciliation error instead of replacing setup that lacks an exact PCZT.
-  New Keystone signature writes must match the current bundle setup and verify
-  before the atomic batch commits.
-- Schema version 19 reconciles released local delegation state. It demotes
-  proofs that cannot be bound to an exact PCZT, removes stale or invalid local
-  Keystone signatures, and preserves proof-bearing, validly signed, submitted,
-  confirmed, and imported state that may still be needed for recovery.
+- Exhausting an invocation's POST budget on a possibly-dispatched attempt, a
+  colliding hash, or cancellation during the final dispatch no longer ends a
+  generation as `SubmittedWithoutHash`. The row stays hashless `Recovering`
+  with its last dispatch diagnostic, and a later invocation may scan or retry.
+  `SubmittedWithoutHash` is now reachable only through chain rejection code 2
+  after unresolved dispatch.
+- `ExactTree` advancement of a hashless dispatch-ambiguity row now scans the
+  tree before any POST, and a code-2 rejection after unresolved dispatch runs
+  one tree pass before the terminal transition, so a generation that already
+  landed is confirmed with positions instead of stranding its bundle.
+  Status-only advancement keeps the direct retry.
+- A non-final exact-tree recovery retry whose accepted hash collides with
+  another generation now continues through the remaining bounded attempts.
+- `ExactTree` advancement of an imported delegation never scans the tree.
+- `VoteRecovery::tx_hash` in the round snapshot now reports the batch row's
+  candidate hash for in-flight batch members, matching `VoteRecoveryWork`.
+- A usable hash that follows durable dispatch ambiguity clears the stored
+  ambiguity diagnostic when the row enters `Tracking`.
+- A vote-chain POST that hits the SDK's own deadline before the transport
+  marks dispatch is now classified as definitely unsent, so the fresh
+  reservation is removed and bounded failover continues instead of persisting
+  terminal `SubmittedWithoutHash` for a request that never left the wallet.
+- Rejection code 2 on an exact-tree recovery retry ends a generation as
+  `SubmittedWithoutHash` only when the durable row still carries unresolved
+  dispatch evidence. A retry after a rejected POST or a committed failure now
+  surfaces an error and leaves the row recoverable.
+- A possibly-dispatched recovery retry now durably records the new dispatch
+  ambiguity and continues through the invocation's remaining bounded attempts;
+  a later invocation may reserve the next POST directly instead of repeating
+  a full tree pass.
+- `resume_plan` now schedules `AdvanceVote` and `AdvanceVoteBatch` for
+  lifecycle-owned and submitted votes whose proposal has no recorded ballot
+  intent, and a missing intent no longer fails planning for a batch member.
+- `VoteRecoveryWork::tx_hash` for `AdvanceVoteBatch` now reports the in-flight
+  batch row's candidate hash, looked up by ordered batch digest.
+- Local delegation, singleton-vote, and vote-batch `resume_plan` advance steps
+  now direct hosts through exact-tree recovery. Following the documented
+  pending loop can therefore resolve a hashless `Recovering` generation instead
+  of repeatedly returning its unchanged status-only result; imported
+  delegations remain poll-only.
+- Delegation advancement no longer reparses or requires a returned full PCZT
+  to reconstruct its sighash. Background-precomputed, recovered, and Keystone
+  flows may omit PCZT bytes without stranding submission in the host adapter.
+- Chain-submission cancellation now removes a fresh reservation when transport
+  dispatch has not begun. Batch admission derives its identity locks from the
+  complete request roster, verifies the persisted roster before reading any
+  member row, and rejects oversized rosters before lock allocation.
+- SQLite chain-submission admission now permits confirmed predecessors to
+  advance, refuses a delegation reservation once a confirmed vote or batch
+  exists in the bundle, classifies reused candidate hashes as hashless recovery, preserves
+  monotonic lifecycle timestamps across wall-clock rollback, and retains
+  possible-dispatch evidence when restart normalization cannot be persisted.
+- Ballot-intent changes and bundle pruning now preserve every active semantic
+  generation and its helper-delivery material under the lifecycle round gate.
+- Lifecycle ownership checks now serialize with every compatibility projection
+  write, unresolved bundle predecessors remain blocked across vote-chain id
+  changes, and tracking diagnostics survive database reopen. Migration rejects
+  the earlier unreleased v18 schema by fingerprint; session reset and deletion
+  retain bundle-scoped and legacy-round progress.
+- Session cleanup now preserves delegation setup fields for bundles with a
+  successful proof so wallets can resume signing without regenerating ZKP1.
+- VAN positions above `u32::MAX` are now read losslessly; legacy `u32` readers
+  return a range error instead of wrapping.
+
+### Removed
+
+- Removed the standalone `recovery::clear` and
+  `VotingDb::clear_recovery_state` APIs. Ordinary reset preserves durable
+  submission evidence; explicit round or account deletion remains the
+  destructive cleanup boundary.
+
+## v3.1.0
+
+### Changed
+
+- Released the exact `v3.1.0-rc.16` implementation as `v3.1.0` without
+  implementation changes. Its supporting production snapshots were released
+  as `pir-types 0.6.2`, `pir-client 0.7.2`, `voting-circuits 0.11.2`,
+  `vote-commitment-tree 0.6.0`, and `vote-commitment-tree-client 0.8.0`.
 
 ## v3.1.0-rc.16
 
@@ -37,18 +686,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the stored hotkey secret and exact round and bundle identity. Restoring that
   secret and using `recoverable_bundle_policy_v1()` reconstructs the same VAN
   after voting database loss without new authority-root or recovery tables.
-
-### Fixed
-
-- Session cleanup now preserves delegation setup fields for bundles with a
-  successful proof so wallets can resume signing without regenerating ZKP1.
-
-### Removed
-
-- Removed the standalone `recovery::clear` and
-  `VotingDb::clear_recovery_state` APIs. Ordinary reset preserves durable
-  submission evidence; explicit round or account deletion remains the
-  destructive cleanup boundary.
 
 ## v3.1.0-rc.15
 

@@ -402,9 +402,7 @@ pub fn import_delegation_capability(
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin delegation capability import failed: {e}"),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("begin delegation capability import failed", &e))?;
     if queries::has_round(&tx, &capability.vote_round_id, &wallet_id)? {
         let (stored, network) =
             queries::load_round_params_with_network(&tx, &capability.vote_round_id, &wallet_id)?;
@@ -451,9 +449,8 @@ pub fn import_delegation_capability(
     .map_err(|e| VotingError::Internal {
         message: format!("advance imported round phase failed: {e}"),
     })?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit delegation capability import failed: {e}"),
-    })?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("commit delegation capability import failed", &e))?;
     Ok(digest)
 }
 
@@ -944,7 +941,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 22);
         for index in 0..2 {
             let data =
                 queries::load_zkp2_inputs(&conn, &params.vote_round_id, WALLET, index).unwrap();
@@ -1101,35 +1098,42 @@ mod tests {
         assert!(!customer.has_round(&params.vote_round_id).unwrap());
     }
 
+    /// Applies a delegation confirmation the way the lifecycle does.
+    ///
+    /// Chain submission has no public confirmation entry point; these tests
+    /// drive the same durable projection the coordinator commits.
+    fn confirm_delegation(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        tx_hash: &str,
+        van_leaf_position: u64,
+    ) -> Result<(), crate::types::VotingError> {
+        let wallet_id = db.wallet_id();
+        let mut conn = db.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        crate::confirmation::apply_delegation_confirmation_with_conn(
+            &tx,
+            &wallet_id,
+            round_id,
+            bundle_index,
+            Some(tx_hash),
+            van_leaf_position,
+        )?;
+        tx.commit().unwrap();
+        Ok(())
+    }
+
     #[test]
     fn confirmation_must_match_the_transaction_hash_in_the_package() {
-        use crate::confirmation::{confirm_delegation_submission, TxEvent, TxEventAttribute};
-
         let (_, params, hotkey, capability) = exported_fixture();
         let customer = test_db(":memory:");
         import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
-        let events = [TxEvent {
-            event_type: "delegate_vote".to_string(),
-            attributes: vec![
-                TxEventAttribute {
-                    key: "vote_round_id".to_string(),
-                    value: params.vote_round_id.clone(),
-                },
-                TxEventAttribute {
-                    key: "leaf_index".to_string(),
-                    value: "0".to_string(),
-                },
-            ],
-        }];
 
-        let error = confirm_delegation_submission(
-            &customer,
-            &params.vote_round_id,
-            0,
-            &"ff".repeat(32),
-            &events,
-        )
-        .expect_err("confirmation must bind the exact signed transaction");
+        let error = confirm_delegation(&customer, &params.vote_round_id, 0, &"ff".repeat(32), 0)
+            .expect_err("confirmation must bind the exact signed transaction");
         assert!(
             error.to_string().contains("delegation tx_hash conflict"),
             "{error}"
@@ -1297,7 +1301,6 @@ mod tests {
         VotingHotkey,
         crate::vote::VanWitness,
     ) {
-        use crate::confirmation::{confirm_delegation_submission, TxEvent, TxEventAttribute};
         use vote_commitment_tree::MemoryTreeServer;
 
         let (_, params, hotkey, capability) = exported_fixture();
@@ -1306,24 +1309,12 @@ mod tests {
 
         for bundle_index in 0..2 {
             let tx_hash = capability.bundles[bundle_index].delegation_tx_hash.clone();
-            confirm_delegation_submission(
+            confirm_delegation(
                 &customer,
                 &params.vote_round_id,
                 bundle_index as u32,
                 &tx_hash,
-                &[TxEvent {
-                    event_type: "delegate_vote".to_string(),
-                    attributes: vec![
-                        TxEventAttribute {
-                            key: "vote_round_id".to_string(),
-                            value: params.vote_round_id.clone(),
-                        },
-                        TxEventAttribute {
-                            key: "leaf_index".to_string(),
-                            value: bundle_index.to_string(),
-                        },
-                    ],
-                }],
+                bundle_index as u64,
             )
             .unwrap();
         }

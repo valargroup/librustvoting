@@ -3,11 +3,19 @@
 //! Wallet SDKs should import [`prelude`] and follow the lifecycle:
 //! create a round, bind eligible notes into bundles, precompute witness/PIR
 //! data, build a delegation PCZT, prove delegation, sync the vote commitment
-//! tree, cast votes with `vote::commit`, confirm chain submissions through
-//! `confirmation`, then recover helper-share payloads through `share`. New
-//! integrations should use `round`, `precompute`, `delegate`, `vote`,
-//! `confirmation`, `share`, and `session` rather than writing storage rows
-//! directly.
+//! tree, cast votes with `vote::commit`, drive chain submission through
+//! [`ChainSubmissionClient`], then recover helper-share payloads through
+//! `share`. New integrations should use `round`, `precompute`, `delegate`,
+//! `vote`, `chain_submission`, `share`, and `session` rather than writing
+//! storage rows directly. Exact commitment-tree recovery is explicit per
+//! advancement call; status-only advancement remains the default.
+//!
+//! [`ChainSubmissionClient`] is the sole authority for submitting, polling,
+//! recovering, and confirming delegation and cast-vote transactions. Hosts
+//! supply an HTTP transport, scheduling, and cancellation; they do not build
+//! chain requests, interpret chain events, or record transaction hashes and
+//! tree positions. See [`chain_submission`] for the removed version-17
+//! mutation APIs and the compile-time checks that keep them removed.
 
 #[cfg(all(feature = "lrz", feature = "zakura"))]
 compile_error!("features `lrz` and `zakura` cannot be enabled together");
@@ -17,10 +25,13 @@ compile_error!("enable exactly one of the `lrz` or `zakura` features");
 
 pub mod action;
 pub mod backend;
+pub mod chain_submission;
 pub mod config;
-pub mod confirmation;
+pub(crate) mod confirmation;
 pub mod delegate;
 pub mod delegation_capability;
+pub mod delegation_pipeline;
+mod delegation_proof_coordination;
 pub mod error;
 pub mod governance;
 pub mod helper;
@@ -36,6 +47,7 @@ pub mod prelude;
 pub mod recovery;
 pub mod round;
 pub mod round_auth;
+mod round_planning;
 pub mod selection;
 pub mod session;
 pub mod share;
@@ -50,12 +62,33 @@ pub mod types;
 mod van_blinding;
 pub mod vote;
 pub mod vote_commitment;
+pub mod vote_work;
 pub mod wire;
 mod wire_codec;
 pub mod witness;
 pub mod zkp1;
 pub mod zkp2;
 
+pub use chain_submission::{
+    AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainAdvanceOutcome,
+    ChainAdvancePolicy, ChainAdvanceRequest, ChainHttpRequest, ChainHttpResponse,
+    ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
+    ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
+    ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
+    ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,
+    ChainSubmissionFailureState, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
+    ChainSubmissionIdentity, ChainSubmissionIdentityError, ChainSubmissionPending,
+    ChainSubmissionResult, ChainSubmissionState, ChainSubmissionStateEvidence,
+    ChainSubmissionTarget, ChainTransport, ChainTransportError, ChainTransportFailureKind,
+    ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
+};
+pub use delegation_pipeline::{
+    start_proving_cache_warmup, DelegationDriver, DelegationPipeline, DelegationSigner,
+    KeystoneSignatureSource, SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport,
+    WalletDbOpener,
+};
+pub use error::{DelegationSetupField, VotingErrorKind, VotingErrorKindView, VotingErrorView};
 pub use helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
     ShareSubmissionStatus,
@@ -68,6 +101,21 @@ pub use http_transport::HyperTransport;
 pub use pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, ImtProofData, NegotiatedPirLayout,
     PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
+};
+pub use pir::{PirFleet, PirProofSource, PirSession};
+pub use transport::{
+    DirectRoute, PirHttpFailure, PirHttpFailurePhase, RouteError, RouteFuture, RouteHttp,
+    RoutePhase, RouteRequest, RouteResponse,
+};
+pub use vote::{
+    persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
+    PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
+};
+pub use vote_work::{
+    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter, ProposalRosterEntry,
+    RoundBinding, RoundExecutor, RoundHostContext, RoundStepDisposition, RoundStepFailure,
+    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge,
+    RoundStepProgressReporter, VoteRecoveryKey, VoteShareDeliveryReport,
 };
 
 pub use delegation_capability::{

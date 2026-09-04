@@ -78,6 +78,8 @@ pub fn derive_gov_nullifier(
 ///
 /// The VAN hashes `num_ballots` (ballot count after floor-division by
 /// BALLOT_DIVISOR), NOT the raw zatoshi `total_weight`.
+/// `van_commitment_hash` also binds the circuit's full proposal-authority mask,
+/// so this crate and `voting-circuits` must be upgraded together.
 ///
 /// Matches `orchard/src/delegation/circuit.rs:van_commitment_hash`.
 pub fn construct_van(
@@ -293,10 +295,11 @@ mod tests {
         let vri = [0x05u8; 32];
         let rcm = [0x06u8; 32];
 
-        // total_weight = 15_000_000 → num_ballots = 1 (after / BALLOT_DIVISOR)
+        // total_weight = 15_000_000 → num_ballots = 1 (after / BALLOT_DIVISOR),
+        // bound to the circuit's full 51-bit proposal-authority mask.
         let result = construct_van(&g_d, &pk_d, 15_000_000, &vri, &rcm).unwrap();
         let expected =
-            hex::decode("60658dfc1b7ae3bd06b713ffc6e3c05c369547b10c4a392bd2d45f06fdd2b82d")
+            hex::decode("5f67a2719c1978820de73ca702555d90780f7d1603709c8a429c622cce135f16")
                 .unwrap();
         assert_eq!(
             result, expected,

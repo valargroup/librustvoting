@@ -5,7 +5,8 @@ use rusqlite::{named_params, Connection, OptionalExtension, TransactionBehavior}
 use crate::{
     helper::url::canonical_helper_url_list,
     round::VotingDb,
-    session::{classify_ballot_intents, Decision},
+    round_planning::{intent_is_lifecycle_owned, vote_phase_is_lifecycle_owned},
+    session::{classify_ballot_intents, load_ballot_intents, Decision},
     share::ShareOperationScope,
     share_policy::{
         plan_share_submissions_with_preferred_servers, round_immediate_share_key,
@@ -36,9 +37,7 @@ pub(crate) fn prepare_share_delivery_plan(
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin helper-share plan transaction failed: {e}"),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("begin helper-share plan transaction failed", &e))?;
     let commitment_bundle_json: String = tx
         .query_row(
             "SELECT commitment_bundle_json FROM votes
@@ -88,8 +87,8 @@ pub(crate) fn prepare_share_delivery_plan(
     )? {
         validate_share_delivery_plan(&existing, payloads.len())?;
         validate_immediate_plan(&existing, immediate_position)?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit helper-share plan read transaction failed: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("commit helper-share plan read transaction failed", &e)
         })?;
         return Ok(existing);
     }
@@ -190,9 +189,8 @@ pub(crate) fn prepare_share_delivery_plan(
     validate_share_delivery_plan(&persisted, payloads.len())?;
     validate_immediate_plan(&persisted, immediate_position)?;
     validate_round_immediate_plans(&tx, round_id, &wallet_id, immediate_key)?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit helper-share plan transaction failed: {e}"),
-    })?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("commit helper-share plan transaction failed", &e))?;
     Ok(persisted)
 }
 
@@ -213,7 +211,7 @@ fn derive_immediate_share(
         });
     }
 
-    let intents = load_ballot_intents_with_conn(conn, round_id, wallet_id)?;
+    let intents = durable_decisions(conn, round_id, wallet_id)?;
     let classification = classify_ballot_intents(proposal_ids, &intents)?;
     if !classification.open_proposals.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -223,7 +221,17 @@ fn derive_immediate_share(
             ),
         });
     }
-    let durable_roster = intents.keys().copied().collect::<BTreeSet<_>>();
+    // The durable roster must match the authenticated one, except for an
+    // intent the host cannot clear: a proposal that left the roster after its
+    // vote reached the chain lifecycle. The planner omits those the same way.
+    let mut durable_roster = BTreeSet::new();
+    for &proposal_id in intents.keys() {
+        if classification.roster.contains(&proposal_id)
+            || !intent_is_lifecycle_owned(conn, wallet_id, round_id, proposal_id)?
+        {
+            durable_roster.insert(proposal_id);
+        }
+    }
     if classification.roster != durable_roster {
         return Err(VotingError::InvalidInput {
             message: "proposal roster does not exactly match the round's durable ballot intents"
@@ -238,12 +246,63 @@ fn derive_immediate_share(
         });
     }
 
-    let immediate_key =
-        immediate_key_for_choices(conn, round_id, wallet_id, &classification.choice_proposals)?;
+    // The round-immediate designation is durable once made: it is read from
+    // its own row and never re-derived while that row exists, so a designated
+    // proposal that later leaves the roster keeps it and no plan names a
+    // second one. Derivation from the complete ballot only seeds it, the
+    // first time the designated vote's own plan is prepared, in this
+    // transaction.
+    let existing = super::immediate_designation::round_immediate_share(conn, round_id, wallet_id)?;
+    let immediate_key = match existing {
+        Some(key) => Some(key),
+        None => {
+            immediate_key_for_choices(conn, round_id, wallet_id, &classification.choice_proposals)?
+        }
+    };
+    if existing.is_none() {
+        if let Some(key) = immediate_key {
+            if key.bundle_index == bundle_index && key.proposal_id == proposal_id {
+                super::immediate_designation::designate_round_immediate_share(
+                    conn, round_id, wallet_id, key,
+                )?;
+            }
+        }
+    }
     let immediate_position =
         immediate_position_for_commitment(immediate_key, bundle_index, proposal_id, payloads)?;
 
     Ok((immediate_key, immediate_position))
+}
+
+/// The round's decisions as helper planning sees them: the recorded ballot
+/// intents, plus the stored choice of every vote the chain lifecycle owns
+/// that has no intent of its own. Such a vote is the wallet's transaction
+/// whatever the ballot says; its shares are owed, so its choice stands as
+/// the decision helper planning derives from.
+fn durable_decisions(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<BTreeMap<u32, Decision>, VotingError> {
+    let mut decisions: BTreeMap<u32, Decision> = load_ballot_intents(conn, round_id, wallet_id)?
+        .into_iter()
+        .collect();
+    let choices: BTreeMap<(u32, u32), u32> =
+        crate::storage::queries::get_votes(conn, round_id, wallet_id)?
+            .into_iter()
+            .map(|vote| ((vote.bundle_index, vote.proposal_id), vote.choice))
+            .collect();
+    for status in crate::phases::vote_submission_statuses_on(conn, wallet_id, round_id)? {
+        if decisions.contains_key(&status.proposal_id)
+            || !vote_phase_is_lifecycle_owned(status.phase)
+        {
+            continue;
+        }
+        if let Some(choice) = choices.get(&(status.bundle_index, status.proposal_id)) {
+            decisions.insert(status.proposal_id, Decision::Choice(*choice));
+        }
+    }
+    Ok(decisions)
 }
 
 fn immediate_key_for_choices(
@@ -298,57 +357,6 @@ fn immediate_position_for_commitment(
         }
         _ => Ok(None),
     }
-}
-
-fn load_ballot_intents_with_conn(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-) -> Result<BTreeMap<u32, Decision>, VotingError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT proposal_id, skipped, choice FROM ballot_intent
-             WHERE round_id = :round_id AND wallet_id = :wallet_id
-             ORDER BY proposal_id",
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("prepare helper-share ballot intents failed: {e}"),
-        })?;
-    let rows = stmt
-        .query_map(
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-            },
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            },
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("query helper-share ballot intents failed: {e}"),
-        })?;
-
-    let mut intents = BTreeMap::new();
-    for row in rows {
-        let (proposal_id, skipped, choice) = row.map_err(|e| VotingError::Internal {
-            message: format!("read helper-share ballot intent failed: {e}"),
-        })?;
-        let decision = if skipped != 0 {
-            Decision::Skipped
-        } else {
-            Decision::Choice(choice.ok_or_else(|| VotingError::Internal {
-                message: format!(
-                    "chosen proposal {proposal_id} is missing its durable ballot choice"
-                ),
-            })? as u32)
-        };
-        intents.insert(proposal_id as u32, decision);
-    }
-    Ok(intents)
 }
 
 fn validate_round_immediate_plans(
@@ -473,7 +481,7 @@ pub(crate) fn load_share_delivery_plan(
     })?;
     validate_current_helper_fleet(current_fleet)?;
     validate_share_delivery_plan(&plan, payloads.len())?;
-    let intents = load_ballot_intents_with_conn(&conn, round_id, scope.wallet_id())?;
+    let intents = durable_decisions(&conn, round_id, scope.wallet_id())?;
     if !matches!(intents.get(&proposal_id), Some(Decision::Choice(_))) {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -481,14 +489,25 @@ pub(crate) fn load_share_delivery_plan(
             ),
         });
     }
-    let choice_proposals = intents
-        .iter()
-        .filter_map(|(&proposal_id, decision)| {
-            matches!(decision, Decision::Choice(_)).then_some(proposal_id)
-        })
-        .collect::<Vec<_>>();
-    let immediate_key =
-        immediate_key_for_choices(&conn, round_id, scope.wallet_id(), &choice_proposals)?;
+    // The durable designation is what the persisted plans were made against;
+    // a choice recorded after it does not move it. Derive only while the
+    // round has none, as preparation does.
+    let immediate_key = match super::immediate_designation::round_immediate_share(
+        &conn,
+        round_id,
+        scope.wallet_id(),
+    )? {
+        Some(key) => Some(key),
+        None => {
+            let choice_proposals = intents
+                .iter()
+                .filter_map(|(&proposal_id, decision)| {
+                    matches!(decision, Decision::Choice(_)).then_some(proposal_id)
+                })
+                .collect::<Vec<_>>();
+            immediate_key_for_choices(&conn, round_id, scope.wallet_id(), &choice_proposals)?
+        }
+    };
     validate_round_immediate_plans(&conn, round_id, scope.wallet_id(), immediate_key)?;
     let immediate_position =
         immediate_position_for_commitment(immediate_key, bundle_index, proposal_id, payloads)?;
