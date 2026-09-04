@@ -686,7 +686,9 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// `Tracking` result waits `pending_repoll` and passes again; a
     /// `Recovering` result escalates to `ExactTree` at most once per episode
     /// and otherwise ends the episode as `StillPending`; terminal results are
-    /// never retried; cancellation is checked between passes.
+    /// never retried. Cancellation, or an operation-epoch change since the
+    /// episode began, is observed between passes and during the repoll wait
+    /// and ends the episode as `Cancelled`.
     pub async fn advance_until_terminal(
         &self,
         request: ChainAdvanceRequest,
@@ -696,8 +698,13 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         let mut recovery = policy.initial_recovery_mode;
         let mut escalated = recovery == ChainRecoveryMode::ExactTree;
         let mut passes = 0usize;
+        // The episode belongs to the epoch it started under. A host that
+        // moves to another epoch mid-episode (session or account switch) has
+        // invalidated this invocation, so a later pass must not capture the
+        // new epoch as if it were its own.
+        let entry_epoch = control.operation_epoch();
         loop {
-            if control.is_cancelled() {
+            if interrupted(control, entry_epoch) {
                 return Ok(ChainAdvanceOutcome::Cancelled);
             }
             passes += 1;
@@ -745,7 +752,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             if policy.max_passes != 0 && passes >= policy.max_passes {
                 return Ok(ChainAdvanceOutcome::StillPending(pending));
             }
-            if cancelled_during(policy.pending_repoll, control).await {
+            if interrupted_during(policy.pending_repoll, control, entry_epoch).await {
                 return Ok(ChainAdvanceOutcome::Cancelled);
             }
         }
@@ -756,20 +763,30 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
 /// check cadence used by the submission coordinator.
 const REPOLL_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 
+/// Whether an episode that began under `entry_epoch` must stop: the host
+/// cancelled, or it has moved to another operation epoch since.
+fn interrupted(control: &ChainSubmissionControl, entry_epoch: u64) -> bool {
+    control.is_cancelled() || control.operation_epoch() != entry_epoch
+}
+
 /// Waits `delay` between polling passes, returning early with `true` as soon
-/// as `control` is cancelled.
+/// as the episode is interrupted (see [`interrupted`]).
 ///
 /// `ChainAdvancePolicy::pending_repoll` is host-configured and unbounded, so
 /// an unconditional sleep would defer shutdown or account-switch cancellation
-/// by the whole interval. Cancellation is observed within
+/// by the whole interval. Interruption is observed within
 /// [`REPOLL_CANCELLATION_CHECK_INTERVAL`] instead.
-async fn cancelled_during(delay: Duration, control: &ChainSubmissionControl) -> bool {
+async fn interrupted_during(
+    delay: Duration,
+    control: &ChainSubmissionControl,
+    entry_epoch: u64,
+) -> bool {
     // A host may configure an effectively infinite repoll. An absolute
     // deadline that far out cannot be represented, so `None` means "wait
     // until cancelled" rather than overflowing.
     let deadline = tokio::time::Instant::now().checked_add(delay);
     loop {
-        if control.is_cancelled() {
+        if interrupted(control, entry_epoch) {
             return true;
         }
         let remaining = match deadline {

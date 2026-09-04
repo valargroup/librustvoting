@@ -2,14 +2,16 @@
 
 use std::time::Duration;
 
-use super::{cancelled_during, ChainSubmissionControl};
+use super::{interrupted_during, ChainSubmissionControl};
 
 #[tokio::test(start_paused = true)]
 async fn a_cancellation_during_the_repoll_wait_returns_promptly() {
     let control = ChainSubmissionControl::new(1);
     let waiter = {
         let control = control.clone();
-        tokio::spawn(async move { cancelled_during(Duration::from_secs(3_600), &control).await })
+        tokio::spawn(
+            async move { interrupted_during(Duration::from_secs(3_600), &control, 1).await },
+        )
     };
     let started = tokio::time::Instant::now();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -34,7 +36,7 @@ async fn an_uncancelled_repoll_wait_lasts_the_full_delay() {
     let control = ChainSubmissionControl::new(1);
     let started = tokio::time::Instant::now();
 
-    let cancelled = cancelled_during(Duration::from_secs(90), &control).await;
+    let cancelled = interrupted_during(Duration::from_secs(90), &control, 1).await;
 
     assert!(!cancelled);
     assert_eq!(started.elapsed(), Duration::from_secs(90));
@@ -46,7 +48,7 @@ async fn an_already_cancelled_control_skips_the_wait() {
     control.cancel();
     let started = tokio::time::Instant::now();
 
-    assert!(cancelled_during(Duration::from_secs(90), &control).await);
+    assert!(interrupted_during(Duration::from_secs(90), &control, 1).await);
     assert_eq!(started.elapsed(), Duration::ZERO);
 }
 
@@ -55,7 +57,7 @@ async fn an_unrepresentable_repoll_deadline_waits_for_cancellation_instead_of_pa
     let control = ChainSubmissionControl::new(1);
     let waiter = {
         let control = control.clone();
-        tokio::spawn(async move { cancelled_during(Duration::MAX, &control).await })
+        tokio::spawn(async move { interrupted_during(Duration::MAX, &control, 1).await })
     };
     tokio::time::sleep(Duration::from_secs(3_600)).await;
     assert!(!waiter.is_finished(), "an unbounded repoll keeps waiting");
@@ -63,4 +65,26 @@ async fn an_unrepresentable_repoll_deadline_waits_for_cancellation_instead_of_pa
     control.cancel();
 
     assert!(waiter.await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_operation_epoch_change_during_the_repoll_wait_interrupts_it() {
+    let control = ChainSubmissionControl::new(1);
+    let waiter = {
+        let control = control.clone();
+        tokio::spawn(
+            async move { interrupted_during(Duration::from_secs(3_600), &control, 1).await },
+        )
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiter.is_finished());
+
+    control.set_operation_epoch(2);
+    let interrupted = waiter.await.unwrap();
+
+    assert!(interrupted);
+    assert!(
+        !control.is_cancelled(),
+        "an epoch change is not a cancellation"
+    );
 }

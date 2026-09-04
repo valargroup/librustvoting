@@ -68,6 +68,18 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `ChainSubmissionClient::advance_until_terminal` and the persisted-vote
+  recovery driver `RoundExecutor::advance` capture the operation epoch on
+  entry; an epoch change is observed like cancellation between passes,
+  during the repoll wait, and at every recovery boundary.
+- `RoundExecutor::with_binding` rejects a binding whose network differs from
+  the chain client's before any proof or helper-plan work can run.
+- A `CastVote` whose tree sync fails after the host cancelled returns a
+  `Cancelled` outcome instead of the transport failure the cancellation
+  produced; the poisoned tree is still reset first.
+- The wallet example's `advance_round_until_idle` returns the last
+  `RoundStepOutcome` so a terminal chain diagnostic is not lost with the plan.
+
 - `HyperTransport` derives one absolute deadline per request before polling
   the route; the direct route abandons connection setup a bounded lead ahead
   of that backstop, so a stalled TCP or TLS connect is reported as a definite
