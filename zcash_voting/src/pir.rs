@@ -102,15 +102,18 @@ pub async fn connect_pir(
 
 /// Canonical form of one endpoint URL, so equivalent spellings dedupe to one
 /// fleet member: lowercase scheme and host, no default port, unreserved
-/// percent escapes decoded, dot segments resolved, no trailing slashes. A string that does not parse as a URL keeps only the whitespace
-/// and slash trimming; connecting to it reports the real problem.
+/// percent escapes decoded, dot segments resolved, no trailing slashes on
+/// the path. The query is kept as given, so a slash that ends a query value
+/// is not a path separator and survives. A string that does not parse as a
+/// URL keeps only the whitespace and slash trimming; connecting to it
+/// reports the real problem.
 fn normalize_endpoint_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = url.trim();
     let Ok(uri) = trimmed.parse::<http::Uri>() else {
-        return trimmed.to_string();
+        return trimmed.trim_end_matches('/').to_string();
     };
     let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) else {
-        return trimmed.to_string();
+        return trimmed.trim_end_matches('/').to_string();
     };
     let scheme = scheme.to_ascii_lowercase();
     let default_port = match scheme.as_str() {

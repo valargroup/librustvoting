@@ -120,6 +120,27 @@ fn equivalent_endpoint_spellings_canonicalize_to_one_identity() {
 }
 
 #[test]
+fn a_slash_ending_a_query_value_is_not_a_trailing_path_slash() {
+    use super::super::normalize_endpoint_url;
+
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/api?token=abc/"),
+        "https://pir.example/api?token=abc/",
+        "the query is kept as given"
+    );
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/api/?token=abc/"),
+        "https://pir.example/api?token=abc/",
+        "only the path loses its trailing slash"
+    );
+    assert_ne!(
+        normalize_endpoint_url("https://pir.example/api?token=abc/"),
+        normalize_endpoint_url("https://pir.example/api?token=abc"),
+        "a tokenized endpoint is not the same resource without its final character"
+    );
+}
+
+#[test]
 fn unreserved_percent_escapes_normalize_to_one_endpoint_identity() {
     use super::super::normalize_endpoint_url;
 
