@@ -197,9 +197,13 @@ impl VotingDb {
     /// Returns [`VotingError::InvalidInput`] for an out-of-range proposal id,
     /// a decision that does not fit its option count, or a repeated proposal
     /// id.
+    /// A round already stored under `round_id` must be stored for
+    /// `expected_network`; the check runs inside the write transaction, and
+    /// a mismatch is [`VotingError::InvalidInput`] with no intent written.
     pub fn set_ballot_intents(
         &self,
         round_id: &str,
+        expected_network: crate::types::Network,
         intents: &[(u32, Decision, u32)],
     ) -> Result<(), VotingError> {
         let mut seen = BTreeSet::new();
@@ -216,6 +220,19 @@ impl VotingDb {
         let now = now_secs();
         let wallet_id = self.wallet_id();
         self.write_transaction("set_ballot_intents transaction failed", |tx| {
+            // Checked under the write lock so a round created for another
+            // network between the caller's check and this write cannot take
+            // choices resolved against a different network's roster.
+            if crate::storage::queries::has_round(tx, round_id, &wallet_id)? {
+                let stored = crate::storage::queries::load_round_network(tx, round_id, &wallet_id)?;
+                if stored != expected_network {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "round {round_id} is stored for network {stored:?} but the ballot intents are for {expected_network:?}"
+                        ),
+                    });
+                }
+            }
             for &(proposal_id, decision, _) in intents {
                 write_ballot_intent_in_tx(tx, &wallet_id, round_id, proposal_id, decision, now)?;
             }

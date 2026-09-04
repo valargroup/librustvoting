@@ -128,3 +128,55 @@ fn a_valid_batch_applies_every_intent() {
         .unwrap();
     assert!(plan.open_proposals.is_empty());
 }
+
+#[test]
+fn intents_for_a_round_stored_under_another_network_are_refused_without_a_write() {
+    // Bound before the round exists, so the binding check has nothing to
+    // compare against.
+    let database = host_database_for_wallet_without_round("wallet-late-round");
+    let helper_client = HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
+    let executor = RoundExecutor::new(
+        Arc::clone(&database),
+        ChainSubmissionClientConfig::for_network(
+            Network::Mainnet,
+            vec!["https://chain.invalid".to_string()],
+        ),
+        helper_client,
+    )
+    .unwrap()
+    .with_binding(RoundBinding {
+        round_id: ROUND_ID.to_string(),
+        network: Network::Mainnet,
+        proposals: vec![ProposalRosterEntry {
+            proposal_id: 1,
+            num_options: 2,
+        }],
+        hotkey_secret: None,
+    })
+    .unwrap();
+    // The round then appears, stored for another network.
+    crate::storage::queries::insert_round(
+        &database.conn(),
+        "wallet-late-round",
+        Network::Testnet,
+        &round_params(),
+        None,
+    )
+    .unwrap();
+
+    let error = executor
+        .set_ballot_intents(&[BallotIntent {
+            proposal_id: 1,
+            decision: Decision::Choice(0),
+        }])
+        .expect_err("the stored round is Testnet");
+    assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+    assert!(
+        error.to_string().contains("stored for network Testnet"),
+        "{error}"
+    );
+    assert!(
+        database.ballot_intents(ROUND_ID).unwrap().is_empty(),
+        "a refused batch must not write into the other network's round"
+    );
+}

@@ -46,7 +46,10 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// Option counts come from the bound roster, so a decision for an unknown
     /// proposal is rejected before anything is written. The whole batch is
     /// resolved against the roster first and then written in one transaction,
-    /// so a rejected batch leaves durable intent unchanged.
+    /// so a rejected batch leaves durable intent unchanged. The stored round's
+    /// network is checked inside that transaction against the binding's, so
+    /// a round created for another network after the binding was made is
+    /// refused before any intent is written.
     pub fn set_ballot_intents(&self, intents: &[BallotIntent]) -> Result<RoundPlan, VotingError> {
         self.wallet_scope()?;
         let binding = self.binding()?;
@@ -65,7 +68,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             })
             .collect::<Result<Vec<_>, VotingError>>()?;
         self.database
-            .set_ballot_intents(&binding.round_id, &resolved)?;
+            .set_ballot_intents(&binding.round_id, self.chain_network, &resolved)?;
         self.plan()
     }
 

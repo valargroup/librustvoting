@@ -55,6 +55,15 @@ pub(super) fn host_database() -> Arc<crate::round::VotingDb> {
     host_database_for("wallet")
 }
 
+/// An in-memory sidecar scoped to `wallet_id` with no round stored yet.
+pub(super) fn host_database_for_wallet_without_round(
+    wallet_id: &str,
+) -> Arc<crate::round::VotingDb> {
+    let db = crate::round::VotingDb::open_in_memory().unwrap();
+    db.set_wallet_id(wallet_id);
+    Arc::new(db)
+}
+
 pub(super) fn host_database_for(wallet_id: &str) -> Arc<crate::round::VotingDb> {
     let database = Arc::new(crate::round::VotingDb::open_in_memory().unwrap());
     database.set_wallet_id(wallet_id);
