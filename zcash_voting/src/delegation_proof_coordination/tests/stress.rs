@@ -28,7 +28,7 @@ use super::super::{coordinate, DelegationProofIdentity};
 const DEADLINE: Duration = Duration::from_secs(30);
 
 fn identity(wallet_id: &str, bundle_index: u32) -> DelegationProofIdentity {
-    DelegationProofIdentity::new(wallet_id.to_string(), "stress-round", bundle_index)
+    DelegationProofIdentity::new(0, wallet_id.to_string(), "stress-round", bundle_index)
 }
 
 /// Runs `work` on a fresh thread and fails the test with `hazard` if it does

@@ -69,6 +69,12 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- Delegation proof coordination keys its process-local lock by sidecar
+  connection as well as wallet, round, and bundle.
+- `CastVote` canonicalizes vote-tree node URLs: trailing slashes are removed
+  and a query or fragment is rejected, since the tree client appends its API
+  path to the base verbatim.
+
 - The in-memory vote-tree cache prunes entries whose sidecar connection has
   been dropped, so reopening a sidecar does not accumulate retained trees.
 - `AdvanceDelegation` keeps the bundle lock inside its re-signing task, so an

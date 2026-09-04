@@ -15,14 +15,24 @@ use crate::{delegate::DelegationProgress, types::DelegationProgressReporter, Vot
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct DelegationProofIdentity {
+    /// The sidecar connection the proof is persisted through, so two
+    /// independently opened sidecars that share a wallet id do not serialize
+    /// on each other's proofs.
+    connection_id: u64,
     wallet_id: String,
     round_id: String,
     bundle_index: u32,
 }
 
 impl DelegationProofIdentity {
-    pub(super) fn new(wallet_id: String, round_id: &str, bundle_index: u32) -> Self {
+    pub(super) fn new(
+        connection_id: u64,
+        wallet_id: String,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Self {
         Self {
+            connection_id,
             wallet_id,
             round_id: round_id.to_string(),
             bundle_index,

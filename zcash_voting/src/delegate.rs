@@ -1261,7 +1261,8 @@ pub fn ensure_proof(
     pir_client: &dyn crate::pir::PirProofSource,
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProofCompletion, VotingError> {
-    let identity = DelegationProofIdentity::new(db.wallet_id(), round_id, bundle_index);
+    let identity =
+        DelegationProofIdentity::new(db.connection_id(), db.wallet_id(), round_id, bundle_index);
     with_live_progress(stages, |progress| {
         crate::delegation_proof_coordination::coordinate(
             identity,
@@ -1321,7 +1322,8 @@ pub fn validate_persisted_proof_reuse(
     notes: &[NoteInfo],
     keys: &DelegationKeys,
 ) -> Result<(), VotingError> {
-    let identity = DelegationProofIdentity::new(db.wallet_id(), round_id, bundle_index);
+    let identity =
+        DelegationProofIdentity::new(db.connection_id(), db.wallet_id(), round_id, bundle_index);
     db.validate_delegation_proof_inputs(&identity, notes, keys)?;
     db.validate_delegation_proof_target(&identity, keys)
 }
