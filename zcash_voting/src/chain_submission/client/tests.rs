@@ -49,3 +49,18 @@ async fn an_already_cancelled_control_skips_the_wait() {
     assert!(cancelled_during(Duration::from_secs(90), &control).await);
     assert_eq!(started.elapsed(), Duration::ZERO);
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_unrepresentable_repoll_deadline_waits_for_cancellation_instead_of_panicking() {
+    let control = ChainSubmissionControl::new(1);
+    let waiter = {
+        let control = control.clone();
+        tokio::spawn(async move { cancelled_during(Duration::MAX, &control).await })
+    };
+    tokio::time::sleep(Duration::from_secs(3_600)).await;
+    assert!(!waiter.is_finished(), "an unbounded repoll keeps waiting");
+
+    control.cancel();
+
+    assert!(waiter.await.unwrap());
+}

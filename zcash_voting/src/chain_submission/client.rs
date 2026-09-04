@@ -764,16 +764,25 @@ const REPOLL_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 /// by the whole interval. Cancellation is observed within
 /// [`REPOLL_CANCELLATION_CHECK_INTERVAL`] instead.
 async fn cancelled_during(delay: Duration, control: &ChainSubmissionControl) -> bool {
-    let deadline = tokio::time::Instant::now() + delay;
+    // A host may configure an effectively infinite repoll. An absolute
+    // deadline that far out cannot be represented, so `None` means "wait
+    // until cancelled" rather than overflowing.
+    let deadline = tokio::time::Instant::now().checked_add(delay);
     loop {
         if control.is_cancelled() {
             return true;
         }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        tokio::time::sleep((deadline - now).min(REPOLL_CANCELLATION_CHECK_INTERVAL)).await;
+        let remaining = match deadline {
+            Some(deadline) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                deadline - now
+            }
+            None => REPOLL_CANCELLATION_CHECK_INTERVAL,
+        };
+        tokio::time::sleep(remaining.min(REPOLL_CANCELLATION_CHECK_INTERVAL)).await;
     }
 }
 
