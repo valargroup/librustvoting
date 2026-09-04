@@ -110,6 +110,18 @@ impl<T: ChainTransport> RoundExecutor<T> {
         error: VotingError,
         step: Option<NextStep>,
     ) -> RoundStepFailure {
+        self.step_voting_failure_after_chain(error, step, None)
+    }
+
+    /// [`Self::step_voting_failure`] for an error raised after the chain
+    /// already produced `chain_outcome`, which stays on the failure so a
+    /// durable confirmation is not lost behind a later delivery error.
+    pub(super) fn step_voting_failure_after_chain(
+        &self,
+        error: VotingError,
+        step: Option<NextStep>,
+        chain_outcome: Option<ChainSubmissionResult>,
+    ) -> RoundStepFailure {
         let kind = match error.kind() {
             VotingErrorKind::InvalidInput
             | VotingErrorKind::InsufficientEligibility
@@ -122,7 +134,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             VotingErrorKind::KeystoneSignatureConflict => RoundStepFailureKind::Signing,
             VotingErrorKind::Internal => RoundStepFailureKind::InvariantViolation,
         };
-        self.step_failure(kind, step, None, None, error.to_string())
+        self.step_failure(kind, step, None, chain_outcome, error.to_string())
     }
 
     pub(super) fn step_chain_failure(

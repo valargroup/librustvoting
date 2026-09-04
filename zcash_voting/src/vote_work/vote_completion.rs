@@ -203,7 +203,13 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 vote.proposal_id(),
             )
             .and_then(|vote| vote.confirmed(&self.database))
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?
+            .map_err(|error| {
+                self.step_voting_failure_after_chain(
+                    error,
+                    Some(step.clone()),
+                    chain_outcome.clone(),
+                )
+            })?
             .ok_or_else(|| {
                 self.step_failure(
                     RoundStepFailureKind::InvariantViolation,
@@ -225,7 +231,13 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     &cancel,
                 )
                 .await
-                .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+                .map_err(|error| {
+                    self.step_voting_failure_after_chain(
+                        error,
+                        Some(step.clone()),
+                        chain_outcome.clone(),
+                    )
+                })?;
             let report = VoteShareDeliveryReport {
                 vote: vote_key(vote.vote()),
                 delivery,
