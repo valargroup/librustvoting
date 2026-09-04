@@ -150,6 +150,21 @@ pub fn verify_witness(witness: &WitnessData) -> Result<(), VotingError> {
     }
 }
 
+/// The wallet's tree sync bound to `transport`, for a caller that must sync,
+/// reset, and generate witnesses on one handle.
+///
+/// Two executors for one wallet may bind different transports concurrently,
+/// and each routed sync replaces the wallet-wide registry entry. A caller
+/// that looked the handle up again between its sync and its witness could be
+/// handed the other executor's replacement without its just-synced round
+/// state. Holding the handle returned here keeps that state stable.
+pub(crate) fn vote_tree_for(
+    db: &VotingDb,
+    transport: Option<Arc<dyn vote_commitment_tree_client::transport::Transport>>,
+) -> Result<Arc<crate::tree_sync::VoteTreeSync>, VotingError> {
+    vote_tree_sync_for(db, transport)
+}
+
 /// Syncs the vote commitment tree for one round and returns the latest height.
 ///
 /// For each confirmed bundle that has not yet submitted a vote, this also

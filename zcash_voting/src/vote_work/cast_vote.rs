@@ -90,22 +90,27 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 "casting a vote requires at least one vote-tree node URL",
             ));
         }
+        // One handle serves the sync, any reset, and the witness, so another
+        // executor rebinding this wallet's transport in between cannot hand
+        // the witness a client without the round state just synced.
+        let tree = {
+            let db = Arc::clone(&self.database);
+            let transport = self.tree_transport.clone();
+            self.blocking(&step, "vote tree binding", move || {
+                crate::precompute::vote_tree_for(&db, transport)
+            })
+            .await?
+        };
         let mut height = None;
         let mut last_failure = None;
         for node_url in &host.vote_tree_node_urls {
             let db = Arc::clone(&self.database);
+            let sync_tree = Arc::clone(&tree);
             let sync_round_id = round_id.clone();
             let node_url = node_url.clone();
-            let transport = self.tree_transport.clone();
             let synced = self
-                .blocking(&step, "vote tree sync", move || match transport {
-                    Some(transport) => crate::precompute::sync_vote_tree_with(
-                        &db,
-                        &sync_round_id,
-                        &node_url,
-                        transport,
-                    ),
-                    None => crate::precompute::sync_vote_tree(&db, &sync_round_id, &node_url),
+                .blocking(&step, "vote tree sync", move || {
+                    sync_tree.sync(&db, &sync_round_id, &node_url)
                 })
                 .await;
             match synced {
@@ -114,11 +119,11 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     break;
                 }
                 Err(mut failure) => {
-                    let db = Arc::clone(&self.database);
-                    let round_id = round_id.clone();
+                    let reset_tree = Arc::clone(&tree);
+                    let reset_round_id = round_id.clone();
                     if let Err(reset_failure) = self
                         .blocking(&step, "vote tree reset", move || {
-                            crate::precompute::reset_vote_tree(&db, &round_id)
+                            reset_tree.reset(&reset_round_id)
                         })
                         .await
                     {
@@ -140,9 +145,10 @@ impl<T: ChainTransport> RoundExecutor<T> {
         progress.report(RoundStepProgress::TreeSynced { height });
         let witness = {
             let db = Arc::clone(&self.database);
-            let round_id = round_id.clone();
+            let witness_tree = Arc::clone(&tree);
+            let witness_round_id = round_id.clone();
             self.blocking(&step, "VAN witness", move || {
-                crate::precompute::van_witness(&db, &round_id, bundle_index, height)
+                witness_tree.generate_van_witness(&db, &witness_round_id, bundle_index, height)
             })
             .await?
         };

@@ -7,7 +7,9 @@ use std::sync::{
 
 use vote_commitment_tree_client::transport::{Transport, TransportError, TransportResponse};
 
-use super::{reset_vote_tree, sync_vote_tree, sync_vote_tree_with, vote_tree_sync_for};
+use super::{
+    reset_vote_tree, sync_vote_tree, sync_vote_tree_with, vote_tree_for, vote_tree_sync_for,
+};
 use crate::round::VotingDb;
 
 const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -125,5 +127,26 @@ fn an_account_wide_reset_lets_the_next_sync_bind_a_new_transport() {
         1,
         "a reset forgets the transport the client was created with"
     );
+    reset_vote_tree(&db, "").unwrap();
+}
+
+#[test]
+fn a_retained_tree_handle_keeps_its_round_state_when_the_wallet_rebinds() {
+    let db = db("wallet-retained-handle");
+    let first = CountingTransport::new();
+    let tree = vote_tree_for(&db, Some(first.clone())).unwrap();
+    // The sync fails at the transport but has already created the round's
+    // client on this handle, which is the state a witness needs.
+    tree.sync(&db, ROUND_ID, NODE_URL).unwrap_err();
+    assert!(tree.has_round_client(ROUND_ID));
+
+    // Another executor for the same wallet binds a different transport.
+    let second = CountingTransport::new();
+    let replacement = vote_tree_sync_for(&db, Some(second.clone())).unwrap();
+    assert!(!Arc::ptr_eq(&tree, &replacement));
+    assert!(!replacement.has_round_client(ROUND_ID));
+
+    // The retained handle is unaffected by the wallet-wide rebinding.
+    assert!(tree.has_round_client(ROUND_ID));
     reset_vote_tree(&db, "").unwrap();
 }
