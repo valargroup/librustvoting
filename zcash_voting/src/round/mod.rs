@@ -395,6 +395,13 @@ impl VotingDb {
     ///
     /// Existing rounds are left unchanged. `session_json` is stored only on the
     /// first insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when the round already exists for
+    /// another network or with different parameters (snapshot height,
+    /// election key, or roots): the stored parameters bind the round's
+    /// bundles and proofs, so a caller holding others must not build on it.
     pub fn ensure_round(
         &self,
         network: Network,
@@ -405,13 +412,25 @@ impl VotingDb {
         if self.has_round(&params.vote_round_id)? {
             let conn = self.conn();
             let wallet_id = self.wallet_id();
-            let stored_network =
-                queries::load_round_network(&conn, &params.vote_round_id, &wallet_id)?;
+            let (stored, stored_network) =
+                queries::load_round_params_with_network(&conn, &params.vote_round_id, &wallet_id)?;
             if stored_network != network {
                 return Err(VotingError::InvalidInput {
                     message: format!(
                         "round {} exists for network {:?}, not {:?}",
                         params.vote_round_id, stored_network, network
+                    ),
+                });
+            }
+            // The stored parameters bind every bundle, witness, and proof of
+            // the round. A caller holding different ones for the same id is
+            // working from another snapshot; setting up bundles under the
+            // stored ones would persist rows no later witness can validate.
+            if stored != *params {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "round {} exists with different parameters: stored snapshot height {} and roots differ from the supplied snapshot height {}",
+                        params.vote_round_id, stored.snapshot_height, params.snapshot_height
                     ),
                 });
             }
@@ -736,6 +755,10 @@ fn round_eligible_weight(
 #[cfg(test)]
 #[path = "tests/sidecar_registry.rs"]
 mod sidecar_registry_tests;
+
+#[cfg(test)]
+#[path = "tests/ensure_round.rs"]
+mod ensure_round_tests;
 
 #[cfg(test)]
 mod tests {
