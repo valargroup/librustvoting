@@ -67,6 +67,13 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- A host-provided Keystone signature (`KeystoneSignatureSource::Provided`) is
+  persisted under its bundle as soon as the signed payload verifies, so a
+  `Delegate` step cancelled before chain dispatch, or a restart, resumes
+  through `KeystoneSignatureSource::Stored` without asking the device to sign
+  again. A cancelled `Delegate` outcome now also carries the signed bundle in
+  `RoundStepOutcome::delegation`.
+
 - **Breaking:** `NextStepView.kind`, `RoundPlanView.primary_action`, the
   recovery-work `kind` fields, and every wire `phase` field are enums instead
   of strings. Serde labels are unchanged. The crate-side `as_str` and

@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use crate::{
-    delegate::{DelegationSigningRequest, PreparedDelegationBundle, PreparedSigner},
+    delegate::{
+        DelegationSigningRequest, PreparedDelegationBundle, PreparedSigner, SignedDelegationBundle,
+    },
     types::VotingError,
 };
 
@@ -38,6 +40,10 @@ pub enum KeystoneSignatureSource {
     /// `VotingDb::store_keystone_signatures_batch`.
     Stored,
     /// A signature the host holds in memory.
+    ///
+    /// Once a bundle has verified it, the pipeline persists it under the
+    /// bundle, so a later pass or a restart recovers it through `Stored`
+    /// without asking the device to sign again.
     Provided { sig: Vec<u8>, sighash: Vec<u8> },
 }
 
@@ -96,5 +102,34 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
                 PreparedSigner::signature_from_bytes(&record.sig, &record.sighash)
             }
         }
+    }
+
+    /// Persists a host-provided Keystone signature once the bundle verified it.
+    ///
+    /// Software signatures and already-stored Keystone signatures need no
+    /// write. For [`KeystoneSignatureSource::Provided`], the verified tuple
+    /// (signature, sighash, randomized key) is stored under the bundle so a
+    /// pass cancelled before chain dispatch, or a restart, resumes through
+    /// [`KeystoneSignatureSource::Stored`]. Replaying the same tuple is
+    /// idempotent; a different signing context for the bundle fails with
+    /// [`VotingError::KeystoneSignatureConflict`].
+    pub(super) fn retain_provided_keystone_signature(
+        &self,
+        signer: &DelegationSigner,
+        signed: &SignedDelegationBundle,
+    ) -> Result<(), VotingError> {
+        if !matches!(
+            signer,
+            DelegationSigner::Keystone(KeystoneSignatureSource::Provided { .. })
+        ) {
+            return Ok(());
+        }
+        self.voting_db.store_keystone_signature(
+            self.round_id(),
+            signed.bundle_index,
+            &signed.submission.spend_auth_sig,
+            &signed.submission.sighash,
+            &signed.submission.rk,
+        )
     }
 }

@@ -70,12 +70,17 @@ mod round_executor {
     use std::{sync::Arc, time::Duration};
 
     use crate::{
+        delegate::{DelegationProgress, DelegationSubmission, SignedDelegationBundle},
+        delegation_pipeline::{DelegationDriver, DelegationSigner, KeystoneSignatureSource},
+        governance::BUNDLE_NOTE_SLOTS,
+        pir::PirFleet,
         session::{Decision, NextStep},
+        types::DelegationProgressReporter,
         wire::VotingRoundParams,
         BallotIntent, ChainAdvancePolicy, ChainSubmissionClientConfig, ChainSubmissionControl,
-        HelperClient, HelperHealth, HyperTransport, Network, NoopRoundStepProgressReporter,
-        ProposalRosterEntry, RoundBinding, RoundExecutor, RoundHostContext, RoundStepDisposition,
-        RoundStepFailureKind,
+        DelegationStepInputs, HelperClient, HelperHealth, HyperTransport, Network,
+        NoopRoundStepProgressReporter, ProposalRosterEntry, RoundBinding, RoundExecutor,
+        RoundHostContext, RoundStepDisposition, RoundStepFailureKind, VotingError,
     };
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -399,5 +404,130 @@ mod round_executor {
         assert!(same_bundle.is_err(), "the same bundle must wait");
         drop(first);
         let _ = RoundStepFailureKind::Busy;
+    }
+
+    /// A driver that signs instantly and cancels the host control from inside
+    /// the signing thread, so the executor observes cancellation after the
+    /// payload is signed and before chain dispatch.
+    struct CancelAfterSigningDriver {
+        control: ChainSubmissionControl,
+    }
+
+    impl DelegationDriver for CancelAfterSigningDriver {
+        fn round_id(&self) -> &str {
+            ROUND_ID
+        }
+
+        fn prove_and_sign_blocking(
+            &self,
+            bundle_index: u32,
+            _signer: &DelegationSigner,
+            _pir: &PirFleet,
+            progress: &dyn DelegationProgressReporter,
+        ) -> Result<SignedDelegationBundle, VotingError> {
+            progress.on_progress(DelegationProgress::PayloadReady);
+            self.control.cancel();
+            Ok(SignedDelegationBundle {
+                submission: DelegationSubmission {
+                    proof: vec![0x61; 96],
+                    rk: [0x62; 32],
+                    nf_signed: [0x63; 32],
+                    cmx_new: [0x64; 32],
+                    gov_comm: [0x65; 32],
+                    gov_nullifiers: [[0x66; 32]; BUNDLE_NOTE_SLOTS],
+                    alpha: [0x67; 32],
+                    vote_round_id: ROUND_ID.to_string(),
+                    spend_auth_sig: [0x68; 64],
+                    sighash: [0x69; 32],
+                    tx1_effects: Vec::new(),
+                },
+                pczt_bytes: Vec::new(),
+                eligible_weight_zatoshi: crate::governance::BALLOT_DIVISOR,
+                delegated_weight_zatoshi: crate::governance::BALLOT_DIVISOR,
+                bundle_count: 1,
+                bundle_index,
+            })
+        }
+
+        fn resign_blocking(
+            &self,
+            _bundle_index: u32,
+            _signer: &DelegationSigner,
+        ) -> Result<[u8; 64], VotingError> {
+            Ok([0x68; 64])
+        }
+    }
+
+    fn host_with_delegation(control: &ChainSubmissionControl) -> RoundHostContext {
+        RoundHostContext {
+            delegation: Some(DelegationStepInputs {
+                driver: Arc::new(CancelAfterSigningDriver {
+                    control: control.clone(),
+                }),
+                signer: DelegationSigner::Keystone(KeystoneSignatureSource::Provided {
+                    sig: vec![0x68; 64],
+                    sighash: vec![0x69; 32],
+                }),
+                pir: Arc::new(
+                    PirFleet::new(
+                        &["http://pir.invalid".to_string()],
+                        crate::config::PirLayout {
+                            pir_depth: u32::try_from(pir_types::COMPILED_PIR_LAYOUT.pir_depth)
+                                .unwrap(),
+                            tier0_layers: u32::try_from(
+                                pir_types::COMPILED_PIR_LAYOUT.tier0_layers,
+                            )
+                            .unwrap(),
+                            tier1_layers: u32::try_from(
+                                pir_types::COMPILED_PIR_LAYOUT.tier1_layers,
+                            )
+                            .unwrap(),
+                            poly_len: pir_types::DEFAULT_YPIR_POLY_LEN as u32,
+                        },
+                        Arc::new(HyperTransport::new()),
+                    )
+                    .unwrap(),
+                ),
+            }),
+            ..host()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delegate_step_cancelled_after_signing_returns_the_signed_bundle() {
+        let executor = executor();
+        executor
+            .set_ballot_intents(&[
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Choice(0),
+                },
+                BallotIntent {
+                    proposal_id: 2,
+                    decision: Decision::Skipped,
+                },
+            ])
+            .unwrap();
+        let control = ChainSubmissionControl::new(1);
+        let step = NextStep::Delegate { bundle_index: 0 };
+        assert!(executor.plan().unwrap().next_steps.contains(&step));
+
+        let outcome = executor
+            .advance_step(
+                step.clone(),
+                &host_with_delegation(&control),
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
+        assert_eq!(outcome.step, Some(step));
+        let signed = outcome
+            .delegation
+            .expect("a cancelled Delegate step still hands back the signed bundle");
+        assert_eq!(signed.bundle_index, 0);
+        assert_eq!(signed.submission.spend_auth_sig, [0x68; 64]);
     }
 }

@@ -121,7 +121,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     )
                 })?
         else {
-            return self.step_cancelled(Some(step), None, Vec::new());
+            return self.step_cancelled(Some(step), None, Vec::new(), None);
         };
 
         let plan = self
@@ -131,7 +131,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             return Ok(self.no_work(Some(step), plan));
         }
         if control.is_cancelled() {
-            return self.step_cancelled(Some(step), None, Vec::new());
+            return self.step_cancelled(Some(step), None, Vec::new(), None);
         }
         progress.report(RoundStepProgress::Selected(step.clone()));
 
@@ -285,9 +285,11 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // it, so reporting one here would deliver the terminal event twice.
         let signed = signed.map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
         if control.is_cancelled() {
-            // The signed payload is durable; the next pass re-dispatches it
-            // through AdvanceDelegation without proving again.
-            return self.step_cancelled(Some(step), None, Vec::new());
+            // Proof, setup, and a provided Keystone signature are durable by
+            // now, so the next pass re-dispatches through AdvanceDelegation
+            // without proving or asking the device again. The signed bundle
+            // is still returned so an in-process host can submit it directly.
+            return self.step_cancelled(Some(step), None, Vec::new(), Some(signed));
         }
         let request = AdvanceDelegation {
             vote_round_id: self.round_id_bytes(&step)?,
@@ -492,7 +494,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .await?
         };
         if control.is_cancelled() {
-            return self.step_cancelled(Some(step), None, Vec::new());
+            return self.step_cancelled(Some(step), None, Vec::new(), None);
         }
 
         // Proving runs on a dedicated large-stack thread; stages stream back.
@@ -686,7 +688,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .await
             .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
         if control.is_cancelled() {
-            return self.step_cancelled(Some(step), None, Vec::new());
+            return self.step_cancelled(Some(step), None, Vec::new(), None);
         }
         for vote in &votes {
             vote.prepare_share_delivery(
@@ -745,7 +747,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     );
                 }
                 ChainAdvanceOutcome::Cancelled => {
-                    return self.step_cancelled(Some(step), chain_outcome, Vec::new());
+                    return self.step_cancelled(Some(step), chain_outcome, Vec::new(), None);
                 }
                 ChainAdvanceOutcome::SubmittedWithoutHash(_) | ChainAdvanceOutcome::Rejected(_) => {
                     return self.outcome(
@@ -762,7 +764,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let mut deliveries = Vec::with_capacity(votes.len());
         for vote in votes {
             if control.is_cancelled() {
-                return self.step_cancelled(Some(step), chain_outcome, deliveries);
+                return self.step_cancelled(Some(step), chain_outcome, deliveries, None);
             }
             // Confirmation updates the durable recovery generation, so recover
             // a fresh handle and let the type system prove it is confirmed.
@@ -809,7 +811,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 });
             deliveries.push(report);
             if cancelled {
-                return self.step_cancelled(Some(step), chain_outcome, deliveries);
+                return self.step_cancelled(Some(step), chain_outcome, deliveries, None);
             }
             if incomplete {
                 return Err(self.step_failure(
@@ -947,6 +949,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         step: Option<NextStep>,
         chain_outcome: Option<ChainSubmissionResult>,
         share_deliveries: Vec<VoteShareDeliveryReport>,
+        delegation: Option<crate::delegate::SignedDelegationBundle>,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let plan = self
             .plan()
@@ -956,7 +959,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             disposition: RoundStepDisposition::Cancelled,
             chain_outcome,
             share_deliveries,
-            delegation: None,
+            delegation,
             plan,
         })
     }

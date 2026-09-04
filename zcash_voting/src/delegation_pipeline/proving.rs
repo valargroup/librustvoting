@@ -130,7 +130,9 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     /// builds the PCZT when no proof is persisted yet and reuses persisted
     /// setup otherwise; Keystone signing never rebuilds the PCZT the device
     /// signed. Retryable PIR failures move to the next fleet endpoint while
-    /// reusing the same prepared bundle.
+    /// reusing the same prepared bundle. A host-provided Keystone signature
+    /// is persisted under the bundle once verified, so the signed payload is
+    /// durable before this returns.
     pub fn prove_and_sign_blocking(
         &self,
         bundle_index: u32,
@@ -156,6 +158,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         progress.on_progress(DelegationProgress::SigningPayload);
         let prepared_signer = self.spend_auth_signature(&prepared, bundle_index, signer)?;
         let signed = prepared.signed_bundle(&self.voting_db, pczt_bytes, prepared_signer)?;
+        self.retain_provided_keystone_signature(signer, &signed)?;
         progress.on_progress(DelegationProgress::PayloadReady);
         Ok(signed)
     }
