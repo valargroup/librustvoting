@@ -993,6 +993,11 @@ The captured host operation epoch is checked at the same pre-commit boundaries.
 planner never emits vote work for a bundle whose delegation is still
 in flight, so the two scopes do not overlap on one bundle's lifecycle rows.
 
+Which facts the executor re-verifies inside each act's own transaction or
+lock, after planning from a read snapshot, is tabulated under "Check-then-act"
+in [`round_orchestration_invariants.md`](round_orchestration_invariants.md);
+for chain work the act is this lifecycle's generation compare-and-swap.
+
 ## Cleanup, pruning, and deletion
 
 Ordinary cleanup and reset use the authoritative state under the same operation
