@@ -377,9 +377,15 @@ ready list to be a distinct subset of that fleet.
 `CommittedVote::prepare_share_delivery` consumes that validated snapshot.
 It also consumes the complete proposal-id roster from the authenticated round
 configuration. The roster must be nonempty, distinct, and exactly match the
-round's durable terminal ballot intents. The SDK combines those intents with
-the durable bundle set to derive the single immediate share; the host does not
-select an immediate share index.
+round's durable terminal decisions. Those decisions are the recorded ballot
+intents plus, for a vote the chain lifecycle owns or has finished that has no
+intent of its own, its stored choice: such a vote is the wallet's transaction
+whatever the ballot says, its shares are owed, and its choice stands
+(`durable_decisions`, regression test
+`a_lifecycle_owned_vote_without_an_intent_still_plans_and_delivers_its_shares`).
+The SDK combines those decisions with the durable bundle set to seed the
+single immediate share the first time; the host does not select an immediate
+share index.
 
 The planner carries the other half of that contract: `resume_plan` does not
 emit `NextStep::CastVote` while any roster proposal still lacks a terminal
@@ -1247,8 +1253,14 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
    schedule already delivered to an accepted helper.
 9. Immediate overdue recovery sets durable `submit_at` to zero. Early
    replenishment leaves it unchanged.
-10. Share writes and confirmation MUST match the current durable ballot intent.
-   Changing or skipping that intent clears stale share rows.
+10. Share writes and confirmation MUST match the current durable decision for
+   the proposal. Changing or skipping a recorded intent clears stale share
+   rows. A delivery pass whose every eligible POST for some share ended
+   ambiguously reports the step as pending rather than advanced: no helper
+   definitely holds that share, the ambiguous helpers are excluded from the
+   next initial pass, and only tracking can classify them, so rerunning
+   delivery at once would make no progress
+   (`a_share_every_helper_answered_ambiguously_waits_for_tracking_rather_than_advancing`).
 11. Pending rounds are wallet-scoped and remain discoverable until every share
     is confirmed.
 12. An asynchronous submission or tracking pass captures its wallet scope
