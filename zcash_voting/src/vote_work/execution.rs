@@ -53,6 +53,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         };
 
         let Some(_round_guard) = round_lock::acquire(
+            self.database.connection_id(),
             wallet_id,
             request.round_id,
             None,

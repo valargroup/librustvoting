@@ -476,6 +476,7 @@ mod round_executor {
     async fn bundle_scoped_locks_do_not_serialize_distinct_bundles() {
         let control = ChainSubmissionControl::new(1);
         let first = super::super::round_lock::acquire(
+            7,
             "w".to_string(),
             ROUND_ID,
             Some(0),
@@ -488,6 +489,7 @@ mod round_executor {
         let second = tokio::time::timeout(
             Duration::from_millis(200),
             super::super::round_lock::acquire(
+                7,
                 "w".to_string(),
                 ROUND_ID,
                 Some(1),
@@ -502,6 +504,7 @@ mod round_executor {
         let round_scope = tokio::time::timeout(
             Duration::from_millis(200),
             super::super::round_lock::acquire(
+                7,
                 "w".to_string(),
                 ROUND_ID,
                 None,
@@ -516,6 +519,7 @@ mod round_executor {
         let same_bundle = tokio::time::timeout(
             Duration::from_millis(100),
             super::super::round_lock::acquire(
+                7,
                 "w".to_string(),
                 ROUND_ID,
                 Some(0),
@@ -1359,6 +1363,7 @@ mod round_executor {
     async fn a_queued_lock_wait_stops_when_the_operation_epoch_changes() {
         let control = ChainSubmissionControl::new(1);
         let held = super::super::round_lock::acquire(
+            7,
             "epoch-wait-wallet".to_string(),
             ROUND_ID,
             None,
@@ -1370,6 +1375,7 @@ mod round_executor {
         .unwrap();
 
         let waiter = super::super::round_lock::acquire(
+            7,
             "epoch-wait-wallet".to_string(),
             ROUND_ID,
             None,
@@ -1430,5 +1436,37 @@ mod round_executor {
             "{}",
             failure.message
         );
+    }
+
+    #[tokio::test]
+    async fn locks_for_different_sidecars_with_one_wallet_id_do_not_serialize() {
+        let control = ChainSubmissionControl::new(1);
+        let first = super::super::round_lock::acquire(
+            11,
+            "shared-wallet-name".to_string(),
+            ROUND_ID,
+            None,
+            &control,
+            control.operation_epoch(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let other_sidecar = tokio::time::timeout(
+            Duration::from_millis(200),
+            super::super::round_lock::acquire(
+                12,
+                "shared-wallet-name".to_string(),
+                ROUND_ID,
+                None,
+                &control,
+                control.operation_epoch(),
+            ),
+        )
+        .await
+        .expect("an unrelated sidecar must not wait")
+        .unwrap();
+        assert!(other_sidecar.is_some());
+        drop(first);
     }
 }

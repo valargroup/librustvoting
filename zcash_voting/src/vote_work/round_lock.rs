@@ -10,10 +10,12 @@ use crate::ChainSubmissionControl;
 
 const ROUND_LOCK_CANCEL_CHECK_MILLISECONDS: u64 = 50;
 
-/// `(wallet_id, round_id, bundle)`. `None` is the round-wide scope used by
-/// chain and share steps; `Some(bundle)` scopes delegation work so bundles
-/// prove and sign concurrently.
-type RoundLockKey = (String, String, Option<u32>);
+/// `(sidecar connection, wallet_id, round_id, bundle)`. `None` is the
+/// round-wide scope used by chain and share steps; `Some(bundle)` scopes
+/// delegation work so bundles prove and sign concurrently. The connection id
+/// keeps two independently opened sidecars that share a wallet id from
+/// serializing against each other.
+type RoundLockKey = (u64, String, String, Option<u32>);
 
 static ROUND_LOCKS: LazyLock<Mutex<HashMap<RoundLockKey, Weak<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -28,13 +30,14 @@ pub(super) type HeldRoundLock = Arc<OwnedMutexGuard<()>>;
 /// the caller is queued. A stale caller therefore stops waiting instead of
 /// holding its place behind a long-running proof.
 pub(super) async fn acquire(
+    connection_id: u64,
     wallet_id: String,
     round_id: &str,
     bundle_index: Option<u32>,
     control: &ChainSubmissionControl,
     entry_epoch: u64,
 ) -> Result<Option<OwnedMutexGuard<()>>, String> {
-    let key = (wallet_id, round_id.to_string(), bundle_index);
+    let key = (connection_id, wallet_id, round_id.to_string(), bundle_index);
     let lock = {
         let mut locks = ROUND_LOCKS
             .lock()
