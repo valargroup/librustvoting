@@ -130,6 +130,9 @@ mod episode {
         ChainSubmissionFailureKind, ChainSubmissionPending, ChainSubmissionResult,
     };
 
+    /// Whether an outcome is the one a scripted terminal result must produce.
+    type OutcomeCheck = fn(&ChainAdvanceOutcome) -> bool;
+
     fn tracking() -> ChainSubmissionResult {
         ChainSubmissionResult::Pending(ChainSubmissionPending::Tracking {
             candidate_transaction_hash: CandidateTransactionHash::from_bytes([0x11; 32]),
@@ -230,11 +233,7 @@ mod episode {
     #[tokio::test(start_paused = true)]
     async fn episode_never_retries_terminal_outcomes() {
         let control = ChainSubmissionControl::new(1);
-        let terminal: [(
-            ChainSubmissionResult,
-            &str,
-            fn(&ChainAdvanceOutcome) -> bool,
-        ); 4] = [
+        let terminal: [(ChainSubmissionResult, &str, OutcomeCheck); 4] = [
             (confirmed(), "confirmed", |outcome: &ChainAdvanceOutcome| {
                 matches!(outcome, ChainAdvanceOutcome::Confirmed(_))
             }),
