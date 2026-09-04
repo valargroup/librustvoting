@@ -114,25 +114,31 @@ impl<T: ChainTransport> RoundExecutor<T> {
         step: NextStep,
         bundle_index: u32,
         host: &RoundHostContext,
+        lock: &HeldRoundLock,
         control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let inputs = self.delegation_inputs(&step, host)?;
         let driver = Arc::clone(&inputs.driver);
         let signer = inputs.signer.clone();
-        let signature =
-            tokio::task::spawn_blocking(move || driver.resign_blocking(bundle_index, &signer))
-                .await
-                .map_err(|error| {
-                    self.step_failure(
-                        RoundStepFailureKind::InvariantViolation,
-                        Some(step.clone()),
-                        None,
-                        None,
-                        format!("delegation signing task failed: {error}"),
-                    )
-                })?
-                .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+        // The signing task keeps the bundle lock while it runs, so an aborted
+        // future cannot let a new pass prompt the host signer concurrently.
+        let held_lock = Arc::clone(lock);
+        let signature = tokio::task::spawn_blocking(move || {
+            let _held_lock = held_lock;
+            driver.resign_blocking(bundle_index, &signer)
+        })
+        .await
+        .map_err(|error| {
+            self.step_failure(
+                RoundStepFailureKind::InvariantViolation,
+                Some(step.clone()),
+                None,
+                None,
+                format!("delegation signing task failed: {error}"),
+            )
+        })?
+        .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
         let request = AdvanceDelegation {
             vote_round_id: self.round_id_bytes(&step)?,
             bundle_index,

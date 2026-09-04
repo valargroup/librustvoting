@@ -132,6 +132,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             _ => None,
         };
         let Some(guard) = round_lock::acquire(
+            self.database.connection_id(),
             wallet_id,
             &round_id,
             scope,
@@ -183,7 +184,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     .await
             }
             NextStep::AdvanceDelegation { bundle_index } => {
-                self.run_advance_delegation(step, bundle_index, host, control, progress)
+                self.run_advance_delegation(step, bundle_index, host, &lock, control, progress)
                     .await
             }
             NextStep::AdvanceImportedDelegation { bundle_index } => {
