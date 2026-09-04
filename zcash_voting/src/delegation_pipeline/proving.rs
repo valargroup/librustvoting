@@ -82,17 +82,20 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     /// Generates or reuses the bundle's durable proof without signing.
     ///
     /// A bundle whose proof is already persisted returns
-    /// [`DelegationProofStatus::Reused`] without touching PIR.
+    /// [`DelegationProofStatus::Reused`] without touching PIR, after checking
+    /// that this pipeline's notes and target-bound hotkey are the ones the
+    /// proof was generated for.
     pub fn ensure_proof(
         &self,
         bundle_index: u32,
         pir: &PirFleet,
         progress: &dyn DelegationProgressReporter,
     ) -> Result<DelegationProofStatus, VotingError> {
+        let prepared = self.prepare(bundle_index)?;
         if self.has_persisted_proof(bundle_index)? {
+            prepared.validate_persisted_proof(self.scoped_voting_db()?)?;
             return Ok(DelegationProofStatus::Reused);
         }
-        let prepared = self.prepare(bundle_index)?;
         self.ensure_setup(&prepared, &NoopProgressReporter)?;
         self.prove_with_fleet(&prepared, pir, progress)
     }
@@ -150,6 +153,10 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
             _ => Vec::new(),
         };
         if proof_persisted {
+            // Reuse is only valid for the notes and target the proof was
+            // generated for; a different same-network hotkey must not be
+            // handed the original target's delegation.
+            prepared.validate_persisted_proof(self.scoped_voting_db()?)?;
             progress.on_progress(DelegationProgress::ProofComplete);
         } else {
             self.prove_with_fleet(&prepared, pir, progress)?;

@@ -7,7 +7,9 @@ use std::{
 };
 
 use crate::{
-    delegate::{ensure_proof, DelegationProgress, DelegationProofStatus},
+    delegate::{
+        ensure_proof, validate_persisted_proof_reuse, DelegationProgress, DelegationProofStatus,
+    },
     types::DelegationProgressBridge,
     Network, VotingError, VotingHotkeyTarget,
 };
@@ -339,4 +341,35 @@ fn wallet_switch_does_not_retarget_waiting_proof() {
     assert_eq!(completion.status, DelegationProofStatus::Reused);
     assert_eq!(completion.proof.bytes, vec![WALLET_A_PROOF_BYTE; 96]);
     assert_eq!(db.wallet_id(), WALLET_B);
+}
+
+#[test]
+fn persisted_proof_reuse_validation_rejects_another_hotkey_without_pir() {
+    let db = db_with_persisted_proofs();
+
+    validate_persisted_proof_reuse(&db, ROUND_ID, 0, &[note()], &keys(Network::Testnet, 1))
+        .expect("the original notes and target may reuse the proof");
+
+    let error = validate_persisted_proof_reuse(
+        &db,
+        ROUND_ID,
+        0,
+        &[note()],
+        &keys_for_hotkey(Network::Testnet, 1, 0x22),
+    )
+    .expect_err("a different same-network hotkey must not reuse the proof");
+    assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("hotkey target does not match stored bundle target"),
+        "{error}"
+    );
+
+    let mut other_note = note();
+    other_note.commitment[0] ^= 1;
+    let error =
+        validate_persisted_proof_reuse(&db, ROUND_ID, 0, &[other_note], &keys(Network::Testnet, 1))
+            .expect_err("different notes must not reuse the proof");
+    assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
 }

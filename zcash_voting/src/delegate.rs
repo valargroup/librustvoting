@@ -1001,6 +1001,24 @@ impl PreparedDelegationBundle {
         )
     }
 
+    /// Checks that this bundle's notes and keys are the ones a persisted
+    /// proof was generated for, without touching PIR.
+    ///
+    /// Reusing a persisted proof is only correct for the same bundle notes
+    /// and the same target-bound hotkey. A pipeline constructed with another
+    /// same-network hotkey would otherwise be handed the stored delegation
+    /// for the original target. Fails with [`VotingError::InvalidInput`] on a
+    /// note, network, round, or target mismatch.
+    pub fn validate_persisted_proof(&self, voting_db: &VotingDb) -> Result<(), VotingError> {
+        validate_persisted_proof_reuse(
+            voting_db,
+            &self.round_id,
+            self.bundle_index,
+            &self.bundle_note_infos,
+            &self.delegation_keys,
+        )
+    }
+
     /// Assembles chain-ready submission fields for this prepared bundle.
     pub fn submission(
         &self,
@@ -1292,6 +1310,20 @@ fn generate_and_persist_proof(
         van_comm: array32("van_comm", proof.van_comm)?,
         gov_nullifiers: array32x_bundle_note_slots("gov_nullifiers", proof.gov_nullifiers)?,
     })
+}
+
+/// Validates that `notes` and `keys` match the durable bundle a persisted
+/// proof belongs to; see [`PreparedDelegationBundle::validate_persisted_proof`].
+pub fn validate_persisted_proof_reuse(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+) -> Result<(), VotingError> {
+    let identity = DelegationProofIdentity::new(db.wallet_id(), round_id, bundle_index);
+    db.validate_delegation_proof_inputs(&identity, notes, keys)?;
+    db.validate_delegation_proof_target(&identity, keys)
 }
 
 fn load_persisted_proof(
