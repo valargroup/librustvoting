@@ -321,7 +321,7 @@ Regression coverage:
    `a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster`,
    `the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it`,
    `the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation`,
-   `later_lower_choice_blocks_stale_submission_but_keeps_the_first_designation`).
+   `a_later_lower_choice_does_not_move_the_designation_or_block_its_submission`).
 5. `immediate = true` and `submit_at = 0` are not equivalent. Last-moment and
    single-share planning can assign `submit_at = 0` to undesignated shares,
    but the designated immediate share MUST always have `submit_at = 0`.

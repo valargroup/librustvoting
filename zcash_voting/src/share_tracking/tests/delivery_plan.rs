@@ -405,7 +405,7 @@ fn a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster() 
 }
 
 #[tokio::test]
-async fn later_lower_choice_blocks_stale_submission_but_keeps_the_first_designation() {
+async fn a_later_lower_choice_does_not_move_the_designation_or_block_its_submission() {
     let db = db_with_round_and_bundle();
     seed_recoverable_vote_for_proposal(&db, 2, 1);
     let configured = helpers(3);
@@ -416,10 +416,12 @@ async fn later_lower_choice_blocks_stale_submission_but_keeps_the_first_designat
         .unwrap();
     assert!(original.share_plans[0].immediate);
 
+    // A lower choice recorded after the designation does not move it: the
+    // designated shares still submit against the plan they were made with.
     db.set_ballot_intent(ROUND_ID, 1, crate::session::Decision::Choice(0), 3)
         .unwrap();
     let transport = Arc::new(MockTransport::default());
-    let error = second
+    second
         .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
@@ -427,15 +429,14 @@ async fn later_lower_choice_blocks_stale_submission_but_keeps_the_first_designat
             &never_cancel(),
         )
         .await
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("does not match durable ballot intent"));
-    assert!(transport.calls().is_empty());
+        .expect("submission validates the plan against the durable designation");
+    assert!(
+        !transport.calls().is_empty(),
+        "the designated share reaches the helpers"
+    );
 
-    // The designation was made when proposal 2's plan was prepared and is
-    // durable: the lower choice recorded afterwards does not move it, so
-    // proposal 2 keeps the immediate share and proposal 1 gets none.
+    // Against the complete roster, proposal 2 keeps the immediate share and
+    // proposal 1's plan names none.
     seed_recoverable_vote_for_proposal(&db, 1, 0);
     let reloaded = second
         .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
@@ -446,6 +447,12 @@ async fn later_lower_choice_blocks_stale_submission_but_keeps_the_first_designat
         .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
         .unwrap();
     assert!(first_plan.share_plans.iter().all(|plan| !plan.immediate));
+    assert_eq!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &db.wallet_id())
+            .unwrap()
+            .map(|key| key.proposal_id),
+        Some(2)
+    );
 }
 
 #[test]

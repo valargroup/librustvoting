@@ -342,8 +342,11 @@ Conformance is demonstrated by behavior. Tests cover:
   (`the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it`);
 - a designation survives its proposal leaving the roster
   (`a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster`)
-  and a lower choice recorded afterwards
-  (`later_lower_choice_blocks_stale_submission_but_keeps_the_first_designation`);
+  and a lower choice recorded afterwards, and submission reads the row rather
+  than re-deriving
+  (`a_later_lower_choice_does_not_move_the_designation_or_block_its_submission`);
+- a batch every member of which left the roster is retired once and reported
+  whole (`a_batch_whose_every_member_left_the_roster_is_retired_once_and_recast_from_nothing`);
 - a designation is voided with the undispatched generation it was made for
   and is not voided by confirmation
   (`the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation`);

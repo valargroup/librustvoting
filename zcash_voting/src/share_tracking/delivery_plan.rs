@@ -462,14 +462,25 @@ pub(crate) fn load_share_delivery_plan(
             ),
         });
     }
-    let choice_proposals = intents
-        .iter()
-        .filter_map(|(&proposal_id, decision)| {
-            matches!(decision, Decision::Choice(_)).then_some(proposal_id)
-        })
-        .collect::<Vec<_>>();
-    let immediate_key =
-        immediate_key_for_choices(&conn, round_id, scope.wallet_id(), &choice_proposals)?;
+    // The durable designation is what the persisted plans were made against;
+    // a choice recorded after it does not move it. Derive only while the
+    // round has none, as preparation does.
+    let immediate_key = match super::immediate_designation::round_immediate_share(
+        &conn,
+        round_id,
+        scope.wallet_id(),
+    )? {
+        Some(key) => Some(key),
+        None => {
+            let choice_proposals = intents
+                .iter()
+                .filter_map(|(&proposal_id, decision)| {
+                    matches!(decision, Decision::Choice(_)).then_some(proposal_id)
+                })
+                .collect::<Vec<_>>();
+            immediate_key_for_choices(&conn, round_id, scope.wallet_id(), &choice_proposals)?
+        }
+    };
     validate_round_immediate_plans(&conn, round_id, scope.wallet_id(), immediate_key)?;
     let immediate_position =
         immediate_position_for_commitment(immediate_key, bundle_index, proposal_id, payloads)?;
