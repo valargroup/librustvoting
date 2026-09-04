@@ -1,0 +1,51 @@
+//! The inter-pass repoll wait observes host cancellation promptly.
+
+use std::time::Duration;
+
+use super::{cancelled_during, ChainSubmissionControl};
+
+#[tokio::test(start_paused = true)]
+async fn a_cancellation_during_the_repoll_wait_returns_promptly() {
+    let control = ChainSubmissionControl::new(1);
+    let waiter = {
+        let control = control.clone();
+        tokio::spawn(async move { cancelled_during(Duration::from_secs(3_600), &control).await })
+    };
+    let started = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !waiter.is_finished(),
+        "the wait must not end before cancellation"
+    );
+
+    control.cancel();
+    let cancelled = waiter.await.unwrap();
+
+    assert!(cancelled);
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "cancellation took {:?} to be observed",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_uncancelled_repoll_wait_lasts_the_full_delay() {
+    let control = ChainSubmissionControl::new(1);
+    let started = tokio::time::Instant::now();
+
+    let cancelled = cancelled_during(Duration::from_secs(90), &control).await;
+
+    assert!(!cancelled);
+    assert_eq!(started.elapsed(), Duration::from_secs(90));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_cancelled_control_skips_the_wait() {
+    let control = ChainSubmissionControl::new(1);
+    control.cancel();
+    let started = tokio::time::Instant::now();
+
+    assert!(cancelled_during(Duration::from_secs(90), &control).await);
+    assert_eq!(started.elapsed(), Duration::ZERO);
+}

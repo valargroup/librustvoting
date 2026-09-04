@@ -745,7 +745,37 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             if policy.max_passes != 0 && passes >= policy.max_passes {
                 return Ok(ChainAdvanceOutcome::StillPending(pending));
             }
-            tokio::time::sleep(policy.pending_repoll).await;
+            if cancelled_during(policy.pending_repoll, control).await {
+                return Ok(ChainAdvanceOutcome::Cancelled);
+            }
         }
     }
 }
+
+/// How often a repoll wait re-checks host cancellation. Matches the control
+/// check cadence used by the submission coordinator.
+const REPOLL_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Waits `delay` between polling passes, returning early with `true` as soon
+/// as `control` is cancelled.
+///
+/// `ChainAdvancePolicy::pending_repoll` is host-configured and unbounded, so
+/// an unconditional sleep would defer shutdown or account-switch cancellation
+/// by the whole interval. Cancellation is observed within
+/// [`REPOLL_CANCELLATION_CHECK_INTERVAL`] instead.
+async fn cancelled_during(delay: Duration, control: &ChainSubmissionControl) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if control.is_cancelled() {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(REPOLL_CANCELLATION_CHECK_INTERVAL)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests;

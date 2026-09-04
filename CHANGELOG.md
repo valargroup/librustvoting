@@ -68,6 +68,10 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `ChainSubmissionClient::advance_until_terminal` observes cancellation
+  during the `pending_repoll` wait between passes, within 25 ms, instead of
+  only at the start of the next pass.
+
 - `VotingDb::open_wallet_sidecar` serializes concurrent opens per sidecar
   path only. A slow open of one sidecar (busy timeout, migrations, busy
   retries) no longer delays opening a different sidecar.
