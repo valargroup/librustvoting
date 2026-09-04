@@ -109,3 +109,257 @@ fn the_client_keeps_the_wallet_it_was_constructed_for() {
 
     assert_eq!(client.wallet_id(), "wallet-a");
 }
+
+mod episode {
+    //! The episode loop: escalation, terminal outcomes, the pass budget, and
+    //! interruption, driven by scripted pass results.
+
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use super::super::{
+        run_episode, ChainAdvanceOutcome, ChainAdvancePolicy, ChainRecoveryMode,
+        ChainSubmissionControl,
+    };
+    use crate::chain_submission::{
+        result::ValidatedChainSubmissionConfirmation, CandidateTransactionHash,
+        ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind, ChainSubmissionPending,
+        ChainSubmissionResult,
+    };
+
+    fn tracking() -> ChainSubmissionResult {
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Tracking {
+            candidate_transaction_hash: CandidateTransactionHash::from_bytes([0x11; 32]),
+        })
+    }
+
+    fn recovering() -> ChainSubmissionResult {
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            diagnostic: diagnostic(ChainSubmissionDiagnosticKind::AmbiguousDispatch),
+        })
+    }
+
+    fn diagnostic(kind: ChainSubmissionDiagnosticKind) -> ChainSubmissionDiagnostic {
+        ChainSubmissionDiagnostic::from_redacted_message(kind, "scripted")
+    }
+
+    fn confirmed() -> ChainSubmissionResult {
+        ChainSubmissionResult::Confirmed(
+            ValidatedChainSubmissionConfirmation::from_tree(7, vec![3])
+                .unwrap()
+                .into_public(),
+        )
+    }
+
+    /// Runs the loop over `script`, one result per pass, and returns the
+    /// outcome with the recovery mode each pass was asked for.
+    async fn run(
+        policy: &ChainAdvancePolicy,
+        control: &ChainSubmissionControl,
+        script: Vec<ChainSubmissionResult>,
+    ) -> (ChainAdvanceOutcome, Vec<ChainRecoveryMode>) {
+        let script = Arc::new(Mutex::new(VecDeque::from(script)));
+        let modes = Arc::new(Mutex::new(Vec::new()));
+        let outcome = run_episode(policy, control, 1, |mode| {
+            modes.lock().unwrap().push(mode);
+            let next = script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("the script covers every pass the loop runs");
+            async move { Ok(next) }
+        })
+        .await
+        .unwrap();
+        let modes = modes.lock().unwrap().clone();
+        (outcome, modes)
+    }
+
+    fn policy() -> ChainAdvancePolicy {
+        ChainAdvancePolicy {
+            initial_recovery_mode: ChainRecoveryMode::StatusOnly,
+            pending_repoll: Duration::from_secs(2),
+            escalate_to_exact_tree: true,
+            max_passes: 45,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn episode_escalates_to_exact_tree_once() {
+        let control = ChainSubmissionControl::new(1);
+        let started = tokio::time::Instant::now();
+
+        let (outcome, modes) = run(&policy(), &control, vec![recovering(), recovering()]).await;
+
+        assert!(matches!(
+            outcome,
+            ChainAdvanceOutcome::StillPending(ChainSubmissionPending::Recovering { .. })
+        ));
+        assert_eq!(
+            modes,
+            vec![ChainRecoveryMode::StatusOnly, ChainRecoveryMode::ExactTree],
+            "one Recovering pass escalates; the second ends the episode"
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "escalation is a different pass, not a repoll"
+        );
+
+        let exact_from_the_start = ChainAdvancePolicy {
+            initial_recovery_mode: ChainRecoveryMode::ExactTree,
+            ..policy()
+        };
+        let (outcome, modes) = run(&exact_from_the_start, &control, vec![recovering()]).await;
+        assert!(matches!(outcome, ChainAdvanceOutcome::StillPending(_)));
+        assert_eq!(modes, vec![ChainRecoveryMode::ExactTree]);
+
+        let no_escalation = ChainAdvancePolicy {
+            escalate_to_exact_tree: false,
+            ..policy()
+        };
+        let (outcome, modes) = run(&no_escalation, &control, vec![recovering()]).await;
+        assert!(matches!(outcome, ChainAdvanceOutcome::StillPending(_)));
+        assert_eq!(modes, vec![ChainRecoveryMode::StatusOnly]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn episode_never_retries_terminal_outcomes() {
+        let control = ChainSubmissionControl::new(1);
+        let terminal: [(
+            ChainSubmissionResult,
+            &str,
+            fn(&ChainAdvanceOutcome) -> bool,
+        ); 4] = [
+            (confirmed(), "confirmed", |outcome: &ChainAdvanceOutcome| {
+                matches!(outcome, ChainAdvanceOutcome::Confirmed(_))
+            }),
+            (
+                ChainSubmissionResult::SubmittedWithoutHash(diagnostic(
+                    ChainSubmissionDiagnosticKind::NullifierAlreadySpent,
+                )),
+                "submitted without hash",
+                |outcome: &ChainAdvanceOutcome| {
+                    matches!(outcome, ChainAdvanceOutcome::SubmittedWithoutHash(_))
+                },
+            ),
+            (
+                ChainSubmissionResult::Rejected(diagnostic(
+                    ChainSubmissionDiagnosticKind::ChainRejected,
+                )),
+                "rejected",
+                |outcome: &ChainAdvanceOutcome| matches!(outcome, ChainAdvanceOutcome::Rejected(_)),
+            ),
+            (
+                ChainSubmissionResult::Cancelled,
+                "cancelled",
+                |outcome: &ChainAdvanceOutcome| matches!(outcome, ChainAdvanceOutcome::Cancelled),
+            ),
+        ];
+        for (result, label, expected) in terminal {
+            let started = tokio::time::Instant::now();
+            // Two more passes are scripted; a retry would consume them.
+            let (outcome, modes) =
+                run(&policy(), &control, vec![result, tracking(), tracking()]).await;
+            assert!(expected(&outcome), "{label}: {outcome:?}");
+            assert_eq!(modes.len(), 1, "{label} ended the episode on its own pass");
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "{label} waited for nothing"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn episode_ends_after_its_pass_budget_and_paces_tracking_polls() {
+        let control = ChainSubmissionControl::new(1);
+        let bounded = ChainAdvancePolicy {
+            max_passes: 3,
+            ..policy()
+        };
+        let started = tokio::time::Instant::now();
+
+        let (outcome, modes) = run(
+            &bounded,
+            &control,
+            vec![tracking(), tracking(), tracking(), tracking()],
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ChainAdvanceOutcome::StillPending(ChainSubmissionPending::Tracking { .. })
+        ));
+        assert_eq!(modes.len(), 3, "the budget bounds the passes");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(4),
+            "each Tracking pass but the last waits pending_repoll"
+        );
+
+        let unbounded = ChainAdvancePolicy {
+            max_passes: 0,
+            ..policy()
+        };
+        let (outcome, modes) = run(
+            &unbounded,
+            &control,
+            vec![
+                tracking(),
+                tracking(),
+                tracking(),
+                tracking(),
+                ChainSubmissionResult::Rejected(diagnostic(
+                    ChainSubmissionDiagnosticKind::ChainRejected,
+                )),
+            ],
+        )
+        .await;
+        assert!(matches!(outcome, ChainAdvanceOutcome::Rejected(_)));
+        assert_eq!(
+            modes.len(),
+            5,
+            "a zero budget runs until the row leaves Tracking"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_epoch_change_or_cancellation_between_passes_ends_the_episode() {
+        let control = ChainSubmissionControl::new(1);
+        let bump = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                control.set_operation_epoch(2);
+            })
+        };
+        let (outcome, modes) = run(&policy(), &control, vec![tracking(), tracking()]).await;
+        bump.await.unwrap();
+        assert!(matches!(outcome, ChainAdvanceOutcome::Cancelled));
+        assert_eq!(
+            modes.len(),
+            1,
+            "the epoch change during the repoll wait ends the episode before a second pass"
+        );
+
+        let stale = ChainSubmissionControl::new(1);
+        stale.set_operation_epoch(2);
+        let (outcome, modes) = run(&policy(), &stale, vec![tracking()]).await;
+        assert!(matches!(outcome, ChainAdvanceOutcome::Cancelled));
+        assert!(
+            modes.is_empty(),
+            "an episode whose entry epoch has already passed runs no pass at all"
+        );
+
+        let cancelled = ChainSubmissionControl::new(1);
+        cancelled.cancel();
+        let (outcome, modes) = run(&policy(), &cancelled, vec![tracking()]).await;
+        assert!(matches!(outcome, ChainAdvanceOutcome::Cancelled));
+        assert!(modes.is_empty());
+    }
+}

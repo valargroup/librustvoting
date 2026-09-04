@@ -1241,9 +1241,18 @@ Tests cover:
 - `episode_escalates_to_exact_tree_once`: one `Recovering` pass escalates
   the episode to `ExactTree`; a second ends it as `StillPending`.
 - `episode_never_retries_terminal_outcomes`: `SubmittedWithoutHash`,
-  `Rejected`, and `Confirmed` end the episode on the pass that produced them.
-- `route_executor_phase_classification`: a `RouteHttp` failure before the
-  dispatch hook is `definitely_unsent`; after it is `possibly_dispatched`.
+  `Rejected`, `Confirmed`, and `Cancelled` end the episode on the pass that
+  produced them.
+- `episode_ends_after_its_pass_budget_and_paces_tracking_polls`: the pass
+  budget bounds an episode, a zero budget runs until the row leaves
+  `Tracking`, and every `Tracking` pass but the last waits `pending_repoll`.
+- `an_epoch_change_or_cancellation_between_passes_ends_the_episode`: an
+  epoch change during the repoll wait, a stale entry epoch, or cancellation
+  ends the episode as `Cancelled` without another pass.
+- `chain_failures_classify_by_dispatch_and_mark_the_dispatch_handle` and
+  `helper_failures_classify_by_dispatch_and_phase`: a `RouteHttp` failure
+  before the dispatch hook is `definitely_unsent`; after it is
+  `possibly_dispatched`.
 
 ### Recovery
 

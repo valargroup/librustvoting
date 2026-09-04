@@ -783,63 +783,83 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         control: &ChainSubmissionControl,
         entry_epoch: u64,
     ) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure> {
-        let mut recovery = policy.initial_recovery_mode;
-        let mut escalated = recovery == ChainRecoveryMode::ExactTree;
-        let mut passes = 0usize;
-        loop {
-            if interrupted(control, entry_epoch) {
-                return Ok(ChainAdvanceOutcome::Cancelled);
-            }
-            passes += 1;
-            let result = if let ChainAdvanceRequest::ImportedDelegation(_) = &request {
-                // Imported delegations carry no recovery mode.
-                self.advance_pass_in_epoch(
-                    &request,
-                    ChainRecoveryMode::StatusOnly,
-                    control,
-                    entry_epoch,
-                )
-                .await?
+        // Imported delegations carry no recovery mode.
+        let imported = matches!(request, ChainAdvanceRequest::ImportedDelegation(_));
+        run_episode(policy, control, entry_epoch, |recovery| {
+            let recovery = if imported {
+                ChainRecoveryMode::StatusOnly
             } else {
-                self.advance_pass_in_epoch(&request, recovery, control, entry_epoch)
-                    .await?
+                recovery
             };
-            let pending = match result {
-                ChainSubmissionResult::Confirmed(confirmation) => {
-                    return Ok(ChainAdvanceOutcome::Confirmed(confirmation))
-                }
-                ChainSubmissionResult::SubmittedWithoutHash(diagnostic) => {
-                    return Ok(ChainAdvanceOutcome::SubmittedWithoutHash(diagnostic))
-                }
-                ChainSubmissionResult::Rejected(diagnostic) => {
-                    return Ok(ChainAdvanceOutcome::Rejected(diagnostic))
-                }
-                ChainSubmissionResult::Cancelled => return Ok(ChainAdvanceOutcome::Cancelled),
-                ChainSubmissionResult::Pending(pending) => pending,
-            };
-            let escalating_now = match &pending {
-                ChainSubmissionPending::Recovering { .. } => {
-                    if policy.escalate_to_exact_tree && !escalated {
-                        escalated = true;
-                        recovery = ChainRecoveryMode::ExactTree;
-                        true
-                    } else {
-                        return Ok(ChainAdvanceOutcome::StillPending(pending));
-                    }
-                }
-                ChainSubmissionPending::Tracking { .. } => false,
-            };
-            if policy.max_passes != 0 && passes >= policy.max_passes {
-                return Ok(ChainAdvanceOutcome::StillPending(pending));
+            self.advance_pass_in_epoch(&request, recovery, control, entry_epoch)
+        })
+        .await
+    }
+}
+
+/// The episode loop over `pass`, one bounded advancement per call.
+///
+/// A `Tracking` result waits `policy.pending_repoll` and passes again; a
+/// `Recovering` result escalates to `ExactTree` at most once per episode and
+/// otherwise ends the episode as `StillPending`; terminal results end the
+/// episode on the pass that produced them; `policy.max_passes` bounds the
+/// passes. Cancellation, or an operation epoch other than `entry_epoch`, is
+/// observed before every pass and during the repoll wait and ends the
+/// episode as `Cancelled`.
+async fn run_episode<F, Fut>(
+    policy: &ChainAdvancePolicy,
+    control: &ChainSubmissionControl,
+    entry_epoch: u64,
+    mut pass: F,
+) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure>
+where
+    F: FnMut(ChainRecoveryMode) -> Fut,
+    Fut: std::future::Future<Output = Result<ChainSubmissionResult, ChainSubmissionFailure>>,
+{
+    let mut recovery = policy.initial_recovery_mode;
+    let mut escalated = recovery == ChainRecoveryMode::ExactTree;
+    let mut passes = 0usize;
+    loop {
+        if interrupted(control, entry_epoch) {
+            return Ok(ChainAdvanceOutcome::Cancelled);
+        }
+        passes += 1;
+        let result = pass(recovery).await?;
+        let pending = match result {
+            ChainSubmissionResult::Confirmed(confirmation) => {
+                return Ok(ChainAdvanceOutcome::Confirmed(confirmation))
             }
-            // `pending_repoll` paces Tracking polls. Escalating to the exact
-            // tree is a different pass, not a repoll; run it at once.
-            if escalating_now {
-                continue;
+            ChainSubmissionResult::SubmittedWithoutHash(diagnostic) => {
+                return Ok(ChainAdvanceOutcome::SubmittedWithoutHash(diagnostic))
             }
-            if interrupted_during(policy.pending_repoll, control, entry_epoch).await {
-                return Ok(ChainAdvanceOutcome::Cancelled);
+            ChainSubmissionResult::Rejected(diagnostic) => {
+                return Ok(ChainAdvanceOutcome::Rejected(diagnostic))
             }
+            ChainSubmissionResult::Cancelled => return Ok(ChainAdvanceOutcome::Cancelled),
+            ChainSubmissionResult::Pending(pending) => pending,
+        };
+        let escalating_now = match &pending {
+            ChainSubmissionPending::Recovering { .. } => {
+                if policy.escalate_to_exact_tree && !escalated {
+                    escalated = true;
+                    recovery = ChainRecoveryMode::ExactTree;
+                    true
+                } else {
+                    return Ok(ChainAdvanceOutcome::StillPending(pending));
+                }
+            }
+            ChainSubmissionPending::Tracking { .. } => false,
+        };
+        if policy.max_passes != 0 && passes >= policy.max_passes {
+            return Ok(ChainAdvanceOutcome::StillPending(pending));
+        }
+        // `pending_repoll` paces Tracking polls. Escalating to the exact
+        // tree is a different pass, not a repoll; run it at once.
+        if escalating_now {
+            continue;
+        }
+        if interrupted_during(policy.pending_repoll, control, entry_epoch).await {
+            return Ok(ChainAdvanceOutcome::Cancelled);
         }
     }
 }
