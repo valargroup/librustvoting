@@ -190,6 +190,16 @@ This release is `zcash_voting` 4.0.0.
   failure and progress reporter now carry the report over the sibling shares
   that were already accepted or ambiguously dispatched, with the failed and
   unattempted shares pending.
+- The planner's advancement pass now schedules `AdvanceVote` /
+  `AdvanceVoteBatch` for a submitted or managed vote whose proposal left the
+  roster while its intent survives, so the on-chain submission is driven to
+  resolution instead of being stranded.
+- `CastVote` is refused with the new `RoundStepFailureKind::VoteEnded` (wire:
+  `vote_ended`) when the host's clock is at or past the authenticated vote
+  end, before any tree I/O; advancement and recovery steps are unaffected.
+- The wallet example's `advance_round_until_idle` returns the final step's
+  own `Advanced` outcome when it leaves the plan idle instead of polling once
+  more and returning an empty `NoWork`.
 - `DelegationPipeline` checks a persisted delegation setup against the
   pipeline's notes and target-bound hotkey before reusing it for signing, the
   same check a persisted proof already gets.

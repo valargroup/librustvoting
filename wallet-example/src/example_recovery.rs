@@ -81,6 +81,9 @@ pub fn routed_pir_fleet<R: RouteHttp>(
 /// terminal chain result (`ChainTerminal`) the plan deliberately schedules no
 /// retry and carries no vote diagnostic, so `RoundStepOutcome::chain_outcome`
 /// is the only place the rejection or hashless-submission diagnostic survives.
+/// When the final step advances and leaves the plan idle, that `Advanced`
+/// outcome is returned as is; the loop does not poll once more, which would
+/// return an empty `NoWork` in its place.
 ///
 /// `route` carries every request the executor makes itself: helper POSTs,
 /// vote-chain calls, and vote-tree sync all run through it, so a wallet that
@@ -133,9 +136,15 @@ pub async fn advance_round_until_idle<R: RouteHttp>(
             .advance_next(&host(), control, &NoopRoundStepProgressReporter {})
             .await
             .map_err(RoundAdvanceError::Step)?;
+        // Continue only while the refreshed plan still lists work. A final
+        // step that leaves the plan idle returns its own outcome, with the
+        // chain result, delivery reports, and delegation payload it produced;
+        // polling once more would replace those with an empty `NoWork`.
+        if outcome.plan.next_steps.is_empty() {
+            return Ok(outcome);
+        }
         match outcome.disposition {
-            RoundStepDisposition::Advanced => continue,
-            RoundStepDisposition::NoWork if !outcome.plan.next_steps.is_empty() => continue,
+            RoundStepDisposition::Advanced | RoundStepDisposition::NoWork => continue,
             _ => return Ok(outcome),
         }
     }
