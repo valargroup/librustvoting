@@ -159,6 +159,21 @@ This release is `zcash_voting` 4.0.0.
   sidecar file is open, not only the handle that populated it, so a second
   `VotingDb::open` handle on the same file still finds a round the first one
   synced after the first is dropped.
+- A ballot intent for a proposal that left the roster after its vote reached
+  the chain lifecycle (submitted, managed, hashless, rejected, or confirmed)
+  no longer withholds `CastVote` or fails helper-plan derivation, and is
+  omitted from `RoundPlan::unrostered_intents`: it cannot be cleared, so the
+  host could not otherwise unblock the round.
+- `VotingDb::set_ballot_intents` takes the expected network and checks the
+  stored round's network inside its write transaction, so a mismatch writes
+  nothing.
+- A sidecar's identity canonicalizes the full path when the file exists, so a
+  symlink to a sidecar and its real path share one sidecar id.
+- The wallet example's `advance_round_until_idle` returns a structured
+  `RoundAdvanceError` that keeps the executor's `RoundStepFailure` (chain
+  outcome, strongest state, delivery reports, refreshed plan) instead of only
+  its message, and gains `routed_pir_fleet` for building the host's PIR fleet
+  over the same route.
 - `DelegationPipeline` checks a persisted delegation setup against the
   pipeline's notes and target-bound hotkey before reusing it for signing, the
   same check a persisted proof already gets.

@@ -5,10 +5,69 @@ use zcash_voting::prelude::{
     recover_atomic_vote_batch, resume_plan, round_snapshot, ChainSubmissionClientConfig,
     ChainSubmissionControl, CommittedVote, HelperClient, HelperHealth, Network, NextStep,
     NoopRoundStepProgressReporter, ProposalRosterEntry, RoundBinding, RoundExecutor,
-    RoundHostContext, RoundPlan, RoundRecoverySnapshot, RoundStepDisposition, RoundStepOutcome,
-    SignedVoteBatch, VotingDb,
+    RoundHostContext, RoundPlan, RoundRecoverySnapshot, RoundStepDisposition, RoundStepFailure,
+    RoundStepOutcome, SignedVoteBatch, VotingDb,
 };
-use zcash_voting::{HelperTransport, HyperTransport, RouteHttp};
+use zcash_voting::wire::PirLayout;
+use zcash_voting::{
+    ChainSubmissionFailure, HelperTransport, HyperTransport, PirFleet, RouteHttp, VotingError,
+};
+
+/// Why [`advance_round_until_idle`] stopped before the plan went idle.
+///
+/// The step variant keeps the executor's complete [`RoundStepFailure`]: the
+/// chain outcome, strongest durable state, helper delivery reports that did
+/// reach the helpers, and the refreshed plan. A caller that only wants text
+/// can use `Display`; one that must act on what already happened matches on
+/// the variant.
+#[derive(Debug)]
+pub enum RoundAdvanceError {
+    /// The executor could not be built over the chain configuration.
+    Executor(ChainSubmissionFailure),
+    /// The round binding was refused.
+    Binding(VotingError),
+    /// A step failed; its durable effects are on the failure.
+    Step(RoundStepFailure),
+}
+
+impl std::fmt::Display for RoundAdvanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Executor(failure) => write!(f, "build round executor: {}", failure.message()),
+            Self::Binding(error) => write!(f, "bind round executor: {error}"),
+            Self::Step(failure) => f.write_str(&failure.message),
+        }
+    }
+}
+
+impl std::error::Error for RoundAdvanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Executor(failure) => Some(failure),
+            Self::Binding(error) => Some(error),
+            Self::Step(_) => None,
+        }
+    }
+}
+
+/// A PIR fleet whose requests travel `route`, for the `host` closure passed
+/// to [`advance_round_until_idle`].
+///
+/// Delegation PIR runs over the fleet in `RoundHostContext::delegation`,
+/// which the host builds, not over the executor's transports; a wallet that
+/// requires a private route builds its fleet here with the same route it
+/// passes to the loop, so no PIR request falls back to a direct connection.
+pub fn routed_pir_fleet<R: RouteHttp>(
+    route: Arc<R>,
+    endpoints: &[String],
+    layout: PirLayout,
+) -> Result<PirFleet, VotingError> {
+    PirFleet::new(
+        endpoints,
+        layout,
+        Arc::new(HyperTransport::with_shared_route(route)),
+    )
+}
 
 /// Drives one round to its next idle point with the SDK-owned executor.
 ///
@@ -23,11 +82,15 @@ use zcash_voting::{HelperTransport, HyperTransport, RouteHttp};
 /// retry and carries no vote diagnostic, so `RoundStepOutcome::chain_outcome`
 /// is the only place the rejection or hashless-submission diagnostic survives.
 ///
-/// `route` carries every voting-related request: helper POSTs, vote-chain
-/// calls, and vote-tree sync all run through it, so a wallet that requires
-/// Tor or another privacy route passes its executor once and nothing falls
-/// back to a direct connection. Pass `Arc::new(DirectRoute::default())` when
-/// no route is required.
+/// `route` carries every request the executor makes itself: helper POSTs,
+/// vote-chain calls, and vote-tree sync all run through it, so a wallet that
+/// requires Tor or another privacy route passes its executor once and none of
+/// those fall back to a direct connection. Pass `Arc::new(DirectRoute::default())`
+/// when no route is required. Delegation PIR is the exception: it runs over
+/// the `PirFleet` inside the `RoundHostContext` that `host` returns, which
+/// this helper never sees. Build that fleet with [`routed_pir_fleet`] over
+/// the same `route`; a fleet built over a direct transport sends PIR
+/// requests directly regardless of `route`.
 ///
 /// `helper_health` is the wallet's helper score table. It is caller-owned so
 /// that failures and cooldowns observed in one call still steer helper
@@ -49,7 +112,7 @@ pub async fn advance_round_until_idle<R: RouteHttp>(
     binding: RoundBinding,
     host: impl Fn() -> RoundHostContext,
     control: &ChainSubmissionControl,
-) -> Result<RoundStepOutcome> {
+) -> Result<RoundStepOutcome, RoundAdvanceError> {
     // One transport, and so one blocking runtime, serves helpers, the chain,
     // and the vote tree; each `HyperTransport` owns worker threads.
     let transport = Arc::new(HyperTransport::with_shared_route(route));
@@ -61,15 +124,15 @@ pub async fn advance_round_until_idle<R: RouteHttp>(
         ChainSubmissionClientConfig::for_network(network, chain_endpoints),
         helper_client,
     )
-    .map_err(|failure| anyhow::anyhow!(failure.message().to_string()))?
+    .map_err(RoundAdvanceError::Executor)?
     .with_binding(binding)
-    .context("bind round executor")?
+    .map_err(RoundAdvanceError::Binding)?
     .with_tree_transport(transport);
     loop {
         let outcome = executor
             .advance_next(&host(), control, &NoopRoundStepProgressReporter {})
             .await
-            .map_err(|failure| anyhow::anyhow!(failure.message))?;
+            .map_err(RoundAdvanceError::Step)?;
         match outcome.disposition {
             RoundStepDisposition::Advanced => continue,
             RoundStepDisposition::NoWork if !outcome.plan.next_steps.is_empty() => continue,
