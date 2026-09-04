@@ -581,6 +581,19 @@ a later invocation with a fresh bounded budget and a newly committed
 reservation, after a tree pass under exact-tree advancement. Retries are
 allowed only for the same semantic generation.
 
+### Host request executors
+
+`HyperTransport<R: RouteHttp>` applies this classification for every host
+executor. The executor calls the dispatch hook immediately before request
+bytes can reach a network stack; the SDK treats any failure or deadline it
+observes after that call as `possibly_dispatched` and before it as
+`definitely_unsent`. An executor's post-dispatch phase is honored even without
+the hook; a `BeforeDispatch` phase reported after the hook is honored only
+from an executor that declares `hook_precedes_connection_setup` (the SDK's
+`DirectRoute`, whose Hyper client fuses connection setup with the first write
+and reports connect failures distinctly). An executor must fail closed when
+its route is unavailable and must never fall back to a direct connection.
+
 ## Reconciliation and retry
 
 One lifecycle facade provides typed local delegation, imported-delegation,
@@ -901,6 +914,18 @@ unnecessary. Storage failure is reported alongside the strongest truthful
 state already durable or known to the current call without inventing a durable
 transition.
 
+### Episodes
+
+`ChainSubmissionClient::advance_until_terminal` composes bounded passes into
+one finite episode under a `ChainAdvancePolicy`. Every iteration is one
+`advance_*_with_recovery` pass, so every public result above still describes
+exactly one pass. An episode re-polls after `Tracking`, escalates to
+`ExactTree` at most once after `Recovering` and otherwise ends as
+`StillPending`, never repeats a pass after `SubmittedWithoutHash`,
+`Rejected`, or `Confirmed`, and checks cancellation between passes. Persisted
+work starts with `ExactTree` (`ChainAdvancePolicy::for_persisted_work`), as
+the resume planner requires.
+
 ## Concurrency, generation locking, and cancellation
 
 The lock order is:
@@ -960,6 +985,13 @@ effects:
   write.
 
 The captured host operation epoch is checked at the same pre-commit boundaries.
+
+### Round executor lock scopes
+
+`RoundExecutor` serializes `Delegate` and `AdvanceDelegation` per
+`(wallet, round, bundle)` and every other step per `(wallet, round)`. The
+planner never emits vote work for a bundle whose delegation is still
+in flight, so the two scopes do not overlap on one bundle's lifecycle rows.
 
 ## Cleanup, pruning, and deletion
 
@@ -1174,6 +1206,13 @@ Tests cover:
   attempts may exceed endpoint count, and endpoint selection cycles by ordinal;
   and
 - retries cannot change semantic generation.
+
+- `episode_escalates_to_exact_tree_once`: one `Recovering` pass escalates
+  the episode to `ExactTree`; a second ends it as `StillPending`.
+- `episode_never_retries_terminal_outcomes`: `SubmittedWithoutHash`,
+  `Rejected`, and `Confirmed` end the episode on the pass that produced them.
+- `route_executor_phase_classification`: a `RouteHttp` failure before the
+  dispatch hook is `definitely_unsent`; after it is `possibly_dispatched`.
 
 ### Recovery
 
