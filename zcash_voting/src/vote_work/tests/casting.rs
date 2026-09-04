@@ -129,3 +129,38 @@ async fn a_bound_hotkey_that_is_not_the_delegation_target_is_refused_before_tree
         "no tree request may be made for a hotkey that cannot vote"
     );
 }
+
+#[tokio::test]
+async fn a_cast_after_the_authenticated_vote_end_is_refused_before_tree_io() {
+    let (executor, transport) = executor_ready_to_cast("wallet-vote-ended");
+    let cast = NextStep::CastVote {
+        bundle_index: 0,
+        proposal_id: 1,
+        choice: 0,
+    };
+    let control = ChainSubmissionControl::new(1);
+    let mut after_end = host();
+    after_end.now_seconds = after_end.vote_end_time_seconds.unwrap();
+
+    let failure = executor
+        .advance_step(
+            cast,
+            &after_end,
+            &control,
+            &NoopRoundStepProgressReporter {},
+        )
+        .await
+        .expect_err("the vote has ended");
+
+    assert_eq!(failure.kind, RoundStepFailureKind::VoteEnded);
+    assert!(
+        failure.message.contains("vote ended"),
+        "{}",
+        failure.message
+    );
+    assert_eq!(
+        transport.requests.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no tree request may be made for a vote that can no longer be cast"
+    );
+}

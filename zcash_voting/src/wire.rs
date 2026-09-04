@@ -717,6 +717,7 @@ pub enum RoundStepFailureKindView {
     ProofFailed,
     Signing,
     HelperDeliveryIncomplete,
+    VoteEnded,
 }
 
 /// Outcome of one round step.

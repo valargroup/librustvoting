@@ -1099,6 +1099,7 @@ impl From<crate::RoundStepFailureKind> for RoundStepFailureKindView {
             K::ProofFailed => Self::ProofFailed,
             K::Signing => Self::Signing,
             K::HelperDeliveryIncomplete => Self::HelperDeliveryIncomplete,
+            K::VoteEnded => Self::VoteEnded,
         }
     }
 }

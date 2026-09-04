@@ -35,6 +35,24 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let binding = self
             .binding()
             .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+        // A fresh vote after the authenticated deadline would sync the tree,
+        // prove, persist recovery material, and submit only to be rejected;
+        // refuse it here. Advancing or recovering work already on the wire
+        // is not a cast and is unaffected.
+        if let Some(vote_end) = host.vote_end_time_seconds {
+            if host.now_seconds >= vote_end {
+                return Err(self.step_failure(
+                    RoundStepFailureKind::VoteEnded,
+                    Some(step),
+                    None,
+                    None,
+                    format!(
+                        "vote ended at {vote_end} and the host clock reads {}; a new vote cannot be cast",
+                        host.now_seconds
+                    ),
+                ));
+            }
+        }
         let single_share = host.is_last_moment();
         let mut drafts = Vec::new();
         for planned in &plan.next_steps {

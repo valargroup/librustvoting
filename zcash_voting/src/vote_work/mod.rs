@@ -242,6 +242,10 @@ pub enum RoundStepFailureKind {
     ProofFailed,
     Signing,
     HelperDeliveryIncomplete,
+    /// The authenticated vote-end time has passed, so a new vote cannot be
+    /// cast. Steps that advance or recover work already on the wire still
+    /// run; only `CastVote` is refused.
+    VoteEnded,
 }
 
 /// Failure that retains the strongest truthful durable state and a
