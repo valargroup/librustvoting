@@ -352,7 +352,7 @@ fn record_impl(
 /// Records a helper-share submission for integration-test fixture setup.
 ///
 /// Production callers submit through
-/// [`crate::vote::CommittedVote::submit_prepared_shares`], which owns the
+/// [`crate::vote::ConfirmedVote::submit_prepared_shares`], which owns the
 /// journal-before-dispatch lifecycle. This lower-level entry point exists only
 /// for the `test-fixtures` feature so integration tests can seed durable state
 /// without opening a network connection.
@@ -484,7 +484,7 @@ pub(crate) fn record_delivery(
 ///
 /// This bypasses network dispatch and is unavailable without the
 /// `test-fixtures` feature. Production callers must use
-/// [`crate::vote::CommittedVote::submit_prepared_shares`].
+/// [`crate::vote::ConfirmedVote::submit_prepared_shares`].
 #[cfg(feature = "test-fixtures")]
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]

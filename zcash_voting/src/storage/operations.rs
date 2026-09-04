@@ -2293,7 +2293,7 @@ impl VotingDb {
     /// This raw storage helper is crate-internal because callers must provide a
     /// nullifier that matches the persisted vote recovery bundle. Wallet
     /// integrations should use
-    /// `CommittedVote::submit_prepared_shares`, which derives the nullifier
+    /// `ConfirmedVote::submit_prepared_shares`, which derives the nullifier
     /// and owns journaled delivery.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) fn record_share_delegation(

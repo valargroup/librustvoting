@@ -426,8 +426,9 @@ pub enum NextStep {
     ///
     /// Recover the `CommittedVote`, preflight the complete helper fleet, and
     /// call `CommittedVote::prepare_share_delivery` to create or reload its
-    /// complete persisted plan. After confirmation, submit through
-    /// `CommittedVote::submit_prepared_shares` with the current fleet. A
+    /// complete persisted plan. After confirmation, convert it with
+    /// `CommittedVote::confirmed` and submit through
+    /// `ConfirmedVote::submit_prepared_shares` with the current fleet. A
     /// reloaded plan retains its original target while delivery excludes
     /// helpers removed from the current fleet. The typed method rebuilds
     /// payloads with the confirmed commitment-tree position and journals each
@@ -448,8 +449,9 @@ pub enum NextStep {
     /// `share_index` identifies one missing share for stable recovery UI and
     /// FFI routing. The host should recover the `CommittedVote`, call
     /// `CommittedVote::prepare_share_delivery` to load or create the
-    /// SDK-persisted complete plan, and then call
-    /// `CommittedVote::submit_prepared_shares` with the current helper fleet.
+    /// SDK-persisted complete plan, convert it with `CommittedVote::confirmed`,
+    /// and then call `ConfirmedVote::submit_prepared_shares` with the current
+    /// helper fleet.
     /// Submission validates the immutable plan against its persisted planning
     /// fleet, contacts only current helpers, validates the whole batch before
     /// network I/O, journals every attempt and outcome, and resumes only the

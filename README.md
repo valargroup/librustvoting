@@ -106,7 +106,7 @@ finer control:
   `VoteRecoveryBundle`, and reconstructs vote-chain submissions after a crash.
 - `share::*` computes helper-share nullifiers and applies scheduling policy.
   `HelperClient::preflight_fleet`, `CommittedVote::prepare_share_delivery`, and
-  `CommittedVote::submit_prepared_shares` own validated, journaled initial
+  `ConfirmedVote::submit_prepared_shares` own validated, journaled initial
   delivery, while `track_pending_shares` requires two distinct configured
   helpers to agree before persisting confirmation.
 - `session::*` records durable ballot intent and returns a round-level
@@ -138,8 +138,9 @@ finer control:
   from the authenticated round configuration. The SDK requires matching
   terminal ballot intents and derives the round's single immediate share while
   atomically creating or reloading the complete plan. After vote confirmation,
-  recover a fresh `CommittedVote`, then call
-  `CommittedVote::submit_prepared_shares` with the complete current fleet. The
+  recover a fresh `CommittedVote`, convert it with `CommittedVote::confirmed`,
+  and call `ConfirmedVote::submit_prepared_shares` with the complete current
+  fleet. The
   crate validates every payload, rebuilds it with the confirmed VC position,
   and journals delivery before dispatch. After restart, prepare again to load
   the original plan; never replan only missing shares. Re-run `resume_plan`
