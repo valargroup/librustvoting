@@ -205,11 +205,15 @@ atomic batch (or one singleton when there is one draft).
   not polling, because no helper holds the share.
 - A `Submitted` share row at least one helper accepted is `Confirm` work:
   polling only.
-- `Deliver` states whether the vote's durable helper plan exists. A fresh cast
-  makes its plans durable before the chain broadcast; resumed work
-  reconciles the chain first and loads or creates the plan only after
-  confirmation, right before delivery, so an open ballot cannot keep an
-  already-dispatched vote from being polled or recovered.
+- `Deliver` states whether the vote's durable helper plan exists. A fresh
+  cast, and a `ReconcileChain` for a unit that was never dispatched (a cast
+  whose plan preparation failed after persistence), make plans durable before
+  the chain broadcast; work already on the wire reconciles the chain first
+  and loads or creates the plan only after confirmation, right before
+  delivery, so an open ballot cannot keep an already-dispatched vote from
+  being polled or recovered
+  (`a_committed_vote_never_dispatched_prepares_its_plan_before_the_chain`,
+  `a_dispatched_vote_is_reconciled_before_its_ballot_is_terminal`).
 
 ### Projection
 

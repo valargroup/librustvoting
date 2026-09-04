@@ -240,10 +240,17 @@ impl<T: ChainTransport> RoundExecutor<T> {
             Obligation::ReconcileChain {
                 unit,
                 ordered_proposal_ids,
+                undispatched,
                 ..
             } => {
-                self.run_reconcile_chain(&scope, unit, &ordered_proposal_ids, progress)
-                    .await
+                self.run_reconcile_chain(
+                    &scope,
+                    unit,
+                    &ordered_proposal_ids,
+                    undispatched,
+                    progress,
+                )
+                .await
             }
             Obligation::Deliver {
                 bundle_index,

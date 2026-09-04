@@ -23,10 +23,15 @@ pub(super) enum CompletionEntry {
     /// The step just committed the vote: plans are prepared before the chain
     /// broadcast so a confirmed vote never lacks a durable plan.
     FreshCast,
-    /// Work recovered from durable state. The chain is reconciled first
-    /// (when `advance_chain`), and each vote's plan is loaded or created only
-    /// after confirmation, right before its shares are delivered.
-    Resume { advance_chain: bool },
+    /// Work recovered from durable state. With `plans_first` the unit has
+    /// never been dispatched, so it completes as a fresh cast does: plans
+    /// before the broadcast. Otherwise the chain is reconciled first (when
+    /// `advance_chain`), and each vote's plan is loaded or created only after
+    /// confirmation, right before its shares are delivered.
+    Resume {
+        advance_chain: bool,
+        plans_first: bool,
+    },
 }
 
 /// Planning inputs for one vote's helper plan under the host's clock.
@@ -46,12 +51,15 @@ fn planning_params<'a>(
 
 impl<T: ChainTransport> RoundExecutor<T> {
     /// Drives a committed or on-wire unit through the chain lifecycle and,
-    /// once confirmed, delivers its shares.
+    /// once confirmed, delivers its shares. An `undispatched` unit (no POST
+    /// reserved yet, typically a cast whose plan preparation failed) makes
+    /// its plans durable before the broadcast, as the cast would have.
     pub(super) async fn run_reconcile_chain(
         &self,
         scope: &StepScope<'_>,
         unit: VoteUnitId,
         ordered_proposal_ids: &[u32],
+        undispatched: bool,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let ledger = StepLedger::default();
@@ -64,6 +72,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             batch,
             CompletionEntry::Resume {
                 advance_chain: true,
+                plans_first: undispatched,
             },
             &persisted_policy(scope.host),
             ledger,
@@ -90,6 +99,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             None,
             CompletionEntry::Resume {
                 advance_chain: false,
+                plans_first: false,
             },
             &persisted_policy(scope.host),
             ledger,
@@ -182,13 +192,17 @@ impl<T: ChainTransport> RoundExecutor<T> {
         }
         let (advance_chain, plans_before_chain) = match entry {
             CompletionEntry::FreshCast => (true, true),
-            CompletionEntry::Resume { advance_chain } => (advance_chain, false),
+            CompletionEntry::Resume {
+                advance_chain,
+                plans_first,
+            } => (advance_chain, plans_first),
         };
         let mut fleet_preflight = None;
         if plans_before_chain {
-            // A fresh cast makes its plans durable before the broadcast, so
-            // a crash between the two cannot leave a confirmed vote without a
-            // plan. Resumed work already went through this at cast time (or
+            // A fresh cast, and a committed unit that was never dispatched,
+            // make their plans durable before the broadcast, so a crash
+            // between the two cannot leave a confirmed vote without a plan.
+            // Work already on the wire went through this at cast time (or
             // predates plans); it reconciles the chain first, so an open
             // ballot cannot keep an already-dispatched vote from being polled
             // or recovered, and ensures its plan only before delivery.
@@ -282,6 +296,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
                         .map_err(|error| {
                             self.step_voting_failure(error, Some(&scope.step), &ledger)
                         })?;
+                    // The preflight may have waited on unreachable helpers;
+                    // a plan (and the round's immutable designation) must not
+                    // be written for a step the host has since left.
+                    if scope.interrupted() {
+                        return self.step_cancelled(scope, ledger);
+                    }
                     fleet_preflight = Some(preflight);
                 }
                 let preflight = fleet_preflight

@@ -77,6 +77,7 @@ fn a_reconcile_obligation_names_the_whole_batch_a_step_anchors() {
         },
         bundle_index: 0,
         ordered_proposal_ids: vec![1, 2],
+        undispatched: false,
         tx_hash: None,
         prerequisite: None,
     }];

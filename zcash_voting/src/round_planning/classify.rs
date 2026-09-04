@@ -70,6 +70,9 @@ pub(crate) enum Obligation {
         unit: VoteUnitId,
         bundle_index: u32,
         ordered_proposal_ids: Vec<u32>,
+        /// No POST has been reserved for the unit yet: it is resumed the way
+        /// a fresh cast completes, helper plans before the broadcast.
+        undispatched: bool,
         tx_hash: Option<String>,
         prerequisite: Option<u32>,
     },
@@ -264,6 +267,8 @@ pub(crate) fn classify(
             unit: unit.id,
             bundle_index: unit.bundle_index,
             ordered_proposal_ids: unit.proposal_ids().copied().collect(),
+            undispatched: LifecyclePosition::of(Some(unit.phase))
+                == LifecyclePosition::Undispatched,
             tx_hash,
             prerequisite: None,
         });
