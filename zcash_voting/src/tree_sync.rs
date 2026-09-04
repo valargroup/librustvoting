@@ -341,6 +341,19 @@ impl RoundTreeClient {
     }
 }
 
+/// What a [`VoteTreeSync`] holds for one round, as seen without waiting on
+/// the round's lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachedRoundState {
+    /// No in-memory tree for the round.
+    Absent,
+    /// The round's tree exists but is locked by a sync or witness in flight.
+    Syncing,
+    /// The height the round's tree is synced to; zero until a first sync
+    /// completes.
+    SyncedTo(u32),
+}
+
 /// Manages per-round in-memory vote commitment trees for VAN witness generation.
 ///
 /// The map lock is held only while locating a round. Each round has a separate
@@ -534,6 +547,42 @@ impl VoteTreeSync {
             .lock()
             .map(|clients| clients.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Whether any caller besides this sync still holds the transport it was
+    /// built over. A sync over a host transport nobody else holds can never
+    /// be asked for by that transport again.
+    pub fn transport_is_shared(&self) -> bool {
+        Arc::strong_count(&self.transport) > 1
+    }
+
+    /// The round's in-memory state, without blocking on a sync in flight.
+    ///
+    /// Only the map lock is taken; the round lock is tried, so a caller
+    /// choosing between clients is never parked behind another client's
+    /// network round trip.
+    pub fn cached_round_state(&self, round_id: &str) -> CachedRoundState {
+        let Ok(clients) = self.clients.lock() else {
+            return CachedRoundState::Absent;
+        };
+        let Some(round_client) = clients.get(round_id).map(Arc::clone) else {
+            return CachedRoundState::Absent;
+        };
+        drop(clients);
+        let state = match round_client.try_lock() {
+            Ok(round_client) => {
+                CachedRoundState::SyncedTo(round_client.client.last_synced_height().unwrap_or(0))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => CachedRoundState::Syncing,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => CachedRoundState::SyncedTo(
+                poisoned
+                    .into_inner()
+                    .client
+                    .last_synced_height()
+                    .unwrap_or(0),
+            ),
+        };
+        state
     }
 
     /// Drop the in-memory TreeClient for a round so the next `sync` call

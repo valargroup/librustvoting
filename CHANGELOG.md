@@ -118,6 +118,13 @@ This release is `zcash_voting` 4.0.0.
   helper selection in the next instead of resetting per call.
 - `VotingDb::open_wallet_sidecar` refuses an empty wallet id with
   `InvalidInput` before opening the sidecar.
+- The process keeps one vote-tree client per wallet and transport instead
+  of one per wallet. A sync over another transport no longer replaces the
+  wallet's client and discards its synced state; `sync_vote_tree`,
+  `van_witness`, and a round-scoped `reset_vote_tree` are served by the
+  client that holds the round, so the standalone sync-then-witness path lands
+  on the same state even when another executor synced in between. A routed
+  client is dropped once no caller holds its transport.
 - `DelegationPipeline` checks a persisted delegation setup against the
   pipeline's notes and target-bound hotkey before reusing it for signing, the
   same check a persisted proof already gets.
