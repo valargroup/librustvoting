@@ -15,9 +15,9 @@ use crate::{
 };
 
 use super::{
-    execution::bounded_message, round_lock::HeldRoundLock, step_control::StepControl,
-    steps::PROVING_STACK_BYTES, RoundExecutor, RoundHostContext, RoundStepFailure,
-    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
+    round_lock::HeldRoundLock, step_control::StepControl, steps::PROVING_STACK_BYTES,
+    RoundExecutor, RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome,
+    RoundStepProgress, RoundStepProgressReporter,
 };
 
 impl<T: ChainTransport> RoundExecutor<T> {
@@ -103,9 +103,14 @@ impl<T: ChainTransport> RoundExecutor<T> {
             let sync_tree = Arc::clone(&tree);
             let sync_round_id = round_id.clone();
             let node_url = node_url.clone();
+            // The sync and its failure cleanup run in one detached closure
+            // that also holds the round lock, so a dropped step future cannot
+            // leave a partially appended tree behind for the next pass.
+            let held_lock = Arc::clone(lock);
             let synced = self
                 .blocking(&step, "vote tree sync", move || {
-                    sync_tree.sync(&db, &sync_round_id, &node_url)
+                    let _held_lock = held_lock;
+                    sync_round_with_cleanup(&sync_tree, &db, &sync_round_id, &node_url)
                 })
                 .await;
             match synced {
@@ -113,20 +118,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     height = Some(synced);
                     break;
                 }
-                Err(mut failure) => {
-                    let reset_tree = Arc::clone(&tree);
-                    let reset_round_id = round_id.clone();
-                    if let Err(reset_failure) = self
-                        .blocking(&step, "vote tree reset", move || {
-                            reset_tree.reset(&reset_round_id)
-                        })
-                        .await
-                    {
-                        failure.message = bounded_message(&format!(
-                            "{}; resetting the cached vote tree also failed: {}",
-                            failure.message, reset_failure.message
-                        ));
-                    }
+                Err(failure) => {
                     // A host that cancelled while the request was in flight
                     // asked for the step to stop; report that, not the
                     // transport error the cancellation produced.
@@ -302,4 +294,27 @@ pub(super) fn validate_vote_tree_node_urls(
         }
     }
     Ok(())
+}
+
+/// Syncs one round from `node_url` and, on failure, drops the round's cached
+/// tree before returning, so neither the next node nor the next pass inherits
+/// a partially appended or mismatched tree. Runs to completion on the
+/// blocking thread even if the awaiting future was dropped.
+fn sync_round_with_cleanup(
+    tree: &crate::tree_sync::VoteTreeSync,
+    db: &crate::round::VotingDb,
+    round_id: &str,
+    node_url: &str,
+) -> Result<u32, VotingError> {
+    match tree.sync(db, round_id, node_url) {
+        Ok(height) => Ok(height),
+        Err(sync_error) => match tree.reset(round_id) {
+            Ok(()) => Err(sync_error),
+            Err(reset_error) => Err(VotingError::Internal {
+                message: format!(
+                    "{sync_error}; resetting the cached vote tree also failed: {reset_error}"
+                ),
+            }),
+        },
+    }
 }

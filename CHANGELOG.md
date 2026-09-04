@@ -69,6 +69,12 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- A failed vote-tree sync resets the round's cached tree inside the detached
+  blocking work, holding the round lock, so cleanup happens even when the
+  step future is dropped mid-sync.
+- The recovery driver keeps the chain confirmation on a failure raised during
+  helper delivery, as the step API does.
+
 - `RoundExecutor` proving threads keep the step's round or bundle lock until
   they finish persisting, so dropping a step future mid-proof cannot let a
   new pass start a competing proof.
