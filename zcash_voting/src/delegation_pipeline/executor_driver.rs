@@ -4,7 +4,7 @@ use crate::{
     delegate::{PreparedSigner, SignedDelegationBundle},
     pir::PirFleet,
     round::VotingDb,
-    types::{DelegationProgressReporter, Network, VotingError},
+    types::{DelegationProgressReporter, Network, VotingError, VotingHotkey, VotingHotkeyTarget},
 };
 
 use super::{DelegationPipeline, DelegationSigner, WalletDbOpener};
@@ -23,6 +23,15 @@ pub trait DelegationDriver: Send + Sync {
     /// so a proof for one network is never generated and persisted against a
     /// chain client configured for another.
     fn network(&self) -> Network;
+
+    /// The voting-hotkey target the driver delegates to, when it holds a
+    /// hotkey.
+    ///
+    /// The executor compares it with the target derived from
+    /// `RoundBinding::hotkey_secret` before any delegation stage, so a
+    /// delegation cannot land for one hotkey while `CastVote` later
+    /// reconstructs another that cannot spend the confirmed VAN.
+    fn delegation_target(&self) -> Option<VotingHotkeyTarget>;
 
     /// Wallet the driver captured at construction.
     ///
@@ -67,6 +76,10 @@ impl<W: WalletDbOpener> DelegationDriver for DelegationPipeline<W> {
 
     fn network(&self) -> Network {
         DelegationPipeline::network(self)
+    }
+
+    fn delegation_target(&self) -> Option<VotingHotkeyTarget> {
+        self.hotkey.as_ref().map(VotingHotkey::delegation_target)
     }
 
     fn wallet_id(&self) -> &str {

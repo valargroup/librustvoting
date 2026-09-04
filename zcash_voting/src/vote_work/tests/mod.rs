@@ -481,8 +481,15 @@ mod round_executor {
         control: ChainSubmissionControl,
         interrupt: Interrupt,
         network: Network,
+        target: Option<crate::VotingHotkeyTarget>,
         wallet_id: String,
         database: Arc<crate::round::VotingDb>,
+    }
+
+    fn hotkey_target(secret_byte: u8) -> crate::VotingHotkeyTarget {
+        crate::VotingHotkey::from_stored_secret(&[secret_byte; 64], Network::Testnet)
+            .unwrap()
+            .delegation_target()
     }
 
     impl CancelAfterSigningDriver {
@@ -503,6 +510,10 @@ mod round_executor {
 
         fn network(&self) -> Network {
             self.network
+        }
+
+        fn delegation_target(&self) -> Option<crate::VotingHotkeyTarget> {
+            self.target
         }
 
         fn wallet_id(&self) -> &str {
@@ -584,12 +595,31 @@ mod round_executor {
         driver_wallet_id: &str,
         database: &Arc<crate::round::VotingDb>,
     ) -> RoundHostContext {
+        host_with_driver_target(
+            control,
+            interrupt,
+            network,
+            Some(hotkey_target(0x21)),
+            driver_wallet_id,
+            database,
+        )
+    }
+
+    fn host_with_driver_target(
+        control: &ChainSubmissionControl,
+        interrupt: Interrupt,
+        network: Network,
+        target: Option<crate::VotingHotkeyTarget>,
+        driver_wallet_id: &str,
+        database: &Arc<crate::round::VotingDb>,
+    ) -> RoundHostContext {
         RoundHostContext {
             delegation: Some(DelegationStepInputs {
                 driver: Arc::new(CancelAfterSigningDriver {
                     control: control.clone(),
                     interrupt,
                     network,
+                    target,
                     wallet_id: driver_wallet_id.to_string(),
                     database: Arc::clone(database),
                 }),
@@ -1165,5 +1195,63 @@ mod round_executor {
         assert_eq!(control.operation_epoch(), 8);
         assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
         assert_eq!(outcome.step, Some(step));
+    }
+
+    #[tokio::test]
+    async fn a_driver_for_another_hotkey_than_the_binding_is_refused_before_proving() {
+        // The binding votes with hotkey 0x21; the driver would delegate to 0x22.
+        let (executor, _) = bound_executor(
+            host_database(),
+            Some(zeroize::Zeroizing::new(vec![0x21; 64])),
+        );
+        decided_ballot(&executor);
+        let control = ChainSubmissionControl::new(1);
+
+        let failure = executor
+            .advance_step(
+                NextStep::Delegate { bundle_index: 0 },
+                &host_with_driver_target(
+                    &control,
+                    Interrupt::Cancel,
+                    Network::Testnet,
+                    Some(hotkey_target(0x22)),
+                    "wallet",
+                    &executor.database(),
+                ),
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .expect_err("a delegation for another hotkey must not be proved");
+        assert_eq!(failure.kind, RoundStepFailureKind::InvalidInput);
+        assert!(
+            failure.message.contains("voting hotkey"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            !control.is_cancelled(),
+            "the driver must not have been invoked"
+        );
+
+        // The matching hotkey proceeds to the driver.
+        let control = ChainSubmissionControl::new(1);
+        let outcome = executor
+            .advance_step(
+                NextStep::Delegate { bundle_index: 0 },
+                &host_with_driver_target(
+                    &control,
+                    Interrupt::Cancel,
+                    Network::Testnet,
+                    Some(hotkey_target(0x21)),
+                    "wallet",
+                    &executor.database(),
+                ),
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
     }
 }

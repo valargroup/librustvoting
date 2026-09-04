@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::{
     session::NextStep, types::DelegationProgressBridge, AdvanceDelegation, ChainAdvanceRequest,
-    ChainTransport,
+    ChainTransport, VotingHotkey,
 };
 
 use super::{
@@ -205,6 +205,35 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 None,
                 "delegation driver persists into a different voting database than the executor",
             ));
+        }
+        // The delegation must land for the hotkey CastVote will later
+        // reconstruct from the binding; otherwise the confirmed VAN cannot be
+        // spent by the executor's own votes.
+        if let Some(secret) = binding.hotkey_secret.as_ref() {
+            let bound_target = VotingHotkey::from_stored_secret(secret, binding.network)
+                .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?
+                .delegation_target();
+            match inputs.driver.delegation_target() {
+                Some(target) if target == bound_target => {}
+                Some(_) => {
+                    return Err(self.step_failure(
+                        RoundStepFailureKind::InvalidInput,
+                        Some(step.clone()),
+                        None,
+                        None,
+                        "delegation driver delegates to a different voting hotkey than the round binding",
+                    ));
+                }
+                None => {
+                    return Err(self.step_failure(
+                        RoundStepFailureKind::InvalidInput,
+                        Some(step.clone()),
+                        None,
+                        None,
+                        "delegation driver holds no voting hotkey while the round binding does",
+                    ));
+                }
+            }
         }
         Ok(inputs)
     }
