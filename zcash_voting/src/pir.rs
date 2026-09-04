@@ -101,8 +101,8 @@ pub async fn connect_pir(
 }
 
 /// Canonical form of one endpoint URL, so equivalent spellings dedupe to one
-/// fleet member: lowercase scheme and host, no default port, no trailing
-/// slashes. A string that does not parse as a URL keeps only the whitespace
+/// fleet member: lowercase scheme and host, no default port, unreserved
+/// percent escapes decoded, dot segments resolved, no trailing slashes. A string that does not parse as a URL keeps only the whitespace
 /// and slash trimming; connecting to it reports the real problem.
 fn normalize_endpoint_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
@@ -123,7 +123,8 @@ fn normalize_endpoint_url(url: &str) -> String {
         .filter(|port| Some(*port) != default_port)
         .map(|port| format!(":{port}"))
         .unwrap_or_default();
-    let path = normalize_path_escapes(uri.path().trim_end_matches('/'));
+    let path = remove_dot_segments(&normalize_path_escapes(uri.path()));
+    let path = path.trim_end_matches('/');
     let query = uri
         .query()
         .map(|query| format!("?{query}"))
@@ -159,6 +160,30 @@ fn normalize_path_escapes(path: &str) -> String {
         index += 1;
     }
     out
+}
+
+/// Resolves `.` and `..` segments (RFC 3986 section 5.2.4), so `/a/../api`
+/// and `/api` name one endpoint. A `..` at the root is dropped, as a server
+/// resolving the path would drop it. Runs after escape normalization so an
+/// escaped dot segment is resolved too.
+fn remove_dot_segments(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "." => {}
+            ".." => {
+                // The leading empty segment is the root and is never popped.
+                if segments.len() > 1 {
+                    segments.pop();
+                }
+            }
+            other => segments.push(other),
+        }
+    }
+    segments.join("/")
 }
 
 fn map_pir_connect_error(endpoint: &str, err: anyhow::Error) -> VotingError {

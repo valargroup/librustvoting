@@ -142,3 +142,31 @@ fn unreserved_percent_escapes_normalize_to_one_endpoint_identity() {
         "https://pir.example/a%zz"
     );
 }
+
+#[test]
+fn dot_segments_resolve_to_one_endpoint_identity() {
+    use super::super::normalize_endpoint_url;
+
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/a/../api"),
+        normalize_endpoint_url("https://pir.example/api")
+    );
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/./api/."),
+        "https://pir.example/api"
+    );
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/a/b/../../c"),
+        "https://pir.example/c"
+    );
+    // `..` above the root is dropped rather than escaping the host.
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/../api"),
+        "https://pir.example/api"
+    );
+    // An escaped dot segment resolves after escape normalization.
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/%2E%2E/api"),
+        "https://pir.example/api"
+    );
+}
