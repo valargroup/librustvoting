@@ -28,13 +28,20 @@ use zcash_voting::{HyperTransport, RouteHttp};
 /// Tor or another privacy route passes its executor once and nothing falls
 /// back to a direct connection. Pass `Arc::new(DirectRoute::default())` when
 /// no route is required.
+///
+/// `host` is called before every step so each pass sees the current time and
+/// fleet: a long proof can cross the last-moment or vote-end boundary, and the
+/// following `CastVote` must plan against the clock it actually runs under.
+/// A `NoWork` outcome whose refreshed plan still lists steps (another
+/// executor finished the selected step first) continues rather than returns,
+/// so the helper really runs until the plan is idle.
 pub async fn advance_round_until_idle<R: RouteHttp>(
     voting_db: Arc<VotingDb>,
     network: Network,
     chain_endpoints: Vec<String>,
     route: Arc<R>,
     binding: RoundBinding,
-    host: RoundHostContext,
+    host: impl Fn() -> RoundHostContext,
     control: &ChainSubmissionControl,
 ) -> Result<RoundStepOutcome> {
     let helper_client = HelperClient::new(
@@ -53,13 +60,14 @@ pub async fn advance_round_until_idle<R: RouteHttp>(
     .with_tree_transport(Arc::new(HyperTransport::with_shared_route(route)));
     loop {
         let outcome = executor
-            .advance_next(&host, control, &NoopRoundStepProgressReporter {})
+            .advance_next(&host(), control, &NoopRoundStepProgressReporter {})
             .await
             .map_err(|failure| anyhow::anyhow!(failure.message))?;
-        if outcome.disposition == RoundStepDisposition::Advanced {
-            continue;
+        match outcome.disposition {
+            RoundStepDisposition::Advanced => continue,
+            RoundStepDisposition::NoWork if !outcome.plan.next_steps.is_empty() => continue,
+            _ => return Ok(outcome),
         }
-        return Ok(outcome);
     }
 }
 

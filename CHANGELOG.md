@@ -69,6 +69,16 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `advance_until_terminal` escalates to the exact tree immediately after a
+  `Recovering` result; `pending_repoll` paces only `Tracking` polls.
+- `RoundExecutor::with_binding` validates every roster entry's proposal id
+  and option count.
+- `PirFleet::new` also normalizes unreserved percent escapes in endpoint
+  paths before dropping duplicates.
+- The wallet example's `advance_round_until_idle` obtains a fresh host
+  context before each step and continues past a raced `NoWork` whose plan
+  still lists steps.
+
 - A plan refresh that fails after a step or recovery pass produced a chain
   outcome keeps that outcome on the failure.
 - `RoundExecutor::with_binding` rejects a hotkey secret that does not
