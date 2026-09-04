@@ -100,8 +100,38 @@ pub async fn connect_pir(
         .map_err(|err| map_pir_connect_error(&endpoint, err))
 }
 
+/// Canonical form of one endpoint URL, so equivalent spellings dedupe to one
+/// fleet member: lowercase scheme and host, no default port, no trailing
+/// slashes. A string that does not parse as a URL keeps only the whitespace
+/// and slash trimming; connecting to it reports the real problem.
 fn normalize_endpoint_url(url: &str) -> String {
-    url.trim().trim_end_matches('/').to_string()
+    let trimmed = url.trim().trim_end_matches('/');
+    let Ok(uri) = trimmed.parse::<http::Uri>() else {
+        return trimmed.to_string();
+    };
+    let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) else {
+        return trimmed.to_string();
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    let port = uri
+        .port_u16()
+        .filter(|port| Some(*port) != default_port)
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let path = uri.path().trim_end_matches('/');
+    let query = uri
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    format!(
+        "{scheme}://{}{port}{path}{query}",
+        host.to_ascii_lowercase()
+    )
 }
 
 fn map_pir_connect_error(endpoint: &str, err: anyhow::Error) -> VotingError {

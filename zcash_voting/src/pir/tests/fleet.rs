@@ -94,3 +94,27 @@ fn local_contention_is_returned_instead_of_failing_over() {
         "another endpoint cannot fix local contention"
     );
 }
+
+#[test]
+fn equivalent_endpoint_spellings_canonicalize_to_one_identity() {
+    use super::super::normalize_endpoint_url;
+
+    assert_eq!(
+        normalize_endpoint_url(" HTTPS://PIR.Example:443/ "),
+        "https://pir.example"
+    );
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example"),
+        "https://pir.example"
+    );
+    assert_eq!(
+        normalize_endpoint_url("http://pir.example:8080/mount//"),
+        "http://pir.example:8080/mount"
+    );
+    assert_eq!(
+        normalize_endpoint_url("http://Pir.Example:80/mount"),
+        "http://pir.example/mount"
+    );
+    // Unparseable input keeps the plain trimming; connect reports the error.
+    assert_eq!(normalize_endpoint_url("not a url/"), "not a url");
+}
