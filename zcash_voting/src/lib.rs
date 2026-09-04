@@ -47,6 +47,7 @@ pub mod prelude;
 pub mod recovery;
 pub mod round;
 pub mod round_auth;
+mod round_planning;
 pub mod selection;
 pub mod session;
 pub mod share;

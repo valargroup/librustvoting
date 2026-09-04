@@ -2312,17 +2312,34 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
         })?;
     let mut recoveries = Vec::new();
     for row in rows {
-        let recovery = parse_recovery(&row.map_err(|error| VotingError::Storage {
-            message: format!("read vote batch recovery row failed: {error}"),
-        })?)?;
-        if recovery
-            .batch
-            .as_ref()
-            .is_some_and(|batch| batch.digest == batch_digest)
-        {
-            recoveries.push(recovery);
-        }
+        recoveries.push(parse_recovery(&row.map_err(|error| {
+            VotingError::Storage {
+                message: format!("read vote batch recovery row failed: {error}"),
+            }
+        })?)?);
     }
+    assemble_vote_batch_recoveries(round_id, bundle_index, batch_digest, recoveries)
+}
+
+/// Selects, orders, and validates the members of the atomic batch
+/// `batch_digest` among `candidates`, the recovery bundles persisted on
+/// `bundle_index`. Every member must be present exactly once at its index,
+/// and the batch sighash recomputed from the members must equal the digest.
+pub(crate) fn assemble_vote_batch_recoveries(
+    round_id: &str,
+    bundle_index: u32,
+    batch_digest: [u8; 32],
+    candidates: Vec<VoteRecoveryBundle>,
+) -> Result<Vec<VoteRecoveryBundle>, VotingError> {
+    let mut recoveries = candidates
+        .into_iter()
+        .filter(|recovery| {
+            recovery
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.digest == batch_digest)
+        })
+        .collect::<Vec<_>>();
     recoveries.sort_by_key(|recovery| recovery.batch.as_ref().map(|batch| batch.index));
     let expected_size = recoveries
         .first()

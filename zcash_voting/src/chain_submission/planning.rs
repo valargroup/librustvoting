@@ -10,7 +10,7 @@
 //! These helpers are deliberately narrow: they answer "what does the lifecycle
 //! already know about this target" and never mutate.
 
-use rusqlite::{named_params, Connection, OptionalExtension};
+use rusqlite::{named_params, Connection};
 
 use crate::storage::VotingDb;
 use crate::types::VotingError;
@@ -24,38 +24,6 @@ pub(crate) enum PlanningTarget {
     Vote { proposal_id: u32 },
     /// One atomic vote batch, matched by its ordered batch digest.
     VoteBatch { ordered_batch_digest: [u8; 32] },
-}
-
-/// Returns whether one bundle came from a delegation capability import.
-///
-/// Imported bundles deliberately omit local note selection; locally prepared
-/// bundles always persist it. The marker remains stable after confirmation.
-pub(crate) fn delegation_is_capability_imported(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-) -> Result<bool, VotingError> {
-    db.conn()
-        .query_row(
-            "SELECT note_positions_blob IS NULL
-             FROM bundles
-             WHERE round_id = :round_id
-               AND wallet_id = :wallet_id
-               AND bundle_index = :bundle_index",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": db.wallet_id(),
-                ":bundle_index": i64::from(bundle_index),
-            },
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| VotingError::Internal {
-            message: format!("failed to classify delegation bundle source: {error}"),
-        })?
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: format!("bundle not found for round {round_id} index {bundle_index}"),
-        })
 }
 
 /// Returns the transaction hash the lifecycle associates with `target`.
@@ -150,6 +118,121 @@ pub(crate) fn lifecycle_transaction_hash(
         _ => None,
     };
     Ok(hash.map(hex::encode))
+}
+
+/// The lifecycle transaction hashes of every submission row in one round,
+/// read once so a planner can answer [`lifecycle_transaction_hash`] for any
+/// target from one consistent snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LifecycleTransactionHashes {
+    /// Distinct non-null hashes per target. Planners carry no network
+    /// context, so a target that owns rows on more than one network has
+    /// more than one hash here and reports none; see
+    /// [`lifecycle_transaction_hash`].
+    hashes: std::collections::BTreeMap<LifecycleHashKey, std::collections::BTreeSet<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LifecycleHashKey {
+    Delegation {
+        bundle_index: u32,
+    },
+    Vote {
+        bundle_index: u32,
+        proposal_id: u32,
+    },
+    VoteBatch {
+        bundle_index: u32,
+        ordered_batch_digest: [u8; 32],
+    },
+}
+
+impl LifecycleTransactionHashes {
+    /// The hash [`lifecycle_transaction_hash`] would report for `target` on
+    /// `bundle_index`: the one distinct hash the lifecycle knows, or none.
+    pub(crate) fn hash(&self, bundle_index: u32, target: PlanningTarget) -> Option<String> {
+        let key = match target {
+            PlanningTarget::Delegation => LifecycleHashKey::Delegation { bundle_index },
+            PlanningTarget::Vote { proposal_id } => LifecycleHashKey::Vote {
+                bundle_index,
+                proposal_id,
+            },
+            PlanningTarget::VoteBatch {
+                ordered_batch_digest,
+            } => LifecycleHashKey::VoteBatch {
+                bundle_index,
+                ordered_batch_digest,
+            },
+        };
+        let hashes = self.hashes.get(&key)?;
+        match hashes.len() {
+            1 => hashes.iter().next().map(hex::encode),
+            _ => None,
+        }
+    }
+}
+
+/// Reads every lifecycle transaction hash of `round_id` for `wallet_id`.
+pub(crate) fn lifecycle_transaction_hashes(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+) -> Result<LifecycleTransactionHashes, VotingError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT cs.kind, cs.bundle_index, cs.proposal_id, cs.ordered_batch_digest,
+                    COALESCE(cs.confirmed_transaction_hash, cs.candidate_transaction_hash)
+               FROM chain_submissions cs
+              WHERE cs.round_id = :round_id
+                AND cs.wallet_id = :wallet_id
+                AND COALESCE(cs.confirmed_transaction_hash, cs.candidate_transaction_hash) IS NOT NULL",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare lifecycle transaction hashes query: {e}"),
+        })?;
+    let rows = statement
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u32,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load lifecycle transaction hashes: {e}"),
+        })?;
+    let mut hashes = LifecycleTransactionHashes::default();
+    for row in rows {
+        let (kind, bundle_index, proposal_id, digest, hash) =
+            row.map_err(|e| VotingError::Internal {
+                message: format!("failed to read lifecycle transaction hash: {e}"),
+            })?;
+        let key = match (kind.as_str(), proposal_id, digest) {
+            ("delegation", _, _) => LifecycleHashKey::Delegation { bundle_index },
+            ("vote", Some(proposal_id), _) => LifecycleHashKey::Vote {
+                bundle_index,
+                proposal_id: proposal_id as u32,
+            },
+            ("vote_batch", _, Some(digest)) => LifecycleHashKey::VoteBatch {
+                bundle_index,
+                ordered_batch_digest: digest.try_into().map_err(|_| VotingError::Internal {
+                    message: "stored ordered batch digest is not 32 bytes".to_string(),
+                })?,
+            },
+            (kind, _, _) => {
+                return Err(VotingError::Internal {
+                    message: format!("chain submission row has unexpected shape for kind {kind}"),
+                })
+            }
+        };
+        hashes.hashes.entry(key).or_default().insert(hash);
+    }
+    Ok(hashes)
 }
 
 /// Transaction hash to report for one bundle's delegation.

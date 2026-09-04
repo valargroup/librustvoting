@@ -75,6 +75,12 @@ This release is `zcash_voting` 4.0.0.
 - **Breaking:** `VotingError::InsufficientEligibility::required_notes` and
   the matching view field are renamed `bundle_note_slots`; the value is the
   bundle's note capacity, not a required note count.
+- `session::resume_plan` reads the round once, as one snapshot taken in a
+  single deferred read transaction, and derives the plan from that snapshot
+  alone. It previously assembled the plan from more than a dozen separate
+  reads, so a concurrent write (a tracking pass, an intent write from
+  another handle, a chain confirmation) could land between two of them and
+  the plan could describe a round state that never existed.
 - `RoundExecutor::plan` revalidates the stored round's network on every call,
   and `CastVote` checks that the bound hotkey is the bundle's confirmed
   delegation target before the first tree request.

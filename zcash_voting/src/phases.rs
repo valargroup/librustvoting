@@ -345,65 +345,7 @@ impl VotingDb {
     ) -> Result<Vec<DelegationSubmissionStatus>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let mut stmt = conn
-            .prepare(
-                "SELECT b.bundle_index,
-                        b.pczt_sighash IS NOT NULL OR b.rk IS NOT NULL,
-                        EXISTS(
-                            SELECT 1 FROM proofs p
-                            WHERE p.round_id = b.round_id
-                              AND p.wallet_id = b.wallet_id
-                              AND p.bundle_index = b.bundle_index
-                              AND p.success = 1
-                        ),
-                        b.delegation_tx_hash IS NOT NULL,
-                        b.van_leaf_position IS NOT NULL,
-                        s.state, s.diagnostic_kind, s.diagnostic
-                 FROM bundles b
-                 LEFT JOIN chain_submissions s
-                   ON s.round_id = b.round_id
-                  AND s.wallet_id = b.wallet_id
-                  AND s.bundle_index = b.bundle_index
-                  AND s.kind = 'delegation'
-                 WHERE b.round_id = :round_id
-                   AND b.wallet_id = :wallet_id
-                 ORDER BY b.bundle_index",
-            )
-            .map_err(|e| {
-                VotingError::from_sqlite("failed to prepare delegation phases query", &e)
-            })?;
-
-        let rows = stmt
-            .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u32,
-                        phase_from_columns(
-                            row.get::<_, i64>(1)? != 0,
-                            row.get::<_, i64>(2)? != 0,
-                            row.get::<_, i64>(3)? != 0,
-                            row.get::<_, i64>(4)? != 0,
-                            row.get::<_, Option<String>>(5)?.as_deref(),
-                        ),
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                },
-            )
-            .map_err(|e| VotingError::from_sqlite("failed to query delegation phases", &e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| VotingError::from_sqlite("failed to read delegation phase row", &e))?;
-
-        rows.into_iter()
-            .map(|(bundle_index, phase, diagnostic_kind, diagnostic)| {
-                Ok(DelegationSubmissionStatus {
-                    bundle_index,
-                    phase,
-                    diagnostic: stored_submission_diagnostic(diagnostic_kind, diagnostic)?,
-                })
-            })
-            .collect()
+        delegation_submission_statuses_on(&conn, &wallet_id, round_id)
     }
 
     /// Loads the canonical vote phase for one bundle/proposal pair.
@@ -504,36 +446,112 @@ impl VotingDb {
     ) -> Result<Vec<(u32, u32, u32, SharePhase)>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let mut stmt = conn
-            .prepare(
-                "SELECT bundle_index, proposal_id, share_index, confirmed
+        share_phases_on(&conn, &wallet_id, round_id)
+    }
+}
+
+/// [`VotingDb::share_phases`] on `conn`, so a caller can read it inside one
+/// transaction with the rest of a round's state.
+pub(crate) fn share_phases_on(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+) -> Result<Vec<(u32, u32, u32, SharePhase)>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, proposal_id, share_index, confirmed
                  FROM share_delegations
                  WHERE round_id = :round_id AND wallet_id = :wallet_id
                  ORDER BY bundle_index, proposal_id, share_index",
-            )
-            .map_err(|e| VotingError::from_sqlite("failed to prepare share phases query", &e))?;
+        )
+        .map_err(|e| VotingError::from_sqlite("failed to prepare share phases query", &e))?;
 
-        let rows = stmt
-            .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u32,
-                        row.get::<_, i64>(1)? as u32,
-                        row.get::<_, i64>(2)? as u32,
-                        if row.get::<_, i64>(3)? != 0 {
-                            SharePhase::Confirmed
-                        } else {
-                            SharePhase::Submitted
-                        },
-                    ))
-                },
-            )
-            .map_err(|e| VotingError::from_sqlite("failed to query share phases", &e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| VotingError::from_sqlite("failed to read share phase row", &e))?;
-        Ok(rows)
-    }
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, i64>(1)? as u32,
+                    row.get::<_, i64>(2)? as u32,
+                    if row.get::<_, i64>(3)? != 0 {
+                        SharePhase::Confirmed
+                    } else {
+                        SharePhase::Submitted
+                    },
+                ))
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("failed to query share phases", &e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::from_sqlite("failed to read share phase row", &e))?;
+    Ok(rows)
+}
+
+/// [`VotingDb::delegation_submission_statuses`] on `conn`, so a caller can
+/// read it inside one transaction with the rest of a round's state.
+pub(crate) fn delegation_submission_statuses_on(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+) -> Result<Vec<DelegationSubmissionStatus>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.bundle_index,
+                    b.pczt_sighash IS NOT NULL OR b.rk IS NOT NULL,
+                    EXISTS(
+                        SELECT 1 FROM proofs p
+                        WHERE p.round_id = b.round_id
+                          AND p.wallet_id = b.wallet_id
+                          AND p.bundle_index = b.bundle_index
+                          AND p.success = 1
+                    ),
+                    b.delegation_tx_hash IS NOT NULL,
+                    b.van_leaf_position IS NOT NULL,
+                    s.state, s.diagnostic_kind, s.diagnostic
+             FROM bundles b
+             LEFT JOIN chain_submissions s
+               ON s.round_id = b.round_id
+              AND s.wallet_id = b.wallet_id
+              AND s.bundle_index = b.bundle_index
+              AND s.kind = 'delegation'
+             WHERE b.round_id = :round_id
+               AND b.wallet_id = :wallet_id
+             ORDER BY b.bundle_index",
+        )
+        .map_err(|e| VotingError::from_sqlite("failed to prepare delegation phases query", &e))?;
+
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    phase_from_columns(
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)? != 0,
+                        row.get::<_, i64>(4)? != 0,
+                        row.get::<_, Option<String>>(5)?.as_deref(),
+                    ),
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("failed to query delegation phases", &e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::from_sqlite("failed to read delegation phase row", &e))?;
+
+    rows.into_iter()
+        .map(|(bundle_index, phase, diagnostic_kind, diagnostic)| {
+            Ok(DelegationSubmissionStatus {
+                bundle_index,
+                phase,
+                diagnostic: stored_submission_diagnostic(diagnostic_kind, diagnostic)?,
+            })
+        })
+        .collect()
 }
 
 struct VotePhaseEvidence {
@@ -545,6 +563,16 @@ struct VotePhaseEvidence {
     singleton_submission_state: Option<String>,
     singleton_diagnostic_kind: Option<String>,
     singleton_diagnostic: Option<String>,
+}
+
+/// [`VotingDb::vote_submission_statuses`] on `conn`, so a caller can read it
+/// inside one transaction with the rest of a round's state.
+pub(crate) fn vote_submission_statuses_on(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+) -> Result<Vec<VoteSubmissionStatus>, VotingError> {
+    load_vote_submission_statuses(conn, wallet_id, round_id, None, None)
 }
 
 /// Canonical phases of one proposal's votes, read on `conn` so a caller can

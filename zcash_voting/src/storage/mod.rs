@@ -362,6 +362,29 @@ impl VotingDb {
         Ok(value)
     }
 
+    /// Runs `body` inside one deferred read transaction and rolls it back.
+    ///
+    /// The connection mutex is held for the whole call, so no other handle
+    /// in this process can interleave a write between two of `body`'s reads,
+    /// and the transaction pins one WAL read snapshot against writers in
+    /// other processes. `body` receives only the transaction, so it cannot
+    /// re-enter the (non-reentrant) connection mutex, and it must not write:
+    /// the transaction ends with a rollback whatever `body` did.
+    pub(crate) fn read_transaction<T>(
+        &self,
+        context: &str,
+        body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, VotingError>,
+    ) -> Result<T, VotingError> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|e| VotingError::from_sqlite(context, &e))?;
+        let value = body(&tx)?;
+        tx.rollback()
+            .map_err(|e| VotingError::from_sqlite(context, &e))?;
+        Ok(value)
+    }
+
     /// Set the wallet identifier used to scope all subsequent operations.
     pub fn set_wallet_id(&self, id: &str) {
         *self.wallet_id.lock().expect("wallet_id mutex poisoned") = id.to_string();

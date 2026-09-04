@@ -1,20 +1,17 @@
 //! Durable ballot intent + resumable voting-session planner.
 //!
-//! `resume_plan` is pure and I/O-free over the wallet's voting DB: it reports
-//! the ordered remaining work for a round, built on the per-artifact phase
-//! APIs in `crate::phases`. The wallet executes each step with its own
-//! network/proof/sign plumbing.
+//! `resume_plan` reads a round once, as one [`RoundSnapshot`] taken in a
+//! single read transaction, and derives the ordered remaining work for the
+//! round from that snapshot alone. The wallet executes each step with its
+//! own network/proof/sign plumbing.
 
 use rusqlite::named_params;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::chain_submission::planning::{
-    delegation_is_capability_imported, delegation_transaction_hash, vote_batch_transaction_hash,
-    vote_transaction_hash,
-};
 use crate::chain_submission::ChainSubmissionDiagnostic;
-use crate::phases::{DelegationPhase, DelegationSubmissionStatus, SharePhase, VotePhase};
+use crate::phases::{DelegationPhase, SharePhase, VotePhase};
+use crate::round_planning::{load_round_snapshot, RoundSnapshot};
 use crate::share_policy::{round_immediate_share_key, ImmediateShareKey};
 use crate::storage::{queries, VotingDb};
 use crate::types::{
@@ -385,6 +382,18 @@ impl VotingDb {
     pub fn ballot_intents(&self, round_id: &str) -> Result<Vec<(u32, Decision)>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
+        load_ballot_intents(&conn, round_id, &wallet_id)
+    }
+}
+
+/// [`VotingDb::ballot_intents`] on `conn`, so a caller can read it inside one
+/// transaction with the rest of a round's state.
+pub(crate) fn load_ballot_intents(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<(u32, Decision)>, VotingError> {
+    {
         let mut stmt = conn
             .prepare(
                 "SELECT proposal_id, skipped, choice FROM ballot_intent
@@ -412,6 +421,8 @@ impl VotingDb {
             .map_err(|e| VotingError::from_sqlite("collect ballot_intents", &e))
     }
 }
+
+impl VotingDb {}
 
 fn validate_ballot_intent_decision(
     decision: Decision,
@@ -856,21 +867,16 @@ fn missing_recovery_field(message: String) -> VotingError {
     VotingError::Internal { message }
 }
 
-fn delegation_statuses(
-    db: &VotingDb,
-    round_id: &str,
-    delegation: &[DelegationSubmissionStatus],
-) -> Result<Vec<DelegationStatus>, VotingError> {
-    delegation
+fn delegation_statuses(snapshot: &RoundSnapshot) -> Vec<DelegationStatus> {
+    snapshot
+        .delegations
         .iter()
-        .map(|status| {
-            Ok(DelegationStatus {
-                bundle_index: status.bundle_index,
-                phase: status.phase,
-                tx_hash: delegation_transaction_hash(db, round_id, status.bundle_index)?,
-                submission_diagnostic: status.diagnostic.clone(),
-                terminal: is_terminal_delegation_phase(status.phase),
-            })
+        .map(|status| DelegationStatus {
+            bundle_index: status.bundle_index,
+            phase: status.phase,
+            tx_hash: snapshot.delegation_tx_hash(status.bundle_index),
+            submission_diagnostic: status.diagnostic.clone(),
+            terminal: is_terminal_delegation_phase(status.phase),
         })
         .collect()
 }
@@ -896,11 +902,11 @@ fn is_terminal_delegation_phase(phase: DelegationPhase) -> bool {
 }
 
 fn recovered_delegation_work_from_steps(
-    db: &VotingDb,
-    round_id: &str,
+    snapshot: &RoundSnapshot,
     delegation: &BTreeMap<u32, DelegationPhase>,
     steps: &[NextStep],
 ) -> Result<Vec<DelegationRecoveryWork>, VotingError> {
+    let round_id = snapshot.round_id.as_str();
     let mut work = Vec::<DelegationRecoveryWork>::new();
     for step in steps {
         match *step {
@@ -925,7 +931,7 @@ fn recovered_delegation_work_from_steps(
                 })?;
                 // A reserved-but-undispatched generation has no hash yet, so
                 // the hash is reported when known rather than required.
-                let tx_hash = delegation_transaction_hash(db, round_id, bundle_index)?;
+                let tx_hash = snapshot.delegation_tx_hash(bundle_index);
                 work.push(DelegationRecoveryWork {
                     kind: DelegationRecoveryWorkKind::AdvanceDelegation,
                     bundle_index,
@@ -939,7 +945,7 @@ fn recovered_delegation_work_from_steps(
                         "imported delegation step missing phase for round={round_id}, bundle={bundle_index}"
                     ))
                 })?;
-                let tx_hash = delegation_transaction_hash(db, round_id, bundle_index)?;
+                let tx_hash = snapshot.delegation_tx_hash(bundle_index);
                 work.push(DelegationRecoveryWork {
                     kind: DelegationRecoveryWorkKind::AdvanceImportedDelegation,
                     bundle_index,
@@ -960,12 +966,12 @@ fn recovered_delegation_work_from_steps(
 }
 
 fn recovered_vote_work_from_steps(
-    db: &VotingDb,
-    round_id: &str,
+    snapshot: &RoundSnapshot,
     blocking_confirm_share_keys: &BTreeSet<(u32, u32, u32)>,
     active_vote_batches: &BTreeMap<(u32, u32), ActiveVoteBatch>,
     steps: &[NextStep],
 ) -> Result<Vec<VoteRecoveryWork>, VotingError> {
+    let round_id = snapshot.round_id.as_str();
     let mut work = Vec::<VoteRecoveryWork>::new();
     let mut pending_vote_confirmation_keys = BTreeSet::new();
     for step in steps {
@@ -1015,7 +1021,7 @@ fn recovered_vote_work_from_steps(
                 bundle_index,
                 proposal_id,
             } => {
-                let tx_hash = vote_transaction_hash(db, round_id, bundle_index, proposal_id)?;
+                let tx_hash = snapshot.vote_tx_hash(bundle_index, proposal_id);
                 work.push(VoteRecoveryWork {
                     kind: VoteRecoveryWorkKind::AdvanceVote,
                     bundle_index,
@@ -1034,13 +1040,7 @@ fn recovered_vote_work_from_steps(
                 let batch = active_vote_batches
                     .get(&(bundle_index, proposal_id))
                     .expect("classified above from the same step list");
-                let tx_hash = vote_batch_transaction_hash(
-                    db,
-                    round_id,
-                    bundle_index,
-                    batch.digest,
-                    proposal_id,
-                )?;
+                let tx_hash = snapshot.vote_batch_tx_hash(bundle_index, batch.digest, proposal_id);
                 work.push(VoteRecoveryWork {
                     kind: VoteRecoveryWorkKind::AdvanceVoteBatch,
                     bundle_index,
@@ -1054,14 +1054,9 @@ fn recovered_vote_work_from_steps(
                 bundle_index,
                 proposal_id,
                 share_index,
-            } => push_submit_share_work(
-                db,
-                round_id,
-                &mut work,
-                bundle_index,
-                proposal_id,
-                share_index,
-            )?,
+            } => {
+                push_submit_share_work(snapshot, &mut work, bundle_index, proposal_id, share_index)?
+            }
             NextStep::ConfirmShare {
                 bundle_index,
                 proposal_id,
@@ -1073,8 +1068,7 @@ fn recovered_vote_work_from_steps(
             )) && !pending_vote_confirmation_keys.contains(&(bundle_index, proposal_id)) =>
             {
                 push_submit_share_work(
-                    db,
-                    round_id,
+                    snapshot,
                     &mut work,
                     bundle_index,
                     proposal_id,
@@ -1094,13 +1088,13 @@ fn recovered_vote_work_from_steps(
 }
 
 fn push_submit_share_work(
-    db: &VotingDb,
-    round_id: &str,
+    snapshot: &RoundSnapshot,
     work: &mut Vec<VoteRecoveryWork>,
     bundle_index: u32,
     proposal_id: u32,
     share_index: u32,
 ) -> Result<(), VotingError> {
+    let round_id = snapshot.round_id.as_str();
     if let Some(existing) = work.iter_mut().find(|item| {
         item.kind == VoteRecoveryWorkKind::SubmitShares
             && item.bundle_index == bundle_index
@@ -1112,9 +1106,7 @@ fn push_submit_share_work(
         return Ok(());
     }
 
-    let vc_tree_position = db
-        .get_commitment_bundle(round_id, bundle_index, proposal_id)?
-        .map(|(_, position)| position)
+    let vc_tree_position = confirmed_tree_position(snapshot, bundle_index, proposal_id)?
         .ok_or_else(|| {
             missing_recovery_field(format!(
                 "submit shares step missing vc_tree_position for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
@@ -1213,14 +1205,13 @@ struct ActiveVoteBatch {
 }
 
 fn active_vote_batches_by_vote(
-    db: &VotingDb,
-    round_id: &str,
+    snapshot: &RoundSnapshot,
     votes: &BTreeMap<(u32, u32), VotePhase>,
     vote_choices: &BTreeMap<(u32, u32), u32>,
     intents: &BTreeMap<u32, Decision>,
 ) -> Result<BTreeMap<(u32, u32), ActiveVoteBatch>, VotingError> {
+    let round_id = snapshot.round_id.as_str();
     let mut batches_by_vote = BTreeMap::new();
-    let wallet_id = db.wallet_id();
 
     for (&(bundle_index, proposal_id), &phase) in votes {
         if !matches!(
@@ -1232,24 +1223,23 @@ fn active_vote_batches_by_vote(
         if batches_by_vote.contains_key(&(bundle_index, proposal_id)) {
             continue;
         }
-        let Some(recovery) = crate::vote::recovery_bundle(db, round_id, bundle_index, proposal_id)?
+        let Some(recovery) = snapshot
+            .votes
+            .get(&(bundle_index, proposal_id))
+            .and_then(|vote| vote.recovery.as_ref())
         else {
             continue;
         };
-        let Some(batch) = recovery.batch else {
+        let Some(batch) = recovery.batch.clone() else {
             continue;
         };
 
-        let recoveries = {
-            let conn = db.conn();
-            crate::vote::load_vote_batch_recoveries_with_conn(
-                &conn,
-                &wallet_id,
-                round_id,
-                bundle_index,
-                batch.digest,
-            )?
-        };
+        let recoveries = crate::vote::assemble_vote_batch_recoveries(
+            round_id,
+            bundle_index,
+            batch.digest,
+            snapshot.bundle_recoveries(bundle_index),
+        )?;
         let anchor_proposal_id = recoveries
             .first()
             .map(|recovery| recovery.proposal_id)
@@ -1299,9 +1289,7 @@ fn active_vote_batches_by_vote(
                 // A batch generation reserved before its POST has no hash yet.
                 // Every member that does report one must agree, because one
                 // atomic batch is exactly one transaction.
-                if let Some(tx_hash) =
-                    vote_transaction_hash(db, round_id, bundle_index, recovery.proposal_id)?
-                {
+                if let Some(tx_hash) = snapshot.vote_tx_hash(bundle_index, recovery.proposal_id) {
                     if shared_tx_hash
                         .as_ref()
                         .is_some_and(|expected| expected != &tx_hash)
@@ -1345,17 +1333,17 @@ fn active_vote_batches_by_vote(
 /// must still hold its recovery material, because advancement reconstructs
 /// the transaction from it.
 fn push_vote_advance_step(
-    db: &VotingDb,
-    round_id: &str,
+    snapshot: &RoundSnapshot,
     steps: &mut Vec<NextStep>,
     planned_vote_batches: &mut BTreeSet<(u32, [u8; 32])>,
     active_vote_batches: &BTreeMap<(u32, u32), ActiveVoteBatch>,
     vote_key: (u32, u32),
     phase: VotePhase,
 ) -> Result<(), VotingError> {
+    let round_id = snapshot.round_id.as_str();
     let (bundle_index, proposal_id) = vote_key;
     if phase == VotePhase::Submitted
-        && !vote_has_recovery_bundle(db, round_id, bundle_index, proposal_id)?
+        && !vote_has_recovery_bundle(snapshot, bundle_index, proposal_id)
     {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -1398,23 +1386,37 @@ pub fn resume_plan(
     round_id: &str,
     proposal_ids: &[u32],
 ) -> Result<RoundPlan, VotingError> {
-    let delegation_submissions = db.delegation_submission_statuses(round_id)?;
-    let delegation: BTreeMap<u32, DelegationPhase> = delegation_submissions
+    let wallet_id = db.wallet_id();
+    let snapshot = db.read_transaction("plan round", |tx| {
+        load_round_snapshot(tx, &wallet_id, round_id)
+    })?;
+    plan_from_snapshot(&snapshot, proposal_ids)
+}
+
+/// Derives the round plan from one snapshot. Pure: every fact comes from
+/// `snapshot` or `proposal_ids`.
+fn plan_from_snapshot(
+    snapshot: &RoundSnapshot,
+    proposal_ids: &[u32],
+) -> Result<RoundPlan, VotingError> {
+    let round_id = snapshot.round_id.as_str();
+    let delegation: BTreeMap<u32, DelegationPhase> = snapshot
+        .delegations
         .iter()
         .map(|status| (status.bundle_index, status.phase))
         .collect();
-    let votes: BTreeMap<(u32, u32), VotePhase> = db
-        .vote_phases(round_id)?
-        .into_iter()
-        .map(|(b, p, ph)| ((b, p), ph))
+    let votes: BTreeMap<(u32, u32), VotePhase> = snapshot
+        .votes
+        .iter()
+        .map(|(&key, vote)| (key, vote.phase))
         .collect();
-    let vote_choices: BTreeMap<(u32, u32), u32> = db
-        .get_votes(round_id)?
-        .into_iter()
-        .map(|vote| ((vote.bundle_index, vote.proposal_id), vote.choice))
+    let vote_choices: BTreeMap<(u32, u32), u32> = snapshot
+        .votes
+        .iter()
+        .map(|(&key, vote)| (key, vote.choice))
         .collect();
-    let share_phase_rows = db.share_phases(round_id)?;
-    let share_delegations = db.get_share_delegations(round_id)?;
+    let share_phase_rows = &snapshot.share_phases;
+    let share_delegations = &snapshot.shares;
     let share_indexes_by_vote = share_phase_rows.iter().fold(
         BTreeMap::<(u32, u32), BTreeSet<u32>>::new(),
         |mut acc, (bundle_index, proposal_id, share_index, _)| {
@@ -1424,8 +1426,8 @@ pub fn resume_plan(
             acc
         },
     );
-    let intents: BTreeMap<u32, Decision> = db.ballot_intents(round_id)?.into_iter().collect();
-    let intent_classification = classify_ballot_intents(proposal_ids, &intents)?;
+    let intents = &snapshot.intents;
+    let intent_classification = classify_ballot_intents(proposal_ids, intents)?;
 
     let bundles: Vec<u32> = delegation.keys().copied().collect();
     let roster = intent_classification.roster;
@@ -1476,7 +1478,7 @@ pub fn resume_plan(
         })
         .collect();
     let active_vote_batches =
-        active_vote_batches_by_vote(db, round_id, &votes, &vote_choices, &intents)?;
+        active_vote_batches_by_vote(snapshot, &votes, &vote_choices, intents)?;
     let mut planned_vote_batches = BTreeSet::new();
     // A committed but undispatched vote for a proposal the roster no longer
     // lists will never be submitted: `CastVote` retires it before casting
@@ -1593,8 +1595,7 @@ pub fn resume_plan(
             match votes.get(&vote_key) {
                 Some(VotePhase::Confirmed) => {
                     for share_index in missing_share_indexes_for_confirmed_vote(
-                        db,
-                        round_id,
+                        snapshot,
                         b,
                         pid,
                         share_indexes_by_vote
@@ -1615,8 +1616,7 @@ pub fn resume_plan(
                     | VotePhase::SubmissionManaged),
                 ) => {
                     push_vote_advance_step(
-                        db,
-                        round_id,
+                        snapshot,
                         &mut steps,
                         &mut planned_vote_batches,
                         &active_vote_batches,
@@ -1658,8 +1658,7 @@ pub fn resume_plan(
         }
         match phase {
             VotePhase::Submitted | VotePhase::SubmissionManaged => push_vote_advance_step(
-                db,
-                round_id,
+                snapshot,
                 &mut steps,
                 &mut planned_vote_batches,
                 &active_vote_batches,
@@ -1670,8 +1669,7 @@ pub fn resume_plan(
             // roster now says; its durable plan drives the missing ones.
             VotePhase::Confirmed => {
                 for share_index in missing_share_indexes_for_confirmed_vote(
-                    db,
-                    round_id,
+                    snapshot,
                     b,
                     pid,
                     share_indexes_by_vote
@@ -1696,7 +1694,7 @@ pub fn resume_plan(
         match delegation.get(&b) {
             Some(DelegationPhase::Confirmed) => {}
             Some(DelegationPhase::Submitted | DelegationPhase::SubmissionManaged) => {
-                if delegation_is_capability_imported(db, round_id, b)? {
+                if delegation_is_capability_imported(snapshot, b)? {
                     steps.push(NextStep::AdvanceImportedDelegation { bundle_index: b });
                 } else {
                     steps.push(NextStep::AdvanceDelegation { bundle_index: b });
@@ -1714,7 +1712,7 @@ pub fn resume_plan(
     }
 
     // Confirm already-submitted helper shares.
-    for &(b, p, s, phase) in &share_phase_rows {
+    for &(b, p, s, phase) in share_phase_rows {
         if stale_vote_keys.contains(&(b, p)) {
             continue;
         }
@@ -1743,9 +1741,9 @@ pub fn resume_plan(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let blocking_confirm_share_keys = db
-        .get_unconfirmed_delegations(round_id)?
-        .into_iter()
+    let blocking_confirm_share_keys = share_delegations
+        .iter()
+        .filter(|share| !share.confirmed)
         .filter(|share| share.sent_to_urls.is_empty())
         .filter(|share| {
             confirm_share_step_keys.contains(&(
@@ -1789,7 +1787,7 @@ pub fn resume_plan(
             _ => true,
         });
 
-    let delegation_statuses = delegation_statuses(db, round_id, &delegation_submissions)?;
+    let delegation_statuses = delegation_statuses(snapshot);
     let hotkey_bound = delegation
         .values()
         .any(|phase| *phase != DelegationPhase::Prepared)
@@ -1832,7 +1830,7 @@ pub fn resume_plan(
     let completed_vote_display = completed_for_display.then(|| {
         completed_vote_display(
             proposal_ids,
-            &intents,
+            intents,
             &vote_choices,
             &stale_vote_keys,
             voted_at,
@@ -1849,10 +1847,9 @@ pub fn resume_plan(
         completed_for_display,
     );
     let recovered_delegation_work =
-        recovered_delegation_work_from_steps(db, round_id, &delegation, &steps)?;
+        recovered_delegation_work_from_steps(snapshot, &delegation, &steps)?;
     let recovered_vote_work = recovered_vote_work_from_steps(
-        db,
-        round_id,
+        snapshot,
         &blocking_confirm_share_keys,
         &active_vote_batches,
         &steps,
@@ -1865,12 +1862,9 @@ pub fn resume_plan(
     // Once a persisted plan carries the designation it is what will be
     // executed, whatever the current roster derives; report that marker, and
     // derive from the current choices only while no plan exists.
-    let immediate_share_key = crate::share_tracking::persisted_round_immediate_key(
-        &db.conn(),
-        round_id,
-        &db.wallet_id(),
-    )?
-    .or_else(|| round_immediate_share_key(bundles.iter().copied().max(), &choice_proposals));
+    let immediate_share_key = snapshot
+        .persisted_immediate_share
+        .or_else(|| round_immediate_share_key(bundles.iter().copied().max(), &choice_proposals));
     let immediate_share_confirmed = immediate_share_key.as_ref().is_some_and(|key| {
         share_delegations.iter().any(|share| {
             share.bundle_index == key.bundle_index
@@ -1960,26 +1954,71 @@ fn summarize_plan_work(steps: &[NextStep], blocking_share_work: bool) -> PlanWor
     summary
 }
 
-fn vote_has_recovery_bundle(
-    db: &VotingDb,
-    round_id: &str,
+fn vote_has_recovery_bundle(snapshot: &RoundSnapshot, bundle_index: u32, proposal_id: u32) -> bool {
+    snapshot
+        .votes
+        .get(&(bundle_index, proposal_id))
+        .is_some_and(|vote| vote.recovery.is_some())
+}
+
+/// Whether `bundle_index` came from a delegation capability import.
+fn delegation_is_capability_imported(
+    snapshot: &RoundSnapshot,
+    bundle_index: u32,
+) -> Result<bool, VotingError> {
+    snapshot
+        .bundles
+        .get(&bundle_index)
+        .map(|bundle| bundle.capability_imported)
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "bundle not found for round {} index {bundle_index}",
+                snapshot.round_id
+            ),
+        })
+}
+
+/// The confirmed tree position of one vote that holds a recovery bundle.
+///
+/// `None` when the vote holds no recovery material at all; a recovery bundle
+/// stored without a position is an internal error, because assuming position
+/// zero would name a real leaf.
+fn confirmed_tree_position(
+    snapshot: &RoundSnapshot,
     bundle_index: u32,
     proposal_id: u32,
-) -> Result<bool, VotingError> {
-    Ok(matches!(
-        db.get_commitment_bundle_recovery_fields(round_id, bundle_index, proposal_id)?,
-        Some((Some(_), _))
-    ))
+) -> Result<Option<u64>, VotingError> {
+    let Some(vote) = snapshot.votes.get(&(bundle_index, proposal_id)) else {
+        return Err(VotingError::Internal {
+            message: format!("failed to get commitment bundle: vote not found for round={}, bundle={bundle_index}, proposal={proposal_id}", snapshot.round_id),
+        });
+    };
+    match (&vote.recovery, vote.vc_tree_position) {
+        (Some(_), Some(position)) => {
+            u64::try_from(position).map(Some).map_err(|_| VotingError::Internal {
+                message: format!("stored vc_tree_position must be non-negative, got {position}"),
+            })
+        }
+        (Some(_), None) => Err(VotingError::Internal {
+            message:
+                "commitment bundle is stored without vc_tree_position; refusing to assume position 0"
+                    .to_string(),
+        }),
+        (None, _) => Ok(None),
+    }
 }
 
 fn missing_share_indexes_for_confirmed_vote(
-    db: &VotingDb,
-    round_id: &str,
+    snapshot: &RoundSnapshot,
     bundle_index: u32,
     proposal_id: u32,
     recorded_share_indexes: BTreeSet<u32>,
 ) -> Result<Vec<u32>, VotingError> {
-    let Some(recovery) = crate::vote::recovery_bundle(db, round_id, bundle_index, proposal_id)?
+    let round_id = snapshot.round_id.as_str();
+    let Some(recovery) = snapshot
+        .votes
+        .get(&(bundle_index, proposal_id))
+        .and_then(|vote| vote.recovery.as_ref())
     else {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -1987,7 +2026,7 @@ fn missing_share_indexes_for_confirmed_vote(
             ),
         });
     };
-    let expected_share_indexes = crate::share::recover_payloads(&recovery)?
+    let expected_share_indexes = crate::share::recover_payloads(recovery)?
         .iter()
         .map(|payload| payload.enc_share.share_index)
         .collect::<BTreeSet<_>>();
