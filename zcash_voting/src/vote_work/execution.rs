@@ -53,7 +53,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         };
 
         let Some(_round_guard) = round_lock::acquire(
-            self.database.connection_id(),
+            self.database.sidecar_id(),
             wallet_id,
             request.round_id,
             None,
@@ -375,6 +375,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     chain_outcome.clone(),
                     request,
                 )
+                .with_share_deliveries(share_deliveries.clone())
             })?;
         Ok(VoteRecoveryAdvance {
             attempted_work: Some(work),

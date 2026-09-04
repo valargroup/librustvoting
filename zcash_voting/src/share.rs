@@ -845,7 +845,7 @@ pub fn pending_rounds_for_accounts(
     wallet_ids.dedup();
     let mut rounds = Vec::new();
     for wallet_id in wallet_ids {
-        let scoped = db.scoped(wallet_id);
+        let scoped = db.scoped(wallet_id)?;
         for round in pending_rounds(&scoped)? {
             rounds.push(PendingShareRoundForAccount {
                 wallet_id: wallet_id.to_string(),

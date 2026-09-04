@@ -3,7 +3,9 @@ pub mod operations;
 pub mod queries;
 
 use std::{
-    sync::{Arc, Mutex},
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
@@ -91,15 +93,57 @@ pub struct KeystoneSignatureBatchResult {
 /// In-process writers serialize on the connection mutex, so SQLite reports
 /// `SQLITE_BUSY` only when another process holds the file.
 pub(crate) struct SidecarConnection {
-    /// Process-unique identity of this connection, so caches keyed by wallet
-    /// id can tell two sidecars that use the same wallet id apart.
+    /// Identity of the sidecar the connection is open on. Every connection
+    /// to one file gets the same id within the process, so proof
+    /// single-flighting, round locks, and tree caches keyed by it coordinate
+    /// across separately opened handles; each in-memory database gets its
+    /// own. Two sidecars that use the same wallet id stay distinct.
     id: u64,
     conn: Mutex<Connection>,
     chain_submission_coordination: crate::chain_submission::coordination::SubmissionCoordination,
 }
 
-static NEXT_SIDECAR_CONNECTION_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static NEXT_SIDECAR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Sidecar ids already assigned to file paths in this process.
+static SIDECAR_IDS: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The sidecar id for `path`: the id assigned to its canonical path, or a
+/// fresh one for an in-memory database.
+fn sidecar_id_for(path: &str) -> u64 {
+    let fresh = || NEXT_SIDECAR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if path == ":memory:" {
+        return fresh();
+    }
+    let key = sidecar_registry_key(Path::new(path));
+    *SIDECAR_IDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_insert_with(fresh)
+}
+
+/// The canonical identity of a sidecar path: its parent directory
+/// canonicalized (symlinks and `..` resolved) plus the file name, so every
+/// spelling of one file maps to one key. The file itself need not exist yet.
+/// A parent that cannot be canonicalized keeps the path as given.
+pub(crate) fn sidecar_registry_key(sidecar_path: &Path) -> PathBuf {
+    match (sidecar_path.parent(), sidecar_path.file_name()) {
+        (Some(parent), Some(file_name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            parent
+                .canonicalize()
+                .map(|parent| parent.join(file_name))
+                .unwrap_or_else(|_| sidecar_path.to_path_buf())
+        }
+        _ => sidecar_path.to_path_buf(),
+    }
+}
 
 /// Database handle for voting state: a shared SQLite connection plus a
 /// wallet identifier that scopes all round data to a single wallet.
@@ -121,7 +165,7 @@ impl VotingDb {
     /// [`VotingDb::open_wallet_sidecar`], which shares one connection per
     /// sidecar path.
     pub fn open(path: &str) -> Result<Self, VotingError> {
-        Ok(Self::from_connection(Self::open_connection(path)?))
+        Ok(Self::from_connection(Self::open_connection(path)?, path))
     }
 
     pub(crate) fn open_connection(path: &str) -> Result<Connection, VotingError> {
@@ -142,10 +186,10 @@ impl VotingDb {
         Ok(conn)
     }
 
-    pub(crate) fn from_connection(conn: Connection) -> Self {
+    pub(crate) fn from_connection(conn: Connection, path: &str) -> Self {
         Self {
             inner: Arc::new(SidecarConnection {
-                id: NEXT_SIDECAR_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                id: sidecar_id_for(path),
                 conn: Mutex::new(conn),
                 chain_submission_coordination: Default::default(),
             }),
@@ -167,13 +211,21 @@ impl VotingDb {
     /// Returns a handle on the same connection scoped to another wallet.
     ///
     /// Use this to read several accounts' state through one open sidecar
-    /// instead of opening a connection per account.
-    pub fn scoped(&self, wallet_id: &str) -> Self {
-        Self::from_shared(Arc::clone(&self.inner), wallet_id)
+    /// instead of opening a connection per account. An empty `wallet_id` is
+    /// refused with [`VotingError::InvalidInput`]: a handle scoped to no
+    /// wallet would fail on its first wallet-scoped operation.
+    pub fn scoped(&self, wallet_id: &str) -> Result<Self, VotingError> {
+        if wallet_id.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "wallet id must not be empty".to_string(),
+            });
+        }
+        Ok(Self::from_shared(Arc::clone(&self.inner), wallet_id))
     }
 
-    /// Process-unique identity of the underlying sidecar connection.
-    pub(crate) fn connection_id(&self) -> u64 {
+    /// Identity of the underlying sidecar: shared by every connection to one
+    /// file within the process, unique per in-memory database.
+    pub(crate) fn sidecar_id(&self) -> u64 {
         self.inner.id
     }
 
@@ -307,7 +359,7 @@ mod tests {
     fn scoped_handles_share_one_connection_and_keep_their_own_wallet_id() {
         let db = test_db();
         db.set_wallet_id("wallet-a");
-        let other = db.scoped("wallet-b");
+        let other = db.scoped("wallet-b").unwrap();
         assert!(db.shares_connection_with(&other));
         assert_eq!(db.wallet_id(), "wallet-a");
         assert_eq!(other.wallet_id(), "wallet-b");

@@ -402,7 +402,12 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         // caller keeps its own handle, and re-scoping that one must not move
         // a later pass of an in-flight episode to another wallet's state.
         let wallet_id = db.wallet_id();
-        let db = Arc::new(db.scoped(&wallet_id));
+        let db = Arc::new(db.scoped(&wallet_id).map_err(|error| {
+            ChainSubmissionFailure::without_state(
+                ChainSubmissionFailureKind::InvalidInput,
+                error.to_string(),
+            )
+        })?);
         let store = Arc::new(SqliteChainSubmissionStore::new(db));
         let coordinator =
             ChainSubmissionCoordinator::new(protocol, store, SystemChainSubmissionClock, policy)?;

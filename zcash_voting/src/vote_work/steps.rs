@@ -136,7 +136,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             _ => None,
         };
         let Some(guard) = round_lock::acquire(
-            self.database.connection_id(),
+            self.database.sidecar_id(),
             wallet_id,
             &round_id,
             scope,

@@ -139,6 +139,22 @@ This release is `zcash_voting` 4.0.0.
   `HelperDeliveryIncomplete` failure or a later error keeps the accepted,
   ambiguous, and pending share results. `RoundStepFailureView` gains the
   matching optional `share_deliveries` field.
+- A sidecar's identity is now its file, not its connection: every
+  `VotingDb::open` of one path shares one sidecar id within the process, so
+  delegation-proof single-flighting, round locks, and vote-tree caches keyed
+  by it coordinate across separately opened handles. In-memory databases keep
+  distinct ids.
+- `VotingDb::scoped` returns `Result` and refuses an empty wallet id with
+  `InvalidInput` instead of building a handle whose first wallet-scoped call
+  panics.
+- Step and recovery failures raised by the final plan refresh (after a step
+  advanced, was cancelled, or a recovery pass completed) also carry the
+  accumulated helper delivery reports.
+- SQLite failures while writing ballot intents or clearing stale share
+  delegations are reported as `Storage` (or `DbBusy`) instead of `Internal`.
+- `VotingErrorView` carries `setup_field` for `SetupAlreadyPersisted`, so a
+  wire consumer can tell a reusable sighash or effects conflict from a fatal
+  padded-note-secrets conflict without parsing the message.
 - `DelegationPipeline` checks a persisted delegation setup against the
   pipeline's notes and target-bound hotkey before reusing it for signing, the
   same check a persisted proof already gets.

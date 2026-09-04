@@ -281,7 +281,7 @@ fn rejected_delegation_reuses_persisted_proof() {
 #[test]
 fn wallet_switch_does_not_retarget_waiting_proof() {
     let db = Arc::new(db_with_persisted_proofs());
-    let connection_id = db.connection_id();
+    let sidecar_id = db.sidecar_id();
     let leader_started = Arc::new(Barrier::new(2));
     let release_leader = Arc::new((Mutex::new(false), Condvar::new()));
 
@@ -290,7 +290,7 @@ fn wallet_switch_does_not_retarget_waiting_proof() {
         let release_leader = Arc::clone(&release_leader);
         thread::spawn(move || {
             coordinate(
-                DelegationProofIdentity::new(connection_id, WALLET_A.to_string(), ROUND_ID, 0),
+                DelegationProofIdentity::new(sidecar_id, WALLET_A.to_string(), ROUND_ID, 0),
                 || {},
                 |_| {
                     leader_started.wait();

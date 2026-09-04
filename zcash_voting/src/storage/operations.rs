@@ -1403,7 +1403,7 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         let identity = DelegationProofIdentity::new(
-            self.connection_id(),
+            self.sidecar_id(),
             wallet_id.clone(),
             round_id,
             bundle_index,

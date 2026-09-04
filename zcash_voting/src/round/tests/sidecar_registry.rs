@@ -117,6 +117,48 @@ fn a_bare_file_name_keys_the_same_connection_as_its_other_spellings() {
 }
 
 #[test]
+fn every_connection_to_one_file_shares_a_sidecar_id() {
+    let wallet_path = fresh_wallet_path("sidecar-id");
+    let sidecar = VotingDb::wallet_sidecar_path(&wallet_path);
+    let sidecar = sidecar.to_str().unwrap();
+    let first = VotingDb::open(sidecar).unwrap();
+    let second = VotingDb::open(sidecar).unwrap();
+    assert!(
+        !first.shares_connection_with(&second),
+        "VotingDb::open opens a connection per call"
+    );
+    assert_eq!(
+        first.sidecar_id(),
+        second.sidecar_id(),
+        "proof locks and round locks keyed by the id must coordinate across connections to one file"
+    );
+
+    let other_file = fresh_wallet_path("sidecar-id-other");
+    let other =
+        VotingDb::open(VotingDb::wallet_sidecar_path(&other_file).to_str().unwrap()).unwrap();
+    assert_ne!(first.sidecar_id(), other.sidecar_id());
+    assert_ne!(
+        VotingDb::open_in_memory().unwrap().sidecar_id(),
+        VotingDb::open_in_memory().unwrap().sidecar_id(),
+        "in-memory databases share no state and get distinct ids"
+    );
+}
+
+#[test]
+fn scoping_a_handle_to_an_empty_wallet_id_is_refused() {
+    let db = VotingDb::open_in_memory().unwrap();
+    let refused = match db.scoped("") {
+        Ok(_) => panic!("an empty wallet id must be refused"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(refused, VotingError::InvalidInput { ref message } if message.contains("wallet id")),
+        "got {refused:?}"
+    );
+    assert!(db.scoped("wallet-a").is_ok());
+}
+
+#[test]
 fn an_empty_wallet_id_is_refused_before_the_sidecar_is_opened() {
     let wallet_path = fresh_wallet_path("empty-wallet-id");
 

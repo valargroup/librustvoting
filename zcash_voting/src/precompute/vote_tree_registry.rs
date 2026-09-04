@@ -81,7 +81,7 @@ impl VoteTreeEntry {
 pub(super) type WalletKey = (u64, String);
 
 pub(super) fn wallet_key(db: &VotingDb) -> WalletKey {
-    (db.connection_id(), db.wallet_id())
+    (db.sidecar_id(), db.wallet_id())
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<WalletKey, Vec<VoteTreeEntry>>>> = OnceLock::new();

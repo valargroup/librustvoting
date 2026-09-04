@@ -230,13 +230,13 @@ fn different_sidecars_with_one_wallet_id_enter_proof_work_concurrently() {
     let max_active = Arc::new(AtomicUsize::new(0));
     let mut workers = Vec::new();
 
-    for connection_id in [21, 22] {
+    for sidecar_id in [21, 22] {
         let both_entered = both_entered.clone();
         let active = active.clone();
         let max_active = max_active.clone();
         workers.push(thread::spawn(move || {
             coordinate(
-                DelegationProofIdentity::new(connection_id, "shared".to_string(), "round", 0),
+                DelegationProofIdentity::new(sidecar_id, "shared".to_string(), "round", 0),
                 || {},
                 |_| {
                     let current = active.fetch_add(1, Ordering::SeqCst) + 1;

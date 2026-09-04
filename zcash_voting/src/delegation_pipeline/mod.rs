@@ -90,7 +90,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         }
         bundle_setup::decode_anchor_tree_state(&lwd.anchor_tree_state_bytes)?;
         let wallet_id = voting_db.wallet_id();
-        let voting_db = Arc::new(voting_db.scoped(&wallet_id));
+        let voting_db = Arc::new(voting_db.scoped(&wallet_id)?);
         Ok(Self {
             wallet_id,
             voting_db,
@@ -110,7 +110,11 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     /// one with `set_wallet_id` cannot move a running stage's persistence to
     /// another wallet.
     pub fn voting_db(&self) -> Arc<VotingDb> {
-        Arc::new(self.voting_db.scoped(&self.wallet_id))
+        // The wallet id was accepted by `scoped` at construction.
+        Arc::new(VotingDb::from_shared(
+            self.voting_db.shared_connection(),
+            &self.wallet_id,
+        ))
     }
 
     /// The handle every stage persists through, verified to still select the

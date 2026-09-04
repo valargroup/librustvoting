@@ -444,7 +444,7 @@ impl RoundExecutor<HyperTransport> {
         chain_config: ChainSubmissionClientConfig,
         helper_client: HelperClient,
     ) -> Result<Self, ChainSubmissionFailure> {
-        let (wallet_id, database) = freeze_wallet_scope(&database);
+        let (wallet_id, database) = freeze_wallet_scope(&database)?;
         let chain_network = chain_config.network;
         let chain_client = ChainSubmissionClient::new(Arc::clone(&database), chain_config)?;
         Ok(Self {
@@ -473,7 +473,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         chain_config: ChainSubmissionClientConfig,
         helper_client: HelperClient,
     ) -> Result<Self, ChainSubmissionFailure> {
-        let (wallet_id, database) = freeze_wallet_scope(&database);
+        let (wallet_id, database) = freeze_wallet_scope(&database)?;
         let chain_network = chain_config.network;
         let chain_client = ChainSubmissionClient::with_transport(
             Arc::clone(&database),
@@ -568,7 +568,11 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// one with `set_wallet_id` cannot move a running step's persistence to
     /// another wallet.
     pub fn database(&self) -> Arc<VotingDb> {
-        Arc::new(self.database.scoped(&self.wallet_id))
+        // The wallet id was accepted by `scoped` at construction.
+        Arc::new(crate::round::VotingDb::from_shared(
+            self.database.shared_connection(),
+            &self.wallet_id,
+        ))
     }
 
     /// The wallet every operation is scoped to.
@@ -626,10 +630,17 @@ impl<T: ChainTransport> RoundExecutor<T> {
 
 /// Captures the wallet `database` currently selects and returns a handle
 /// over the same connection that only the executor holds.
-fn freeze_wallet_scope(database: &VotingDb) -> (String, Arc<VotingDb>) {
+fn freeze_wallet_scope(
+    database: &VotingDb,
+) -> Result<(String, Arc<VotingDb>), ChainSubmissionFailure> {
     let wallet_id = database.wallet_id();
-    let scoped = Arc::new(database.scoped(&wallet_id));
-    (wallet_id, scoped)
+    let scoped = Arc::new(database.scoped(&wallet_id).map_err(|error| {
+        ChainSubmissionFailure::without_state(
+            crate::ChainSubmissionFailureKind::InvalidInput,
+            error.to_string(),
+        )
+    })?);
+    Ok((wallet_id, scoped))
 }
 
 #[cfg(test)]

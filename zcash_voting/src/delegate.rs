@@ -1262,7 +1262,7 @@ pub fn ensure_proof(
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProofCompletion, VotingError> {
     let identity =
-        DelegationProofIdentity::new(db.connection_id(), db.wallet_id(), round_id, bundle_index);
+        DelegationProofIdentity::new(db.sidecar_id(), db.wallet_id(), round_id, bundle_index);
     with_live_progress(stages, |progress| {
         crate::delegation_proof_coordination::coordinate(
             identity,
@@ -1323,7 +1323,7 @@ pub fn validate_persisted_proof_reuse(
     keys: &DelegationKeys,
 ) -> Result<(), VotingError> {
     let identity =
-        DelegationProofIdentity::new(db.connection_id(), db.wallet_id(), round_id, bundle_index);
+        DelegationProofIdentity::new(db.sidecar_id(), db.wallet_id(), round_id, bundle_index);
     db.validate_delegation_proof_inputs(&identity, notes, keys)?;
     db.validate_delegation_proof_target(&identity, keys)
 }

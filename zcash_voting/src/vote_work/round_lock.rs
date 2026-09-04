@@ -30,14 +30,14 @@ pub(super) type HeldRoundLock = Arc<OwnedMutexGuard<()>>;
 /// the caller is queued. A stale caller therefore stops waiting instead of
 /// holding its place behind a long-running proof.
 pub(super) async fn acquire(
-    connection_id: u64,
+    sidecar_id: u64,
     wallet_id: String,
     round_id: &str,
     bundle_index: Option<u32>,
     control: &ChainSubmissionControl,
     entry_epoch: u64,
 ) -> Result<Option<OwnedMutexGuard<()>>, String> {
-    let key = (connection_id, wallet_id, round_id.to_string(), bundle_index);
+    let key = (sidecar_id, wallet_id, round_id.to_string(), bundle_index);
     let lock = {
         let mut locks = ROUND_LOCKS
             .lock()

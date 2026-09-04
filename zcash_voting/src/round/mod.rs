@@ -274,27 +274,7 @@ fn register_sidecar_connection(key: &Path, shared: &Arc<crate::storage::SidecarC
     }
 }
 
-/// Canonical registry key: the parent directory is resolved when it exists so
-/// two spellings of one sidecar path share a connection; the file itself may
-/// not exist yet. A bare file name has an empty parent, which is resolved
-/// through the current directory so `wallet.db`, `./wallet.db`, and the
-/// absolute path all key the same connection.
-fn sidecar_registry_key(sidecar_path: &Path) -> PathBuf {
-    match (sidecar_path.parent(), sidecar_path.file_name()) {
-        (Some(parent), Some(file_name)) => {
-            let parent = if parent.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                parent
-            };
-            parent
-                .canonicalize()
-                .map(|parent| parent.join(file_name))
-                .unwrap_or_else(|_| sidecar_path.to_path_buf())
-        }
-        _ => sidecar_path.to_path_buf(),
-    }
-}
+pub(crate) use crate::storage::sidecar_registry_key;
 
 /// Opening runs migrations, which need the write lock. Another process
 /// finishing its own open can hold that lock briefly, so retry a bounded
@@ -373,7 +353,7 @@ impl VotingDb {
                 message: "voting database path is not valid UTF-8".to_string(),
             })?;
         let conn = open_connection_with_busy_retry(path)?;
-        let db = Self::from_connection(conn);
+        let db = Self::from_connection(conn, path);
         db.set_wallet_id(wallet_id);
         register_sidecar_connection(&key, &db.shared_connection());
         Ok(Arc::new(db))
