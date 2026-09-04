@@ -455,8 +455,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let round_id = binding.round_id.clone();
 
         // Tree sync and witness generation block on their own HTTP runtime.
-        // Nodes are tried in order; a failed sync resets the cached tree so
-        // the next node starts from a consistent state.
+        // Nodes are tried in order. Every failed sync drops the round's cached
+        // tree, including the last node's, so neither the next node nor the
+        // next pass inherits a partially appended or mismatched tree.
         if host.vote_tree_node_urls.is_empty() {
             return Err(self.step_failure(
                 RoundStepFailureKind::InvalidInput,
@@ -468,23 +469,20 @@ impl<T: ChainTransport> RoundExecutor<T> {
         }
         let mut height = None;
         let mut last_failure = None;
-        for (index, node_url) in host.vote_tree_node_urls.iter().enumerate() {
+        for node_url in &host.vote_tree_node_urls {
             let db = Arc::clone(&self.database);
-            let round_id = round_id.clone();
+            let sync_round_id = round_id.clone();
             let node_url = node_url.clone();
             let transport = self.tree_transport.clone();
-            let reset_first = index > 0;
             let synced = self
-                .blocking(&step, "vote tree sync", move || {
-                    if reset_first {
-                        crate::precompute::reset_vote_tree(&db, &round_id)?;
-                    }
-                    match transport {
-                        Some(transport) => crate::precompute::sync_vote_tree_with(
-                            &db, &round_id, &node_url, transport,
-                        ),
-                        None => crate::precompute::sync_vote_tree(&db, &round_id, &node_url),
-                    }
+                .blocking(&step, "vote tree sync", move || match transport {
+                    Some(transport) => crate::precompute::sync_vote_tree_with(
+                        &db,
+                        &sync_round_id,
+                        &node_url,
+                        transport,
+                    ),
+                    None => crate::precompute::sync_vote_tree(&db, &sync_round_id, &node_url),
                 })
                 .await;
             match synced {
@@ -492,7 +490,20 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     height = Some(synced);
                     break;
                 }
-                Err(failure) => {
+                Err(mut failure) => {
+                    let db = Arc::clone(&self.database);
+                    let round_id = round_id.clone();
+                    if let Err(reset_failure) = self
+                        .blocking(&step, "vote tree reset", move || {
+                            crate::precompute::reset_vote_tree(&db, &round_id)
+                        })
+                        .await
+                    {
+                        failure.message = bounded_message(&format!(
+                            "{}; resetting the cached vote tree also failed: {}",
+                            failure.message, reset_failure.message
+                        ));
+                    }
                     if control.is_cancelled() {
                         return Err(failure);
                     }

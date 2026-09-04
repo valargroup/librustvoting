@@ -523,6 +523,15 @@ impl VoteTreeSync {
         Ok(VanWitness::from((path, anchor_height)))
     }
 
+    /// Whether a round currently has an in-memory tree client, synced or not.
+    #[cfg(test)]
+    pub(crate) fn has_round_client(&self, round_id: &str) -> bool {
+        self.clients
+            .lock()
+            .map(|clients| clients.contains_key(round_id))
+            .unwrap_or(false)
+    }
+
     /// Drop the in-memory TreeClient for a round so the next `sync` call
     /// creates a fresh one and does a full resync. This recovers from stale
     /// state that would otherwise cause `StartIndexMismatch` or `RootMismatch`.

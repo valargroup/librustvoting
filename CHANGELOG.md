@@ -18,7 +18,8 @@ This release is `zcash_voting` 4.0.0.
   work, and runs focused share confirmation. Delegation steps lock per
   bundle; chain and share steps lock per round. `RoundHostContext` carries
   the per-call host inputs, an ordered list of vote-tree node URLs that
-  `CastVote` fails over across (resetting the cached tree between nodes), and
+  `CastVote` fails over across (dropping the cached tree after every failed
+  node), and
   derives last-moment timing from the shared share policy; `set_ballot_intents` records decisions against the bound
   roster. `VoteRecoveryExecutor` remains as a deprecated alias.
 - `DelegationPipeline` binds the sidecar, a `WalletDbOpener`, the round's
@@ -66,6 +67,11 @@ This release is `zcash_voting` 4.0.0.
   round step outcome, failure, and progress views, and `PendingShareRoundView`.
 
 ### Changed
+
+- `CastVote` drops the round's cached vote tree after every failed node
+  sync, including the last node's and a cancelled attempt's, so a partially
+  appended or root-mismatched tree cannot poison the next node or the next
+  pass.
 
 - `RoundExecutor::advance_step` rejects a step whose bundle still has a
   `Delegate`, `AdvanceDelegation`, or `AdvanceImportedDelegation` step ahead

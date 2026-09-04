@@ -116,8 +116,12 @@ mod round_executor {
 
     /// The host's own handle: wallet "wallet" with one bundle in the round.
     fn host_database() -> Arc<crate::round::VotingDb> {
+        host_database_for("wallet")
+    }
+
+    fn host_database_for(wallet_id: &str) -> Arc<crate::round::VotingDb> {
         let database = Arc::new(crate::round::VotingDb::open_in_memory().unwrap());
-        database.set_wallet_id("wallet");
+        database.set_wallet_id(wallet_id);
         database
             .create_round(Network::Testnet, &round_params(), None)
             .unwrap();
@@ -127,6 +131,13 @@ mod round_executor {
 
     fn executor_over(
         database: Arc<crate::round::VotingDb>,
+    ) -> (RoundExecutor<HyperTransport>, Arc<crate::round::VotingDb>) {
+        bound_executor(database, None)
+    }
+
+    fn bound_executor(
+        database: Arc<crate::round::VotingDb>,
+        hotkey_secret: Option<zeroize::Zeroizing<Vec<u8>>>,
     ) -> (RoundExecutor<HyperTransport>, Arc<crate::round::VotingDb>) {
         let helper_client =
             HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
@@ -152,7 +163,7 @@ mod round_executor {
                     num_options: 3,
                 },
             ],
-            hotkey_secret: None,
+            hotkey_secret,
         })
         .unwrap();
         (executor, database)
@@ -639,5 +650,144 @@ mod round_executor {
         assert_eq!(failure.kind, RoundStepFailureKind::InvalidInput);
         assert_eq!(failure.step, Some(cast));
         assert!(failure.message.contains("Delegate"), "{}", failure.message);
+    }
+
+    /// A vote-tree transport with no reachable node: every request fails
+    /// after being counted, so a sync creates the round's tree client and then
+    /// errors out of it.
+    struct UnreachableTreeTransport {
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl vote_commitment_tree_client::transport::Transport for UnreachableTreeTransport {
+        fn get(
+            &self,
+            _url: &str,
+        ) -> Result<
+            vote_commitment_tree_client::transport::TransportResponse,
+            vote_commitment_tree_client::transport::TransportError,
+        > {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(
+                vote_commitment_tree_client::transport::TransportError::Request(
+                    "node unreachable".to_string(),
+                ),
+            )
+        }
+    }
+
+    /// An executor whose bundle 0 delegation is confirmed and whose ballot is
+    /// decided, so `CastVote` is the plan head and reaches tree sync.
+    fn executor_ready_to_cast(
+        wallet_id: &str,
+    ) -> (RoundExecutor<HyperTransport>, Arc<UnreachableTreeTransport>) {
+        let database = host_database_for(wallet_id);
+        // A confirmed delegation carries its VAN commitment; the tree sync
+        // reads it to place the bundle in the synced tree.
+        let van_commitment = {
+            use crate::backend::pasta_curves::{group::ff::PrimeField, pallas};
+            pallas::Base::from(9u64).to_repr().to_vec()
+        };
+        crate::storage::queries::store_delegation_data(
+            &database.conn(),
+            ROUND_ID,
+            wallet_id,
+            0,
+            &[0x41; 32],
+            &[],
+            &[0x42; 32],
+            &[],
+            &[0x43; 32],
+            &[0x44; 32],
+            &[0x45; 32],
+            &[0x46; 32],
+            &[0x47; 32],
+            &van_commitment,
+            crate::governance::BALLOT_DIVISOR,
+            0,
+            &[],
+            &[0x49; 32],
+            &crate::tx1::placeholder_tx1_effects(),
+        )
+        .unwrap();
+        database
+            .store_delegation_tx_hash(ROUND_ID, 0, "dtx")
+            .unwrap();
+        database.store_van_position(ROUND_ID, 0, 7).unwrap();
+        let (executor, _) = bound_executor(database, Some(zeroize::Zeroizing::new(vec![0x21; 64])));
+        executor
+            .set_ballot_intents(&[
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Choice(0),
+                },
+                BallotIntent {
+                    proposal_id: 2,
+                    decision: Decision::Skipped,
+                },
+            ])
+            .unwrap();
+        let transport = Arc::new(UnreachableTreeTransport {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let executor = executor.with_tree_transport(transport.clone());
+        (executor, transport)
+    }
+
+    async fn cast_against_unreachable_nodes(wallet_id: &str, node_urls: Vec<String>) -> usize {
+        let (executor, transport) = executor_ready_to_cast(wallet_id);
+        let cast = NextStep::CastVote {
+            bundle_index: 0,
+            proposal_id: 1,
+            choice: 0,
+        };
+        assert_eq!(executor.plan().unwrap().next_steps.first(), Some(&cast));
+        let host = RoundHostContext {
+            vote_tree_node_urls: node_urls,
+            ..host()
+        };
+        let control = ChainSubmissionControl::new(1);
+        let failure = executor
+            .advance_step(cast, &host, &control, &NoopRoundStepProgressReporter {})
+            .await
+            .expect_err("no node is reachable");
+        assert!(
+            failure.message.contains("vote tree sync"),
+            "failure must come from tree sync, got: {} ({:?})",
+            failure.message,
+            failure.kind
+        );
+
+        let cached = crate::precompute::has_cached_round_tree(executor.database(), ROUND_ID);
+        crate::precompute::reset_vote_tree(executor.database(), "").unwrap();
+        assert!(
+            !cached,
+            "a failed sync must not leave the round's tree client behind"
+        );
+        transport.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_failed_sync_on_the_only_node_clears_the_cached_round_tree() {
+        let requests = cast_against_unreachable_nodes(
+            "wallet-single-node",
+            vec!["http://node-a.invalid".to_string()],
+        )
+        .await;
+        assert_eq!(requests, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_sync_on_the_last_node_clears_the_cached_round_tree() {
+        let requests = cast_against_unreachable_nodes(
+            "wallet-two-nodes",
+            vec![
+                "http://node-a.invalid".to_string(),
+                "http://node-b.invalid".to_string(),
+            ],
+        )
+        .await;
+        assert_eq!(requests, 2, "both nodes are tried in order");
     }
 }
