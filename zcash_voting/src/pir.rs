@@ -123,7 +123,7 @@ fn normalize_endpoint_url(url: &str) -> String {
         .filter(|port| Some(*port) != default_port)
         .map(|port| format!(":{port}"))
         .unwrap_or_default();
-    let path = uri.path().trim_end_matches('/');
+    let path = normalize_path_escapes(uri.path().trim_end_matches('/'));
     let query = uri
         .query()
         .map(|query| format!("?{query}"))
@@ -132,6 +132,33 @@ fn normalize_endpoint_url(url: &str) -> String {
         "{scheme}://{}{port}{path}{query}",
         host.to_ascii_lowercase()
     )
+}
+
+/// Decodes percent escapes of unreserved characters and uppercases the hex of
+/// every other escape, so URI-equivalent paths such as `/%7Eoperator` and
+/// `/~operator` compare equal. Malformed escapes are kept verbatim.
+fn normalize_path_escapes(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() + 0 && index + 2 <= bytes.len() - 1 {
+            let hex = &path[index + 1..index + 3];
+            if let Ok(value) = u8::from_str_radix(hex, 16) {
+                if value.is_ascii_alphanumeric() || b"-._~".contains(&value) {
+                    out.push(value as char);
+                } else {
+                    out.push('%');
+                    out.push_str(&hex.to_ascii_uppercase());
+                }
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    out
 }
 
 fn map_pir_connect_error(endpoint: &str, err: anyhow::Error) -> VotingError {

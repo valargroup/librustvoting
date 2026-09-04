@@ -118,3 +118,27 @@ fn equivalent_endpoint_spellings_canonicalize_to_one_identity() {
     // Unparseable input keeps the plain trimming; connect reports the error.
     assert_eq!(normalize_endpoint_url("not a url/"), "not a url");
 }
+
+#[test]
+fn unreserved_percent_escapes_normalize_to_one_endpoint_identity() {
+    use super::super::normalize_endpoint_url;
+
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/%7Eoperator"),
+        normalize_endpoint_url("https://pir.example/~operator")
+    );
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/%7eoperator/%41b"),
+        "https://pir.example/~operator/Ab"
+    );
+    // Reserved escapes keep their meaning, in canonical uppercase hex.
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/a%2fb"),
+        "https://pir.example/a%2Fb"
+    );
+    // A malformed escape is left alone rather than guessed at.
+    assert_eq!(
+        normalize_endpoint_url("https://pir.example/a%zz"),
+        "https://pir.example/a%zz"
+    );
+}
