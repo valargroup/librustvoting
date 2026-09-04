@@ -336,8 +336,8 @@ pub struct AdvanceVoteBatch {
 /// state directly.
 pub struct ChainSubmissionClient<T> {
     /// Wallet captured at construction; every submission identity uses it.
+    /// The store holds the private scoped database handle.
     wallet_id: String,
-    db: Arc<VotingDb>,
     network: Network,
     coordinator:
         ChainSubmissionCoordinator<T, SqliteChainSubmissionStore, SystemChainSubmissionClock>,
@@ -403,12 +403,11 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         // a later pass of an in-flight episode to another wallet's state.
         let wallet_id = db.wallet_id();
         let db = Arc::new(db.scoped(&wallet_id));
-        let store = Arc::new(SqliteChainSubmissionStore::new(Arc::clone(&db)));
+        let store = Arc::new(SqliteChainSubmissionStore::new(db));
         let coordinator =
             ChainSubmissionCoordinator::new(protocol, store, SystemChainSubmissionClock, policy)?;
         Ok(Self {
             wallet_id,
-            db,
             network: config.network,
             coordinator,
         })
@@ -813,19 +812,25 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
                 ChainSubmissionResult::Cancelled => return Ok(ChainAdvanceOutcome::Cancelled),
                 ChainSubmissionResult::Pending(pending) => pending,
             };
-            match &pending {
+            let escalating_now = match &pending {
                 ChainSubmissionPending::Recovering { .. } => {
                     if policy.escalate_to_exact_tree && !escalated {
                         escalated = true;
                         recovery = ChainRecoveryMode::ExactTree;
+                        true
                     } else {
                         return Ok(ChainAdvanceOutcome::StillPending(pending));
                     }
                 }
-                ChainSubmissionPending::Tracking { .. } => {}
-            }
+                ChainSubmissionPending::Tracking { .. } => false,
+            };
             if policy.max_passes != 0 && passes >= policy.max_passes {
                 return Ok(ChainAdvanceOutcome::StillPending(pending));
+            }
+            // `pending_repoll` paces Tracking polls. Escalating to the exact
+            // tree is a different pass, not a repoll; run it at once.
+            if escalating_now {
+                continue;
             }
             if interrupted_during(policy.pending_repoll, control, entry_epoch).await {
                 return Ok(ChainAdvanceOutcome::Cancelled);
