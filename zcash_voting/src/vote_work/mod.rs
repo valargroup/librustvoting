@@ -468,8 +468,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
     ///
     /// Returns [`VotingError::InvalidInput`] for a non-canonical round id, a
     /// network other than the chain client's or than the network the wallet
-    /// already stores this round under, an empty roster, a repeated
-    /// proposal id, or a hotkey secret that does not reconstruct. The network is checked here because chain identity
+    /// already stores this round under, an empty roster, a repeated or
+    /// out-of-range proposal id, an option count outside the supported
+    /// range, or a hotkey secret that does not reconstruct. The network is checked here because chain identity
     /// derivation would otherwise reject it only after proving and helper
     /// plans had already been persisted.
     pub fn with_binding(mut self, binding: RoundBinding) -> Result<Self, VotingError> {
@@ -495,6 +496,10 @@ impl<T: ChainTransport> RoundExecutor<T> {
             return Err(VotingError::InvalidInput {
                 message: "round binding requires a nonempty proposal roster".to_string(),
             });
+        }
+        for entry in &binding.proposals {
+            crate::types::validate_proposal_id(entry.proposal_id)?;
+            crate::types::validate_vote_options(entry.num_options)?;
         }
         let mut seen = std::collections::HashSet::new();
         if let Some(repeated) = binding

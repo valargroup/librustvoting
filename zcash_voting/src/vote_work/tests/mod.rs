@@ -1504,4 +1504,28 @@ mod round_executor {
             .expect("a 63-byte hotkey secret cannot reconstruct a hotkey");
         assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
     }
+
+    #[test]
+    fn a_binding_with_an_unsupported_option_count_is_refused() {
+        let (executor, _) = bound_executor_unbound(host_database());
+        let error = executor
+            .with_binding(RoundBinding {
+                round_id: ROUND_ID.to_string(),
+                network: Network::Testnet,
+                proposals: vec![
+                    ProposalRosterEntry {
+                        proposal_id: 1,
+                        num_options: 2,
+                    },
+                    ProposalRosterEntry {
+                        proposal_id: 2,
+                        num_options: 1,
+                    },
+                ],
+                hotkey_secret: None,
+            })
+            .err()
+            .expect("a one-option proposal cannot be voted on");
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+    }
 }
