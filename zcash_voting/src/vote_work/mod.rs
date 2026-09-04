@@ -485,24 +485,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // A round this wallet already holds under another network would only
         // be rejected by prepare_vote_work after CastVote had synced and
         // cached a tree from the binding's node fleet; refuse it up front.
-        {
-            let conn = self.database.conn();
-            if crate::storage::queries::has_round(&conn, &binding.round_id, &self.wallet_id)? {
-                let stored = crate::storage::queries::load_round_network(
-                    &conn,
-                    &binding.round_id,
-                    &self.wallet_id,
-                )?;
-                if stored != binding.network {
-                    return Err(VotingError::InvalidInput {
-                        message: format!(
-                            "round {} is stored for network {stored:?} but the binding names {:?}",
-                            binding.round_id, binding.network
-                        ),
-                    });
-                }
-            }
-        }
+        self.ensure_stored_round_network(&binding.round_id, "the binding")?;
         if binding.proposals.is_empty() {
             return Err(VotingError::InvalidInput {
                 message: "round binding requires a nonempty proposal roster".to_string(),
@@ -562,6 +545,30 @@ impl<T: ChainTransport> RoundExecutor<T> {
             });
         }
         Ok(&self.wallet_id)
+    }
+
+    /// Rejects work on a round this wallet already stores under a network
+    /// other than the chain client's, before any network I/O or durable
+    /// write. `caller` names what supplied the round, for the message.
+    pub(super) fn ensure_stored_round_network(
+        &self,
+        round_id: &str,
+        caller: &str,
+    ) -> Result<(), VotingError> {
+        let conn = self.database.conn();
+        if !crate::storage::queries::has_round(&conn, round_id, &self.wallet_id)? {
+            return Ok(());
+        }
+        let stored = crate::storage::queries::load_round_network(&conn, round_id, &self.wallet_id)?;
+        if stored != self.chain_network {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "round {round_id} is stored for network {stored:?} but {caller} and the chain client use {:?}",
+                    self.chain_network
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn binding(&self) -> Result<&RoundBinding, VotingError> {

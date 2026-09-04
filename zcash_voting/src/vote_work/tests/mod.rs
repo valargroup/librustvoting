@@ -475,13 +475,25 @@ mod round_executor {
     #[tokio::test]
     async fn bundle_scoped_locks_do_not_serialize_distinct_bundles() {
         let control = ChainSubmissionControl::new(1);
-        let first = super::super::round_lock::acquire("w".to_string(), ROUND_ID, Some(0), &control, control.operation_epoch())
-            .await
-            .unwrap()
-            .unwrap();
+        let first = super::super::round_lock::acquire(
+            "w".to_string(),
+            ROUND_ID,
+            Some(0),
+            &control,
+            control.operation_epoch(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let second = tokio::time::timeout(
             Duration::from_millis(200),
-            super::super::round_lock::acquire("w".to_string(), ROUND_ID, Some(1), &control, control.operation_epoch()),
+            super::super::round_lock::acquire(
+                "w".to_string(),
+                ROUND_ID,
+                Some(1),
+                &control,
+                control.operation_epoch(),
+            ),
         )
         .await
         .expect("a different bundle must not wait")
@@ -489,7 +501,13 @@ mod round_executor {
         assert!(second.is_some());
         let round_scope = tokio::time::timeout(
             Duration::from_millis(200),
-            super::super::round_lock::acquire("w".to_string(), ROUND_ID, None, &control, control.operation_epoch()),
+            super::super::round_lock::acquire(
+                "w".to_string(),
+                ROUND_ID,
+                None,
+                &control,
+                control.operation_epoch(),
+            ),
         )
         .await
         .expect("the round scope is independent of bundle scopes")
@@ -497,7 +515,13 @@ mod round_executor {
         assert!(round_scope.is_some());
         let same_bundle = tokio::time::timeout(
             Duration::from_millis(100),
-            super::super::round_lock::acquire("w".to_string(), ROUND_ID, Some(0), &control, control.operation_epoch()),
+            super::super::round_lock::acquire(
+                "w".to_string(),
+                ROUND_ID,
+                Some(0),
+                &control,
+                control.operation_epoch(),
+            ),
         )
         .await;
         assert!(same_bundle.is_err(), "the same bundle must wait");
@@ -1330,6 +1354,7 @@ mod round_executor {
             "{error}"
         );
     }
+
     #[tokio::test]
     async fn a_queued_lock_wait_stops_when_the_operation_epoch_changes() {
         let control = ChainSubmissionControl::new(1);
@@ -1365,4 +1390,45 @@ mod round_executor {
         drop(held);
     }
 
+    #[tokio::test]
+    async fn recovery_on_a_round_stored_for_another_network_is_refused_before_helper_io() {
+        let database = host_database();
+        let helper_client =
+            HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
+        let executor = RoundExecutor::new(
+            database,
+            ChainSubmissionClientConfig::for_network(
+                Network::Mainnet,
+                vec!["https://chain.invalid".to_string()],
+            ),
+            helper_client,
+        )
+        .unwrap();
+        let control = ChainSubmissionControl::new(1);
+        let proposal_ids = [1u32, 2];
+        let helper_urls = vec!["http://helper.invalid".to_string()];
+
+        let failure = executor
+            .advance(
+                crate::VoteRecoveryRequest {
+                    round_id: ROUND_ID,
+                    proposal_ids: &proposal_ids,
+                    configured_helper_urls: &helper_urls,
+                    now_seconds: 10,
+                    vote_end_time_seconds: 100_000,
+                    last_moment_buffer_seconds: None,
+                },
+                &control,
+                &crate::NoopVoteRecoveryProgressReporter {},
+            )
+            .await
+            .expect_err("the stored round is Testnet");
+
+        assert_eq!(failure.kind, crate::VoteRecoveryFailureKind::InvalidInput);
+        assert!(
+            failure.message.contains("stored for network Testnet"),
+            "{}",
+            failure.message
+        );
+    }
 }

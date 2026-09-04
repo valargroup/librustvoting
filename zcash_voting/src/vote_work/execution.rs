@@ -36,6 +36,10 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .wallet_scope()
             .map(str::to_string)
             .map_err(|error| self.voting_failure(error, None, request))?;
+        // No binding is required here, so check the stored round's network
+        // against the chain client before helper preflight or any plan write.
+        self.ensure_stored_round_network(request.round_id, "this recovery request")
+            .map_err(|error| self.voting_failure(error, None, request))?;
         let initial_plan = resume_plan(&self.database, request.round_id, request.proposal_ids)
             .map_err(|error| self.voting_failure(error, None, request))?;
         let Some(work) = initial_plan.recovered_vote_work.first().cloned() else {
@@ -48,19 +52,24 @@ impl<T: ChainTransport> RoundExecutor<T> {
             });
         };
 
-        let Some(_round_guard) =
-            round_lock::acquire(wallet_id, request.round_id, None, control.chain(), control.entry_epoch())
-                .await
-                .map_err(|message| {
-                    self.failure(
-                        VoteRecoveryFailureKind::InvariantViolation,
-                        Some(work.clone()),
-                        None,
-                        None,
-                        message,
-                        request,
-                    )
-                })?
+        let Some(_round_guard) = round_lock::acquire(
+            wallet_id,
+            request.round_id,
+            None,
+            control.chain(),
+            control.entry_epoch(),
+        )
+        .await
+        .map_err(|message| {
+            self.failure(
+                VoteRecoveryFailureKind::InvariantViolation,
+                Some(work.clone()),
+                None,
+                None,
+                message,
+                request,
+            )
+        })?
         else {
             return self.cancelled(Some(work), None, request);
         };
