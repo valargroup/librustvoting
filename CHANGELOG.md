@@ -69,6 +69,13 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- The in-memory vote-tree cache prunes entries whose sidecar connection has
+  been dropped, so reopening a sidecar does not accumulate retained trees.
+- `AdvanceDelegation` keeps the bundle lock inside its re-signing task, so an
+  aborted step cannot let a new pass prompt the host signer concurrently.
+- Round and bundle locks are keyed by sidecar connection as well as wallet
+  and round, so two sidecars sharing a wallet id do not serialize.
+
 - The wallet example's `advance_round_until_idle` takes a `RouteHttp`
   executor and routes helper, vote-chain, and vote-tree traffic through it.
 - `RoundExecutor::advance` rejects a round the wallet stores under a network

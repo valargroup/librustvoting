@@ -16,7 +16,7 @@ use std::borrow::Borrow;
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use zcash_client_sqlite::WalletDb;
@@ -41,6 +41,16 @@ struct BoundVoteTreeSync {
     /// The host transport the client was created with, or `None` for the SDK's
     /// direct HTTP transport.
     transport: Option<Arc<dyn vote_commitment_tree_client::transport::Transport>>,
+    /// The sidecar connection the entry belongs to. Once every handle on it
+    /// is gone the entry is unreachable (a reopened sidecar gets a new id),
+    /// so it is pruned on the next registry access instead of retained.
+    connection: Weak<crate::storage::SidecarConnection>,
+}
+
+impl BoundVoteTreeSync {
+    fn connection_is_live(&self) -> bool {
+        self.connection.strong_count() > 0
+    }
 }
 
 impl BoundVoteTreeSync {
@@ -228,6 +238,7 @@ pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError>
             .map_err(|e| VotingError::Internal {
                 message: format!("vote tree sync registry lock poisoned: {e}"),
             })?;
+        guard.retain(|_, bound| bound.connection_is_live());
         if let Some(bound) = guard.remove(&wallet_id) {
             bound.sync.reset("")?;
         }
@@ -273,7 +284,8 @@ pub fn cached_vote_tree_rounds(db: &VotingDb) -> Vec<String> {
     VOTE_TREE_SYNCS
         .get()
         .and_then(|registry| registry.lock().ok())
-        .and_then(|registry| {
+        .and_then(|mut registry| {
+            registry.retain(|_, bound| bound.connection_is_live());
             registry
                 .get(&wallet_id)
                 .map(|bound| bound.sync.cached_rounds())
@@ -295,6 +307,7 @@ fn vote_tree_sync_for(
         .map_err(|e| VotingError::Internal {
             message: format!("vote tree sync registry lock poisoned: {e}"),
         })?;
+    guard.retain(|_, bound| bound.connection_is_live());
     if let Some(bound) = guard.get(&wallet_id) {
         if bound.honors(transport.as_ref()) {
             return Ok(Arc::clone(&bound.sync));
@@ -309,6 +322,7 @@ fn vote_tree_sync_for(
         BoundVoteTreeSync {
             sync: Arc::clone(&sync),
             transport,
+            connection: Arc::downgrade(&db.shared_connection()),
         },
     );
     Ok(sync)

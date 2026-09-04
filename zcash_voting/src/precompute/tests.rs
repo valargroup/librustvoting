@@ -177,3 +177,29 @@ fn two_sidecars_with_one_wallet_id_keep_separate_tree_state_and_routes() {
     reset_vote_tree(&first_sidecar, "").unwrap();
     reset_vote_tree(&second_sidecar, "").unwrap();
 }
+
+#[test]
+fn a_dropped_sidecar_connection_no_longer_retains_its_tree_cache() {
+    let key = {
+        let short_lived = db("wallet-short-lived");
+        sync_vote_tree(&short_lived, ROUND_ID, NODE_URL).unwrap_err();
+        let key = super::vote_tree_cache_key(&short_lived);
+        assert!(super::VOTE_TREE_SYNCS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .contains_key(&key));
+        key
+    };
+    // Every handle is gone; the next registry access prunes the entry.
+    let other = db("wallet-prunes-neighbours");
+    assert!(super::cached_vote_tree_rounds(&other).is_empty());
+    assert!(!super::VOTE_TREE_SYNCS
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .contains_key(&key));
+    reset_vote_tree(&other, "").unwrap();
+}
