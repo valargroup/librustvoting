@@ -372,16 +372,6 @@ impl CommittedVote {
         )
     }
 
-    /// Submits every incomplete helper share from the persisted complete plan.
-    ///
-    /// The complete plan and every helper payload are validated before the
-    /// first POST. A process-wide semaphore enforces the SDK's exported helper
-    /// concurrency policy across simultaneous wallets and committed votes. The
-    /// plan retains its original target across fleet churn, but only helpers in
-    /// `params.configured_server_urls` are eligible for delivery.
-    /// This handle must match the exact durable recovery snapshot; recover a
-    /// fresh `CommittedVote` after confirmation synchronizes a pre-confirmation
-    /// plan to its confirmed VC tree position.
     /// Returns the confirmed form of this vote, if its chain confirmation is
     /// durable for this exact commitment generation.
     ///
