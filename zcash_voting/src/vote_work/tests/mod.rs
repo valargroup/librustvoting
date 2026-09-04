@@ -87,6 +87,44 @@ fn step_control_treats_an_epoch_change_like_cancellation() {
     assert!(std::ptr::eq(recaptured.chain(), &control));
 }
 
+#[test]
+fn vote_tree_node_urls_must_be_http_urls_and_https_on_mainnet() {
+    use super::cast_vote::validate_vote_tree_node_urls;
+    use crate::{Network, VotingError};
+
+    let urls = |list: &[&str]| list.iter().map(|url| url.to_string()).collect::<Vec<_>>();
+
+    validate_vote_tree_node_urls(
+        &urls(&["http://node.test:8080", "https://node.test"]),
+        Network::Testnet,
+    )
+    .unwrap();
+    validate_vote_tree_node_urls(&urls(&["https://node.example"]), Network::Mainnet).unwrap();
+
+    for (list, network, needle) in [
+        (urls(&[]), Network::Testnet, "at least one"),
+        (
+            urls(&["https://ok.example", "http://node.example"]),
+            Network::Mainnet,
+            "must use HTTPS",
+        ),
+        (
+            urls(&["ftp://node.test"]),
+            Network::Testnet,
+            "http or https",
+        ),
+        (urls(&["not a url"]), Network::Testnet, "is invalid"),
+        (urls(&["/relative/path"]), Network::Testnet, "with a host"),
+    ] {
+        let error = validate_vote_tree_node_urls(&list, network).unwrap_err();
+        assert!(
+            matches!(error, VotingError::InvalidInput { .. }),
+            "{list:?}: {error}"
+        );
+        assert!(error.to_string().contains(needle), "{list:?}: {error}");
+    }
+}
+
 mod round_executor {
     use std::{sync::Arc, time::Duration};
 

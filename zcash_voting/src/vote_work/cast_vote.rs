@@ -11,7 +11,7 @@ use crate::{
         SignedVoteBatch, VoteCommitStage, VoteCommitmentRecovery, VoteSigner, VoteWorkRequest,
     },
     wire::DraftVote,
-    ChainTransport, VotingError, VotingHotkey,
+    ChainTransport, Network, VotingError, VotingHotkey,
 };
 
 use super::{
@@ -81,15 +81,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // Nodes are tried in order. Every failed sync drops the round's cached
         // tree, including the last node's, so neither the next node nor the
         // next pass inherits a partially appended or mismatched tree.
-        if host.vote_tree_node_urls.is_empty() {
-            return Err(self.step_failure(
-                RoundStepFailureKind::InvalidInput,
-                Some(step),
-                None,
-                None,
-                "casting a vote requires at least one vote-tree node URL",
-            ));
-        }
+        validate_vote_tree_node_urls(&host.vote_tree_node_urls, network)
+            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
         // One handle serves the sync, any reset, and the witness, so another
         // executor rebinding this wallet's transport in between cannot hand
         // the witness a client without the round state just synced.
@@ -263,4 +256,43 @@ impl<T: ChainTransport> RoundExecutor<T> {
         };
         Ok((votes, batch))
     }
+}
+
+/// Validates the complete vote-tree node list before any sync.
+///
+/// Every URL must parse with an `http` or `https` scheme and a host, and on
+/// Mainnet every URL must use HTTPS, matching the chain client's endpoint
+/// rule: a plaintext tree endpoint would expose the wallet's round-specific
+/// traffic and let an on-path attacker serve a forged tree that drives
+/// expensive proving before the chain rejects the anchor.
+pub(super) fn validate_vote_tree_node_urls(
+    node_urls: &[String],
+    network: Network,
+) -> Result<(), VotingError> {
+    if node_urls.is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: "casting a vote requires at least one vote-tree node URL".to_string(),
+        });
+    }
+    for node_url in node_urls {
+        let uri: http::Uri = node_url
+            .parse()
+            .map_err(|error| VotingError::InvalidInput {
+                message: format!("vote-tree node URL {node_url:?} is invalid: {error}"),
+            })?;
+        let scheme = uri.scheme_str().unwrap_or_default();
+        if !matches!(scheme, "http" | "https") || uri.host().is_none() {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "vote-tree node URL {node_url:?} must be an http or https URL with a host"
+                ),
+            });
+        }
+        if network == Network::Mainnet && scheme != "https" {
+            return Err(VotingError::InvalidInput {
+                message: format!("production vote-tree node URL {node_url:?} must use HTTPS"),
+            });
+        }
+    }
+    Ok(())
 }
