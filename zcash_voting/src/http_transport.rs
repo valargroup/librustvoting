@@ -568,6 +568,16 @@ impl<R: RouteHttp> HyperTransport<R> {
         body: Vec<u8>,
     ) -> Result<pir_client::TransportResponse> {
         use PirHttpFailurePhase as Phase;
+        // A URL the route cannot even build is a configuration error, not an
+        // endpoint outage: classify it as `Build` here so the fleet does not
+        // retry other endpoints on it or report it as unavailable.
+        if let Err(error) = http::Uri::try_from(url) {
+            return Err(PirHttpFailure {
+                phase: Phase::Build,
+                http_status: None,
+            }
+            .wrap(format!("build PIR request URL {url:?}: {error}")));
+        }
         let response = self
             .execute(
                 RouteRequest {
@@ -864,6 +874,7 @@ impl<R: RouteHttp> ChainTransport for HyperTransport<R> {
 
 #[cfg(test)]
 mod tests {
+    mod pir_request;
     mod route;
 
     use std::{
