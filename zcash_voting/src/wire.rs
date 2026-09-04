@@ -271,10 +271,67 @@ pub struct SubmissionDiagnosticView {
     pub message: String,
 }
 
+/// Discriminator of a [`NextStepView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NextStepKind {
+    Delegate,
+    AdvanceDelegation,
+    AdvanceImportedDelegation,
+    CastVote,
+    AdvanceVote,
+    AdvanceVoteBatch,
+    SubmitShares,
+    ConfirmShare,
+}
+
+/// High-level work area a wallet should show or resume for a round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundPlanActionKind {
+    Idle,
+    Delegate,
+    Vote,
+    SubmitShares,
+    Done,
+}
+
+/// Kind of grouped delegation recovery work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationRecoveryWorkKindView {
+    Delegate,
+    AdvanceDelegation,
+    AdvanceImportedDelegation,
+}
+
+/// Kind of grouped vote recovery work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoteRecoveryWorkKindView {
+    AdvanceVote,
+    AdvanceVoteBatch,
+    SubmitShares,
+}
+
+/// Cross-stage workflow phase of a delegation, vote, or share record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPhaseView {
+    Prepared,
+    Signed,
+    SubmittedDelegation,
+    SubmittedVote,
+    SubmittedShare,
+    SubmissionManaged,
+    SubmissionRejected,
+    Confirmed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationRecoveryView {
     pub bundle_index: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub tx_hash: Option<String>,
     /// Confirmed VAN leaf position, if delegation has been projected.
     pub van_leaf_position: Option<u64>,
@@ -287,7 +344,7 @@ pub struct VoteRecoveryView {
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub choice: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub tx_hash: Option<String>,
     pub vc_tree_position: Option<u64>,
     pub has_commitment_bundle: bool,
@@ -315,7 +372,7 @@ pub struct ShareDelegationRecordView {
     #[serde(default)]
     pub target_count: u32,
     pub nullifier: Vec<u8>,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub confirmed: bool,
     pub submit_at: u64,
     pub created_at: u64,
@@ -326,11 +383,11 @@ pub struct ShareWorkflowRecoveryView {
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub share_index: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NextStepView {
-    pub kind: String,
+    pub kind: NextStepKind,
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub choice: u32,
@@ -352,23 +409,33 @@ pub struct RoundRecoveryStateView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationStatusView {
     pub bundle_index: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub tx_hash: Option<String>,
     #[serde(default)]
     pub submission_diagnostic: Option<SubmissionDiagnosticView>,
+    /// True when this bundle's delegation ended without a confirmation and no
+    /// further delegation step will be planned for it; `submission_diagnostic`
+    /// says why. A confirmed bundle is not terminal in this sense: it
+    /// succeeded, and `phase` says so.
+    ///
+    /// Read this rather than inferring from `phase`: a dispatch that reached
+    /// the chain without a usable transaction hash reports the same phase as a
+    /// healthy submission, and retrying it would resubmit.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationRecoveryWorkView {
-    pub kind: String,
+    pub kind: DelegationRecoveryWorkKindView,
     pub bundle_index: u32,
-    pub phase: String,
+    pub phase: WorkflowPhaseView,
     pub tx_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteRecoveryWorkView {
-    pub kind: String,
+    pub kind: VoteRecoveryWorkKindView,
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub tx_hash: Option<String>,
@@ -394,6 +461,9 @@ pub struct RoundPlanView {
     pub pending_recovery: bool,
     pub blocking_recovery: bool,
     pub blocking_share_work: bool,
+    /// True when any helper-share row is still unconfirmed. Schedule
+    /// background share tracking from this instead of holding share rows.
+    pub has_unconfirmed_shares: bool,
     pub hotkey_bound: bool,
     pub completed_vote_artifact: bool,
     pub completed_for_display: bool,
@@ -416,14 +486,327 @@ pub struct RoundPlanView {
     /// True when any vote or share work remains, counting share confirmation
     /// unconditionally.
     pub has_recoverable_vote_or_share_work: bool,
-    pub primary_action: String,
+    pub primary_action: RoundPlanActionKind,
     pub next_steps: Vec<NextStepView>,
     pub delegation_statuses: Vec<DelegationStatusView>,
     pub recovered_delegation_work: Vec<DelegationRecoveryWorkView>,
     pub recovered_vote_work: Vec<VoteRecoveryWorkView>,
     pub open_proposals: Vec<u32>,
+    /// Durable intents for proposals outside the authenticated roster; casting
+    /// is withheld until the host clears them.
+    #[serde(default)]
+    pub unrostered_intents: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
     pub immediate_share_key: Option<ImmediateShareKey>,
     pub immediate_share_confirmed: bool,
     pub all_decided: bool,
+}
+
+/// Stable error category exposed across the wallet boundary.
+///
+/// Mirrors [`crate::VotingErrorKind`]; `Other` covers categories added to the
+/// crate after this view was generated for a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VotingErrorKindView {
+    InvalidInput,
+    KeystoneSignatureConflict,
+    ProofFailed,
+    Busy,
+    Storage,
+    Internal,
+    InsufficientEligibility,
+    NoSpendableNotes,
+    SetupAlreadyPersisted,
+    DbBusy,
+    PirUnavailable,
+    /// Any category this host does not know. Serde deserializes unknown
+    /// category strings into it, so a newer crate can add kinds without
+    /// breaking an older host's view.
+    #[serde(other)]
+    Other,
+}
+
+/// Wallet-facing view of a [`crate::VotingError`].
+///
+/// `kind`, `retryable`, and `message` are always populated. The remaining
+/// fields carry the structured payload of the kinds that have one:
+/// `bundle_index` for `KeystoneSignatureConflict` and `SetupAlreadyPersisted`;
+/// `snapshot_height`, the weight fields, the selected note count, and the
+/// bundle slot capacity for
+/// `InsufficientEligibility` and `NoSpendableNotes`; `http_status` and
+/// `endpoint` for `PirUnavailable`.
+///
+/// Unknown fields are accepted on purpose: a newer crate may add a structured
+/// field for a category an older host reads as `Other`, and the whole payload
+/// must still parse for that fallback to mean anything.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VotingErrorView {
+    pub kind: VotingErrorKindView,
+    pub retryable: bool,
+    pub message: String,
+    pub bundle_index: Option<u32>,
+    /// For `SetupAlreadyPersisted`, the setup column that already held a
+    /// value. Sighash and effects conflicts are reusable after validation;
+    /// a padded-note-secrets conflict is not.
+    pub setup_field: Option<DelegationSetupFieldView>,
+    pub snapshot_height: Option<u64>,
+    pub required_weight_zatoshi: Option<u64>,
+    pub selected_weight_zatoshi: Option<u64>,
+    pub bundle_note_slots: Option<u32>,
+    pub selected_notes: Option<u32>,
+    pub http_status: Option<u16>,
+    pub endpoint: Option<String>,
+}
+
+/// Wire form of [`crate::types::DelegationSetupField`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationSetupFieldView {
+    PaddedNoteSecrets,
+    PcztSighash,
+    Tx1Effects,
+}
+
+/// One pending helper-share round for one wallet, as returned by
+/// [`crate::share::pending_rounds_for_accounts`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingShareRoundView {
+    pub wallet_id: String,
+    pub round_id: String,
+    pub session_json: Option<String>,
+}
+
+/// Discriminator of a [`ChainSubmissionOutcomeView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainSubmissionOutcomeKind {
+    Confirmed,
+    Tracking,
+    Recovering,
+    SubmittedWithoutHash,
+    Rejected,
+    Cancelled,
+}
+
+/// How a confirmation was established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainConfirmationSourceView {
+    Hash,
+    Tree,
+}
+
+/// Category of a chain submission diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainDiagnosticKindView {
+    AmbiguousDispatch,
+    AmbiguousAttemptsExhausted,
+    NullifierAlreadySpent,
+    TrackingWindowExpired,
+    ChainRejected,
+    ReconciliationPending,
+    InvalidProtocolResponse,
+    StorageFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainDiagnosticView {
+    pub kind: ChainDiagnosticKindView,
+    pub message: String,
+}
+
+/// Flat view of one chain submission result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainSubmissionOutcomeView {
+    pub kind: ChainSubmissionOutcomeKind,
+    pub confirmation_source: Option<ChainConfirmationSourceView>,
+    pub transaction_hash: Option<String>,
+    pub candidate_transaction_hash: Option<String>,
+    pub final_van_position: Option<u64>,
+    pub vote_commitment_positions: Vec<u64>,
+    pub diagnostic: Option<ChainDiagnosticView>,
+}
+
+/// Durable chain submission state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainSubmissionStateView {
+    Submitting,
+    Tracking,
+    Recovering,
+    SubmittedWithoutHash,
+    Confirmed,
+    Rejected,
+}
+
+/// How strongly a failure's state is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainSubmissionStateEvidenceView {
+    Durable,
+    KnownPossiblyDispatched,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainSubmissionFailureStateView {
+    pub state: ChainSubmissionStateView,
+    pub evidence: ChainSubmissionStateEvidenceView,
+}
+
+/// Durable identity of one committed vote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VoteKeyView {
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+}
+
+/// Durable identity of one helper share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ShareKeyView {
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub share_index: u32,
+}
+
+/// Delivery result for one share of a batch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareDeliveryOutcomeView {
+    pub share_index: u32,
+    pub accepted_urls: Vec<String>,
+    pub ambiguous_urls: Vec<String>,
+    pub target_count: u32,
+}
+
+/// Result of one initial helper delivery for a confirmed vote.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareBatchDeliveryReportView {
+    pub vote: VoteKeyView,
+    pub deliveries: Vec<ShareDeliveryOutcomeView>,
+    pub pending_share_indices: Vec<u32>,
+    pub cancelled: bool,
+    /// True when the persisted plan predates complete-plan persistence.
+    pub legacy_best_effort: bool,
+}
+
+/// What one round step call accomplished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundStepDispositionView {
+    NoWork,
+    Advanced,
+    Pending,
+    Cancelled,
+    ChainTerminal,
+}
+
+/// Stable category of a round step failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundStepFailureKindView {
+    InvalidInput,
+    InsufficientEligibility,
+    NoSpendableNotes,
+    Busy,
+    Storage,
+    InvariantViolation,
+    Transport,
+    Protocol,
+    ProofFailed,
+    Signing,
+    HelperDeliveryIncomplete,
+    VoteEnded,
+}
+
+/// Outcome of one round step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundStepOutcomeView {
+    pub step: Option<NextStepView>,
+    pub disposition: RoundStepDispositionView,
+    pub chain_outcome: Option<ChainSubmissionOutcomeView>,
+    pub share_deliveries: Vec<ShareBatchDeliveryReportView>,
+    pub delegation: Option<SignedDelegationPayloadView>,
+    pub plan: RoundPlanView,
+}
+
+/// Failure of one round step with the refreshed plan when it could be read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundStepFailureView {
+    pub kind: RoundStepFailureKindView,
+    pub step: Option<NextStepView>,
+    pub strongest_chain_state: Option<ChainSubmissionFailureStateView>,
+    pub chain_outcome: Option<ChainSubmissionOutcomeView>,
+    pub message: String,
+    pub plan: Option<RoundPlanView>,
+    /// Helper delivery reports accumulated before the failure; absent in
+    /// payloads from SDKs that predate the field.
+    #[serde(default)]
+    pub share_deliveries: Vec<ShareBatchDeliveryReportView>,
+}
+
+/// Delegation proving and signing stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationProgressKind {
+    SelectingNotes,
+    PcztBuilding,
+    PcztBuilt,
+    ProofStarting,
+    WaitingForExistingProof,
+    ProofProgress,
+    ProofComplete,
+    SigningPayload,
+    PayloadReady,
+}
+
+/// Vote proving and signing stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoteCommitStageKind {
+    ProofStarting,
+    ProofProgress,
+    SharePayloadsBuilding,
+    Signing,
+}
+
+/// Discriminator of a [`RoundStepProgressView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundStepProgressKind {
+    Selected,
+    Delegation,
+    TreeSynced,
+    VoteCommit,
+    HelperPlansPrepared,
+    ChainOutcome,
+    ShareOutcome,
+    ShareConfirmed,
+}
+
+/// One progress event from a round step, flattened for the host boundary.
+///
+/// `kind` says which optional payload fields are populated: `step` for
+/// `Selected`; `bundle_index`, `delegation_progress`, and `proof_progress`
+/// for `Delegation`; `tree_height` for `TreeSynced`; `bundle_index`,
+/// `proposal_id`, `vote_commit_stage`, and `proof_progress` for
+/// `VoteCommit`; `vote_keys` for `HelperPlansPrepared`; `chain_outcome` for
+/// `ChainOutcome`; `share_delivery` for `ShareOutcome`; `share` and
+/// `share_confirmed` for `ShareConfirmed`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoundStepProgressView {
+    pub kind: RoundStepProgressKind,
+    pub step: Option<NextStepView>,
+    pub bundle_index: Option<u32>,
+    pub proposal_id: Option<u32>,
+    pub delegation_progress: Option<DelegationProgressKind>,
+    pub vote_commit_stage: Option<VoteCommitStageKind>,
+    pub proof_progress: Option<f64>,
+    pub tree_height: Option<u32>,
+    pub vote_keys: Vec<VoteKeyView>,
+    pub chain_outcome: Option<ChainSubmissionOutcomeView>,
+    pub share_delivery: Option<ShareBatchDeliveryReportView>,
+    pub share: Option<ShareKeyView>,
+    pub share_confirmed: Option<bool>,
 }
