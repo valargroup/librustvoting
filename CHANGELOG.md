@@ -21,7 +21,7 @@ This release is `zcash_voting` 4.0.0.
   `CastVote` fails over across (dropping the cached tree after every failed
   node), and
   derives last-moment timing from the shared share policy; `set_ballot_intents` records decisions against the bound
-  roster. `VoteRecoveryExecutor` remains as a deprecated alias.
+  roster.
 - `DelegationPipeline` binds the sidecar, a `WalletDbOpener`, the round's
   lightwalletd inputs, account, hotkey, and bundle policy once and runs bundle
   setup, eligibility, PIR precompute, proof generation, Keystone requests, and
@@ -138,7 +138,7 @@ This release is `zcash_voting` 4.0.0.
 - `DelegationPipeline::new` refuses anchor tree state bytes that do not
   decode with `InvalidInput`; a decode failure was previously reported as
   `Internal` and, through the executor, as an invariant violation.
-- `RoundStepFailure` and `VoteRecoveryFailure` carry `share_deliveries`, the
+- `RoundStepFailure` carries `share_deliveries`, the
   helper delivery reports accumulated before the failure, so a
   `HelperDeliveryIncomplete` failure or a later error keeps the accepted,
   ambiguous, and pending share results. `RoundStepFailureView` gains the
@@ -412,6 +412,16 @@ This release is `zcash_voting` 4.0.0.
 
 ### Removed
 
+- **Breaking:** removed the persisted-vote recovery driver
+  `VoteRecoveryExecutor::advance` with `VoteRecoveryRequest`,
+  `VoteRecoveryAdvance`, `VoteRecoveryDisposition`, `VoteRecoveryFailure`,
+  `VoteRecoveryFailureKind`, `VoteRecoveryProgress`,
+  `VoteRecoveryProgressReporter`, `VoteRecoveryProgressBridge`,
+  `NoopVoteRecoveryProgressReporter`, and the `VoteRecoveryExecutor` alias.
+  It duplicated the step path with a second failure ladder; `RoundExecutor`
+  resumes persisted vote work through `advance_next` and `advance_step`.
+  `VoteRecoveryKey` and `VoteShareDeliveryReport` remain as the identity a
+  step's progress and delivery reports carry.
 - **Breaking:** removed `VotingDb::build_and_prove_delegation` so durable
   delegation proofs cannot bypass process-local single-flight coordination.
   Use `delegate::ensure_proof` or

@@ -134,16 +134,11 @@ pub use crate::vote::{
     persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
     PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
 };
-#[allow(deprecated)]
-pub use crate::vote_work::VoteRecoveryExecutor;
 pub use crate::vote_work::{
-    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter,
-    NoopVoteRecoveryProgressReporter, ProposalRosterEntry, RoundBinding, RoundExecutor,
-    RoundHostContext, RoundStepDisposition, RoundStepFailure, RoundStepFailureKind,
-    RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge, RoundStepProgressReporter,
-    VoteRecoveryAdvance, VoteRecoveryDisposition, VoteRecoveryFailure, VoteRecoveryFailureKind,
-    VoteRecoveryKey, VoteRecoveryProgress, VoteRecoveryProgressBridge,
-    VoteRecoveryProgressReporter, VoteRecoveryRequest, VoteShareDeliveryReport,
+    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter, ProposalRosterEntry,
+    RoundBinding, RoundExecutor, RoundHostContext, RoundStepDisposition, RoundStepFailure,
+    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge,
+    RoundStepProgressReporter, VoteRecoveryKey, VoteShareDeliveryReport,
 };
 pub use crate::wire::{
     DelegationSubmissionWire, SignedVoteBatchView, VoteCommitmentBatchWire, VoteCommitmentWire,

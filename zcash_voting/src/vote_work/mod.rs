@@ -7,10 +7,10 @@
 
 mod cast_vote;
 mod delegation_steps;
-mod execution;
 mod round_lock;
 mod step_control;
 mod step_outcomes;
+mod step_scope;
 mod steps;
 mod vote_completion;
 
@@ -22,7 +22,7 @@ use crate::delegate::{DelegationProgress, SignedDelegationBundle};
 use crate::delegation_pipeline::{DelegationDriver, DelegationSigner};
 use crate::pir::PirFleet;
 use crate::round::VotingDb;
-use crate::session::{Decision, NextStep, RoundPlan, VoteRecoveryWork};
+use crate::session::{Decision, NextStep, RoundPlan};
 use crate::share_tracking::{ShareBatchDeliveryReport, ShareKey};
 use crate::vote::VoteCommitStage;
 use crate::{
@@ -276,23 +276,6 @@ impl RoundStepFailure {
     }
 }
 
-/// Complete authenticated host inputs for one bounded persisted-vote pass.
-#[derive(Clone, Copy, Debug)]
-pub struct VoteRecoveryRequest<'a> {
-    /// Canonical 32-byte voting round identifier encoded as lowercase hex.
-    pub round_id: &'a str,
-    /// Complete proposal roster from the authenticated round configuration.
-    pub proposal_ids: &'a [u32],
-    /// Complete current helper fleet from authenticated configuration.
-    pub configured_helper_urls: &'a [String],
-    /// Unix time captured for this pass.
-    pub now_seconds: u64,
-    /// Unix vote-end time used when creating a helper delivery plan.
-    pub vote_end_time_seconds: u64,
-    /// Optional last-moment window derived by the SDK timing policy.
-    pub last_moment_buffer_seconds: Option<u64>,
-}
-
 /// Durable identity of one committed vote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VoteRecoveryKey {
@@ -300,122 +283,11 @@ pub struct VoteRecoveryKey {
     pub proposal_id: u32,
 }
 
-/// Progress emitted at durable and network boundaries of one recovery pass.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum VoteRecoveryProgress {
-    /// The executor selected this SDK-grouped work from a fresh round plan.
-    Selected(VoteRecoveryWork),
-    /// Complete delivery plans are durable for all listed votes.
-    HelperPlansPrepared(Vec<VoteRecoveryKey>),
-    /// One bounded chain advancement produced this authoritative outcome.
-    ChainOutcome(ChainSubmissionResult),
-    /// Initial helper delivery completed for one confirmed vote.
-    ShareOutcome(VoteShareDeliveryReport),
-}
-
-/// Synchronous observer for progress from an asynchronous recovery pass.
-pub trait VoteRecoveryProgressReporter: Send + Sync {
-    fn report(&self, progress: VoteRecoveryProgress);
-}
-
-/// Progress reporter used when a host needs only the terminal result.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoopVoteRecoveryProgressReporter {}
-
-impl VoteRecoveryProgressReporter for NoopVoteRecoveryProgressReporter {
-    fn report(&self, _progress: VoteRecoveryProgress) {}
-}
-
-/// Adapts a synchronous closure to [`VoteRecoveryProgressReporter`].
-pub struct VoteRecoveryProgressBridge<F> {
-    report: F,
-}
-
-impl<F> VoteRecoveryProgressBridge<F> {
-    pub fn new(report: F) -> Self {
-        Self { report }
-    }
-}
-
-impl<F> VoteRecoveryProgressReporter for VoteRecoveryProgressBridge<F>
-where
-    F: Fn(VoteRecoveryProgress) + Send + Sync,
-{
-    fn report(&self, progress: VoteRecoveryProgress) {
-        (self.report)(progress);
-    }
-}
-
 /// Helper delivery report bound to its durable vote identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoteShareDeliveryReport {
     pub vote: VoteRecoveryKey,
     pub delivery: ShareBatchDeliveryReport,
-}
-
-/// What one bounded executor call accomplished.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum VoteRecoveryDisposition {
-    /// No persisted chain-advancement or initial-share work was actionable.
-    /// The returned plan may still contain fresh cast or confirmation work.
-    NoWork,
-    /// The selected work unit cleared. More independent work may remain.
-    Advanced,
-    /// Chain reconciliation remains non-terminal and should be scheduled again.
-    Pending,
-    /// Host cancellation stopped the pass without undoing durable effects.
-    Cancelled,
-}
-
-/// Authoritative outcome of one bounded persisted-vote pass.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VoteRecoveryAdvance {
-    pub attempted_work: Option<VoteRecoveryWork>,
-    pub disposition: VoteRecoveryDisposition,
-    pub chain_outcome: Option<ChainSubmissionResult>,
-    pub share_deliveries: Vec<VoteShareDeliveryReport>,
-    pub round_plan: RoundPlan,
-}
-
-/// Stable category for a persisted-vote executor failure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum VoteRecoveryFailureKind {
-    InvalidInput,
-    Busy,
-    Storage,
-    InvariantViolation,
-    Transport,
-    Protocol,
-    ChainTerminal,
-    HelperDeliveryIncomplete,
-}
-
-/// Failure that retains the strongest truthful durable state and refreshed plan.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VoteRecoveryFailure {
-    pub kind: VoteRecoveryFailureKind,
-    pub attempted_work: Option<VoteRecoveryWork>,
-    pub strongest_chain_state: Option<ChainSubmissionFailureState>,
-    pub chain_outcome: Option<ChainSubmissionResult>,
-    pub message: String,
-    pub round_plan: Option<Box<RoundPlan>>,
-    /// Helper delivery reports the pass accumulated before it failed; see
-    /// [`RoundStepFailure::share_deliveries`].
-    pub share_deliveries: Vec<VoteShareDeliveryReport>,
-}
-
-impl VoteRecoveryFailure {
-    /// Attaches the delivery reports accumulated before this failure.
-    pub(crate) fn with_share_deliveries(
-        mut self,
-        share_deliveries: Vec<VoteShareDeliveryReport>,
-    ) -> Self {
-        self.share_deliveries = share_deliveries;
-        self
-    }
 }
 
 /// Executes round steps for one wallet and round.
@@ -436,10 +308,6 @@ pub struct RoundExecutor<T> {
     tree_transport: Option<Arc<dyn vote_commitment_tree_client::transport::Transport>>,
     binding: Option<RoundBinding>,
 }
-
-/// Former name of [`RoundExecutor`].
-#[deprecated(note = "use RoundExecutor")]
-pub type VoteRecoveryExecutor<T> = RoundExecutor<T>;
 
 impl RoundExecutor<HyperTransport> {
     /// Constructs an executor using the SDK's default chain HTTP transport.

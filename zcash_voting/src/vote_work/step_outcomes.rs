@@ -7,7 +7,7 @@ use crate::{
 };
 
 use super::{
-    execution::bounded_message, RoundExecutor, RoundStepDisposition, RoundStepFailure,
+    step_scope::bounded_message, RoundExecutor, RoundStepDisposition, RoundStepFailure,
     RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
     VoteShareDeliveryReport,
 };

@@ -21,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    execution::parse_round_id, round_lock, step_control::StepControl, BallotIntent, RoundExecutor,
+    round_lock, step_control::StepControl, step_scope::parse_round_id, BallotIntent, RoundExecutor,
     RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome, RoundStepProgress,
     RoundStepProgressReporter,
 };

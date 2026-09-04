@@ -7,16 +7,15 @@ use crate::{
         confirm_pending_share, ShareConfirmationParams, ShareDeliveryPlanningParams,
         ShareDeliverySubmissionParams, ShareKey,
     },
-    vote::{CommittedVote, SignedVoteBatch},
+    vote::{recover_atomic_vote_batch, CommittedVote, SignedVoteBatch},
     AdvanceVote, AdvanceVoteBatch, ChainAdvanceOutcome, ChainAdvancePolicy, ChainAdvanceRequest,
     ChainTransport,
 };
 
 use super::{
-    execution::vote_key, step_control::StepControl, steps::persisted_policy, RoundExecutor,
+    step_control::StepControl, step_scope::vote_key, steps::persisted_policy, RoundExecutor,
     RoundHostContext, RoundStepDisposition, RoundStepFailure, RoundStepFailureKind,
-    RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter, VoteRecoveryRequest,
-    VoteShareDeliveryReport,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter, VoteShareDeliveryReport,
 };
 
 /// Where a vote's work stands when `finish_vote_work` takes it over, which
@@ -62,15 +61,6 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let binding = self
             .binding()
             .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        let proposal_ids = binding.proposal_ids();
-        let request = VoteRecoveryRequest {
-            round_id: &binding.round_id,
-            proposal_ids: &proposal_ids,
-            configured_helper_urls: &host.configured_helper_urls,
-            now_seconds: host.now_seconds,
-            vote_end_time_seconds: host.planning_vote_end_seconds(),
-            last_moment_buffer_seconds: host.last_moment_buffer_seconds(),
-        };
         let work = VoteRecoveryWork {
             kind,
             bundle_index,
@@ -80,7 +70,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             share_indexes: Vec::new(),
         };
         let (votes, batch) = self
-            .recover_work_votes(&work, request)
+            .recover_work_votes(&work, &binding.round_id)
             .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
         let advance_chain = !matches!(kind, VoteRecoveryWorkKind::SubmitShares);
         let policy = persisted_policy(host);
@@ -95,6 +85,47 @@ impl<T: ChainTransport> RoundExecutor<T> {
             progress,
         )
         .await
+    }
+
+    /// Recovers the committed vote handles `work` names: one for a singleton,
+    /// every member (with the signed batch) for an atomic batch.
+    fn recover_work_votes(
+        &self,
+        work: &VoteRecoveryWork,
+        round_id: &str,
+    ) -> Result<(Vec<CommittedVote>, Option<SignedVoteBatch>), crate::VotingError> {
+        match work.kind {
+            VoteRecoveryWorkKind::AdvanceVote | VoteRecoveryWorkKind::SubmitShares => Ok((
+                vec![CommittedVote::recover(
+                    &self.database,
+                    round_id,
+                    work.bundle_index,
+                    work.proposal_id,
+                )?],
+                None,
+            )),
+            VoteRecoveryWorkKind::AdvanceVoteBatch => {
+                let batch = recover_atomic_vote_batch(
+                    &self.database,
+                    round_id,
+                    work.bundle_index,
+                    work.proposal_id,
+                )?;
+                let votes = batch
+                    .commitments
+                    .iter()
+                    .map(|commitment| {
+                        CommittedVote::recover(
+                            &self.database,
+                            round_id,
+                            work.bundle_index,
+                            commitment.proposal_id,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((votes, Some(batch)))
+            }
+        }
     }
 
     /// Prepares durable helper plans, advances the chain when needed, and

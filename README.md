@@ -226,9 +226,9 @@ upgrading the crate.
   which orders endpoints and retries only retryable PIR failures.
 - Replace per-stage delegation orchestration with `DelegationPipeline` and
   `DelegationSigner`; keep only the seed-owning `SpendAuthSigner`.
-- Replace host sequencing of plan steps with `RoundExecutor::advance_next`;
-  replace `VoteRecoveryExecutor::advance` (still available, deprecated) with
-  the same. Helper shares are submitted through `ConfirmedVote`.
+- Replace host sequencing of plan steps, and the removed
+  `VoteRecoveryExecutor::advance` driver, with `RoundExecutor::advance_next`.
+  Helper shares are submitted through `ConfirmedVote`.
 - Start chain submissions with `ChainSubmissionClientConfig::for_network` and
   drive them with `advance_until_terminal` instead of a host polling loop.
 
