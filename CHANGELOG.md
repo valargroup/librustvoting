@@ -181,6 +181,15 @@ This release is `zcash_voting` 4.0.0.
 - Closing the last connection to a sidecar and reopening the same path starts
   a new open span: vote-tree cache entries from before the close are dropped
   instead of being inherited by the reopened, possibly replaced, file.
+- A custom `RouteHttp` executor that called the dispatch hook and then
+  reported a `BeforeDispatch` failure is now classified as possibly
+  dispatched, per the hook contract; only an executor that declares the new
+  `RouteHttp::hook_precedes_connection_setup` (the SDK's `DirectRoute`) has
+  that phase honored after the hook.
+- When helper-share delivery fails partway through a vote, the executor's
+  failure and progress reporter now carry the report over the sibling shares
+  that were already accepted or ambiguously dispatched, with the failed and
+  unattempted shares pending.
 - `DelegationPipeline` checks a persisted delegation setup against the
   pipeline's notes and target-bound hotkey before reusing it for signing, the
   same check a persisted proof already gets.

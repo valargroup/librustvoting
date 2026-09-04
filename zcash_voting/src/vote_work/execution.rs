@@ -258,8 +258,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     .with_share_deliveries(deliveries.clone())
                 })?;
             let cancel = || control.interrupted();
-            let delivery = vote
-                .submit_prepared_shares(
+            let delivery = match vote
+                .submit_prepared_shares_keeping_partial_report(
                     &self.database,
                     &self.helper_client,
                     ShareDeliverySubmissionParams {
@@ -269,15 +269,29 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     &cancel,
                 )
                 .await
-                .map_err(|error| {
-                    self.voting_failure_after_chain(
-                        error,
-                        Some(work.clone()),
-                        chain_outcome.clone(),
-                        request,
-                    )
-                    .with_share_deliveries(deliveries.clone())
-                })?;
+            {
+                Ok(delivery) => delivery,
+                Err(failure) => {
+                    // Sibling shares of the failing vote may already have
+                    // reached the helpers; their report rides on the failure.
+                    if let Some(partial) = failure.partial {
+                        let report = VoteShareDeliveryReport {
+                            vote: vote_key(vote.vote()),
+                            delivery: partial,
+                        };
+                        progress.report(VoteRecoveryProgress::ShareOutcome(report.clone()));
+                        deliveries.push(report);
+                    }
+                    return Err(self
+                        .voting_failure_after_chain(
+                            failure.error,
+                            Some(work),
+                            chain_outcome,
+                            request,
+                        )
+                        .with_share_deliveries(deliveries));
+                }
+            };
             let report = VoteShareDeliveryReport {
                 vote: vote_key(vote.vote()),
                 delivery,

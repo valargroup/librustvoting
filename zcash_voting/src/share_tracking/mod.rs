@@ -271,6 +271,79 @@ pub struct ShareBatchDeliveryReport {
     pub placement_guarantee: SharePlacementGuarantee,
 }
 
+/// A delivery pass that ended in an error.
+///
+/// Shares are delivered concurrently, so by the time one share's journaling
+/// or storage fails, sibling shares may already have been accepted or
+/// ambiguously dispatched. `partial` is the report over those siblings
+/// (the failed share and any not yet attempted are pending); it is `None`
+/// when the pass failed before any share was attempted.
+#[derive(Debug)]
+pub(crate) struct ShareDeliveryFailure {
+    pub error: VotingError,
+    pub partial: Option<ShareBatchDeliveryReport>,
+}
+
+impl std::fmt::Display for ShareDeliveryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ShareDeliveryFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Assembles the batch report from per-share results.
+///
+/// `Ok(Some(outcome))` is a processed share, `Ok(None)` a share skipped by
+/// cancellation, and `Err` a share whose delivery could not be journaled.
+/// Every share in `share_indices` without an outcome is reported pending.
+/// The first error, if any, is returned together with the report over the
+/// shares that did complete, so their network effects are not lost.
+pub(crate) fn batch_delivery_report(
+    results: Vec<Result<Option<ShareDeliveryOutcome>, VotingError>>,
+    share_indices: impl IntoIterator<Item = u32>,
+    cancelled: bool,
+    placement_guarantee: SharePlacementGuarantee,
+) -> Result<ShareBatchDeliveryReport, ShareDeliveryFailure> {
+    let mut completed = Vec::new();
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(Some(outcome)) => completed.push(outcome),
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    completed.sort_by_key(|delivery| delivery.share_index);
+    let completed_indices = completed
+        .iter()
+        .map(|delivery| delivery.share_index)
+        .collect::<std::collections::HashSet<_>>();
+    let pending_share_indices = share_indices
+        .into_iter()
+        .filter(|share_index| !completed_indices.contains(share_index))
+        .collect();
+    let report = ShareBatchDeliveryReport {
+        deliveries: completed,
+        pending_share_indices,
+        cancelled,
+        placement_guarantee,
+    };
+    match first_error {
+        None => Ok(report),
+        Some(error) => Err(ShareDeliveryFailure {
+            error,
+            partial: Some(report),
+        }),
+    }
+}
+
 /// Crate-internal per-share request used by the commitment-wide executor.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CommittedShareSubmissionRequest<'a> {

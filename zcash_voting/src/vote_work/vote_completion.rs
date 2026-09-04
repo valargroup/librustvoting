@@ -225,8 +225,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
             // Reports of the votes delivered so far ride on every failure
             // from here on: their network effects happened and are otherwise
             // visible only to a progress reporter.
-            let delivery = vote
-                .submit_prepared_shares(
+            let delivery = match vote
+                .submit_prepared_shares_keeping_partial_report(
                     &self.database,
                     &self.helper_client,
                     ShareDeliverySubmissionParams {
@@ -236,14 +236,24 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     &cancel,
                 )
                 .await
-                .map_err(|error| {
-                    self.step_voting_failure_after_chain(
-                        error,
-                        Some(step.clone()),
-                        chain_outcome.clone(),
-                    )
-                    .with_share_deliveries(deliveries.clone())
-                })?;
+            {
+                Ok(delivery) => delivery,
+                Err(failure) => {
+                    // Sibling shares of the failing vote may already have
+                    // reached the helpers; their report rides on the failure.
+                    if let Some(partial) = failure.partial {
+                        let report = VoteShareDeliveryReport {
+                            vote: vote_key(vote.vote()),
+                            delivery: partial,
+                        };
+                        progress.report(RoundStepProgress::ShareOutcome(report.clone()));
+                        deliveries.push(report);
+                    }
+                    return Err(self
+                        .step_voting_failure_after_chain(failure.error, Some(step), chain_outcome)
+                        .with_share_deliveries(deliveries));
+                }
+            };
             let report = VoteShareDeliveryReport {
                 vote: vote_key(vote.vote()),
                 delivery,

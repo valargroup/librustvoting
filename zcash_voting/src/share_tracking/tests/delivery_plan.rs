@@ -495,7 +495,7 @@ async fn stale_handle_cannot_submit_same_commitment_replacement_plan() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(matches!(error.error, VotingError::InvalidInput { .. }));
     assert!(error
         .to_string()
         .contains("committed vote changed before helper-share submission"));
@@ -534,7 +534,7 @@ async fn same_commitment_replacement_after_plan_load_stops_every_post() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(matches!(error.error, VotingError::InvalidInput { .. }));
     assert!(transport.calls().is_empty());
     assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
 }
@@ -696,7 +696,7 @@ async fn preconfirmation_handle_is_stale_after_confirmation_transition() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(matches!(error.error, VotingError::InvalidInput { .. }));
     assert!(error
         .to_string()
         .contains("recover the current committed vote"));
@@ -933,7 +933,7 @@ async fn every_payload_is_validated_before_the_first_post() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(matches!(error.error, VotingError::InvalidInput { .. }));
     assert!(transport.calls().is_empty());
     assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
 }

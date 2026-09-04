@@ -419,7 +419,17 @@ impl CommittedVote {
         client: &crate::helper::client::HelperClient,
         params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
         cancel: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<crate::share_tracking::ShareBatchDeliveryReport, VotingError> {
+    ) -> Result<
+        crate::share_tracking::ShareBatchDeliveryReport,
+        crate::share_tracking::ShareDeliveryFailure,
+    > {
+        // Nothing has been attempted until the delivery stream runs, so a
+        // failure here carries no partial report.
+        let unstarted = |error| crate::share_tracking::ShareDeliveryFailure {
+            error,
+            partial: None,
+        };
+
         use futures_util::{stream, StreamExt as _};
         use std::sync::LazyLock;
         use std::time::Duration;
@@ -440,7 +450,8 @@ impl CommittedVote {
             &self.commitment_bundle_json,
             params.configured_server_urls,
             &self.commit.share_payloads,
-        )?;
+        )
+        .map_err(unstarted)?;
 
         let recovery = crate::recovery::helper_recovery_material_for_wallet(
             db,
@@ -448,7 +459,8 @@ impl CommittedVote {
             &self.round_id,
             self.bundle_index,
             self.commit.proposal_id,
-        )?;
+        )
+        .map_err(unstarted)?;
         let vc_tree_position = match recovery {
             crate::recovery::HelperRecoveryMaterial::Ready(bundle)
                 if bundle.commitment_bundle_json == plan_generation =>
@@ -456,26 +468,28 @@ impl CommittedVote {
                 bundle.vc_tree_position
             }
             crate::recovery::HelperRecoveryMaterial::Ready(_) => {
-                return Err(VotingError::InvalidInput {
+                return Err(unstarted(VotingError::InvalidInput {
                     message: "committed vote changed after loading its helper-share delivery plan"
                         .to_string(),
-                })
+                }))
             }
             crate::recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
-                return Err(VotingError::InvalidInput {
+                return Err(unstarted(VotingError::InvalidInput {
                     message: "committed vote must be confirmed before submitting helper shares"
                         .to_string(),
-                })
+                }))
             }
             crate::recovery::HelperRecoveryMaterial::Missing => {
-                return Err(VotingError::Internal {
+                return Err(unstarted(VotingError::Internal {
                     message: "committed vote is missing durable helper recovery material"
                         .to_string(),
-                })
+                }))
             }
         };
         for (payload, share_plan) in self.commit.share_payloads.iter().zip(&plan.share_plans) {
-            payload.to_wire_json(Some(vc_tree_position), share_plan.submit_at)?;
+            payload
+                .to_wire_json(Some(vc_tree_position), share_plan.submit_at)
+                .map_err(unstarted)?;
         }
 
         let configured = params.configured_server_urls.to_vec();
@@ -546,30 +560,15 @@ impl CommittedVote {
             .buffer_unordered(crate::share_policy::SHARE_HELPER_MAX_CONCURRENT_POSTS)
             .collect::<Vec<Result<Option<crate::share_tracking::ShareDeliveryOutcome>, VotingError>>>()
             .await;
-        let mut completed = Vec::new();
-        for delivery in deliveries {
-            if let Some(delivery) = delivery? {
-                completed.push(delivery);
-            }
-        }
-        completed.sort_by_key(|delivery| delivery.share_index);
-        let completed_indices = completed
-            .iter()
-            .map(|delivery| delivery.share_index)
-            .collect::<std::collections::HashSet<_>>();
-        let pending_share_indices = self
-            .commit
-            .share_payloads
-            .iter()
-            .map(|payload| payload.enc_share.share_index)
-            .filter(|share_index| !completed_indices.contains(share_index))
-            .collect();
-        Ok(crate::share_tracking::ShareBatchDeliveryReport {
-            deliveries: completed,
-            pending_share_indices,
-            cancelled: cancel(),
-            placement_guarantee: plan.placement_guarantee,
-        })
+        crate::share_tracking::batch_delivery_report(
+            deliveries,
+            self.commit
+                .share_payloads
+                .iter()
+                .map(|payload| payload.enc_share.share_index),
+            cancel(),
+            plan.placement_guarantee,
+        )
     }
 
     /// Submits one committed helper share using crate-owned durable journaling.
@@ -755,6 +754,24 @@ impl ConfirmedVote {
         params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<crate::share_tracking::ShareBatchDeliveryReport, VotingError> {
+        self.submit_prepared_shares_keeping_partial_report(db, client, params, cancel)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`Self::submit_prepared_shares`] whose error keeps the report over
+    /// the shares that completed before the failure, for callers that must
+    /// surface every network effect of a failed pass.
+    pub(crate) async fn submit_prepared_shares_keeping_partial_report(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<
+        crate::share_tracking::ShareBatchDeliveryReport,
+        crate::share_tracking::ShareDeliveryFailure,
+    > {
         self.vote
             .submit_prepared_shares_unchecked(db, client, params, cancel)
             .await

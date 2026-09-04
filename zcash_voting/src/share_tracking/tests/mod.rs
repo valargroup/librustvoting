@@ -577,6 +577,7 @@ async fn submit_initial_share_to_candidates(
     .unwrap()
 }
 
+mod batch_report;
 mod confirmation;
 mod delivery_plan;
 mod initial_delivery;
