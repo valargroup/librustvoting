@@ -5,7 +5,7 @@
 //! APIs in `crate::phases`. The wallet executes each step with its own
 //! network/proof/sign plumbing.
 
-use rusqlite::named_params;
+use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,6 +34,8 @@ pub(crate) struct BallotIntentClassification {
     pub(crate) roster: BTreeSet<u32>,
     pub(crate) choice_proposals: Vec<u32>,
     pub(crate) open_proposals: Vec<u32>,
+    /// Durable intents for proposals outside the authenticated roster.
+    pub(crate) unrostered_intents: Vec<u32>,
 }
 
 pub(crate) fn classify_ballot_intents(
@@ -60,10 +62,17 @@ pub(crate) fn classify_ballot_intents(
         }
     }
 
+    let unrostered_intents = intents
+        .keys()
+        .copied()
+        .filter(|proposal_id| !roster.contains(proposal_id))
+        .collect();
+
     Ok(BallotIntentClassification {
         roster,
         choice_proposals,
         open_proposals,
+        unrostered_intents,
     })
 }
 
@@ -100,6 +109,53 @@ impl VotingDb {
     /// Returns [`VotingError::InvalidInput`] for an out-of-range proposal id,
     /// a decision that does not fit its option count, or a repeated proposal
     /// id.
+    /// Removes the durable decision for one proposal.
+    ///
+    /// A decision that survives a roster change refers to a proposal the
+    /// authenticated configuration no longer lists; the planner reports it in
+    /// `RoundPlan::unrostered_intents` and withholds `CastVote` until it is
+    /// cleared. Clearing an intent that does not exist is not an error. An
+    /// intent whose vote is already submitted cannot be cleared.
+    pub fn clear_ballot_intent(&self, round_id: &str, proposal_id: u32) -> Result<(), VotingError> {
+        validate_proposal_id(proposal_id)?;
+        let wallet_id = self.wallet_id();
+        self.write_transaction("clear_ballot_intent transaction failed", |tx| {
+            let submitted: Option<i64> = tx
+                .query_row(
+                    "SELECT bundle_index FROM votes
+                     WHERE round_id = :round_id AND wallet_id = :wallet_id
+                       AND proposal_id = :proposal_id AND tx_hash IS NOT NULL
+                     LIMIT 1",
+                    named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": wallet_id,
+                        ":proposal_id": proposal_id as i64,
+                    },
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| VotingError::from_sqlite("check submitted vote before clearing intent", &e))?;
+            if let Some(bundle_index) = submitted {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote; its intent cannot be cleared"
+                    ),
+                });
+            }
+            tx.execute(
+                "DELETE FROM ballot_intent
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id AND proposal_id = :proposal_id",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":proposal_id": proposal_id as i64,
+                },
+            )
+            .map_err(|e| VotingError::from_sqlite("clear ballot intent", &e))?;
+            Ok(())
+        })
+    }
+
     pub fn set_ballot_intents(
         &self,
         round_id: &str,
@@ -575,6 +631,11 @@ pub struct RoundPlan {
     /// `Decision::Skipped` is terminal for this plan, so skipped proposals are
     /// not returned here.
     pub open_proposals: Vec<u32>,
+    /// Durable ballot intents for proposals the authenticated roster does not
+    /// list, such as a decision recorded before a proposal was removed.
+    /// Helper-plan derivation rejects them, so `CastVote` is withheld until
+    /// the host clears them with `VotingDb::clear_ballot_intent`.
+    pub unrostered_intents: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
     pub immediate_share_key: Option<ImmediateShareKey>,
     /// True when the designated immediate share has durable helper-quorum confirmation.
@@ -1283,12 +1344,15 @@ pub fn resume_plan(
     let bundles: Vec<u32> = delegation.keys().copied().collect();
     let choice_proposals = intent_classification.choice_proposals;
     let open_proposals = intent_classification.open_proposals;
+    let unrostered_intents = intent_classification.unrostered_intents;
     // Casting derives the round's single immediate helper share from the
     // complete set of choices, so `CommittedVote::prepare_share_delivery`
-    // rejects a roster that still holds an undecided proposal. Planning a
-    // `CastVote` before then would advertise a step that only fails after
-    // proving and persisting the vote, so the ballot must be terminal first.
-    let roster_is_terminal = open_proposals.is_empty();
+    // rejects a roster that still holds an undecided proposal, and equally a
+    // durable intent for a proposal outside the authenticated roster.
+    // Planning a `CastVote` before both hold would advertise a step that only
+    // fails after proving and persisting the vote, so the durable intents must
+    // exactly match the roster first.
+    let roster_is_terminal = open_proposals.is_empty() && unrostered_intents.is_empty();
 
     if !choice_proposals.is_empty() && bundles.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -1649,6 +1713,7 @@ pub fn resume_plan(
         pending_recovery,
         next_steps: steps,
         open_proposals,
+        unrostered_intents,
         immediate_share_key,
         immediate_share_confirmed,
         all_decided,
@@ -2244,6 +2309,39 @@ mod tests {
         assert_eq!(blocking_prerequisite(&steps, &cast_two), None);
         assert_eq!(blocking_prerequisite(&steps, &delegate), None);
         assert_eq!(blocking_prerequisite(&steps, &advance), None);
+    }
+
+    #[test]
+    fn a_durable_intent_outside_the_roster_withholds_cast_until_cleared() {
+        let db = db_with_bundle();
+        for proposal_id in [1, 2, 3] {
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(1), 3)
+                .unwrap();
+        }
+        // A decision recorded for a proposal the roster no longer lists.
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(0), 3).unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert_eq!(plan.unrostered_intents, vec![9]);
+        assert!(plan.open_proposals.is_empty());
+        assert!(
+            !plan
+                .next_steps
+                .iter()
+                .any(|step| matches!(step, NextStep::CastVote { .. })),
+            "casting must wait until the durable intents exactly match the roster: {:?}",
+            plan.next_steps
+        );
+        assert_eq!(plan.next_steps, vec![NextStep::Delegate { bundle_index: 0 }]);
+
+        db.clear_ballot_intent(ROUND, 9).unwrap();
+        db.clear_ballot_intent(ROUND, 9).unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(plan.unrostered_intents.is_empty());
+        assert!(plan
+            .next_steps
+            .iter()
+            .any(|step| matches!(step, NextStep::CastVote { .. })));
     }
 
     #[test]

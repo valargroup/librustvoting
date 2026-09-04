@@ -492,6 +492,10 @@ pub struct RoundPlanView {
     pub recovered_delegation_work: Vec<DelegationRecoveryWorkView>,
     pub recovered_vote_work: Vec<VoteRecoveryWorkView>,
     pub open_proposals: Vec<u32>,
+    /// Durable intents for proposals outside the authenticated roster; casting
+    /// is withheld until the host clears them.
+    #[serde(default)]
+    pub unrostered_intents: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
     pub immediate_share_key: Option<ImmediateShareKey>,
     pub immediate_share_confirmed: bool,

@@ -873,6 +873,7 @@ impl TryFrom<session::RoundPlan> for RoundPlanView {
                 .map(Into::into)
                 .collect(),
             open_proposals: plan.open_proposals,
+            unrostered_intents: plan.unrostered_intents,
             immediate_share_key: plan.immediate_share_key,
             immediate_share_confirmed: plan.immediate_share_confirmed,
             all_decided: plan.all_decided,
@@ -2325,6 +2326,7 @@ mod tests {
                 },
             ],
             open_proposals: vec![11, 12],
+            unrostered_intents: Vec::new(),
             immediate_share_key: Some(crate::share_policy::ImmediateShareKey {
                 bundle_index: 7,
                 proposal_id: 11,

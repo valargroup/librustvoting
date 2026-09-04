@@ -372,11 +372,14 @@ select an immediate share index.
 
 The planner carries the other half of that contract: `resume_plan` does not
 emit `NextStep::CastVote` while any roster proposal still lacks a terminal
-decision. Casting persists the vote before the immediate share is derived, so
-planning a cast against an open ballot would advertise a step that can only
-fail after a ZKP #2 proof and a durable write. The remaining proposals are
-reported through `RoundPlan::open_proposals`; the bundle's `Delegate`
-prerequisite and the advancement of votes already on the wire are unaffected.
+decision, nor while a durable intent exists for a proposal outside the roster.
+Casting persists the vote before the immediate share is derived, so planning a
+cast against a ballot that does not exactly match the roster would advertise a
+step that can only fail after a ZKP #2 proof and a durable write. The remaining
+proposals are reported through `RoundPlan::open_proposals` and the extra
+intents through `RoundPlan::unrostered_intents`, which the host clears with
+`VotingDb::clear_ballot_intent`; the bundle's `Delegate` prerequisite and the
+advancement of votes already on the wire are unaffected.
 Enforcement: `roster_is_terminal` in
 [`resume_plan`](../zcash_voting/src/session.rs) and
 `derive_immediate_share` in
@@ -600,7 +603,7 @@ report invalid or unfinished entries as not ready.
 | Concurrent status GETs per share | 4 (from `SHARE_STATUS_MAX_CONCURRENT_POLLS`) | `poll_share_helpers` |
 | Total status quorum search for one share | 10 seconds (from `SHARE_STATUS_POLL_BUDGET_MILLISECONDS`) | `poll_share_helpers` |
 | One helper POST | 30 seconds | `HelperClient` |
-| Concurrent initial POSTs across the process | 16 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `CommittedVote::submit_prepared_shares` |
+| Concurrent initial POSTs across the process | 16 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `ConfirmedVote::submit_prepared_shares` |
 | Total initial fan-out per share | 60 seconds | committed share delivery |
 | Minimum budget to start an initial POST | 1 second | committed share delivery |
 | Retry backoffs | 200 ms, then 600 ms | `HelperClient::with_retry` |
@@ -744,7 +747,7 @@ plan validates against its own persisted planning fleet. Existing round plans
 are checked so roster drift cannot create a second or conflicting immediate
 designation.
 
-`CommittedVote::submit_prepared_shares` is the delivery boundary. It loads that
+`ConfirmedVote::submit_prepared_shares` is the delivery boundary. It loads that
 plan, requires the plan's exact current committed-vote generation, binds the
 submitting handle to that generation, validates the immutable plan against its
 persisted planning fleet, and separately validates the complete current fleet.
@@ -1430,7 +1433,7 @@ host wallet:
 `share_server_selection_policy` describes a two-second preflight soft window,
 a 30-second hard deadline, and 16 concurrent POSTs.
 `HelperClient::preflight_fleet` enforces both windows and derives the readiness
-target internally. `CommittedVote::submit_prepared_shares` enforces the
+target internally. `ConfirmedVote::submit_prepared_shares` enforces the
 process-wide 16-POST ceiling with a shared semaphore. Complete-plan persistence
 lets the SDK validate commitment-wide quota, current-fleet compatibility, and
 restart reuse before network dispatch. These are enforced behavior, not host
