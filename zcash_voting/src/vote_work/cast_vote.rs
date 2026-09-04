@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::{
-    session::{NextStep, RoundPlan},
+    round_planning::CastDraft,
     types::VoteCommitStageBridge,
     vote::{
         persist_prepared_vote_work, prepare_vote_work, validate_draft_votes, CommittedVote,
@@ -15,26 +15,23 @@ use crate::{
 };
 
 use super::{
-    round_lock::HeldRoundLock, step_control::StepControl, steps::PROVING_STACK_BYTES,
-    RoundExecutor, RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome,
-    RoundStepProgress, RoundStepProgressReporter,
+    round_lock::HeldRoundLock, step_ledger::StepLedger, step_scope::StepScope,
+    steps::PROVING_STACK_BYTES, vote_completion::CompletionEntry, RoundExecutor, RoundStepFailure,
+    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
 };
 
 impl<T: ChainTransport> RoundExecutor<T> {
-    #[allow(clippy::too_many_arguments)]
+    /// Casts every draft of `bundle_index` as one unit.
     pub(super) async fn run_cast_vote(
         &self,
-        step: NextStep,
+        scope: &StepScope<'_>,
         bundle_index: u32,
-        plan: &RoundPlan,
-        host: &RoundHostContext,
+        drafts: &[CastDraft],
         lock: &HeldRoundLock,
-        control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        let binding = self
-            .binding()
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+        let ledger = StepLedger::default();
+        let host = scope.host;
         // A fresh vote after the authenticated deadline would sync the tree,
         // prove, persist recovery material, and submit only to be rejected;
         // refuse it here. Advancing or recovering work already on the wire
@@ -43,9 +40,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
             if host.now_seconds >= vote_end {
                 return Err(self.step_failure(
                     RoundStepFailureKind::VoteEnded,
-                    Some(step),
+                    Some(&scope.step),
                     None,
-                    None,
+                    &ledger,
                     format!(
                         "vote ended at {vote_end} and the host clock reads {}; a new vote cannot be cast",
                         host.now_seconds
@@ -54,80 +51,72 @@ impl<T: ChainTransport> RoundExecutor<T> {
             }
         }
         let single_share = host.is_last_moment();
-        let mut drafts = Vec::new();
-        for planned in &plan.next_steps {
-            if let NextStep::CastVote {
-                bundle_index: planned_bundle,
-                proposal_id,
-                choice,
-            } = planned
-            {
-                if *planned_bundle != bundle_index {
-                    continue;
-                }
-                let num_options = binding.num_options(*proposal_id).ok_or_else(|| {
-                    self.step_failure(
-                        RoundStepFailureKind::InvalidInput,
-                        Some(step.clone()),
-                        None,
-                        None,
-                        format!("proposal {proposal_id} is not in the round roster"),
-                    )
-                })?;
-                drafts.push(DraftVote {
-                    proposal_id: *proposal_id,
-                    choice: *choice,
-                    num_options,
-                    vc_tree_position: 0,
-                    single_share,
-                });
-            }
+        let mut draft_votes = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let num_options = scope.num_options(draft.proposal_id).ok_or_else(|| {
+                self.step_failure(
+                    RoundStepFailureKind::InvalidInput,
+                    Some(&scope.step),
+                    None,
+                    &ledger,
+                    format!("proposal {} is not in the round roster", draft.proposal_id),
+                )
+            })?;
+            draft_votes.push(DraftVote {
+                proposal_id: draft.proposal_id,
+                choice: draft.choice,
+                num_options,
+                vc_tree_position: 0,
+                single_share,
+            });
         }
+        let drafts = draft_votes;
         validate_draft_votes(&drafts)
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        let hotkey_secret = binding.hotkey_secret.clone().ok_or_else(|| {
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
+        let hotkey_secret = scope.hotkey_secret.clone().ok_or_else(|| {
             self.step_failure(
                 RoundStepFailureKind::InvalidInput,
-                Some(step.clone()),
+                Some(&scope.step),
                 None,
-                None,
+                &ledger,
                 "casting a vote requires the round voting hotkey",
             )
         })?;
-        let network = binding.network;
-        let round_id = binding.round_id.clone();
+        let network = scope.network;
+        let round_id = scope.round_id.clone();
         // The bound hotkey must be the one the bundle's delegation targets;
         // otherwise ZKP #2 would fail only after a tree sync and a witness.
         let bound_target = VotingHotkey::from_stored_secret(hotkey_secret.as_slice(), network)
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?
             .delegation_target();
         self.database
             .validate_bundle_hotkey_target(&round_id, bundle_index, &bound_target)
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
         // A committed but undispatched vote on this bundle for a proposal the
         // roster no longer lists can never be submitted and would otherwise
-        // reserve the bundle's VAN against this cast.
+        // reserve the bundle's VAN against this cast. The retirement re-checks
+        // the durable phase inside its own write transaction.
         self.database
             .retire_undispatched_votes_outside_roster(
                 &round_id,
                 bundle_index,
-                &binding.proposal_ids(),
+                &scope.proposal_ids(),
             )
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
 
         // Tree sync and witness generation block on their own HTTP runtime.
         // Nodes are tried in order. Every failed sync drops the round's cached
         // tree, including the last node's, so neither the next node nor the
         // next pass inherits a partially appended or mismatched tree.
         let node_urls = canonical_vote_tree_node_urls(&host.vote_tree_node_urls, network)
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
         // One handle serves the sync, any reset, and the witness, so another
         // executor rebinding this wallet's transport in between cannot hand
         // the witness a client without the round state just synced.
         let tree = {
             let db = Arc::clone(&self.database);
             let transport = self.tree_transport.clone();
-            self.blocking(&step, "vote tree binding", move || {
+            self.blocking(scope, "vote tree binding", move || {
                 crate::precompute::vote_tree_for(&db, transport)
             })
             .await?
@@ -144,7 +133,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             // leave a partially appended tree behind for the next pass.
             let held_lock = Arc::clone(lock);
             let synced = self
-                .blocking(&step, "vote tree sync", move || {
+                .blocking(scope, "vote tree sync", move || {
                     let _held_lock = held_lock;
                     sync_round_with_cleanup(&sync_tree, &db, &sync_round_id, &node_url)
                 })
@@ -158,8 +147,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     // A host that cancelled while the request was in flight
                     // asked for the step to stop; report that, not the
                     // transport error the cancellation produced.
-                    if control.interrupted() {
-                        return self.step_cancelled(Some(step), None, Vec::new(), None);
+                    if scope.interrupted() {
+                        return self.step_cancelled(scope, ledger);
                     }
                     last_failure = Some(failure);
                 }
@@ -173,13 +162,13 @@ impl<T: ChainTransport> RoundExecutor<T> {
             let db = Arc::clone(&self.database);
             let witness_tree = Arc::clone(&tree);
             let witness_round_id = round_id.clone();
-            self.blocking(&step, "VAN witness", move || {
+            self.blocking(scope, "VAN witness", move || {
                 witness_tree.generate_van_witness(&db, &witness_round_id, bundle_index, height)
             })
             .await?
         };
-        if control.interrupted() {
-            return self.step_cancelled(Some(step), None, Vec::new(), None);
+        if scope.interrupted() {
+            return self.step_cancelled(scope, ledger);
         }
 
         // Proving runs on a dedicated large-stack thread; stages stream back.
@@ -191,6 +180,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // even if this future is dropped, so a new pass cannot observe the
         // old CastVote plan and start a competing proof meanwhile.
         let held_lock = Arc::clone(lock);
+        let proving_round_id = round_id.clone();
         std::thread::Builder::new()
             .name("voting-vote-commit".to_string())
             .stack_size(PROVING_STACK_BYTES)
@@ -206,7 +196,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                         &db,
                         VoteSigner::hotkey(&hotkey),
                         VoteWorkRequest {
-                            round_id: &round_id,
+                            round_id: &proving_round_id,
                             bundle_index,
                             drafts: &drafts,
                             witness: &witness,
@@ -221,9 +211,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .map_err(|error| {
                 self.step_failure(
                     RoundStepFailureKind::InvariantViolation,
-                    Some(step.clone()),
+                    Some(&scope.step),
                     None,
-                    None,
+                    &ledger,
                     format!("failed to spawn vote commit thread: {error}"),
                 )
             })?;
@@ -237,9 +227,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     break result.map_err(|_| {
                         self.step_failure(
                             RoundStepFailureKind::InvariantViolation,
-                            Some(step.clone()),
+                            Some(&scope.step),
                             None,
-                            None,
+                            &ledger,
                             "vote commit thread exited without a result",
                         )
                     })?;
@@ -249,24 +239,19 @@ impl<T: ChainTransport> RoundExecutor<T> {
         while let Ok(stage) = stage_rx.try_recv() {
             progress.report(RoundStepProgress::VoteCommit(stage));
         }
-        let recovery =
-            recovery.map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+        let recovery = recovery
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
 
-        let round_id = self
-            .binding()
-            .map(|b| b.round_id.clone())
-            .unwrap_or_default();
         let (votes, batch) = self
             .recover_committed(&round_id, recovery)
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        self.finish_vote_work(
-            step,
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
+        self.complete_vote_unit(
+            scope,
             votes,
             batch,
-            super::vote_completion::VoteWorkStage::FreshCast,
+            CompletionEntry::FreshCast,
             &host.chain_policy,
-            host,
-            control,
+            ledger,
             progress,
         )
         .await

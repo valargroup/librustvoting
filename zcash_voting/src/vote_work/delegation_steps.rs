@@ -4,29 +4,29 @@
 use std::sync::Arc;
 
 use crate::{
-    session::NextStep, types::DelegationProgressBridge, AdvanceDelegation, ChainAdvanceRequest,
-    ChainTransport, VotingHotkey,
+    types::DelegationProgressBridge, AdvanceDelegation, ChainAdvanceRequest, ChainTransport,
+    VotingHotkey,
 };
 
 use super::{
     round_lock::HeldRoundLock,
-    step_control::StepControl,
+    step_ledger::StepLedger,
+    step_scope::StepScope,
     steps::{persisted_policy, PROVING_STACK_BYTES},
-    RoundExecutor, RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome,
-    RoundStepProgress, RoundStepProgressReporter,
+    RoundExecutor, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome, RoundStepProgress,
+    RoundStepProgressReporter,
 };
 
 impl<T: ChainTransport> RoundExecutor<T> {
     pub(super) async fn run_delegate(
         &self,
-        step: NextStep,
+        scope: &StepScope<'_>,
         bundle_index: u32,
-        host: &RoundHostContext,
         lock: &HeldRoundLock,
-        control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        let inputs = self.delegation_inputs(&step, host)?;
+        let ledger = StepLedger::default();
+        let inputs = self.delegation_inputs(scope)?;
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let driver = Arc::clone(&inputs.driver);
@@ -50,9 +50,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .map_err(|error| {
                 self.step_failure(
                     RoundStepFailureKind::InvariantViolation,
-                    Some(step.clone()),
+                    Some(&scope.step),
                     None,
-                    None,
+                    &ledger,
                     format!("failed to spawn delegation thread: {error}"),
                 )
             })?;
@@ -66,9 +66,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     break result.map_err(|_| {
                         self.step_failure(
                             RoundStepFailureKind::InvariantViolation,
-                            Some(step.clone()),
+                            Some(&scope.step),
                             None,
-                            None,
+                            &ledger,
                             "delegation thread exited without a result",
                         )
                     })?;
@@ -83,42 +83,43 @@ impl<T: ChainTransport> RoundExecutor<T> {
         }
         // The driver emits `PayloadReady` itself and the drain above forwards
         // it, so reporting one here would deliver the terminal event twice.
-        let signed = signed.map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        if control.interrupted() {
+        let signed =
+            signed.map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
+        if scope.interrupted() {
             // Proof, setup, and a provided Keystone signature are durable by
             // now, so the next pass re-dispatches through AdvanceDelegation
             // without proving or asking the device again. The signed bundle
             // is still returned so an in-process host can submit it directly.
-            return self.step_cancelled(Some(step), None, Vec::new(), Some(signed));
+            return self.step_cancelled(scope, StepLedger::with_delegation(signed));
         }
         let request = AdvanceDelegation {
-            vote_round_id: self.round_id_bytes(&step)?,
+            vote_round_id: scope.round_id_bytes,
             bundle_index,
             spend_auth_signature: signed.submission.spend_auth_sig,
         };
+        let ledger = StepLedger::with_delegation(signed);
         let outcome = self
             .chain_client
             .advance_until_terminal_in_epoch(
                 ChainAdvanceRequest::Delegation(request),
-                &host.chain_policy,
-                control.chain(),
-                control.entry_epoch(),
+                &scope.host.chain_policy,
+                scope.chain(),
+                scope.entry_epoch(),
             )
             .await
-            .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;
-        self.chain_step_outcome(step, outcome, Some(signed), progress)
+            .map_err(|failure| self.step_chain_failure(failure, Some(&scope.step), &ledger))?;
+        self.chain_step_outcome(scope, outcome, ledger, progress)
     }
 
     pub(super) async fn run_advance_delegation(
         &self,
-        step: NextStep,
+        scope: &StepScope<'_>,
         bundle_index: u32,
-        host: &RoundHostContext,
         lock: &HeldRoundLock,
-        control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        let inputs = self.delegation_inputs(&step, host)?;
+        let ledger = StepLedger::default();
+        let inputs = self.delegation_inputs(scope)?;
         let driver = Arc::clone(&inputs.driver);
         let signer = inputs.signer.clone();
         // The signing task keeps the bundle lock while it runs, so an aborted
@@ -132,15 +133,15 @@ impl<T: ChainTransport> RoundExecutor<T> {
         .map_err(|error| {
             self.step_failure(
                 RoundStepFailureKind::InvariantViolation,
-                Some(step.clone()),
+                Some(&scope.step),
                 None,
-                None,
+                &ledger,
                 format!("delegation signing task failed: {error}"),
             )
         })?
-        .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+        .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
         let request = AdvanceDelegation {
-            vote_round_id: self.round_id_bytes(&step)?,
+            vote_round_id: scope.round_id_bytes,
             bundle_index,
             spend_auth_signature: signature,
         };
@@ -148,102 +149,79 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .chain_client
             .advance_until_terminal_in_epoch(
                 ChainAdvanceRequest::Delegation(request),
-                &persisted_policy(host),
-                control.chain(),
-                control.entry_epoch(),
+                &persisted_policy(scope.host),
+                scope.chain(),
+                scope.entry_epoch(),
             )
             .await
-            .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;
-        self.chain_step_outcome(step, outcome, None, progress)
+            .map_err(|failure| self.step_chain_failure(failure, Some(&scope.step), &ledger))?;
+        self.chain_step_outcome(scope, outcome, ledger, progress)
     }
 
+    /// The host's delegation inputs, refused unless the driver is bound to
+    /// the same network, round, wallet, database and voting hotkey as this
+    /// step's scope.
     pub(super) fn delegation_inputs(
         &self,
-        step: &NextStep,
-        host: &RoundHostContext,
+        scope: &StepScope<'_>,
     ) -> Result<super::DelegationStepInputs, RoundStepFailure> {
-        let inputs = host.delegation.clone().ok_or_else(|| {
+        let ledger = StepLedger::default();
+        let refuse = |message: String| {
             self.step_failure(
                 RoundStepFailureKind::InvalidInput,
-                Some(step.clone()),
+                Some(&scope.step),
                 None,
-                None,
-                "delegation steps require RoundHostContext::delegation",
+                &ledger,
+                message,
             )
+        };
+        let inputs = scope.host.delegation.clone().ok_or_else(|| {
+            refuse("delegation steps require RoundHostContext::delegation".to_string())
         })?;
-        let binding = self
-            .binding()
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        let round_id = binding.round_id.clone();
-        if inputs.driver.network() != binding.network {
-            return Err(self.step_failure(
-                RoundStepFailureKind::InvalidInput,
-                Some(step.clone()),
-                None,
-                None,
-                format!(
-                    "delegation driver network {:?} does not match the round binding network {:?}",
-                    inputs.driver.network(),
-                    binding.network
-                ),
+        if inputs.driver.network() != scope.network {
+            return Err(refuse(format!(
+                "delegation driver network {:?} does not match the round binding network {:?}",
+                inputs.driver.network(),
+                scope.network
+            )));
+        }
+        if inputs.driver.round_id() != scope.round_id {
+            return Err(refuse(
+                "delegation driver is bound to a different round".to_string(),
             ));
         }
-        if inputs.driver.round_id() != round_id {
-            return Err(self.step_failure(
-                RoundStepFailureKind::InvalidInput,
-                Some(step.clone()),
-                None,
-                None,
-                "delegation driver is bound to a different round",
-            ));
-        }
-        if inputs.driver.wallet_id() != self.wallet_id {
-            return Err(self.step_failure(
-                RoundStepFailureKind::InvalidInput,
-                Some(step.clone()),
-                None,
-                None,
-                format!(
-                    "delegation driver is scoped to wallet {} but the executor to wallet {}",
-                    inputs.driver.wallet_id(),
-                    self.wallet_id
-                ),
-            ));
+        if inputs.driver.wallet_id() != scope.wallet_id {
+            return Err(refuse(format!(
+                "delegation driver is scoped to wallet {} but the executor to wallet {}",
+                inputs.driver.wallet_id(),
+                scope.wallet_id
+            )));
         }
         if !inputs.driver.shares_database_with(&self.database) {
-            return Err(self.step_failure(
-                RoundStepFailureKind::InvalidInput,
-                Some(step.clone()),
-                None,
-                None,
-                "delegation driver persists into a different voting database than the executor",
+            return Err(refuse(
+                "delegation driver persists into a different voting database than the executor"
+                    .to_string(),
             ));
         }
         // The delegation must land for the hotkey CastVote will later
         // reconstruct from the binding; otherwise the confirmed VAN cannot be
         // spent by the executor's own votes.
-        if let Some(secret) = binding.hotkey_secret.as_ref() {
-            let bound_target = VotingHotkey::from_stored_secret(secret, binding.network)
-                .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?
+        if let Some(secret) = scope.hotkey_secret.as_ref() {
+            let bound_target = VotingHotkey::from_stored_secret(secret, scope.network)
+                .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?
                 .delegation_target();
             match inputs.driver.delegation_target() {
                 Some(target) if target == bound_target => {}
                 Some(_) => {
-                    return Err(self.step_failure(
-                        RoundStepFailureKind::InvalidInput,
-                        Some(step.clone()),
-                        None,
-                        None,
-                        "delegation driver delegates to a different voting hotkey than the round binding",
+                    return Err(refuse(
+                        "delegation driver delegates to a different voting hotkey than the round binding"
+                            .to_string(),
                     ));
                 }
                 None => {
-                    return Err(self.step_failure(
-                        RoundStepFailureKind::InvalidInput,
-                        Some(step.clone()),
-                        None,
-                        None,
-                        "delegation driver holds no voting hotkey while the round binding does",
+                    return Err(refuse(
+                        "delegation driver holds no voting hotkey while the round binding does"
+                            .to_string(),
                     ));
                 }
             }

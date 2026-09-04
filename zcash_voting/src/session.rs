@@ -72,9 +72,9 @@ pub(crate) fn classify_ballot_intents(
     })
 }
 
+pub(crate) use crate::round_planning::vote_phase_is_lifecycle_owned;
 #[cfg(test)]
-pub(crate) use crate::round_planning::summarize_plan_work;
-pub(crate) use crate::round_planning::{blocking_prerequisite, vote_phase_is_lifecycle_owned};
+pub(crate) use crate::round_planning::{blocking_prerequisite, summarize_plan_work};
 
 /// Whether any vote for `proposal_id` is lifecycle-owned, read on `conn`.
 pub(crate) fn intent_is_lifecycle_owned(

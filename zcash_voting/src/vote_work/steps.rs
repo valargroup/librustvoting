@@ -1,29 +1,35 @@
 //! Step execution for [`RoundExecutor`]: the public step API and dispatch.
 //!
-//! Every step runs under a lock, re-plans from durable state, and reports
-//! progress at durable and network boundaries. Proving never runs on the
-//! async runtime: delegation and vote proofs run on dedicated large-stack
-//! threads and stream their progress back through channels.
+//! Every step captures its scope once, takes its lock, resolves the
+//! requested step to the obligation a fresh plan lists for it, and runs
+//! that obligation. Proving never runs on the async runtime: delegation and
+//! vote proofs run on dedicated large-stack threads and stream their
+//! progress back through channels.
 //!
 //! Mechanism lives in sibling children, one per responsibility:
 //! `delegation_steps` (prove, sign, and advance delegations), `cast_vote`
 //! (tree sync, VAN witness, vote proving, persistence), `vote_completion`
-//! (helper plans, chain advancement, share delivery and confirmation), and
-//! `step_outcomes` (outcome construction and failure projection).
+//! (helper plans, chain advancement, share delivery), `share_confirmation`
+//! (polling a submitted share), `step_scope` and `step_ledger` (what a step
+//! runs under and what it has accomplished), and `step_outcomes` (outcome
+//! construction and failure projection).
 
 use std::sync::Arc;
 
 use crate::{
-    session::{resume_plan, NextStep, RoundPlan, VoteRecoveryWorkKind},
+    round_planning::{
+        blocking_prerequisite, plan_round_classified, resolve_step, ClassifiedPlan, Obligation,
+    },
+    session::{resume_plan, NextStep, RoundPlan},
     share_tracking::ShareKey,
     AdvanceImportedDelegation, ChainAdvancePolicy, ChainAdvanceRequest, ChainRecoveryMode,
     ChainSubmissionControl, ChainTransport, VotingError,
 };
 
 use super::{
-    round_lock, step_control::StepControl, step_scope::parse_round_id, BallotIntent, RoundExecutor,
-    RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome, RoundStepProgress,
-    RoundStepProgressReporter,
+    round_lock, step_control::StepControl, step_ledger::StepLedger, step_scope::StepScope,
+    BallotIntent, RoundExecutor, RoundHostContext, RoundStepFailure, RoundStepFailureKind,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
 };
 
 // Matches the keygen warm-up threads in voting-circuits.
@@ -86,28 +92,29 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let step_control = StepControl::capture(control);
         let plan = self
             .plan()
-            .map_err(|error| self.step_voting_failure(error, None))?;
+            .map_err(|error| self.step_voting_failure(error, None, &StepLedger::default()))?;
         let Some(step) = plan.next_steps.first().cloned() else {
             return Ok(self.no_work(None, plan));
         };
-        self.advance_step_under(step, host, &step_control, progress)
+        self.advance_step_under(step, host, step_control, progress)
             .await
     }
 
     /// Runs one planned step by one bounded pass.
     ///
-    /// The step is re-validated against a fresh plan under the lock; a step
-    /// another pass already completed returns `NoWork`. A step whose bundle
-    /// still has a delegation step ahead of it in the plan fails with
-    /// `InvalidInput` naming that prerequisite, before any lock-scoped work
-    /// or network I/O; run the prerequisite first or use `advance_next`.
-    /// `Delegate` and `AdvanceDelegation` lock their bundle; every other step
-    /// locks the round. A `ConfirmShare` whose share no helper has accepted
-    /// yet (the plan's `blocking_share_work`) runs the share's delivery from
-    /// its durable plan instead of polling for a confirmation no helper can
-    /// give. The operation epoch is captured on entry: cancellation
-    /// or an epoch change is observed at every boundary where the step decides
-    /// to continue, and either ends the step as `Cancelled`.
+    /// The step is resolved against a fresh plan under the lock to the
+    /// obligation it executes; a step another pass already completed returns
+    /// `NoWork`. A step whose bundle still has a delegation step ahead of it
+    /// in the plan fails with `InvalidInput` naming that prerequisite, before
+    /// any lock-scoped work or network I/O; run the prerequisite first or use
+    /// `advance_next`. `Delegate` and `AdvanceDelegation` lock their bundle;
+    /// every other step locks the round. A `ConfirmShare` whose share no
+    /// helper has accepted yet (the plan's `blocking_share_work`) runs the
+    /// share's delivery from its durable plan instead of polling for a
+    /// confirmation no helper can give. The operation epoch is captured on
+    /// entry: cancellation or an epoch change is observed at every boundary
+    /// where the step decides to continue, and either ends the step as
+    /// `Cancelled`.
     pub async fn advance_step(
         &self,
         step: NextStep,
@@ -115,7 +122,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         control: &ChainSubmissionControl,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        self.advance_step_under(step, host, &StepControl::capture(control), progress)
+        self.advance_step_under(step, host, StepControl::capture(control), progress)
             .await
     }
 
@@ -124,18 +131,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
         &self,
         step: NextStep,
         host: &RoundHostContext,
-        control: &StepControl<'_>,
+        control: StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        let wallet_id = self
-            .wallet_scope()
-            .map(str::to_string)
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        let round_id = self
-            .binding()
-            .map(|binding| binding.round_id.clone())
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        let scope = match &step {
+        let scope = StepScope::capture(self, step, host, control)?;
+        let ledger = StepLedger::default();
+        let lock_scope = match &scope.step {
             NextStep::Delegate { bundle_index } | NextStep::AdvanceDelegation { bundle_index } => {
                 Some(*bundle_index)
             }
@@ -143,63 +144,75 @@ impl<T: ChainTransport> RoundExecutor<T> {
         };
         let Some(guard) = round_lock::acquire(
             self.database.sidecar_id(),
-            wallet_id,
-            &round_id,
-            scope,
-            control.chain(),
-            control.entry_epoch(),
+            scope.wallet_id.clone(),
+            &scope.round_id,
+            lock_scope,
+            scope.chain(),
+            scope.entry_epoch(),
         )
         .await
         .map_err(|message| {
             self.step_failure(
                 RoundStepFailureKind::InvariantViolation,
-                Some(step.clone()),
+                Some(&scope.step),
                 None,
-                None,
+                &ledger,
                 message,
             )
         })?
         else {
-            return self.step_cancelled(Some(step), None, Vec::new(), None);
+            return self.step_cancelled(&scope, ledger);
         };
         // Proving threads share this lock so it survives a dropped future for
         // as long as a detached prover keeps working on the round.
         let lock: round_lock::HeldRoundLock = Arc::new(guard);
 
-        let plan = self
-            .plan()
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        if !plan.next_steps.contains(&step) {
-            return Ok(self.no_work(Some(step), plan));
-        }
-        if let Some(prerequisite) = crate::session::blocking_prerequisite(&plan.next_steps, &step) {
+        // The one authoritative read under the lock: the step is resolved to
+        // the obligation this plan lists for it, and that obligation is the
+        // only thing the step executes.
+        let classified = self.classified_plan(&scope)?;
+        let Some(obligation) = resolve_step(&classified.obligations.obligations, &scope.step)
+        else {
+            return Ok(self.no_work(Some(scope.step), classified.plan));
+        };
+        if let Some(prerequisite) = blocking_prerequisite(&classified.plan.next_steps, &scope.step)
+        {
             return Err(self.step_failure(
                 RoundStepFailureKind::InvalidInput,
-                Some(step.clone()),
+                Some(&scope.step),
                 None,
-                None,
+                &ledger,
                 format!(
-                    "{step:?} requires {prerequisite:?} to complete first; run that step or advance_next"
+                    "{:?} requires {prerequisite:?} to complete first; run that step or advance_next",
+                    scope.step
                 ),
             ));
         }
-        if control.interrupted() {
-            return self.step_cancelled(Some(step), None, Vec::new(), None);
+        if scope.interrupted() {
+            return self.step_cancelled(&scope, ledger);
         }
-        progress.report(RoundStepProgress::Selected(step.clone()));
+        progress.report(RoundStepProgress::Selected(scope.step.clone()));
 
-        match step.clone() {
-            NextStep::Delegate { bundle_index } => {
-                self.run_delegate(step, bundle_index, host, &lock, control, progress)
+        match obligation.clone() {
+            Obligation::Delegate { bundle_index } => {
+                self.run_delegate(&scope, bundle_index, &lock, progress)
                     .await
             }
-            NextStep::AdvanceDelegation { bundle_index } => {
-                self.run_advance_delegation(step, bundle_index, host, &lock, control, progress)
+            Obligation::AdvanceDelegation {
+                bundle_index,
+                imported: false,
+                ..
+            } => {
+                self.run_advance_delegation(&scope, bundle_index, &lock, progress)
                     .await
             }
-            NextStep::AdvanceImportedDelegation { bundle_index } => {
+            Obligation::AdvanceDelegation {
+                bundle_index,
+                imported: true,
+                ..
+            } => {
                 let request = AdvanceImportedDelegation {
-                    vote_round_id: self.round_id_bytes(&step)?,
+                    vote_round_id: scope.round_id_bytes,
                     bundle_index,
                 };
                 let outcome = self
@@ -207,98 +220,100 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     .advance_until_terminal_in_epoch(
                         ChainAdvanceRequest::ImportedDelegation(request),
                         &persisted_policy(host),
-                        control.chain(),
-                        control.entry_epoch(),
+                        scope.chain(),
+                        scope.entry_epoch(),
                     )
                     .await
-                    .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;
-                self.chain_step_outcome(step, outcome, None, progress)
+                    .map_err(|failure| {
+                        self.step_chain_failure(failure, Some(&scope.step), &ledger)
+                    })?;
+                self.chain_step_outcome(&scope, outcome, ledger, progress)
             }
-            NextStep::CastVote { bundle_index, .. } => {
-                self.run_cast_vote(step, bundle_index, &plan, host, &lock, control, progress)
+            Obligation::Cast {
+                bundle_index,
+                drafts,
+                ..
+            } => {
+                self.run_cast_vote(&scope, bundle_index, &drafts, &lock, progress)
                     .await
             }
-            NextStep::AdvanceVote {
-                bundle_index,
-                proposal_id,
+            Obligation::ReconcileChain {
+                unit,
+                ordered_proposal_ids,
+                ..
+            } => {
+                self.run_reconcile_chain(&scope, unit, &ordered_proposal_ids, progress)
+                    .await
             }
-            | NextStep::AdvanceVoteBatch {
-                bundle_index,
-                proposal_id,
-            }
-            | NextStep::SubmitShares {
+            Obligation::Deliver {
                 bundle_index,
                 proposal_id,
                 ..
             } => {
-                let kind = match &step {
-                    NextStep::AdvanceVote { .. } => VoteRecoveryWorkKind::AdvanceVote,
-                    NextStep::AdvanceVoteBatch { .. } => VoteRecoveryWorkKind::AdvanceVoteBatch,
-                    _ => VoteRecoveryWorkKind::SubmitShares,
-                };
-                self.run_persisted_vote_work(
-                    step,
-                    kind,
-                    bundle_index,
-                    proposal_id,
-                    host,
-                    control,
-                    progress,
-                )
-                .await
+                self.run_deliver(&scope, bundle_index, proposal_id, progress)
+                    .await
             }
-            NextStep::ConfirmShare {
+            Obligation::Confirm {
                 bundle_index,
                 proposal_id,
                 share_index,
+                accepted,
+                ..
             } => {
                 // A share row no helper has accepted yet (every POST failed
                 // definitely, or a reservation was cleared before dispatch)
-                // cannot be confirmed by polling: no helper holds it. The
-                // planner classifies it as `SubmitShares` recovery work, so
-                // deliver it from its durable plan before polling.
-                let awaits_delivery = plan.recovered_vote_work.iter().any(|work| {
-                    work.kind == VoteRecoveryWorkKind::SubmitShares
-                        && work.bundle_index == bundle_index
-                        && work.proposal_id == proposal_id
-                        && work.share_indexes.contains(&share_index)
-                });
-                if awaits_delivery {
+                // cannot be confirmed by polling: no helper holds it. Deliver
+                // it from its durable plan, unless its vote's own chain work
+                // is still pending, in which case delivery must wait for the
+                // confirmation.
+                let chain_pending =
+                    classified
+                        .obligations
+                        .obligations
+                        .iter()
+                        .any(|candidate| match candidate {
+                            &Obligation::ReconcileChain {
+                                bundle_index: pending_bundle,
+                                ref ordered_proposal_ids,
+                                ..
+                            } => {
+                                pending_bundle == bundle_index
+                                    && ordered_proposal_ids.contains(&proposal_id)
+                            }
+                            _ => false,
+                        });
+                if !accepted && !chain_pending {
                     return self
-                        .run_persisted_vote_work(
-                            step,
-                            VoteRecoveryWorkKind::SubmitShares,
-                            bundle_index,
-                            proposal_id,
-                            host,
-                            control,
-                            progress,
-                        )
+                        .run_deliver(&scope, bundle_index, proposal_id, progress)
                         .await;
                 }
                 self.run_confirm_share(
-                    step,
+                    &scope,
                     ShareKey {
                         bundle_index,
                         proposal_id,
                         share_index,
                     },
-                    host,
-                    control,
                     progress,
                 )
                 .await
             }
+            // Never projected as a step, so never resolved from one.
+            Obligation::Retire { .. } | Obligation::Blocked { .. } => {
+                Ok(self.no_work(Some(scope.step), classified.plan))
+            }
         }
     }
 
-    pub(super) fn round_id_bytes(&self, step: &NextStep) -> Result<[u8; 32], RoundStepFailure> {
-        let round_id = self
-            .binding()
-            .map(|binding| binding.round_id.clone())
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        parse_round_id(&round_id)
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))
+    /// The plan and its obligations for the scope's round, from one
+    /// snapshot.
+    fn classified_plan(&self, scope: &StepScope<'_>) -> Result<ClassifiedPlan, RoundStepFailure> {
+        let ledger = StepLedger::default();
+        self.ensure_stored_round_network(&scope.round_id, "the binding")
+            .and_then(|()| {
+                plan_round_classified(&self.database, &scope.round_id, &scope.proposal_ids())
+            })
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))
     }
 }
 

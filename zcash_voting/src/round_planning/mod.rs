@@ -18,23 +18,19 @@ mod projection;
 mod snapshot;
 mod vote_units;
 
-pub(crate) use classify::RoundObligations;
-pub(crate) use lifecycle::vote_phase_is_lifecycle_owned;
-pub(crate) use projection::blocking_prerequisite;
-pub(crate) use snapshot::{load_round_snapshot, RoundSnapshot};
-pub(crate) use vote_units::group_vote_units;
-// Executor dispatch moves onto obligations in the next change; until then
-// only tests read them.
 #[cfg(test)]
-pub(crate) use classify::{BlockedReason, Obligation};
+pub(crate) use classify::BlockedReason;
+pub(crate) use classify::{CastDraft, Obligation, RoundObligations};
+pub(crate) use lifecycle::vote_phase_is_lifecycle_owned;
 #[cfg(test)]
 pub(crate) use lifecycle::LifecyclePosition;
 #[cfg(test)]
-pub(crate) use projection::{resolve_step, summarize_plan_work};
+pub(crate) use projection::summarize_plan_work;
+pub(crate) use projection::{blocking_prerequisite, resolve_step};
+pub(crate) use snapshot::{load_round_snapshot, RoundSnapshot};
 #[cfg(test)]
 pub(crate) use snapshot::{BundleSnapshot, VoteSnapshot};
-#[cfg(test)]
-pub(crate) use vote_units::VoteUnitId;
+pub(crate) use vote_units::{group_vote_units, VoteUnitId};
 
 use crate::session::{classify_ballot_intents, RoundPlan};
 use crate::storage::VotingDb;
@@ -47,15 +43,34 @@ pub(crate) fn plan_round(
     round_id: &str,
     proposal_ids: &[u32],
 ) -> Result<RoundPlan, VotingError> {
+    Ok(plan_round_classified(db, round_id, proposal_ids)?.plan)
+}
+
+/// A plan together with the obligations it was projected from, so an
+/// executor can resolve a host-selected step to the work it executes.
+pub(crate) struct ClassifiedPlan {
+    pub(crate) plan: RoundPlan,
+    pub(crate) obligations: RoundObligations,
+}
+
+/// [`plan_round`], keeping the obligations beside the plan.
+pub(crate) fn plan_round_classified(
+    db: &VotingDb,
+    round_id: &str,
+    proposal_ids: &[u32],
+) -> Result<ClassifiedPlan, VotingError> {
     let wallet_id = db.wallet_id();
     let snapshot = db.read_transaction("plan round", |tx| {
         load_round_snapshot(tx, &wallet_id, round_id)
     })?;
-    plan_from_snapshot(&snapshot, proposal_ids)
+    let obligations = classify_round(&snapshot, proposal_ids)?;
+    let plan = projection::project(&snapshot, proposal_ids, &obligations)?;
+    Ok(ClassifiedPlan { plan, obligations })
 }
 
 /// The plan derived from one snapshot. Pure over `snapshot` and
 /// `proposal_ids`.
+#[cfg(test)]
 pub(crate) fn plan_from_snapshot(
     snapshot: &RoundSnapshot,
     proposal_ids: &[u32],

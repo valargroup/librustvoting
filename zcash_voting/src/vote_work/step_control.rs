@@ -9,6 +9,7 @@ use crate::ChainSubmissionControl;
 /// the step began. Both are checked at every boundary where a step decides
 /// whether to keep going, so a stale invocation never dispatches a vote or
 /// helper share on behalf of an epoch the host has already left.
+#[derive(Clone, Copy)]
 pub(super) struct StepControl<'a> {
     control: &'a ChainSubmissionControl,
     entry_epoch: u64,

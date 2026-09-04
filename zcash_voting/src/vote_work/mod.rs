@@ -8,7 +8,9 @@
 mod cast_vote;
 mod delegation_steps;
 mod round_lock;
+mod share_confirmation;
 mod step_control;
+mod step_ledger;
 mod step_outcomes;
 mod step_scope;
 mod steps;
@@ -62,7 +64,7 @@ impl RoundBinding {
             .collect()
     }
 
-    fn num_options(&self, proposal_id: u32) -> Option<u32> {
+    pub(super) fn num_options(&self, proposal_id: u32) -> Option<u32> {
         self.proposals
             .iter()
             .find(|entry| entry.proposal_id == proposal_id)
@@ -267,6 +269,7 @@ pub struct RoundStepFailure {
 
 impl RoundStepFailure {
     /// Attaches the delivery reports accumulated before this failure.
+    #[cfg(test)]
     pub(crate) fn with_share_deliveries(
         mut self,
         share_deliveries: Vec<VoteShareDeliveryReport>,

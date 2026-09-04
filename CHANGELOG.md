@@ -86,6 +86,18 @@ This release is `zcash_voting` 4.0.0.
   placed by its lifecycle position, roster relation and ballot relation, and
   the resulting obligations are projected into `next_steps` and the plan's
   flags. The rule is specified in `docs/round_orchestration_invariants.md`.
+- `RoundExecutor` dispatches on the obligation a fresh plan resolves the
+  requested step to, under the round or bundle lock, instead of
+  reinterpreting the step: a `CastVote` runs the bundle's whole draft set
+  from that obligation rather than rescanning the plan for sibling steps, an
+  `AdvanceVoteBatch` recovers the members the obligation names rather than
+  re-deriving them from its anchor, and a `ConfirmShare` for a share no
+  helper accepted runs delivery from the obligation's own state. Each step
+  captures its wallet, round, roster, network, hotkey material and entry
+  epoch once, and records its chain outcome and delivery reports in one
+  ledger that every outcome, cancellation and failure is built from, so a
+  later error cannot drop an earlier confirmation or an accepted delivery.
+  Fresh casts and resumed units complete through one path.
 - `RoundExecutor::plan` revalidates the stored round's network on every call,
   and `CastVote` checks that the bound hotkey is the bundle's confirmed
   delegation target before the first tree request.
