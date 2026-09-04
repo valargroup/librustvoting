@@ -132,8 +132,11 @@ impl<T: ChainTransport> RoundExecutor<T> {
                             failure.message, reset_failure.message
                         ));
                     }
+                    // A host that cancelled while the request was in flight
+                    // asked for the step to stop; report that, not the
+                    // transport error the cancellation produced.
                     if control.interrupted() {
-                        return Err(failure);
+                        return self.step_cancelled(Some(step), None, Vec::new(), None);
                     }
                     last_failure = Some(failure);
                 }
