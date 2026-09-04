@@ -102,7 +102,8 @@ impl VotingDb {
     /// `RoundPlan::unrostered_intents` and withholds `CastVote` until it is
     /// cleared. Clearing an intent that does not exist is not an error.
     ///
-    /// The canonical vote phase decides whether clearing is allowed. A vote
+    /// The canonical vote phase, read inside the same write transaction as
+    /// the deletion, decides whether clearing is allowed. A vote
     /// for the proposal that the chain lifecycle owns or has finished
     /// (submitted, managed, hashless, rejected, or confirmed) may already be
     /// on chain, so its intent cannot be cleared. A vote that is signed but
@@ -115,12 +116,15 @@ impl VotingDb {
     /// or a proposal whose vote is on or past the chain lifecycle.
     pub fn clear_ballot_intent(&self, round_id: &str, proposal_id: u32) -> Result<(), VotingError> {
         validate_proposal_id(proposal_id)?;
-        if let Some((bundle_index, _, phase)) =
-            self.vote_phases(round_id)?
-                .into_iter()
-                .find(|(_, vote_proposal, phase)| {
-                    *vote_proposal == proposal_id
-                        && matches!(
+        let wallet_id = self.wallet_id();
+        self.write_transaction("clear_ballot_intent transaction failed", |tx| {
+            // Evaluated under the write transaction, so a submission that
+            // becomes terminal between a read and the delete cannot slip past.
+            if let Some((bundle_index, phase)) =
+                crate::phases::vote_phases_for_proposal(tx, &wallet_id, round_id, proposal_id)?
+                    .into_iter()
+                    .find(|(_, phase)| {
+                        matches!(
                             phase,
                             VotePhase::Submitted
                                 | VotePhase::SubmissionManaged
@@ -128,17 +132,15 @@ impl VotingDb {
                                 | VotePhase::SubmissionRejected
                                 | VotePhase::Confirmed
                         )
-                })
-        {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "round {round_id} bundle {bundle_index} proposal {proposal_id} vote is {} on the chain lifecycle; its intent cannot be cleared",
-                    phase.as_str()
-                ),
-            });
-        }
-        let wallet_id = self.wallet_id();
-        self.write_transaction("clear_ballot_intent transaction failed", |tx| {
+                    })
+            {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "round {round_id} bundle {bundle_index} proposal {proposal_id} vote is {} on the chain lifecycle; its intent cannot be cleared",
+                        phase.as_str()
+                    ),
+                });
+            }
             crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
                 tx,
                 &wallet_id,

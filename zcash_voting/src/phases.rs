@@ -561,6 +561,22 @@ struct VotePhaseEvidence {
     singleton_diagnostic: Option<String>,
 }
 
+/// Canonical phases of one proposal's votes, read on `conn` so a caller can
+/// evaluate them inside the same write transaction as a dependent change.
+pub(crate) fn vote_phases_for_proposal(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+) -> Result<Vec<(u32, VotePhase)>, VotingError> {
+    Ok(
+        load_vote_submission_statuses(conn, wallet_id, round_id, None, Some(proposal_id))?
+            .into_iter()
+            .map(|status| (status.bundle_index, status.phase))
+            .collect(),
+    )
+}
+
 /// Projects vote rows through their authoritative singleton or atomic-batch
 /// submission. Batch membership is accepted only after the persisted signed
 /// batch and its complete generation digest have been re-derived.
