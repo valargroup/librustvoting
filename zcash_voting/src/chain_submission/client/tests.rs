@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use super::{interrupted_during, ChainSubmissionControl};
+use super::{
+    interrupted_during, ChainSubmissionClient, ChainSubmissionClientConfig, ChainSubmissionControl,
+};
 
 #[tokio::test(start_paused = true)]
 async fn a_cancellation_during_the_repoll_wait_returns_promptly() {
@@ -87,4 +89,23 @@ async fn an_operation_epoch_change_during_the_repoll_wait_interrupts_it() {
         !control.is_cancelled(),
         "an epoch change is not a cancellation"
     );
+}
+
+#[test]
+fn the_client_keeps_the_wallet_it_was_constructed_for() {
+    let host_handle = std::sync::Arc::new(crate::round::VotingDb::open_in_memory().unwrap());
+    host_handle.set_wallet_id("wallet-a");
+    let client = ChainSubmissionClient::new(
+        std::sync::Arc::clone(&host_handle),
+        ChainSubmissionClientConfig::for_network(
+            crate::Network::Testnet,
+            vec!["http://chain.invalid".to_string()],
+        ),
+    )
+    .unwrap();
+
+    // The host moves its own handle to another account mid-episode.
+    host_handle.set_wallet_id("wallet-b");
+
+    assert_eq!(client.wallet_id(), "wallet-a");
 }

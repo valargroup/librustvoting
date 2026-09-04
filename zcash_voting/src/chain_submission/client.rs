@@ -335,6 +335,8 @@ pub struct AdvanceVoteBatch {
 /// bounded pass from [`ChainSubmissionResult`] rather than mutating submission
 /// state directly.
 pub struct ChainSubmissionClient<T> {
+    /// Wallet captured at construction; every submission identity uses it.
+    wallet_id: String,
     db: Arc<VotingDb>,
     network: Network,
     coordinator:
@@ -396,14 +398,26 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
                     diagnostic.message(),
                 )
             })?;
+        // Work on a private handle scoped to the wallet selected now. The
+        // caller keeps its own handle, and re-scoping that one must not move
+        // a later pass of an in-flight episode to another wallet's state.
+        let wallet_id = db.wallet_id();
+        let db = Arc::new(db.scoped(&wallet_id));
         let store = Arc::new(SqliteChainSubmissionStore::new(Arc::clone(&db)));
         let coordinator =
             ChainSubmissionCoordinator::new(protocol, store, SystemChainSubmissionClock, policy)?;
         Ok(Self {
+            wallet_id,
             db,
             network: config.network,
             coordinator,
         })
+    }
+
+    /// The wallet every submission identity is bound to, captured when the
+    /// client was constructed.
+    pub fn wallet_id(&self) -> &str {
+        &self.wallet_id
     }
 
     /// Advances one prepared delegation through one bounded status-only pass.
@@ -711,7 +725,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         target: ChainSubmissionTarget,
     ) -> Result<ChainSubmissionIdentity, ChainSubmissionFailure> {
         ChainSubmissionIdentity::new(
-            self.db.wallet_id(),
+            self.wallet_id.clone(),
             self.network,
             vote_round_id,
             bundle_index,

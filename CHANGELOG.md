@@ -69,6 +69,15 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `ChainSubmissionClient` captures its wallet at construction and works on
+  a private scoped handle; `ChainSubmissionClient::wallet_id` reports it. A
+  host re-scoping the handle it passed no longer moves a later pass of an
+  in-flight episode to another wallet.
+- `RoundExecutor::advance_next` captures the operation epoch before planning.
+- `VoteTreeSync::cached_rounds` and `precompute::cached_vote_tree_rounds`
+  report which rounds hold in-memory tree state; they replace a test-only
+  probe.
+
 - `VotingDb::clear_ballot_intent` decides from the canonical vote phase: an
   intent whose vote the chain lifecycle owns or has finished cannot be
   cleared, and a signed but undispatched vote has its recovery invalidated.
