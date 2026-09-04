@@ -46,22 +46,27 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// Records ballot decisions and returns the refreshed plan.
     ///
     /// Option counts come from the bound roster, so a decision for an unknown
-    /// proposal is rejected before anything is written.
+    /// proposal is rejected before anything is written. The whole batch is
+    /// resolved against the roster first and then written in one transaction,
+    /// so a rejected batch leaves durable intent unchanged.
     pub fn set_ballot_intents(&self, intents: &[BallotIntent]) -> Result<RoundPlan, VotingError> {
         let binding = self.binding()?;
-        for intent in intents {
-            let num_options = binding.num_options(intent.proposal_id).ok_or_else(|| {
-                VotingError::InvalidInput {
-                    message: format!("proposal {} is not in the round roster", intent.proposal_id),
-                }
-            })?;
-            self.database.set_ballot_intent(
-                &binding.round_id,
-                intent.proposal_id,
-                intent.decision,
-                num_options,
-            )?;
-        }
+        let resolved = intents
+            .iter()
+            .map(|intent| {
+                let num_options = binding.num_options(intent.proposal_id).ok_or_else(|| {
+                    VotingError::InvalidInput {
+                        message: format!(
+                            "proposal {} is not in the round roster",
+                            intent.proposal_id
+                        ),
+                    }
+                })?;
+                Ok((intent.proposal_id, intent.decision, num_options))
+            })
+            .collect::<Result<Vec<_>, VotingError>>()?;
+        self.database
+            .set_ballot_intents(&binding.round_id, &resolved)?;
         self.plan()
     }
 

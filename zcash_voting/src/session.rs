@@ -86,6 +86,46 @@ impl VotingDb {
         self.write_ballot_intent(round_id, proposal_id, decision)
     }
 
+    /// Record the voter's decisions for several proposals atomically.
+    ///
+    /// Each entry is `(proposal_id, decision, num_options)`, where
+    /// `num_options` is that proposal's declared option count. Every entry is
+    /// validated, and the batch is rejected if it names one proposal twice,
+    /// before any durable intent is written; the writes then share one
+    /// transaction, so a conflict raised by a later entry — a submitted vote
+    /// that contradicts it, for instance — leaves none of the batch applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] for an out-of-range proposal id,
+    /// a decision that does not fit its option count, or a repeated proposal
+    /// id.
+    pub fn set_ballot_intents(
+        &self,
+        round_id: &str,
+        intents: &[(u32, Decision, u32)],
+    ) -> Result<(), VotingError> {
+        let mut seen = BTreeSet::new();
+        for &(proposal_id, decision, num_options) in intents {
+            validate_proposal_id(proposal_id)?;
+            validate_ballot_intent_decision(decision, num_options)?;
+            if !seen.insert(proposal_id) {
+                return Err(VotingError::InvalidInput {
+                    message: format!("ballot intent batch decides proposal {proposal_id} twice"),
+                });
+            }
+        }
+
+        let now = now_secs();
+        let wallet_id = self.wallet_id();
+        self.write_transaction("set_ballot_intents transaction failed", |tx| {
+            for &(proposal_id, decision, _) in intents {
+                write_ballot_intent_in_tx(tx, &wallet_id, round_id, proposal_id, decision, now)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Record a choice intent from a fully validated draft vote.
     pub fn set_ballot_intent_for_draft_vote(
         &self,
@@ -102,91 +142,108 @@ impl VotingDb {
         proposal_id: u32,
         decision: Decision,
     ) -> Result<(), VotingError> {
-        let (skipped, choice): (i64, Option<i64>) = match decision {
-            Decision::Choice(c) => (0, Some(c as i64)),
-            Decision::Skipped => (1, None),
-        };
         let now = now_secs();
         let wallet_id = self.wallet_id();
         self.write_transaction("set_ballot_intent transaction failed", |tx| {
-            let skipped_bool = skipped != 0;
-            let choice_u32 = choice.map(|c| c as u32);
-            queries::ensure_no_submitted_vote_conflict_for_intent(
-                tx,
-                round_id,
-                &wallet_id,
-                proposal_id,
-                skipped_bool,
-                choice_u32,
-            )?;
-            crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
-                tx,
-                &wallet_id,
-                round_id,
-                proposal_id,
-                choice_u32,
-            )?;
-            tx.execute(
-                "INSERT INTO ballot_intent
-                    (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
-                 VALUES (:round_id, :wallet_id, :proposal_id, :skipped, :choice, :now, :now)
-                 ON CONFLICT(round_id, wallet_id, proposal_id)
-                 DO UPDATE SET skipped = :skipped, choice = :choice, updated_at = :now",
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":proposal_id": proposal_id as i64,
-                    ":skipped": skipped,
-                    ":choice": choice,
-                    ":now": now,
-                },
-            )
-            .map_err(|e| VotingError::Internal {
-                message: format!("set_ballot_intent failed: {e}"),
-            })?;
-            if skipped_bool {
-                tx.execute(
-                    "DELETE FROM share_delegations
-                     WHERE round_id = :round_id
-                       AND wallet_id = :wallet_id
-                       AND proposal_id = :proposal_id",
-                    named_params! {
-                        ":round_id": round_id,
-                        ":wallet_id": wallet_id,
-                        ":proposal_id": proposal_id as i64,
-                    },
-                )
-            } else if let Some(choice) = choice_u32 {
-                tx.execute(
-                    "DELETE FROM share_delegations
-                     WHERE round_id = :round_id
-                       AND wallet_id = :wallet_id
-                       AND proposal_id = :proposal_id
-                       AND NOT EXISTS (
-                           SELECT 1 FROM votes
-                           WHERE votes.round_id = share_delegations.round_id
-                             AND votes.wallet_id = share_delegations.wallet_id
-                             AND votes.bundle_index = share_delegations.bundle_index
-                             AND votes.proposal_id = share_delegations.proposal_id
-                             AND votes.choice = :choice
-                       )",
-                    named_params! {
-                        ":round_id": round_id,
-                        ":wallet_id": wallet_id,
-                        ":proposal_id": proposal_id as i64,
-                        ":choice": choice as i64,
-                    },
-                )
-            } else {
-                Ok(0)
-            }
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to clear stale share delegations: {e}"),
-            })?;
-            Ok(())
+            write_ballot_intent_in_tx(tx, &wallet_id, round_id, proposal_id, decision, now)
         })
     }
+}
 
+/// Writes one durable ballot intent inside a caller-owned transaction.
+///
+/// Resolves the conflicting-vote and stale-share side effects of the decision
+/// alongside the intent row, so a batch of intents can commit atomically.
+fn write_ballot_intent_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+    decision: Decision,
+    now: i64,
+) -> Result<(), VotingError> {
+    let (skipped, choice): (i64, Option<i64>) = match decision {
+        Decision::Choice(c) => (0, Some(c as i64)),
+        Decision::Skipped => (1, None),
+    };
+    let skipped_bool = skipped != 0;
+    let choice_u32 = choice.map(|c| c as u32);
+    queries::ensure_no_submitted_vote_conflict_for_intent(
+        tx,
+        round_id,
+        wallet_id,
+        proposal_id,
+        skipped_bool,
+        choice_u32,
+    )?;
+    crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
+        tx,
+        wallet_id,
+        round_id,
+        proposal_id,
+        choice_u32,
+    )?;
+    tx.execute(
+        "INSERT INTO ballot_intent
+            (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
+         VALUES (:round_id, :wallet_id, :proposal_id, :skipped, :choice, :now, :now)
+         ON CONFLICT(round_id, wallet_id, proposal_id)
+         DO UPDATE SET skipped = :skipped, choice = :choice, updated_at = :now",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":proposal_id": proposal_id as i64,
+            ":skipped": skipped,
+            ":choice": choice,
+            ":now": now,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("set_ballot_intent failed: {e}"),
+    })?;
+    if skipped_bool {
+        tx.execute(
+            "DELETE FROM share_delegations
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND proposal_id = :proposal_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+            },
+        )
+    } else if let Some(choice) = choice_u32 {
+        tx.execute(
+            "DELETE FROM share_delegations
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND proposal_id = :proposal_id
+               AND NOT EXISTS (
+                   SELECT 1 FROM votes
+                   WHERE votes.round_id = share_delegations.round_id
+                     AND votes.wallet_id = share_delegations.wallet_id
+                     AND votes.bundle_index = share_delegations.bundle_index
+                     AND votes.proposal_id = share_delegations.proposal_id
+                     AND votes.choice = :choice
+               )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+                ":choice": choice as i64,
+            },
+        )
+    } else {
+        Ok(0)
+    }
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear stale share delegations: {e}"),
+    })?;
+    Ok(())
+}
+
+impl VotingDb {
     /// Load the voter's decisions for a round, sorted by proposal id.
     pub fn ballot_intents(&self, round_id: &str) -> Result<Vec<(u32, Decision)>, VotingError> {
         let conn = self.conn();
@@ -265,6 +322,14 @@ pub enum NextStep {
     /// signer or dispatches the transaction again.
     AdvanceImportedDelegation { bundle_index: u32 },
     /// Cast a vote using the recorded ballot intent choice.
+    ///
+    /// Only planned once every proposal in the roster has a terminal decision,
+    /// a choice or a skip. Casting persists the vote and then derives the
+    /// round's immediate helper share from the complete set of choices, so an
+    /// undecided proposal would make the step fail after the proof was
+    /// generated and the vote written. While the ballot is still open the plan
+    /// reports the remaining proposals through `RoundPlan::open_proposals` and
+    /// plans the bundle's `Delegate` prerequisite instead.
     ///
     /// A changed choice is recoverable only until a cast-vote transaction has
     /// been submitted. Once submitted, the proposal authority for that bundle
@@ -1136,6 +1201,12 @@ fn push_vote_advance_step(
 /// Wallets should execute one returned step, persist that step's result, then
 /// call `resume_plan` again; later steps may depend on earlier on-chain
 /// confirmations.
+///
+/// A proposal in `proposal_ids` with no durable ballot intent is reported in
+/// `RoundPlan::open_proposals` and suppresses [`NextStep::CastVote`] for the
+/// whole round; see that variant for why the ballot must be terminal first.
+/// Delegation and the advancement of votes already on the wire are planned
+/// regardless.
 pub fn resume_plan(
     db: &VotingDb,
     round_id: &str,
@@ -1173,6 +1244,12 @@ pub fn resume_plan(
     let bundles: Vec<u32> = delegation.keys().copied().collect();
     let choice_proposals = intent_classification.choice_proposals;
     let open_proposals = intent_classification.open_proposals;
+    // Casting derives the round's single immediate helper share from the
+    // complete set of choices, so `CommittedVote::prepare_share_delivery`
+    // rejects a roster that still holds an undecided proposal. Planning a
+    // `CastVote` before then would advertise a step that only fails after
+    // proving and persisting the vote, so the ballot must be terminal first.
+    let roster_is_terminal = open_proposals.is_empty();
 
     if !choice_proposals.is_empty() && bundles.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -1256,12 +1333,16 @@ pub fn resume_plan(
                 if bundles_with_pending_vote_chains.contains(&b) {
                     continue;
                 }
-                steps.push(NextStep::CastVote {
-                    bundle_index: b,
-                    proposal_id: pid,
-                    choice: intent_choice,
-                });
+                // Delegation is a prerequisite either way, so it is still
+                // planned while the voter decides the rest of the roster.
                 bundles_needing_delegation.insert(b);
+                if roster_is_terminal {
+                    steps.push(NextStep::CastVote {
+                        bundle_index: b,
+                        proposal_id: pid,
+                        choice: intent_choice,
+                    });
+                }
                 continue;
             }
             match votes.get(&vote_key) {
@@ -1305,12 +1386,14 @@ pub fn resume_plan(
                     if bundles_with_pending_vote_chains.contains(&b) {
                         continue;
                     }
-                    steps.push(NextStep::CastVote {
-                        bundle_index: b,
-                        proposal_id: pid,
-                        choice: intent_choice,
-                    });
                     bundles_needing_delegation.insert(b);
+                    if roster_is_terminal {
+                        steps.push(NextStep::CastVote {
+                            bundle_index: b,
+                            proposal_id: pid,
+                            choice: intent_choice,
+                        });
+                    }
                 }
             }
         }
@@ -2086,12 +2169,80 @@ mod tests {
     #[test]
     fn answered_but_uncast_proposal_yields_cast_then_delegate_prereq() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
-            .unwrap();
+        for proposal_id in [1, 2, 3] {
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(1), 3)
+                .unwrap();
+        }
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert!(plan.pending_recovery);
-        // Bundle 0 is only Prepared, and proposal 2 needs casting on it, so the
-        // delegate prerequisite is emitted, ordered before the cast.
+        // Bundle 0 is only Prepared, and every proposal needs casting on it, so
+        // the delegate prerequisite is emitted, ordered before the casts.
+        assert_eq!(
+            plan.next_steps,
+            vec![
+                NextStep::Delegate { bundle_index: 0 },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 1,
+                    choice: 1,
+                },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                    choice: 1,
+                },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 3,
+                    choice: 1,
+                },
+            ]
+        );
+        assert!(plan.open_proposals.is_empty());
+        assert_eq!(
+            plan.recovered_delegation_work,
+            vec![DelegationRecoveryWork {
+                kind: DelegationRecoveryWorkKind::Delegate,
+                bundle_index: 0,
+                phase: DelegationPhase::Prepared,
+                tx_hash: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_open_proposal_defers_casting_but_still_plans_the_delegate_prereq() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+
+        // Proposals 1 and 3 are undecided, so helper-share planning could not
+        // derive the round's immediate share yet. The cast is withheld, but
+        // delegation is a prerequisite either way and is still planned.
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::Delegate { bundle_index: 0 }]
+        );
+        // `open_proposals` is what surfaces the remaining decisions here;
+        // `needs_draft_setup` is suppressed by the pending `Delegate` step.
+        assert_eq!(plan.open_proposals, vec![1, 3]);
+        assert_eq!(
+            plan.recovered_delegation_work,
+            vec![DelegationRecoveryWork {
+                kind: DelegationRecoveryWorkKind::Delegate,
+                bundle_index: 0,
+                phase: DelegationPhase::Prepared,
+                tx_hash: None,
+            }]
+        );
+
+        // A skip is terminal, so completing the roster releases the cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert_eq!(
             plan.next_steps,
             vec![
@@ -2103,16 +2254,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(plan.open_proposals, vec![1, 3]);
-        assert_eq!(
-            plan.recovered_delegation_work,
-            vec![DelegationRecoveryWork {
-                kind: DelegationRecoveryWorkKind::Delegate,
-                bundle_index: 0,
-                phase: DelegationPhase::Prepared,
-                tx_hash: None,
-            }]
-        );
+        assert!(plan.open_proposals.is_empty());
     }
 
     #[test]
@@ -3300,6 +3442,9 @@ mod tests {
             .unwrap();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         store_two_action_batch_recovery_fixture(&db);
@@ -3338,6 +3483,9 @@ mod tests {
         db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
             .unwrap();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
             .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
@@ -3653,6 +3801,11 @@ mod tests {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
             .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
@@ -3805,6 +3958,11 @@ mod tests {
 
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
         assert_eq!(
@@ -3836,6 +3994,11 @@ mod tests {
         .unwrap();
 
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
             .unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xDD; 16]).unwrap();
 
@@ -3988,6 +4151,11 @@ mod tests {
         );
 
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
             .unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 

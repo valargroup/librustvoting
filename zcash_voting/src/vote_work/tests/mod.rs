@@ -90,12 +90,28 @@ mod round_executor {
         }
     }
 
+    /// One eligible note, so a choice intent has a bundle to plan against.
+    fn note() -> crate::NoteInfo {
+        crate::NoteInfo {
+            commitment: vec![0x01; 32],
+            nullifier: vec![0x02; 32],
+            value: crate::governance::BALLOT_DIVISOR,
+            position: 0,
+            diversifier: vec![0x03; 11],
+            rho: vec![0x04; 32],
+            rseed: vec![0x05; 32],
+            scope: 0,
+            ufvk_str: "uview1test".to_string(),
+        }
+    }
+
     fn executor() -> RoundExecutor<HyperTransport> {
         let database = Arc::new(crate::round::VotingDb::open_in_memory().unwrap());
         database.set_wallet_id("wallet");
         database
             .create_round(Network::Testnet, &round_params(), None)
             .unwrap();
+        database.ensure_bundles(ROUND_ID, &[note()]).unwrap();
         let helper_client =
             HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
         RoundExecutor::new(
@@ -182,6 +198,117 @@ mod round_executor {
             .unwrap_err();
         assert_eq!(error.kind(), crate::VotingErrorKind::InvalidInput);
         assert!(error.to_string().contains("roster"));
+    }
+
+    #[test]
+    fn a_batch_naming_an_unknown_proposal_writes_nothing() {
+        let executor = executor();
+        let error = executor
+            .set_ballot_intents(&[
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Choice(0),
+                },
+                BallotIntent {
+                    proposal_id: 9,
+                    decision: Decision::Choice(0),
+                },
+            ])
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::VotingErrorKind::InvalidInput);
+        assert!(error.to_string().contains("roster"));
+
+        // The valid leading intent must not have been applied.
+        assert_eq!(executor.plan().unwrap().open_proposals, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_batch_deciding_one_proposal_twice_is_rejected() {
+        let executor = executor();
+        let error = executor
+            .set_ballot_intents(&[
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Choice(0),
+                },
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Skipped,
+                },
+            ])
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::VotingErrorKind::InvalidInput);
+        assert!(error.to_string().contains("twice"));
+        assert_eq!(executor.plan().unwrap().open_proposals, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_batch_rejected_by_a_later_intent_rolls_back_the_earlier_one() {
+        let executor = executor();
+        let database = executor.database();
+        database
+            .set_ballot_intent(ROUND_ID, 2, Decision::Choice(1), 3)
+            .unwrap();
+        database
+            .store_delegation_tx_hash(ROUND_ID, 0, "dtx")
+            .unwrap();
+        database.store_van_position(ROUND_ID, 0, 7).unwrap();
+        crate::storage::queries::store_vote(
+            &database.conn(),
+            ROUND_ID,
+            "wallet",
+            0,
+            2,
+            1,
+            &[0xCC; 16],
+        )
+        .unwrap();
+        database
+            .record_vote_submission(ROUND_ID, 0, 2, "vtx")
+            .unwrap();
+
+        // Proposal 1 is valid, proposal 2 now contradicts a submitted vote.
+        let error = executor
+            .set_ballot_intents(&[
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Choice(0),
+                },
+                BallotIntent {
+                    proposal_id: 2,
+                    decision: Decision::Choice(2),
+                },
+            ])
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::VotingErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("ballot intent"),
+            "unexpected error: {error}"
+        );
+
+        // Proposal 1 stays open and proposal 2 keeps its original choice.
+        assert_eq!(
+            database.ballot_intents(ROUND_ID).unwrap(),
+            vec![(2, Decision::Choice(1))]
+        );
+    }
+
+    #[test]
+    fn a_valid_batch_applies_every_intent() {
+        let executor = executor();
+        let plan = executor
+            .set_ballot_intents(&[
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Choice(0),
+                },
+                BallotIntent {
+                    proposal_id: 2,
+                    decision: Decision::Skipped,
+                },
+            ])
+            .unwrap();
+        assert!(plan.open_proposals.is_empty());
     }
 
     #[tokio::test]

@@ -220,6 +220,34 @@ fn complete_plan_is_persisted_and_reused() {
 }
 
 #[test]
+fn planning_rejects_a_roster_with_an_undecided_proposal() {
+    // The round's single immediate share is derived from the complete set of
+    // choices, so an open proposal has to be refused before any plan is
+    // written. `resume_plan` withholds `NextStep::CastVote` until then.
+    let db = db_with_unique_recoverable_vote();
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+
+    let error = committed
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), crate::VotingErrorKind::InvalidInput);
+    assert!(
+        error.to_string().contains("terminal decisions"),
+        "unexpected error: {error}"
+    );
+    let stored: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM helper_share_plans", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored, 0);
+}
+
+#[test]
 fn complete_roster_derives_exactly_one_round_immediate_share() {
     let db = db_with_unique_recoverable_vote();
     seed_recoverable_vote_for_proposal(&db, 2, 1);

@@ -1298,19 +1298,14 @@ fn load_persisted_proof(
     db: &VotingDb,
     identity: &DelegationProofIdentity,
 ) -> Result<Option<DelegationProof>, VotingError> {
-    if !matches!(
-        db.delegation_phase_for_wallet(
+    if !db
+        .delegation_phase_for_wallet(
             identity.wallet_id(),
             identity.round_id(),
             identity.bundle_index(),
-        )?,
-        DelegationPhase::Proved
-            | DelegationPhase::Submitted
-            | DelegationPhase::SubmissionManaged
-            | DelegationPhase::SubmittedWithoutHash
-            | DelegationPhase::SubmissionRejected
-            | DelegationPhase::Confirmed
-    ) {
+        )?
+        .has_persisted_proof()
+    {
         return Ok(None);
     }
 

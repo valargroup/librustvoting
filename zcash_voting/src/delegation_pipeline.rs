@@ -31,7 +31,6 @@ use crate::{
         PreparedSigner, SignedDelegationBundle,
     },
     note_bundling::{BundlePolicy, MinimumVotingEligibility},
-    phases::DelegationPhase,
     pir::{PirFleet, PirProofSource},
     round::{BundleLayout, VotingDb},
     selection::select_notes_with_wallet_db,
@@ -303,14 +302,16 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     }
 
     /// Whether a durable proof already exists for the bundle.
+    ///
+    /// Every post-proof phase counts, including the lifecycle-owned and
+    /// terminal submission phases, so an offline resume or a retry after a
+    /// rejected generation reuses the persisted proof instead of re-entering
+    /// PIR. See [`crate::phases::DelegationPhase::has_persisted_proof`].
     pub fn has_persisted_proof(&self, bundle_index: u32) -> Result<bool, VotingError> {
-        let phase = self
+        Ok(self
             .voting_db
-            .delegation_phase(self.round_id(), bundle_index)?;
-        Ok(matches!(
-            phase,
-            DelegationPhase::Proved | DelegationPhase::Submitted | DelegationPhase::Confirmed
-        ))
+            .delegation_phase(self.round_id(), bundle_index)?
+            .has_persisted_proof())
     }
 
     /// Builds and persists the governance PCZT, or reuses the persisted setup.

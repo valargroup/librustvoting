@@ -369,6 +369,18 @@ configuration. The roster must be nonempty, distinct, and exactly match the
 round's durable terminal ballot intents. The SDK combines those intents with
 the durable bundle set to derive the single immediate share; the host does not
 select an immediate share index.
+
+The planner carries the other half of that contract: `resume_plan` does not
+emit `NextStep::CastVote` while any roster proposal still lacks a terminal
+decision. Casting persists the vote before the immediate share is derived, so
+planning a cast against an open ballot would advertise a step that can only
+fail after a ZKP #2 proof and a durable write. The remaining proposals are
+reported through `RoundPlan::open_proposals`; the bundle's `Delegate`
+prerequisite and the advancement of votes already on the wire are unaffected.
+Enforcement: `roster_is_terminal` in
+[`resume_plan`](../zcash_voting/src/session.rs) and
+`derive_immediate_share` in
+[`share_tracking/delivery_plan.rs`](../zcash_voting/src/share_tracking/delivery_plan.rs).
 Low-level pure planners remain implementation tools, not the wallet lifecycle
 boundary.
 
