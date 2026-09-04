@@ -455,6 +455,50 @@ async fn a_later_lower_choice_does_not_move_the_designation_or_block_its_submiss
     );
 }
 
+#[tokio::test]
+async fn a_lifecycle_owned_vote_without_an_intent_still_plans_and_delivers_its_shares() {
+    // The confirmed vote's intent row is gone (a legacy round, or a host that
+    // never recorded one); the vote is on chain, so its shares are owed and
+    // its stored choice is the decision planning derives from.
+    let db = db_with_round_and_bundle();
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    db.conn()
+        .execute(
+            "UPDATE votes SET tx_hash = 'aa' WHERE round_id = :round_id
+               AND wallet_id = :wallet_id AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": db.wallet_id() },
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "DELETE FROM ballot_intent WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": db.wallet_id() },
+        )
+        .unwrap();
+    assert!(db.ballot_intents(ROUND_ID).unwrap().is_empty());
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+
+    let plan = committed
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1]))
+        .expect("the stored choice of a lifecycle-owned vote stands as its decision");
+    assert!(plan.share_plans[0].immediate);
+
+    let transport = Arc::new(MockTransport::default());
+    committed
+        .submit_prepared_shares_unchecked(
+            &db,
+            &client_with(transport.clone()),
+            submission_params(&configured),
+            &never_cancel(),
+        )
+        .await
+        .expect("submission applies the same decision");
+    assert!(!transport.calls().is_empty());
+}
+
 #[test]
 fn the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it() {
     let db = db_with_round_and_bundle();

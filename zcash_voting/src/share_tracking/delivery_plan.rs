@@ -5,7 +5,7 @@ use rusqlite::{named_params, Connection, OptionalExtension, TransactionBehavior}
 use crate::{
     helper::url::canonical_helper_url_list,
     round::VotingDb,
-    round_planning::intent_is_lifecycle_owned,
+    round_planning::{intent_is_lifecycle_owned, vote_phase_is_lifecycle_owned},
     session::{classify_ballot_intents, load_ballot_intents, Decision},
     share::ShareOperationScope,
     share_policy::{
@@ -211,9 +211,7 @@ fn derive_immediate_share(
         });
     }
 
-    let intents: BTreeMap<u32, Decision> = load_ballot_intents(conn, round_id, wallet_id)?
-        .into_iter()
-        .collect();
+    let intents = durable_decisions(conn, round_id, wallet_id)?;
     let classification = classify_ballot_intents(proposal_ids, &intents)?;
     if !classification.open_proposals.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -274,6 +272,37 @@ fn derive_immediate_share(
         immediate_position_for_commitment(immediate_key, bundle_index, proposal_id, payloads)?;
 
     Ok((immediate_key, immediate_position))
+}
+
+/// The round's decisions as helper planning sees them: the recorded ballot
+/// intents, plus the stored choice of every vote the chain lifecycle owns
+/// that has no intent of its own. Such a vote is the wallet's transaction
+/// whatever the ballot says; its shares are owed, so its choice stands as
+/// the decision helper planning derives from.
+fn durable_decisions(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<BTreeMap<u32, Decision>, VotingError> {
+    let mut decisions: BTreeMap<u32, Decision> = load_ballot_intents(conn, round_id, wallet_id)?
+        .into_iter()
+        .collect();
+    let choices: BTreeMap<(u32, u32), u32> =
+        crate::storage::queries::get_votes(conn, round_id, wallet_id)?
+            .into_iter()
+            .map(|vote| ((vote.bundle_index, vote.proposal_id), vote.choice))
+            .collect();
+    for status in crate::phases::vote_submission_statuses_on(conn, wallet_id, round_id)? {
+        if decisions.contains_key(&status.proposal_id)
+            || !vote_phase_is_lifecycle_owned(status.phase)
+        {
+            continue;
+        }
+        if let Some(choice) = choices.get(&(status.bundle_index, status.proposal_id)) {
+            decisions.insert(status.proposal_id, Decision::Choice(*choice));
+        }
+    }
+    Ok(decisions)
 }
 
 fn immediate_key_for_choices(
@@ -452,9 +481,7 @@ pub(crate) fn load_share_delivery_plan(
     })?;
     validate_current_helper_fleet(current_fleet)?;
     validate_share_delivery_plan(&plan, payloads.len())?;
-    let intents: BTreeMap<u32, Decision> = load_ballot_intents(&conn, round_id, scope.wallet_id())?
-        .into_iter()
-        .collect();
+    let intents = durable_decisions(&conn, round_id, scope.wallet_id())?;
     if !matches!(intents.get(&proposal_id), Some(Decision::Choice(_))) {
         return Err(VotingError::InvalidInput {
             message: format!(
