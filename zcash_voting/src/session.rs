@@ -95,20 +95,6 @@ impl VotingDb {
         self.write_ballot_intent(round_id, proposal_id, decision)
     }
 
-    /// Record the voter's decisions for several proposals atomically.
-    ///
-    /// Each entry is `(proposal_id, decision, num_options)`, where
-    /// `num_options` is that proposal's declared option count. Every entry is
-    /// validated, and the batch is rejected if it names one proposal twice,
-    /// before any durable intent is written; the writes then share one
-    /// transaction, so a conflict raised by a later entry — a submitted vote
-    /// that contradicts it, for instance — leaves none of the batch applied.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VotingError::InvalidInput`] for an out-of-range proposal id,
-    /// a decision that does not fit its option count, or a repeated proposal
-    /// id.
     /// Removes the durable decision for one proposal.
     ///
     /// A decision that survives a roster change refers to a proposal the
@@ -156,6 +142,20 @@ impl VotingDb {
         })
     }
 
+    /// Record the voter's decisions for several proposals atomically.
+    ///
+    /// Each entry is `(proposal_id, decision, num_options)`, where
+    /// `num_options` is that proposal's declared option count. Every entry is
+    /// validated, and the batch is rejected if it names one proposal twice,
+    /// before any durable intent is written; the writes then share one
+    /// transaction, so a conflict raised by a later entry — a submitted vote
+    /// that contradicts it, for instance — leaves none of the batch applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] for an out-of-range proposal id,
+    /// a decision that does not fit its option count, or a repeated proposal
+    /// id.
     pub fn set_ballot_intents(
         &self,
         round_id: &str,
