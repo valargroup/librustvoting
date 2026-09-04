@@ -372,7 +372,9 @@ impl PirFleet {
     }
 
     /// Runs `operation` against connected endpoints in order until it
-    /// succeeds or fails with a non-retryable error.
+    /// succeeds or fails with anything other than a retryable PIR failure.
+    /// Local contention (`Busy`, `DbBusy`) is returned to the caller for an
+    /// operation-level retry rather than repeated against other servers.
     ///
     /// The operation must be safe to repeat against another endpoint; proof
     /// fetches and cache warm-ups are, because every persisted proof is
@@ -390,7 +392,24 @@ impl PirFleet {
     }
 }
 
-/// Shared failover policy over an ordered endpoint list.
+/// Whether a failure justifies trying the next PIR endpoint.
+///
+/// Only a retryable PIR transport failure does. Local contention such as
+/// `Busy` or `DbBusy` is also retryable, but changing servers cannot fix it
+/// and would repeat private PIR requests and database waits; it is returned
+/// to the host for an operation-level retry instead.
+fn moves_to_next_endpoint(error: &VotingError) -> bool {
+    matches!(
+        error,
+        VotingError::PirUnavailable {
+            retryable: true,
+            ..
+        }
+    )
+}
+
+/// Shared failover policy over an ordered endpoint list; see
+/// [`moves_to_next_endpoint`] for which failures advance.
 fn failover_over<S, T>(
     endpoints: &[String],
     mut connect: impl FnMut(&str) -> Result<S, VotingError>,
@@ -401,12 +420,12 @@ fn failover_over<S, T>(
         let has_next = index < last;
         let session = match connect(endpoint) {
             Ok(session) => session,
-            Err(error) if error.retryable() && has_next => continue,
+            Err(error) if moves_to_next_endpoint(&error) && has_next => continue,
             Err(error) => return Err(error),
         };
         match operation(&session) {
             Ok(value) => return Ok((session, value)),
-            Err(error) if error.retryable() && has_next => continue,
+            Err(error) if moves_to_next_endpoint(&error) && has_next => continue,
             Err(error) => return Err(error),
         }
     }

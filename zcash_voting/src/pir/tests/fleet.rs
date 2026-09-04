@@ -70,3 +70,27 @@ fn failover_stops_on_non_retryable_failure_and_on_exhaustion() {
         VotingError::PirUnavailable { endpoint: Some(ref endpoint), .. } if endpoint == "b"
     ));
 }
+
+#[test]
+fn local_contention_is_returned_instead_of_failing_over() {
+    let endpoints: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+    let mut operations = 0;
+    let error = failover_over(
+        &endpoints,
+        |endpoint| Ok(endpoint.to_string()),
+        |_| {
+            operations += 1;
+            Err::<(), _>(VotingError::DbBusy {
+                message: "database is locked".to_string(),
+            })
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.retryable(), "the host may retry the operation later");
+    assert_eq!(error.kind(), crate::VotingErrorKind::DbBusy);
+    assert_eq!(
+        operations, 1,
+        "another endpoint cannot fix local contention"
+    );
+}
