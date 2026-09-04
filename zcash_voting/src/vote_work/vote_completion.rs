@@ -4,7 +4,9 @@
 
 use crate::{
     round_planning::VoteUnitId,
-    share_tracking::{ShareDeliveryPlanningParams, ShareDeliverySubmissionParams},
+    share_tracking::{
+        ShareBatchDeliveryReport, ShareDeliveryPlanningParams, ShareDeliverySubmissionParams,
+    },
     vote::{recover_atomic_vote_batch, CommittedVote, SignedVoteBatch},
     AdvanceVote, AdvanceVoteBatch, ChainAdvanceOutcome, ChainAdvancePolicy, ChainAdvanceRequest,
     ChainTransport, VotingError,
@@ -32,6 +34,41 @@ pub(super) enum CompletionEntry {
         advance_chain: bool,
         plans_first: bool,
     },
+}
+
+/// What one vote's helper delivery report says about the shares it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeliveryProgress {
+    /// Every share reached at least one helper definitely.
+    Complete,
+    /// Every share reached the helpers, but some only ambiguously: no helper
+    /// definitely holds it yet, and tracking must reconcile those attempts
+    /// before another delivery can make progress.
+    AwaitingAmbiguousHelpers,
+    /// Some share reached no helper at all, or was left pending.
+    Incomplete,
+}
+
+/// Classifies `report`. Ambiguous attempts are excluded from the next
+/// delivery pass, so treating them as complete would let a step report
+/// `Advanced` forever without a share ever landing.
+pub(super) fn delivery_progress(report: &ShareBatchDeliveryReport) -> DeliveryProgress {
+    if !report.pending_share_indices.is_empty()
+        || report.deliveries.iter().any(|delivery| {
+            delivery.submission.accepted_urls.is_empty()
+                && delivery.submission.ambiguous_urls.is_empty()
+        })
+    {
+        return DeliveryProgress::Incomplete;
+    }
+    if report
+        .deliveries
+        .iter()
+        .any(|delivery| delivery.submission.accepted_urls.is_empty())
+    {
+        return DeliveryProgress::AwaitingAmbiguousHelpers;
+    }
+    DeliveryProgress::Complete
 }
 
 /// Planning inputs for one vote's helper plan under the host's clock.
@@ -369,23 +406,29 @@ impl<T: ChainTransport> RoundExecutor<T> {
             };
             progress.report(RoundStepProgress::ShareOutcome(report.clone()));
             let cancelled = report.delivery.cancelled;
-            let incomplete = !report.delivery.pending_share_indices.is_empty()
-                || report.delivery.deliveries.iter().any(|delivery| {
-                    delivery.submission.accepted_urls.is_empty()
-                        && delivery.submission.ambiguous_urls.is_empty()
-                });
+            let delivery_progress = delivery_progress(&report.delivery);
             ledger.record_delivery(report);
             if cancelled {
                 return self.step_cancelled(scope, ledger);
             }
-            if incomplete {
-                return Err(self.step_failure(
-                    RoundStepFailureKind::HelperDeliveryIncomplete,
-                    Some(&scope.step),
-                    None,
-                    &ledger,
-                    "helper delivery ended with pending shares",
-                ));
+            match delivery_progress {
+                DeliveryProgress::Complete => {}
+                DeliveryProgress::AwaitingAmbiguousHelpers => {
+                    // The step made no definite placement it could repeat:
+                    // only tracking can classify those attempts. Report
+                    // pending so the host schedules again instead of
+                    // rerunning delivery at once.
+                    return self.outcome(scope, RoundStepDisposition::Pending, ledger);
+                }
+                DeliveryProgress::Incomplete => {
+                    return Err(self.step_failure(
+                        RoundStepFailureKind::HelperDeliveryIncomplete,
+                        Some(&scope.step),
+                        None,
+                        &ledger,
+                        "helper delivery ended with pending shares",
+                    ));
+                }
             }
         }
         self.outcome(scope, RoundStepDisposition::Advanced, ledger)
