@@ -227,6 +227,11 @@ pub type RouteFuture<'a> =
 ///   call and classifies its own deadline by whether the hook was called.
 /// - Report `phase` truthfully. It is consulted for failures the dispatch hook
 ///   cannot classify, such as a body-read failure after headers arrived.
+/// - Never follow redirects. Return a 3xx response as received. The SDK
+///   records helper acceptance against the configured URL and rejects
+///   vote-chain redirects; a client that followed a 307 or 308 would deliver
+///   a share to an unconfigured endpoint and report it as accepted by the
+///   configured one. [`DirectRoute`] does not follow redirects.
 pub trait RouteHttp: Send + Sync + 'static {
     fn execute<'a>(
         &'a self,
