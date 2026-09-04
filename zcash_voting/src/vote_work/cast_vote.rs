@@ -78,6 +78,14 @@ impl<T: ChainTransport> RoundExecutor<T> {
         })?;
         let network = binding.network;
         let round_id = binding.round_id.clone();
+        // The bound hotkey must be the one the bundle's delegation targets;
+        // otherwise ZKP #2 would fail only after a tree sync and a witness.
+        let bound_target = VotingHotkey::from_stored_secret(hotkey_secret.as_slice(), network)
+            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?
+            .delegation_target();
+        self.database
+            .validate_bundle_hotkey_target(&round_id, bundle_index, &bound_target)
+            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
 
         // Tree sync and witness generation block on their own HTTP runtime.
         // Nodes are tried in order. Every failed sync drops the round's cached

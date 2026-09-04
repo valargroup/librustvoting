@@ -902,27 +902,76 @@ mod round_executor {
         wallet_id: &str,
         cancel_on_request: Option<ChainSubmissionControl>,
     ) -> (RoundExecutor<HyperTransport>, Arc<UnreachableTreeTransport>) {
-        let database = host_database_for(wallet_id);
-        // A confirmed delegation carries its VAN commitment; the tree sync
-        // reads it to place the bundle in the synced tree.
-        let van_commitment = {
+        executor_ready_to_cast_with_hotkey_and_control(wallet_id, 0x21, cancel_on_request)
+    }
+
+    fn executor_ready_to_cast_with_hotkey_and_control(
+        wallet_id: &str,
+        bound_hotkey_byte: u8,
+        cancel_on_request: Option<ChainSubmissionControl>,
+    ) -> (RoundExecutor<HyperTransport>, Arc<UnreachableTreeTransport>) {
+        // Regtest activates NU6.3 at a low height, which the Ironwood
+        // governance-output derivation below requires of the round snapshot.
+        let network = Network::Regtest;
+        let round_params = VotingRoundParams {
+            snapshot_height: u64::from(crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT),
+            ..round_params()
+        };
+        let database = Arc::new(crate::round::VotingDb::open_in_memory().unwrap());
+        database.set_wallet_id(wallet_id);
+        database.create_round(network, &round_params, None).unwrap();
+        database.ensure_bundles(ROUND_ID, &[note()]).unwrap();
+
+        // The stored delegation rows derive from hotkey 0x21's target: the
+        // governance output commitment and the target-bound VAN commitment
+        // both have to reproduce for CastVote to accept the bound hotkey.
+        let target = crate::VotingHotkey::from_stored_secret(&[0x21; 64], network)
+            .unwrap()
+            .delegation_target();
+        let (rho_signed, van_comm_rand) = {
             use crate::backend::pasta_curves::{group::ff::PrimeField, pallas};
-            pallas::Base::from(9u64).to_repr().to_vec()
+            (
+                pallas::Base::from(5u64).to_repr(),
+                pallas::Base::from(9u64).to_repr(),
+            )
+        };
+        let rseed_output = [0x47u8; 32];
+        let cmx_new = crate::action::derive_governance_output_cmx(
+            target.raw_orchard_address(),
+            &rho_signed,
+            &rseed_output,
+            network,
+            round_params.snapshot_height,
+        )
+        .unwrap();
+        let van_commitment = {
+            let (g_d_x, pk_d_x) = crate::action::derive_hotkey_x_coords_from_raw_address(
+                target.raw_orchard_address(),
+            )
+            .unwrap();
+            crate::governance::construct_van(
+                &g_d_x,
+                &pk_d_x,
+                crate::governance::BALLOT_DIVISOR,
+                &hex::decode(ROUND_ID).unwrap(),
+                &van_comm_rand,
+            )
+            .unwrap()
         };
         crate::storage::queries::store_delegation_data(
             &database.conn(),
             ROUND_ID,
             wallet_id,
             0,
-            &[0x41; 32],
+            &van_comm_rand,
             &[],
-            &[0x42; 32],
+            &rho_signed,
             &[],
             &[0x43; 32],
-            &[0x44; 32],
+            &cmx_new,
             &[0x45; 32],
             &[0x46; 32],
-            &[0x47; 32],
+            &rseed_output,
             &van_commitment,
             crate::governance::BALLOT_DIVISOR,
             0,
@@ -935,7 +984,34 @@ mod round_executor {
             .store_delegation_tx_hash(ROUND_ID, 0, "dtx")
             .unwrap();
         database.store_van_position(ROUND_ID, 0, 7).unwrap();
-        let (executor, _) = bound_executor(database, Some(zeroize::Zeroizing::new(vec![0x21; 64])));
+
+        let helper_client =
+            HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
+        let executor = RoundExecutor::new(
+            database,
+            ChainSubmissionClientConfig::for_network(
+                network,
+                vec!["http://chain.invalid".to_string()],
+            ),
+            helper_client,
+        )
+        .unwrap()
+        .with_binding(RoundBinding {
+            round_id: ROUND_ID.to_string(),
+            network,
+            proposals: vec![
+                ProposalRosterEntry {
+                    proposal_id: 1,
+                    num_options: 2,
+                },
+                ProposalRosterEntry {
+                    proposal_id: 2,
+                    num_options: 3,
+                },
+            ],
+            hotkey_secret: Some(zeroize::Zeroizing::new(vec![bound_hotkey_byte; 64])),
+        })
+        .unwrap();
         executor
             .set_ballot_intents(&[
                 BallotIntent {
@@ -1527,5 +1603,38 @@ mod round_executor {
             .err()
             .expect("a one-option proposal cannot be voted on");
         assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_bound_hotkey_that_is_not_the_delegation_target_is_refused_before_tree_io() {
+        // The bundle's confirmed delegation targets hotkey 0x21; the executor
+        // is bound to a different valid hotkey.
+        let (executor, transport) =
+            executor_ready_to_cast_with_hotkey_and_control("wallet-wrong-hotkey", 0x22, None);
+        let cast = NextStep::CastVote {
+            bundle_index: 0,
+            proposal_id: 1,
+            choice: 0,
+        };
+        let control = ChainSubmissionControl::new(1);
+
+        let failure = executor
+            .advance_step(cast, &host(), &control, &NoopRoundStepProgressReporter {})
+            .await
+            .expect_err("hotkey 0x22 cannot spend a delegation made for 0x21");
+
+        assert_eq!(failure.kind, RoundStepFailureKind::InvalidInput);
+        assert!(
+            failure
+                .message
+                .contains("does not match the confirmed delegation target"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(
+            transport.requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no tree request may be made for a hotkey that cannot vote"
+        );
     }
 }

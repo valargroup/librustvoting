@@ -81,6 +81,24 @@ fn validate_delegation_target_for_bundle(
     identity: &DelegationProofIdentity,
     keys: &DelegationKeys,
 ) -> Result<(), VotingError> {
+    validate_hotkey_address_for_bundle(
+        conn,
+        params,
+        stored_network,
+        identity,
+        &keys.hotkey_raw_address,
+    )
+}
+
+/// Checks that `hotkey_raw_address` reproduces the bundle's persisted
+/// governance output and target-bound VAN commitment.
+fn validate_hotkey_address_for_bundle(
+    conn: &rusqlite::Connection,
+    params: &VotingRoundParams,
+    stored_network: Network,
+    identity: &DelegationProofIdentity,
+    hotkey_raw_address: &[u8; 43],
+) -> Result<(), VotingError> {
     let binding = queries::load_delegation_target_binding_inputs(
         conn,
         identity.round_id(),
@@ -121,14 +139,14 @@ fn validate_delegation_target_for_bundle(
                 ),
             })?;
     let expected_cmx = crate::action::derive_governance_output_cmx(
-        &keys.hotkey_raw_address,
+        hotkey_raw_address,
         &rho_signed,
         &rseed_output,
         stored_network,
         params.snapshot_height,
     )?;
     let (g_d_x, pk_d_x) =
-        crate::action::derive_hotkey_x_coords_from_raw_address(&keys.hotkey_raw_address)?;
+        crate::action::derive_hotkey_x_coords_from_raw_address(hotkey_raw_address)?;
     let vote_round_id =
         hex::decode(&params.vote_round_id).map_err(|error| VotingError::Internal {
             message: format!(
@@ -1371,6 +1389,42 @@ impl VotingDb {
             identity.bundle_index(),
             notes,
         )
+    }
+
+    /// Validates that a voting hotkey target reproduces a persisted bundle's
+    /// governance output and target-bound VAN commitment, so a vote is not
+    /// prepared for a hotkey that cannot spend the bundle's delegation.
+    pub(crate) fn validate_bundle_hotkey_target(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        target: &crate::VotingHotkeyTarget,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let identity = DelegationProofIdentity::new(
+            self.connection_id(),
+            wallet_id.clone(),
+            round_id,
+            bundle_index,
+        );
+        let (params, stored_network) =
+            queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
+        validate_hotkey_address_for_bundle(
+            &conn,
+            &params,
+            stored_network,
+            &identity,
+            target.raw_orchard_address(),
+        )
+        .map_err(|error| match error {
+            VotingError::InvalidInput { .. } => VotingError::InvalidInput {
+                message: format!(
+                    "round {round_id} bundle {bundle_index}: the bound voting hotkey does not match the confirmed delegation target"
+                ),
+            },
+            other => other,
+        })
     }
 
     /// Validates that supplied keys reproduce a persisted bundle's target-bound
