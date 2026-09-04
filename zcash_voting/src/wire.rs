@@ -532,7 +532,8 @@ pub enum VotingErrorKindView {
 /// `kind`, `retryable`, and `message` are always populated. The remaining
 /// fields carry the structured payload of the kinds that have one:
 /// `bundle_index` for `KeystoneSignatureConflict` and `SetupAlreadyPersisted`;
-/// `snapshot_height`, the weight fields, and the note counts for
+/// `snapshot_height`, the weight fields, the selected note count, and the
+/// bundle slot capacity for
 /// `InsufficientEligibility` and `NoSpendableNotes`; `http_status` and
 /// `endpoint` for `PirUnavailable`.
 ///
@@ -548,7 +549,7 @@ pub struct VotingErrorView {
     pub snapshot_height: Option<u64>,
     pub required_weight_zatoshi: Option<u64>,
     pub selected_weight_zatoshi: Option<u64>,
-    pub required_notes: Option<u32>,
+    pub bundle_note_slots: Option<u32>,
     pub selected_notes: Option<u32>,
     pub http_status: Option<u16>,
     pub endpoint: Option<String>,
@@ -693,6 +694,8 @@ pub enum RoundStepDispositionView {
 #[serde(rename_all = "snake_case")]
 pub enum RoundStepFailureKindView {
     InvalidInput,
+    InsufficientEligibility,
+    NoSpendableNotes,
     Busy,
     Storage,
     InvariantViolation,

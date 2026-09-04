@@ -502,7 +502,7 @@ pub(crate) fn minimum_voting_eligibility_error(
         required_weight_zatoshi: MINIMUM_VOTING_WEIGHT_ZATOSHI,
         selected_weight_zatoshi: eligibility.eligible_weight,
         snapshot_height: None,
-        required_notes: u32::try_from(MINIMUM_VOTING_NOTE_COUNT).unwrap_or(u32::MAX),
+        bundle_note_slots: u32::try_from(MINIMUM_VOTING_NOTE_COUNT).unwrap_or(u32::MAX),
         selected_notes: u32::try_from(eligibility.distinct_note_count).unwrap_or(u32::MAX),
     }
 }

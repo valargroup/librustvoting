@@ -69,6 +69,18 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- **Breaking:** `RoundStepFailureKind` (and its wire view) gains
+  `InsufficientEligibility` and `NoSpendableNotes` so hosts can tell an
+  eligibility problem from malformed input without parsing messages.
+- **Breaking:** `VotingError::InsufficientEligibility::required_notes` and
+  the matching view field are renamed `bundle_note_slots`; the value is the
+  bundle's note capacity, not a required note count.
+- `RoundExecutor::plan` revalidates the stored round's network on every call,
+  and `CastVote` checks that the bound hotkey is the bundle's confirmed
+  delegation target before the first tree request.
+- The wallet example builds one `HyperTransport` for helpers, the chain, and
+  the vote tree.
+
 - `advance_until_terminal` escalates to the exact tree immediately after a
   `Recovering` result; `pending_repoll` paces only `Tracking` polls.
 - `RoundExecutor::with_binding` validates every roster entry's proposal id

@@ -230,6 +230,10 @@ pub struct RoundStepOutcome {
 #[non_exhaustive]
 pub enum RoundStepFailureKind {
     InvalidInput,
+    /// The wallet's eligible weight is below the round minimum.
+    InsufficientEligibility,
+    /// The wallet holds no spendable notes at the round snapshot.
+    NoSpendableNotes,
     Busy,
     Storage,
     InvariantViolation,

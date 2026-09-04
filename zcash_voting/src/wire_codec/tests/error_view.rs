@@ -11,7 +11,7 @@ fn voting_error_view_carries_structured_payloads() {
         required_weight_zatoshi: 12_500_000,
         selected_weight_zatoshi: 3,
         snapshot_height: None,
-        required_notes: 5,
+        bundle_note_slots: 5,
         selected_notes: 2,
     }
     .with_snapshot_height(42)
@@ -24,7 +24,7 @@ fn voting_error_view_carries_structured_payloads() {
     assert_eq!(eligibility.snapshot_height, Some(42));
     assert_eq!(eligibility.required_weight_zatoshi, Some(12_500_000));
     assert_eq!(eligibility.selected_weight_zatoshi, Some(3));
-    assert_eq!(eligibility.required_notes, Some(5));
+    assert_eq!(eligibility.bundle_note_slots, Some(5));
     assert_eq!(eligibility.selected_notes, Some(2));
     assert!(eligibility.message.contains("at snapshot height 42"));
 

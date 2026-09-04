@@ -125,7 +125,7 @@ pub enum VotingError {
         /// Snapshot height the check was evaluated at, when the caller knows it.
         snapshot_height: Option<u64>,
         /// Note slots one bundle must fill before it carries voting weight.
-        required_notes: u32,
+        bundle_note_slots: u32,
         /// Distinct notes that survived bundle planning.
         selected_notes: u32,
     },
@@ -199,13 +199,13 @@ impl VotingError {
                 required_weight_zatoshi,
                 selected_weight_zatoshi,
                 snapshot_height: None,
-                required_notes,
+                bundle_note_slots,
                 selected_notes,
             } => Self::InsufficientEligibility {
                 required_weight_zatoshi,
                 selected_weight_zatoshi,
                 snapshot_height: Some(height),
-                required_notes,
+                bundle_note_slots,
                 selected_notes,
             },
             other => other,

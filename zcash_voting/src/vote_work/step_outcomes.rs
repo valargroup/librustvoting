@@ -123,10 +123,13 @@ impl<T: ChainTransport> RoundExecutor<T> {
         chain_outcome: Option<ChainSubmissionResult>,
     ) -> RoundStepFailure {
         let kind = match error.kind() {
-            VotingErrorKind::InvalidInput
-            | VotingErrorKind::InsufficientEligibility
-            | VotingErrorKind::NoSpendableNotes
-            | VotingErrorKind::SetupAlreadyPersisted => RoundStepFailureKind::InvalidInput,
+            VotingErrorKind::InvalidInput | VotingErrorKind::SetupAlreadyPersisted => {
+                RoundStepFailureKind::InvalidInput
+            }
+            VotingErrorKind::InsufficientEligibility => {
+                RoundStepFailureKind::InsufficientEligibility
+            }
+            VotingErrorKind::NoSpendableNotes => RoundStepFailureKind::NoSpendableNotes,
             VotingErrorKind::Busy | VotingErrorKind::DbBusy => RoundStepFailureKind::Busy,
             VotingErrorKind::Storage => RoundStepFailureKind::Storage,
             VotingErrorKind::PirUnavailable => RoundStepFailureKind::Transport,

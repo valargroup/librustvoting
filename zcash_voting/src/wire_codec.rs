@@ -1089,6 +1089,8 @@ impl From<crate::RoundStepFailureKind> for RoundStepFailureKindView {
         use crate::RoundStepFailureKind as K;
         match kind {
             K::InvalidInput => Self::InvalidInput,
+            K::InsufficientEligibility => Self::InsufficientEligibility,
+            K::NoSpendableNotes => Self::NoSpendableNotes,
             K::Busy => Self::Busy,
             K::Storage => Self::Storage,
             K::InvariantViolation => Self::InvariantViolation,
@@ -1285,7 +1287,7 @@ impl From<&VotingError> for VotingErrorView {
             snapshot_height: None,
             required_weight_zatoshi: None,
             selected_weight_zatoshi: None,
-            required_notes: None,
+            bundle_note_slots: None,
             selected_notes: None,
             http_status: None,
             endpoint: None,
@@ -1298,13 +1300,13 @@ impl From<&VotingError> for VotingErrorView {
                 required_weight_zatoshi,
                 selected_weight_zatoshi,
                 snapshot_height,
-                required_notes,
+                bundle_note_slots,
                 selected_notes,
             } => {
                 view.required_weight_zatoshi = Some(*required_weight_zatoshi);
                 view.selected_weight_zatoshi = Some(*selected_weight_zatoshi);
                 view.snapshot_height = *snapshot_height;
-                view.required_notes = Some(*required_notes);
+                view.bundle_note_slots = Some(*bundle_note_slots);
                 view.selected_notes = Some(*selected_notes);
             }
             VotingError::NoSpendableNotes { snapshot_height } => {

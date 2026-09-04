@@ -30,7 +30,7 @@ fn eligibility_error_text_matches_legacy_wording_with_optional_height() {
         required_weight_zatoshi: 12_500_000,
         selected_weight_zatoshi: 30,
         snapshot_height: None,
-        required_notes: 5,
+        bundle_note_slots: 5,
         selected_notes: 2,
     };
     assert_eq!(
