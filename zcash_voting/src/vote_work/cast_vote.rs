@@ -83,7 +83,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // Nodes are tried in order. Every failed sync drops the round's cached
         // tree, including the last node's, so neither the next node nor the
         // next pass inherits a partially appended or mismatched tree.
-        validate_vote_tree_node_urls(&host.vote_tree_node_urls, network)
+        let node_urls = canonical_vote_tree_node_urls(&host.vote_tree_node_urls, network)
             .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
         // One handle serves the sync, any reset, and the witness, so another
         // executor rebinding this wallet's transport in between cannot hand
@@ -98,7 +98,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         };
         let mut height = None;
         let mut last_failure = None;
-        for node_url in &host.vote_tree_node_urls {
+        for node_url in &node_urls {
             let db = Arc::clone(&self.database);
             let sync_tree = Arc::clone(&tree);
             let sync_round_id = round_id.clone();
@@ -257,43 +257,57 @@ impl<T: ChainTransport> RoundExecutor<T> {
     }
 }
 
-/// Validates the complete vote-tree node list before any sync.
+/// Validates the complete vote-tree node list before any sync and returns the
+/// base URLs the tree client will extend.
 ///
-/// Every URL must parse with an `http` or `https` scheme and a host, and on
-/// Mainnet every URL must use HTTPS, matching the chain client's endpoint
-/// rule: a plaintext tree endpoint would expose the wallet's round-specific
-/// traffic and let an on-path attacker serve a forged tree that drives
-/// expensive proving before the chain rejects the anchor.
-pub(super) fn validate_vote_tree_node_urls(
+/// Every URL must parse with an `http` or `https` scheme and a host, carry no
+/// query or fragment, and on Mainnet use HTTPS, matching the chain client's
+/// endpoint rule: a plaintext tree endpoint would expose the wallet's
+/// round-specific traffic and let an on-path attacker serve a forged tree that
+/// drives expensive proving before the chain rejects the anchor. The tree
+/// client appends its API path to the base verbatim, so a query would swallow
+/// the path and a trailing slash would double it; trailing slashes are
+/// removed and query or fragment forms rejected.
+pub(super) fn canonical_vote_tree_node_urls(
     node_urls: &[String],
     network: Network,
-) -> Result<(), VotingError> {
+) -> Result<Vec<String>, VotingError> {
     if node_urls.is_empty() {
         return Err(VotingError::InvalidInput {
             message: "casting a vote requires at least one vote-tree node URL".to_string(),
         });
     }
-    for node_url in node_urls {
-        let uri: http::Uri = node_url
-            .parse()
-            .map_err(|error| VotingError::InvalidInput {
-                message: format!("vote-tree node URL {node_url:?} is invalid: {error}"),
-            })?;
-        let scheme = uri.scheme_str().unwrap_or_default();
-        if !matches!(scheme, "http" | "https") || uri.host().is_none() {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "vote-tree node URL {node_url:?} must be an http or https URL with a host"
-                ),
-            });
-        }
-        if network == Network::Mainnet && scheme != "https" {
-            return Err(VotingError::InvalidInput {
-                message: format!("production vote-tree node URL {node_url:?} must use HTTPS"),
-            });
-        }
-    }
-    Ok(())
+    node_urls
+        .iter()
+        .map(|node_url| {
+            if node_url.contains('?') || node_url.contains('#') {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "vote-tree node URL {node_url:?} must be a base URL without a query or fragment"
+                    ),
+                });
+            }
+            let uri: http::Uri = node_url
+                .parse()
+                .map_err(|error| VotingError::InvalidInput {
+                    message: format!("vote-tree node URL {node_url:?} is invalid: {error}"),
+                })?;
+            let scheme = uri.scheme_str().unwrap_or_default();
+            if !matches!(scheme, "http" | "https") || uri.host().is_none() {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "vote-tree node URL {node_url:?} must be an http or https URL with a host"
+                    ),
+                });
+            }
+            if network == Network::Mainnet && scheme != "https" {
+                return Err(VotingError::InvalidInput {
+                    message: format!("production vote-tree node URL {node_url:?} must use HTTPS"),
+                });
+            }
+            Ok(node_url.trim_end_matches('/').to_string())
+        })
+        .collect()
 }
 
 /// Syncs one round from `node_url` and, on failure, drops the round's cached

@@ -88,18 +88,25 @@ fn step_control_treats_an_epoch_change_like_cancellation() {
 }
 
 #[test]
-fn vote_tree_node_urls_must_be_http_urls_and_https_on_mainnet() {
-    use super::cast_vote::validate_vote_tree_node_urls;
+fn vote_tree_node_urls_are_canonical_base_urls_and_https_on_mainnet() {
+    use super::cast_vote::canonical_vote_tree_node_urls;
     use crate::{Network, VotingError};
 
     let urls = |list: &[&str]| list.iter().map(|url| url.to_string()).collect::<Vec<_>>();
 
-    validate_vote_tree_node_urls(
-        &urls(&["http://node.test:8080", "https://node.test"]),
-        Network::Testnet,
-    )
-    .unwrap();
-    validate_vote_tree_node_urls(&urls(&["https://node.example"]), Network::Mainnet).unwrap();
+    assert_eq!(
+        canonical_vote_tree_node_urls(
+            &urls(&["http://node.test:8080/", "https://node.test/mount///"]),
+            Network::Testnet,
+        )
+        .unwrap(),
+        urls(&["http://node.test:8080", "https://node.test/mount"]),
+        "trailing slashes are removed so the API path is appended once"
+    );
+    assert_eq!(
+        canonical_vote_tree_node_urls(&urls(&["https://node.example"]), Network::Mainnet).unwrap(),
+        urls(&["https://node.example"])
+    );
 
     for (list, network, needle) in [
         (urls(&[]), Network::Testnet, "at least one"),
@@ -115,8 +122,18 @@ fn vote_tree_node_urls_must_be_http_urls_and_https_on_mainnet() {
         ),
         (urls(&["not a url"]), Network::Testnet, "is invalid"),
         (urls(&["/relative/path"]), Network::Testnet, "with a host"),
+        (
+            urls(&["https://node.example?api_key=x"]),
+            Network::Testnet,
+            "without a query or fragment",
+        ),
+        (
+            urls(&["https://node.example/#tree"]),
+            Network::Testnet,
+            "without a query or fragment",
+        ),
     ] {
-        let error = validate_vote_tree_node_urls(&list, network).unwrap_err();
+        let error = canonical_vote_tree_node_urls(&list, network).unwrap_err();
         assert!(
             matches!(error, VotingError::InvalidInput { .. }),
             "{list:?}: {error}"
