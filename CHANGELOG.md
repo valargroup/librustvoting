@@ -69,6 +69,13 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- A plan refresh that fails after a step or recovery pass produced a chain
+  outcome keeps that outcome on the failure.
+- `RoundExecutor::with_binding` rejects a hotkey secret that does not
+  reconstruct, before any tree sync.
+- `PirFleet::new` canonicalizes endpoint URLs (scheme and host case, default
+  port, trailing slashes) before dropping duplicates.
+
 - Delegation proof coordination keys its process-local lock by sidecar
   connection as well as wallet, round, and bundle.
 - `CastVote` canonicalizes vote-tree node URLs: trailing slashes are removed

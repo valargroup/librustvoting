@@ -365,7 +365,14 @@ impl<T: ChainTransport> RoundExecutor<T> {
         request: VoteRecoveryRequest<'_>,
     ) -> Result<VoteRecoveryAdvance, VoteRecoveryFailure> {
         let round_plan = resume_plan(&self.database, request.round_id, request.proposal_ids)
-            .map_err(|error| self.voting_failure(error, Some(work.clone()), request))?;
+            .map_err(|error| {
+                self.voting_failure_after_chain(
+                    error,
+                    Some(work.clone()),
+                    chain_outcome.clone(),
+                    request,
+                )
+            })?;
         Ok(VoteRecoveryAdvance {
             attempted_work: Some(work),
             disposition,
@@ -382,7 +389,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
         request: VoteRecoveryRequest<'_>,
     ) -> Result<VoteRecoveryAdvance, VoteRecoveryFailure> {
         let round_plan = resume_plan(&self.database, request.round_id, request.proposal_ids)
-            .map_err(|error| self.voting_failure(error, work.clone(), request))?;
+            .map_err(|error| {
+                self.voting_failure_after_chain(error, work.clone(), chain_outcome.clone(), request)
+            })?;
         Ok(VoteRecoveryAdvance {
             attempted_work: work,
             disposition: VoteRecoveryDisposition::Cancelled,
