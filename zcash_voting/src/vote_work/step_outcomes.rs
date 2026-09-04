@@ -172,6 +172,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             chain_outcome,
             message: bounded_message(message.as_ref()),
             plan: self.plan().ok().map(Box::new),
+            share_deliveries: Vec::new(),
         }
     }
 }

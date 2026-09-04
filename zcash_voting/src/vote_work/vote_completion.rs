@@ -209,6 +209,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     Some(step.clone()),
                     chain_outcome.clone(),
                 )
+                .with_share_deliveries(deliveries.clone())
             })?
             .ok_or_else(|| {
                 self.step_failure(
@@ -218,8 +219,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     chain_outcome.clone(),
                     "vote was reported confirmed but its recovery material has no tree position",
                 )
+                .with_share_deliveries(deliveries.clone())
             })?;
             let cancel = || control.interrupted();
+            // Reports of the votes delivered so far ride on every failure
+            // from here on: their network effects happened and are otherwise
+            // visible only to a progress reporter.
             let delivery = vote
                 .submit_prepared_shares(
                     &self.database,
@@ -237,6 +242,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                         Some(step.clone()),
                         chain_outcome.clone(),
                     )
+                    .with_share_deliveries(deliveries.clone())
                 })?;
             let report = VoteShareDeliveryReport {
                 vote: vote_key(vote.vote()),
@@ -254,13 +260,15 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 return self.step_cancelled(Some(step), chain_outcome, deliveries, None);
             }
             if incomplete {
-                return Err(self.step_failure(
-                    RoundStepFailureKind::HelperDeliveryIncomplete,
-                    Some(step),
-                    None,
-                    chain_outcome,
-                    "helper delivery ended with pending shares",
-                ));
+                return Err(self
+                    .step_failure(
+                        RoundStepFailureKind::HelperDeliveryIncomplete,
+                        Some(step),
+                        None,
+                        chain_outcome,
+                        "helper delivery ended with pending shares",
+                    )
+                    .with_share_deliveries(deliveries));
             }
         }
         self.outcome(

@@ -124,7 +124,21 @@ This release is `zcash_voting` 4.0.0.
   `van_witness`, and a round-scoped `reset_vote_tree` are served by the
   client that holds the round, so the standalone sync-then-witness path lands
   on the same state even when another executor synced in between. A routed
-  client is dropped once no caller holds its transport.
+  client is kept while a caller holds its transport or while it holds any
+  round's tree state, so a host that moves its only transport clone into
+  `sync_vote_tree_with` still gets that sync's state from `van_witness`.
+- PIR endpoint canonicalization resolves `.` and `..` path segments, so
+  `https://pir.example/a/../api` and `https://pir.example/api` dedupe to one
+  fleet member and failover never repeats a request against the same
+  resource.
+- `DelegationPipeline::new` refuses anchor tree state bytes that do not
+  decode with `InvalidInput`; a decode failure was previously reported as
+  `Internal` and, through the executor, as an invariant violation.
+- `RoundStepFailure` and `VoteRecoveryFailure` carry `share_deliveries`, the
+  helper delivery reports accumulated before the failure, so a
+  `HelperDeliveryIncomplete` failure or a later error keeps the accepted,
+  ambiguous, and pending share results. `RoundStepFailureView` gains the
+  matching optional `share_deliveries` field.
 - `DelegationPipeline` checks a persisted delegation setup against the
   pipeline's notes and target-bound hotkey before reusing it for signing, the
   same check a persisted proof already gets.

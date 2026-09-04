@@ -726,6 +726,10 @@ pub struct RoundStepFailureView {
     pub chain_outcome: Option<ChainSubmissionOutcomeView>,
     pub message: String,
     pub plan: Option<RoundPlanView>,
+    /// Helper delivery reports accumulated before the failure; absent in
+    /// payloads from SDKs that predate the field.
+    #[serde(default)]
+    pub share_deliveries: Vec<ShareBatchDeliveryReportView>,
 }
 
 /// Delegation proving and signing stages.

@@ -254,6 +254,22 @@ pub struct RoundStepFailure {
     pub chain_outcome: Option<ChainSubmissionResult>,
     pub message: String,
     pub plan: Option<Box<RoundPlan>>,
+    /// Helper delivery reports the step accumulated before it failed. Each
+    /// records network effects that did happen (accepted, ambiguous, and
+    /// pending shares), so a `HelperDeliveryIncomplete` failure or a later
+    /// error does not lose what earlier shares reached the helpers.
+    pub share_deliveries: Vec<VoteShareDeliveryReport>,
+}
+
+impl RoundStepFailure {
+    /// Attaches the delivery reports accumulated before this failure.
+    pub(crate) fn with_share_deliveries(
+        mut self,
+        share_deliveries: Vec<VoteShareDeliveryReport>,
+    ) -> Self {
+        self.share_deliveries = share_deliveries;
+        self
+    }
 }
 
 /// Complete authenticated host inputs for one bounded persisted-vote pass.
@@ -382,6 +398,20 @@ pub struct VoteRecoveryFailure {
     pub chain_outcome: Option<ChainSubmissionResult>,
     pub message: String,
     pub round_plan: Option<Box<RoundPlan>>,
+    /// Helper delivery reports the pass accumulated before it failed; see
+    /// [`RoundStepFailure::share_deliveries`].
+    pub share_deliveries: Vec<VoteShareDeliveryReport>,
+}
+
+impl VoteRecoveryFailure {
+    /// Attaches the delivery reports accumulated before this failure.
+    pub(crate) fn with_share_deliveries(
+        mut self,
+        share_deliveries: Vec<VoteShareDeliveryReport>,
+    ) -> Self {
+        self.share_deliveries = share_deliveries;
+        self
+    }
 }
 
 /// Executes round steps for one wallet and round.

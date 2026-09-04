@@ -273,6 +273,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                         chain_outcome.clone(),
                         request,
                     )
+                    .with_share_deliveries(deliveries.clone())
                 })?;
             let report = VoteShareDeliveryReport {
                 vote: vote_key(vote.vote()),
@@ -296,14 +297,16 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 })
             {
                 deliveries.push(report);
-                return Err(self.failure(
-                    VoteRecoveryFailureKind::HelperDeliveryIncomplete,
-                    Some(work),
-                    None,
-                    chain_outcome,
-                    "helper delivery ended with pending shares",
-                    request,
-                ));
+                return Err(self
+                    .failure(
+                        VoteRecoveryFailureKind::HelperDeliveryIncomplete,
+                        Some(work),
+                        None,
+                        chain_outcome,
+                        "helper delivery ended with pending shares",
+                        request,
+                    )
+                    .with_share_deliveries(deliveries));
             }
             deliveries.push(report);
         }
@@ -478,6 +481,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             round_plan: resume_plan(&self.database, request.round_id, request.proposal_ids)
                 .ok()
                 .map(Box::new),
+            share_deliveries: Vec::new(),
         }
     }
 }

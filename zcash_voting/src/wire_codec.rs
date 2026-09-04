@@ -1139,6 +1139,11 @@ impl TryFrom<crate::RoundStepFailure> for RoundStepFailureView {
                 .plan
                 .map(|plan| RoundPlanView::try_from(*plan))
                 .transpose()?,
+            share_deliveries: failure
+                .share_deliveries
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         })
     }
 }
@@ -1371,6 +1376,7 @@ impl std::error::Error for VotingErrorView {}
 #[cfg(test)]
 mod tests {
     mod error_view;
+    mod step_failure_view;
 
     use super::*;
     use crate::vote::SignedVoteCommitment;
