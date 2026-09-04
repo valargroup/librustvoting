@@ -5,7 +5,7 @@
 //! APIs in `crate::phases`. The wallet executes each step with its own
 //! network/proof/sign plumbing.
 
-use rusqlite::{named_params, TransactionBehavior};
+use rusqlite::named_params;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,6 +34,8 @@ pub(crate) struct BallotIntentClassification {
     pub(crate) roster: BTreeSet<u32>,
     pub(crate) choice_proposals: Vec<u32>,
     pub(crate) open_proposals: Vec<u32>,
+    /// Durable intents for proposals outside the authenticated roster.
+    pub(crate) unrostered_intents: Vec<u32>,
 }
 
 pub(crate) fn classify_ballot_intents(
@@ -60,11 +62,48 @@ pub(crate) fn classify_ballot_intents(
         }
     }
 
+    let unrostered_intents = intents
+        .keys()
+        .copied()
+        .filter(|proposal_id| !roster.contains(proposal_id))
+        .collect();
+
     Ok(BallotIntentClassification {
         roster,
         choice_proposals,
         open_proposals,
+        unrostered_intents,
     })
+}
+
+/// Whether a vote in `phase` is owned or finished by the chain lifecycle:
+/// submitted, managed, hashless, rejected, or confirmed. Such a vote may be
+/// on chain, so the ballot intent behind it is locked: it cannot be cleared,
+/// and when its proposal leaves the roster it is not treated as an intent the
+/// host must resolve.
+pub(crate) fn vote_phase_is_lifecycle_owned(phase: VotePhase) -> bool {
+    matches!(
+        phase,
+        VotePhase::Submitted
+            | VotePhase::SubmissionManaged
+            | VotePhase::SubmittedWithoutHash
+            | VotePhase::SubmissionRejected
+            | VotePhase::Confirmed
+    )
+}
+
+/// Whether any vote for `proposal_id` is lifecycle-owned, read on `conn`.
+pub(crate) fn intent_is_lifecycle_owned(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+) -> Result<bool, VotingError> {
+    Ok(
+        crate::phases::vote_phases_for_proposal(conn, wallet_id, round_id, proposal_id)?
+            .into_iter()
+            .any(|(_, phase)| vote_phase_is_lifecycle_owned(phase)),
+    )
 }
 
 impl VotingDb {
@@ -86,6 +125,148 @@ impl VotingDb {
         self.write_ballot_intent(round_id, proposal_id, decision)
     }
 
+    /// Retires committed but undispatched votes on `bundle_index` for
+    /// proposals outside `roster`, returning the retired proposal ids.
+    ///
+    /// Such a vote can never be submitted once its proposal left the
+    /// authenticated roster, but its commitment keeps the bundle's VAN
+    /// reserved and blocks every later cast on the bundle; its intent cannot
+    /// be cleared while a sibling bundle's vote for the same proposal is on
+    /// the chain lifecycle. The executor retires them before casting. Votes
+    /// the chain lifecycle owns or has finished are left untouched.
+    pub fn retire_undispatched_votes_outside_roster(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        roster: &[u32],
+    ) -> Result<Vec<u32>, VotingError> {
+        let wallet_id = self.wallet_id();
+        self.write_transaction("retire undispatched votes transaction failed", |tx| {
+            crate::vote::retire_undispatched_votes_outside_roster_with_conn(
+                tx,
+                &wallet_id,
+                round_id,
+                bundle_index,
+                roster,
+            )
+        })
+    }
+
+    /// Removes the durable decision for one proposal.
+    ///
+    /// A decision that survives a roster change refers to a proposal the
+    /// authenticated configuration no longer lists; the planner reports it in
+    /// `RoundPlan::unrostered_intents` and withholds `CastVote` until it is
+    /// cleared. Clearing an intent that does not exist is not an error.
+    ///
+    /// The canonical vote phase, read inside the same write transaction as
+    /// the deletion, decides whether clearing is allowed. A vote
+    /// for the proposal that the chain lifecycle owns or has finished
+    /// (submitted, managed, hashless, rejected, or confirmed) may already be
+    /// on chain, so its intent cannot be cleared. A vote that is signed but
+    /// not dispatched has its unsubmitted recovery invalidated, exactly as a
+    /// changed intent does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] for an out-of-range proposal id
+    /// or a proposal whose vote is on or past the chain lifecycle.
+    pub fn clear_ballot_intent(&self, round_id: &str, proposal_id: u32) -> Result<(), VotingError> {
+        validate_proposal_id(proposal_id)?;
+        let wallet_id = self.wallet_id();
+        self.write_transaction("clear_ballot_intent transaction failed", |tx| {
+            // Evaluated under the write transaction, so a submission that
+            // becomes terminal between a read and the delete cannot slip past.
+            if let Some((bundle_index, phase)) =
+                crate::phases::vote_phases_for_proposal(tx, &wallet_id, round_id, proposal_id)?
+                    .into_iter()
+                    .find(|(_, phase)| vote_phase_is_lifecycle_owned(*phase))
+            {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "round {round_id} bundle {bundle_index} proposal {proposal_id} vote is {} on the chain lifecycle; its intent cannot be cleared",
+                        phase.as_str()
+                    ),
+                });
+            }
+            crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
+                tx,
+                &wallet_id,
+                round_id,
+                proposal_id,
+                None,
+            )?;
+            tx.execute(
+                "DELETE FROM ballot_intent
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id AND proposal_id = :proposal_id",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":proposal_id": proposal_id as i64,
+                },
+            )
+            .map_err(|e| VotingError::from_sqlite("clear ballot intent", &e))?;
+            Ok(())
+        })
+    }
+
+    /// Record the voter's decisions for several proposals atomically.
+    ///
+    /// Each entry is `(proposal_id, decision, num_options)`, where
+    /// `num_options` is that proposal's declared option count. Every entry is
+    /// validated, and the batch is rejected if it names one proposal twice,
+    /// before any durable intent is written; the writes then share one
+    /// transaction, so a conflict raised by a later entry — a submitted vote
+    /// that contradicts it, for instance — leaves none of the batch applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] for an out-of-range proposal id,
+    /// a decision that does not fit its option count, or a repeated proposal
+    /// id.
+    /// A round already stored under `round_id` must be stored for
+    /// `expected_network`; the check runs inside the write transaction, and
+    /// a mismatch is [`VotingError::InvalidInput`] with no intent written.
+    pub fn set_ballot_intents(
+        &self,
+        round_id: &str,
+        expected_network: crate::types::Network,
+        intents: &[(u32, Decision, u32)],
+    ) -> Result<(), VotingError> {
+        let mut seen = BTreeSet::new();
+        for &(proposal_id, decision, num_options) in intents {
+            validate_proposal_id(proposal_id)?;
+            validate_ballot_intent_decision(decision, num_options)?;
+            if !seen.insert(proposal_id) {
+                return Err(VotingError::InvalidInput {
+                    message: format!("ballot intent batch decides proposal {proposal_id} twice"),
+                });
+            }
+        }
+
+        let now = now_secs();
+        let wallet_id = self.wallet_id();
+        self.write_transaction("set_ballot_intents transaction failed", |tx| {
+            // Checked under the write lock so a round created for another
+            // network between the caller's check and this write cannot take
+            // choices resolved against a different network's roster.
+            if crate::storage::queries::has_round(tx, round_id, &wallet_id)? {
+                let stored = crate::storage::queries::load_round_network(tx, round_id, &wallet_id)?;
+                if stored != expected_network {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "round {round_id} is stored for network {stored:?} but the ballot intents are for {expected_network:?}"
+                        ),
+                    });
+                }
+            }
+            for &(proposal_id, decision, _) in intents {
+                write_ballot_intent_in_tx(tx, &wallet_id, round_id, proposal_id, decision, now)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Record a choice intent from a fully validated draft vote.
     pub fn set_ballot_intent_for_draft_vote(
         &self,
@@ -102,98 +283,104 @@ impl VotingDb {
         proposal_id: u32,
         decision: Decision,
     ) -> Result<(), VotingError> {
-        let (skipped, choice): (i64, Option<i64>) = match decision {
-            Decision::Choice(c) => (0, Some(c as i64)),
-            Decision::Skipped => (1, None),
-        };
         let now = now_secs();
-        let mut conn = self.conn();
         let wallet_id = self.wallet_id();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("set_ballot_intent transaction failed: {e}"),
-            })?;
-        let skipped_bool = skipped != 0;
-        let choice_u32 = choice.map(|c| c as u32);
-        queries::ensure_no_submitted_vote_conflict_for_intent(
-            &tx,
-            round_id,
-            &wallet_id,
-            proposal_id,
-            skipped_bool,
-            choice_u32,
-        )?;
-        crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
-            &tx,
-            &wallet_id,
-            round_id,
-            proposal_id,
-            choice_u32,
-        )?;
+        self.write_transaction("set_ballot_intent transaction failed", |tx| {
+            write_ballot_intent_in_tx(tx, &wallet_id, round_id, proposal_id, decision, now)
+        })
+    }
+}
+
+/// Writes one durable ballot intent inside a caller-owned transaction.
+///
+/// Resolves the conflicting-vote and stale-share side effects of the decision
+/// alongside the intent row, so a batch of intents can commit atomically.
+fn write_ballot_intent_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+    decision: Decision,
+    now: i64,
+) -> Result<(), VotingError> {
+    let (skipped, choice): (i64, Option<i64>) = match decision {
+        Decision::Choice(c) => (0, Some(c as i64)),
+        Decision::Skipped => (1, None),
+    };
+    let skipped_bool = skipped != 0;
+    let choice_u32 = choice.map(|c| c as u32);
+    queries::ensure_no_submitted_vote_conflict_for_intent(
+        tx,
+        round_id,
+        wallet_id,
+        proposal_id,
+        skipped_bool,
+        choice_u32,
+    )?;
+    crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
+        tx,
+        wallet_id,
+        round_id,
+        proposal_id,
+        choice_u32,
+    )?;
+    tx.execute(
+        "INSERT INTO ballot_intent
+            (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
+         VALUES (:round_id, :wallet_id, :proposal_id, :skipped, :choice, :now, :now)
+         ON CONFLICT(round_id, wallet_id, proposal_id)
+         DO UPDATE SET skipped = :skipped, choice = :choice, updated_at = :now",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":proposal_id": proposal_id as i64,
+            ":skipped": skipped,
+            ":choice": choice,
+            ":now": now,
+        },
+    )
+    .map_err(|e| VotingError::from_sqlite("set_ballot_intent", &e))?;
+    if skipped_bool {
         tx.execute(
-            "INSERT INTO ballot_intent
-                (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
-             VALUES (:round_id, :wallet_id, :proposal_id, :skipped, :choice, :now, :now)
-             ON CONFLICT(round_id, wallet_id, proposal_id)
-             DO UPDATE SET skipped = :skipped, choice = :choice, updated_at = :now",
+            "DELETE FROM share_delegations
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND proposal_id = :proposal_id",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":proposal_id": proposal_id as i64,
-                ":skipped": skipped,
-                ":choice": choice,
-                ":now": now,
             },
         )
-        .map_err(|e| VotingError::Internal {
-            message: format!("set_ballot_intent failed: {e}"),
-        })?;
-        if skipped_bool {
-            tx.execute(
-                "DELETE FROM share_delegations
-                 WHERE round_id = :round_id
-                   AND wallet_id = :wallet_id
-                   AND proposal_id = :proposal_id",
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":proposal_id": proposal_id as i64,
-                },
-            )
-        } else if let Some(choice) = choice_u32 {
-            tx.execute(
-                "DELETE FROM share_delegations
-                 WHERE round_id = :round_id
-                   AND wallet_id = :wallet_id
-                   AND proposal_id = :proposal_id
-                   AND NOT EXISTS (
-                       SELECT 1 FROM votes
-                       WHERE votes.round_id = share_delegations.round_id
-                         AND votes.wallet_id = share_delegations.wallet_id
-                         AND votes.bundle_index = share_delegations.bundle_index
-                         AND votes.proposal_id = share_delegations.proposal_id
-                         AND votes.choice = :choice
-                   )",
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":proposal_id": proposal_id as i64,
-                    ":choice": choice as i64,
-                },
-            )
-        } else {
-            Ok(0)
-        }
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to clear stale share delegations: {e}"),
-        })?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("set_ballot_intent commit failed: {e}"),
-        })?;
-        Ok(())
+    } else if let Some(choice) = choice_u32 {
+        tx.execute(
+            "DELETE FROM share_delegations
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND proposal_id = :proposal_id
+               AND NOT EXISTS (
+                   SELECT 1 FROM votes
+                   WHERE votes.round_id = share_delegations.round_id
+                     AND votes.wallet_id = share_delegations.wallet_id
+                     AND votes.bundle_index = share_delegations.bundle_index
+                     AND votes.proposal_id = share_delegations.proposal_id
+                     AND votes.choice = :choice
+               )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+                ":choice": choice as i64,
+            },
+        )
+    } else {
+        Ok(0)
     }
+    .map_err(|e| VotingError::from_sqlite("clear stale share delegations", &e))?;
+    Ok(())
+}
 
+impl VotingDb {
     /// Load the voter's decisions for a round, sorted by proposal id.
     pub fn ballot_intents(&self, round_id: &str) -> Result<Vec<(u32, Decision)>, VotingError> {
         let conn = self.conn();
@@ -204,9 +391,7 @@ impl VotingDb {
                  WHERE round_id = :round_id AND wallet_id = :wallet_id
                  ORDER BY proposal_id",
             )
-            .map_err(|e| VotingError::Internal {
-                message: format!("prepare ballot_intents: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("prepare ballot_intents", &e))?;
         let rows = stmt
             .query_map(
                 named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -222,13 +407,9 @@ impl VotingDb {
                     Ok((pid, decision))
                 },
             )
-            .map_err(|e| VotingError::Internal {
-                message: format!("query ballot_intents: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("query ballot_intents", &e))?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| VotingError::Internal {
-                message: format!("collect ballot_intents: {e}"),
-            })
+            .map_err(|e| VotingError::from_sqlite("collect ballot_intents", &e))
     }
 }
 
@@ -273,6 +454,14 @@ pub enum NextStep {
     AdvanceImportedDelegation { bundle_index: u32 },
     /// Cast a vote using the recorded ballot intent choice.
     ///
+    /// Only planned once every proposal in the roster has a terminal decision,
+    /// a choice or a skip. Casting persists the vote and then derives the
+    /// round's immediate helper share from the complete set of choices, so an
+    /// undecided proposal would make the step fail after the proof was
+    /// generated and the vote written. While the ballot is still open the plan
+    /// reports the remaining proposals through `RoundPlan::open_proposals` and
+    /// plans the bundle's `Delegate` prerequisite instead.
+    ///
     /// A changed choice is recoverable only until a cast-vote transaction has
     /// been submitted. Once submitted, the proposal authority for that bundle
     /// has moved on-chain and `resume_plan` reports the conflict as invalid
@@ -292,8 +481,9 @@ pub enum NextStep {
     ///
     /// Recover the `CommittedVote`, preflight the complete helper fleet, and
     /// call `CommittedVote::prepare_share_delivery` to create or reload its
-    /// complete persisted plan. After confirmation, submit through
-    /// `CommittedVote::submit_prepared_shares` with the current fleet. A
+    /// complete persisted plan. After confirmation, convert it with
+    /// `CommittedVote::confirmed` and submit through
+    /// `ConfirmedVote::submit_prepared_shares` with the current fleet. A
     /// reloaded plan retains its original target while delivery excludes
     /// helpers removed from the current fleet. The typed method rebuilds
     /// payloads with the confirmed commitment-tree position and journals each
@@ -314,8 +504,9 @@ pub enum NextStep {
     /// `share_index` identifies one missing share for stable recovery UI and
     /// FFI routing. The host should recover the `CommittedVote`, call
     /// `CommittedVote::prepare_share_delivery` to load or create the
-    /// SDK-persisted complete plan, and then call
-    /// `CommittedVote::submit_prepared_shares` with the current helper fleet.
+    /// SDK-persisted complete plan, convert it with `CommittedVote::confirmed`,
+    /// and then call `ConfirmedVote::submit_prepared_shares` with the current
+    /// helper fleet.
     /// Submission validates the immutable plan against its persisted planning
     /// fleet, contacts only current helpers, validates the whole batch before
     /// network I/O, journals every attempt and outcome, and resumes only the
@@ -333,17 +524,26 @@ pub enum NextStep {
 }
 
 impl NextStep {
-    /// Returns the stable string discriminator used by FFI layers.
-    pub fn kind(&self) -> &'static str {
+    /// Typed discriminator exposed to hosts through [`crate::wire::NextStepView`].
+    ///
+    /// Hosts match on the enum rather than a string, so a new step kind is a
+    /// compile-time event for them instead of a silently unmatched label:
+    ///
+    /// ```compile_fail
+    /// let step = zcash_voting::session::NextStep::Delegate { bundle_index: 0 };
+    /// let _: &str = step.kind();
+    /// ```
+    pub fn kind_view(&self) -> crate::wire::NextStepKind {
+        use crate::wire::NextStepKind as Kind;
         match self {
-            Self::Delegate { .. } => "delegate",
-            Self::AdvanceDelegation { .. } => "advance_delegation",
-            Self::AdvanceImportedDelegation { .. } => "advance_imported_delegation",
-            Self::CastVote { .. } => "cast_vote",
-            Self::AdvanceVote { .. } => "advance_vote",
-            Self::AdvanceVoteBatch { .. } => "advance_vote_batch",
-            Self::SubmitShares { .. } => "submit_shares",
-            Self::ConfirmShare { .. } => "confirm_share",
+            Self::Delegate { .. } => Kind::Delegate,
+            Self::AdvanceDelegation { .. } => Kind::AdvanceDelegation,
+            Self::AdvanceImportedDelegation { .. } => Kind::AdvanceImportedDelegation,
+            Self::CastVote { .. } => Kind::CastVote,
+            Self::AdvanceVote { .. } => Kind::AdvanceVote,
+            Self::AdvanceVoteBatch { .. } => Kind::AdvanceVoteBatch,
+            Self::SubmitShares { .. } => Kind::SubmitShares,
+            Self::ConfirmShare { .. } => Kind::ConfirmShare,
         }
     }
 }
@@ -364,15 +564,14 @@ pub enum RoundPlanAction {
     Done,
 }
 
-impl RoundPlanAction {
-    /// Returns the stable string discriminator used by FFI layers.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Delegate => "delegate",
-            Self::Vote => "vote",
-            Self::SubmitShares => "submit_shares",
-            Self::Done => "done",
+impl From<RoundPlanAction> for crate::wire::RoundPlanActionKind {
+    fn from(action: RoundPlanAction) -> Self {
+        match action {
+            RoundPlanAction::Idle => Self::Idle,
+            RoundPlanAction::Delegate => Self::Delegate,
+            RoundPlanAction::Vote => Self::Vote,
+            RoundPlanAction::SubmitShares => Self::SubmitShares,
+            RoundPlanAction::Done => Self::Done,
         }
     }
 }
@@ -389,13 +588,14 @@ pub enum DelegationRecoveryWorkKind {
     AdvanceImportedDelegation,
 }
 
-impl DelegationRecoveryWorkKind {
-    /// Returns the stable string discriminator used by FFI layers.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Delegate => "delegate",
-            Self::AdvanceDelegation => "advance_delegation",
-            Self::AdvanceImportedDelegation => "advance_imported_delegation",
+impl From<DelegationRecoveryWorkKind> for crate::wire::DelegationRecoveryWorkKindView {
+    fn from(kind: DelegationRecoveryWorkKind) -> Self {
+        match kind {
+            DelegationRecoveryWorkKind::Delegate => Self::Delegate,
+            DelegationRecoveryWorkKind::AdvanceDelegation => Self::AdvanceDelegation,
+            DelegationRecoveryWorkKind::AdvanceImportedDelegation => {
+                Self::AdvanceImportedDelegation
+            }
         }
     }
 }
@@ -424,6 +624,18 @@ pub struct DelegationStatus {
     /// manual handling. May also be present while `SubmissionManaged`
     /// recovers from an ambiguous dispatch.
     pub submission_diagnostic: Option<ChainSubmissionDiagnostic>,
+    /// True when this bundle's delegation ended without a confirmation and no
+    /// further delegation step will ever be planned for it: a terminal
+    /// failure, not a terminal state.
+    ///
+    /// Such a bundle needs manual handling, not a retry: it was either
+    /// rejected, or dispatched without a usable transaction hash and must not
+    /// be resubmitted. `submission_diagnostic` says which. A `Confirmed`
+    /// bundle is not terminal in this sense: it succeeded, and `phase` says
+    /// so. Hosts cannot derive the failure from `phase` alone, because the
+    /// wallet-facing phase reports a hashless dispatch and a healthy
+    /// submission the same way.
+    pub terminal: bool,
 }
 
 /// Kind of vote recovery work grouped from `NextStep`s.
@@ -438,13 +650,12 @@ pub enum VoteRecoveryWorkKind {
     SubmitShares,
 }
 
-impl VoteRecoveryWorkKind {
-    /// Returns the stable string discriminator used by FFI layers.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::AdvanceVote => "advance_vote",
-            Self::AdvanceVoteBatch => "advance_vote_batch",
-            Self::SubmitShares => "submit_shares",
+impl From<VoteRecoveryWorkKind> for crate::wire::VoteRecoveryWorkKindView {
+    fn from(kind: VoteRecoveryWorkKind) -> Self {
+        match kind {
+            VoteRecoveryWorkKind::AdvanceVote => Self::AdvanceVote,
+            VoteRecoveryWorkKind::AdvanceVoteBatch => Self::AdvanceVoteBatch,
+            VoteRecoveryWorkKind::SubmitShares => Self::SubmitShares,
         }
     }
 }
@@ -497,7 +708,21 @@ pub struct RoundPlan {
     /// `Decision::Skipped` is terminal for this plan, so skipped proposals are
     /// not returned here.
     pub open_proposals: Vec<u32>,
+    /// Durable ballot intents for proposals the authenticated roster does not
+    /// list, such as a decision recorded before a proposal was removed.
+    /// Helper-plan derivation rejects them, so `CastVote` is withheld until
+    /// the host clears them with `VotingDb::clear_ballot_intent`.
+    ///
+    /// An unrostered intent whose vote the chain lifecycle owns or has
+    /// finished is omitted: it cannot be cleared, its vote is still driven to
+    /// resolution, and it does not withhold casting for the current roster.
+    pub unrostered_intents: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
+    /// The round's single immediate helper-share submission, if designated.
+    ///
+    /// Reports the designation a persisted helper plan carries whenever one
+    /// exists, since that plan is what delivery executes; only while no plan
+    /// exists is it derived from the current ballot choices.
     pub immediate_share_key: Option<ImmediateShareKey>,
     /// True when the designated immediate share has durable helper-quorum confirmation.
     pub immediate_share_confirmed: bool,
@@ -513,6 +738,13 @@ pub struct RoundPlan {
     pub blocking_recovery: bool,
     /// True when an unconfirmed helper-share row has no accepted helper URL yet.
     pub blocking_share_work: bool,
+    /// True when any helper-share row is still unconfirmed, whether or not a
+    /// helper has already accepted it.
+    ///
+    /// Hosts schedule background share tracking from this rather than holding
+    /// share rows themselves; `blocking_share_work` is the stricter subset
+    /// that must block the foreground vote flow.
+    pub has_unconfirmed_shares: bool,
     /// True once round artifacts require the same voting hotkey to be reused.
     pub hotkey_bound: bool,
     /// True once the local DB contains a vote or helper-share artifact for the round.
@@ -587,6 +819,39 @@ fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
     }
 }
 
+/// The earlier step in `steps` that must clear before `step` can run.
+///
+/// Plans are rank-ordered, but rank is proposal-primary and says nothing about
+/// per-bundle dependencies. Vote and share work for a bundle requires that
+/// bundle's delegation to be confirmed, so while `steps` still holds a
+/// `Delegate`, `AdvanceDelegation`, or `AdvanceImportedDelegation` for the
+/// same bundle, that step is the blocking prerequisite. Delegation steps and
+/// steps on other bundles have none.
+pub(crate) fn blocking_prerequisite<'a>(
+    steps: &'a [NextStep],
+    step: &NextStep,
+) -> Option<&'a NextStep> {
+    let dependent_bundle = match step {
+        NextStep::Delegate { .. }
+        | NextStep::AdvanceDelegation { .. }
+        | NextStep::AdvanceImportedDelegation { .. } => return None,
+        NextStep::CastVote { bundle_index, .. }
+        | NextStep::AdvanceVote { bundle_index, .. }
+        | NextStep::AdvanceVoteBatch { bundle_index, .. }
+        | NextStep::SubmitShares { bundle_index, .. }
+        | NextStep::ConfirmShare { bundle_index, .. } => *bundle_index,
+    };
+    steps.iter().find(|candidate| {
+        matches!(
+            candidate,
+            NextStep::Delegate { bundle_index }
+                | NextStep::AdvanceDelegation { bundle_index }
+                | NextStep::AdvanceImportedDelegation { bundle_index }
+                if *bundle_index == dependent_bundle
+        )
+    })
+}
+
 fn missing_recovery_field(message: String) -> VotingError {
     VotingError::Internal { message }
 }
@@ -604,9 +869,30 @@ fn delegation_statuses(
                 phase: status.phase,
                 tx_hash: delegation_transaction_hash(db, round_id, status.bundle_index)?,
                 submission_diagnostic: status.diagnostic.clone(),
+                terminal: is_terminal_delegation_phase(status.phase),
             })
         })
         .collect()
+}
+
+/// Whether a delegation phase schedules no further work.
+///
+/// Whether a delegation ended without a confirmation and will never be
+/// planned again; `Confirmed` is a success, not a terminal failure.
+///
+/// Exhaustive on purpose: a new phase must be classified here rather than
+/// defaulting into "retry", which for a hashless dispatch would resubmit a
+/// transaction that may already be on the chain.
+fn is_terminal_delegation_phase(phase: DelegationPhase) -> bool {
+    match phase {
+        DelegationPhase::SubmittedWithoutHash | DelegationPhase::SubmissionRejected => true,
+        DelegationPhase::Prepared
+        | DelegationPhase::PcztBuilt
+        | DelegationPhase::Proved
+        | DelegationPhase::Submitted
+        | DelegationPhase::SubmissionManaged
+        | DelegationPhase::Confirmed => false,
+    }
 }
 
 fn recovered_delegation_work_from_steps(
@@ -1101,6 +1387,12 @@ fn push_vote_advance_step(
 /// Wallets should execute one returned step, persist that step's result, then
 /// call `resume_plan` again; later steps may depend on earlier on-chain
 /// confirmations.
+///
+/// A proposal in `proposal_ids` with no durable ballot intent is reported in
+/// `RoundPlan::open_proposals` and suppresses [`NextStep::CastVote`] for the
+/// whole round; see that variant for why the ballot must be terminal first.
+/// Delegation and the advancement of votes already on the wire are planned
+/// regardless.
 pub fn resume_plan(
     db: &VotingDb,
     round_id: &str,
@@ -1136,8 +1428,30 @@ pub fn resume_plan(
     let intent_classification = classify_ballot_intents(proposal_ids, &intents)?;
 
     let bundles: Vec<u32> = delegation.keys().copied().collect();
+    let roster = intent_classification.roster;
     let choice_proposals = intent_classification.choice_proposals;
     let open_proposals = intent_classification.open_proposals;
+    // An unrostered intent whose vote the chain lifecycle owns cannot be
+    // cleared (`clear_ballot_intent` refuses it), so it is not something the
+    // host can resolve: it is neither reported nor allowed to withhold
+    // casting. Helper-plan derivation applies the same rule.
+    let unrostered_intents: Vec<u32> = intent_classification
+        .unrostered_intents
+        .into_iter()
+        .filter(|proposal_id| {
+            !votes.iter().any(|(&(_, vote_proposal_id), &phase)| {
+                vote_proposal_id == *proposal_id && vote_phase_is_lifecycle_owned(phase)
+            })
+        })
+        .collect();
+    // Casting derives the round's single immediate helper share from the
+    // complete set of choices, so `CommittedVote::prepare_share_delivery`
+    // rejects a roster that still holds an undecided proposal, and equally a
+    // durable intent for a proposal outside the authenticated roster.
+    // Planning a `CastVote` before both hold would advertise a step that only
+    // fails after proving and persisting the vote, so the durable intents must
+    // exactly match the roster first.
+    let roster_is_terminal = open_proposals.is_empty() && unrostered_intents.is_empty();
 
     if !choice_proposals.is_empty() && bundles.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -1164,10 +1478,36 @@ pub fn resume_plan(
     let active_vote_batches =
         active_vote_batches_by_vote(db, round_id, &votes, &vote_choices, &intents)?;
     let mut planned_vote_batches = BTreeSet::new();
+    // A committed but undispatched vote for a proposal the roster no longer
+    // lists will never be submitted: `CastVote` retires it before casting
+    // (or the host clears its intent), so it does not hold the bundle.
+    // A batch is one signed envelope, so retiring one member retires every
+    // member on that bundle; the rostered members are cast again.
+    let mut retirable_vote_keys: BTreeSet<(u32, u32)> = votes
+        .iter()
+        .filter(|(&(_, proposal_id), &phase)| {
+            phase == VotePhase::Committed && !roster.contains(&proposal_id)
+        })
+        .map(|(&key, _)| key)
+        .collect();
+    let retirable_batches: BTreeSet<(u32, [u8; 32])> = retirable_vote_keys
+        .iter()
+        .filter_map(|key| {
+            active_vote_batches
+                .get(key)
+                .map(|batch| (key.0, batch.digest))
+        })
+        .collect();
+    for (&key, batch) in &active_vote_batches {
+        if retirable_batches.contains(&(key.0, batch.digest)) {
+            retirable_vote_keys.insert(key);
+        }
+    }
     let bundles_with_pending_vote_chains = votes
         .iter()
         .filter(|(key, phase)| {
             !stale_vote_keys.contains(key)
+                && !retirable_vote_keys.contains(key)
                 && matches!(
                     phase,
                     VotePhase::Committed
@@ -1221,12 +1561,33 @@ pub fn resume_plan(
                 if bundles_with_pending_vote_chains.contains(&b) {
                     continue;
                 }
-                steps.push(NextStep::CastVote {
-                    bundle_index: b,
-                    proposal_id: pid,
-                    choice: intent_choice,
-                });
+                // Delegation is a prerequisite either way, so it is still
+                // planned while the voter decides the rest of the roster.
                 bundles_needing_delegation.insert(b);
+                if roster_is_terminal {
+                    steps.push(NextStep::CastVote {
+                        bundle_index: b,
+                        proposal_id: pid,
+                        choice: intent_choice,
+                    });
+                }
+                continue;
+            }
+            if retirable_vote_keys.contains(&vote_key) {
+                // A member of a committed batch another member's removal
+                // from the roster retires: `CastVote` clears the batch and
+                // casts this proposal again.
+                if bundles_with_pending_vote_chains.contains(&b) {
+                    continue;
+                }
+                bundles_needing_delegation.insert(b);
+                if roster_is_terminal {
+                    steps.push(NextStep::CastVote {
+                        bundle_index: b,
+                        proposal_id: pid,
+                        choice: intent_choice,
+                    });
+                }
                 continue;
             }
             match votes.get(&vote_key) {
@@ -1270,12 +1631,14 @@ pub fn resume_plan(
                     if bundles_with_pending_vote_chains.contains(&b) {
                         continue;
                     }
-                    steps.push(NextStep::CastVote {
-                        bundle_index: b,
-                        proposal_id: pid,
-                        choice: intent_choice,
-                    });
                     bundles_needing_delegation.insert(b);
+                    if roster_is_terminal {
+                        steps.push(NextStep::CastVote {
+                            bundle_index: b,
+                            proposal_id: pid,
+                            choice: intent_choice,
+                        });
+                    }
                 }
             }
         }
@@ -1283,25 +1646,48 @@ pub fn resume_plan(
 
     // Advancement for votes already on the wire does not depend on ballot
     // intent. A lifecycle-owned or submitted vote whose proposal has no
-    // recorded intent is still the wallet's transaction and must be driven to
+    // recorded intent, or whose intent survives for a proposal the roster no
+    // longer lists, is still the wallet's transaction and must be driven to
     // resolution; a skipped or differing intent was rejected above as a
-    // conflict, so only intent-less proposals reach this pass.
+    // conflict, and rostered proposals were planned above, so only
+    // intent-less and unrostered proposals reach this pass.
     for (&vote_key, &phase) in &votes {
         let (b, pid) = vote_key;
-        if intents.contains_key(&pid)
-            || !matches!(phase, VotePhase::Submitted | VotePhase::SubmissionManaged)
-        {
+        if intents.contains_key(&pid) && roster.contains(&pid) {
             continue;
         }
-        push_vote_advance_step(
-            db,
-            round_id,
-            &mut steps,
-            &mut planned_vote_batches,
-            &active_vote_batches,
-            (b, pid),
-            phase,
-        )?;
+        match phase {
+            VotePhase::Submitted | VotePhase::SubmissionManaged => push_vote_advance_step(
+                db,
+                round_id,
+                &mut steps,
+                &mut planned_vote_batches,
+                &active_vote_batches,
+                (b, pid),
+                phase,
+            )?,
+            // A confirmed vote's shares are owed to the helpers whatever the
+            // roster now says; its durable plan drives the missing ones.
+            VotePhase::Confirmed => {
+                for share_index in missing_share_indexes_for_confirmed_vote(
+                    db,
+                    round_id,
+                    b,
+                    pid,
+                    share_indexes_by_vote
+                        .get(&vote_key)
+                        .cloned()
+                        .unwrap_or_default(),
+                )? {
+                    steps.push(NextStep::SubmitShares {
+                        bundle_index: b,
+                        proposal_id: pid,
+                        share_index,
+                    });
+                }
+            }
+            _ => {}
+        }
     }
 
     // Delegation steps: resume any mid-flight delegation; otherwise only the
@@ -1474,8 +1860,17 @@ pub fn resume_plan(
 
     let work_summary = summarize_plan_work(&steps, blocking_share_work);
 
-    let immediate_share_key =
-        round_immediate_share_key(bundles.iter().copied().max(), &choice_proposals);
+    let has_unconfirmed_shares = share_delegations.iter().any(|share| !share.confirmed);
+
+    // Once a persisted plan carries the designation it is what will be
+    // executed, whatever the current roster derives; report that marker, and
+    // derive from the current choices only while no plan exists.
+    let immediate_share_key = crate::share_tracking::persisted_round_immediate_key(
+        &db.conn(),
+        round_id,
+        &db.wallet_id(),
+    )?
+    .or_else(|| round_immediate_share_key(bundles.iter().copied().max(), &choice_proposals));
     let immediate_share_confirmed = immediate_share_key.as_ref().is_some_and(|key| {
         share_delegations.iter().any(|share| {
             share.bundle_index == key.bundle_index
@@ -1490,12 +1885,14 @@ pub fn resume_plan(
         pending_recovery,
         next_steps: steps,
         open_proposals,
+        unrostered_intents,
         immediate_share_key,
         immediate_share_confirmed,
         all_decided,
         delegation_statuses,
         blocking_recovery,
         blocking_share_work,
+        has_unconfirmed_shares,
         hotkey_bound,
         completed_vote_artifact,
         completed_for_display,
@@ -2031,6 +2428,7 @@ mod tests {
                 phase: DelegationPhase::Prepared,
                 tx_hash: None,
                 submission_diagnostic: None,
+                terminal: false,
             }]
         );
         assert!(!plan.blocking_recovery);
@@ -2045,14 +2443,442 @@ mod tests {
     }
 
     #[test]
+    fn a_bundles_delegation_step_blocks_its_own_vote_and_share_steps_only() {
+        let delegate = NextStep::Delegate { bundle_index: 0 };
+        let advance = NextStep::AdvanceDelegation { bundle_index: 1 };
+        let cast_zero = NextStep::CastVote {
+            bundle_index: 0,
+            proposal_id: 1,
+            choice: 1,
+        };
+        let cast_one = NextStep::CastVote {
+            bundle_index: 1,
+            proposal_id: 1,
+            choice: 1,
+        };
+        let cast_two = NextStep::CastVote {
+            bundle_index: 2,
+            proposal_id: 1,
+            choice: 1,
+        };
+        let share_one = NextStep::ConfirmShare {
+            bundle_index: 1,
+            proposal_id: 1,
+            share_index: 0,
+        };
+        let steps = vec![
+            delegate.clone(),
+            advance.clone(),
+            cast_zero.clone(),
+            cast_one.clone(),
+            cast_two.clone(),
+            share_one.clone(),
+        ];
+
+        assert_eq!(blocking_prerequisite(&steps, &cast_zero), Some(&delegate));
+        assert_eq!(blocking_prerequisite(&steps, &cast_one), Some(&advance));
+        assert_eq!(blocking_prerequisite(&steps, &share_one), Some(&advance));
+        assert_eq!(blocking_prerequisite(&steps, &cast_two), None);
+        assert_eq!(blocking_prerequisite(&steps, &delegate), None);
+        assert_eq!(blocking_prerequisite(&steps, &advance), None);
+    }
+
+    #[test]
+    fn a_durable_intent_outside_the_roster_withholds_cast_until_cleared() {
+        let db = db_with_bundle();
+        for proposal_id in [1, 2, 3] {
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(1), 3)
+                .unwrap();
+        }
+        // A decision recorded for a proposal the roster no longer lists.
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(0), 3)
+            .unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert_eq!(plan.unrostered_intents, vec![9]);
+        assert!(plan.open_proposals.is_empty());
+        assert!(
+            !plan
+                .next_steps
+                .iter()
+                .any(|step| matches!(step, NextStep::CastVote { .. })),
+            "casting must wait until the durable intents exactly match the roster: {:?}",
+            plan.next_steps
+        );
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::Delegate { bundle_index: 0 }]
+        );
+
+        db.clear_ballot_intent(ROUND, 9).unwrap();
+        db.clear_ballot_intent(ROUND, 9).unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(plan.unrostered_intents.is_empty());
+        assert!(plan
+            .next_steps
+            .iter()
+            .any(|step| matches!(step, NextStep::CastVote { .. })));
+    }
+
+    #[test]
+    fn an_unrostered_intent_the_chain_lifecycle_owns_does_not_withhold_casting() {
+        let db = db_with_bundle();
+        for proposal_id in [1, 2, 3] {
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(1), 3)
+                .unwrap();
+        }
+        // Proposal 9 was voted and confirmed on chain, then left the roster.
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3)
+            .unwrap();
+        confirm_vote_fixture(&db, 0, 9, 1);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(
+            plan.unrostered_intents.is_empty(),
+            "an intent the host cannot clear is not reported as actionable: {:?}",
+            plan.unrostered_intents
+        );
+        assert!(
+            plan.next_steps
+                .iter()
+                .any(|step| matches!(step, NextStep::CastVote { .. })),
+            "casting for the current roster must not be withheld: {:?}",
+            plan.next_steps
+        );
+    }
+
+    #[test]
+    fn an_unrostered_submitted_vote_is_still_advanced() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(1), 3)
+            .unwrap();
+        // Proposal 9 was voted and is tracking on chain, then left the roster.
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3)
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 9, 1, &[0xCC; 16]).unwrap();
+        insert_in_flight_submission(&db, "tracking", "vote", Some(9), Some([0x5A; 32]));
+
+        let plan = resume_plan(&db, ROUND, &[1]).unwrap();
+        assert!(
+            plan.next_steps.iter().any(|step| matches!(
+                step,
+                NextStep::AdvanceVote {
+                    bundle_index: 0,
+                    proposal_id: 9
+                } | NextStep::AdvanceVoteBatch {
+                    bundle_index: 0,
+                    proposal_id: 9
+                }
+            )),
+            "the on-chain submission for a dropped proposal must still be driven to resolution: {:?}",
+            plan.next_steps
+        );
+    }
+
+    fn db_with_two_bundles() -> VotingDb {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(W);
+        db.create_round(crate::Network::Testnet, &round_params(), None)
+            .unwrap();
+        db.ensure_bundles(
+            ROUND,
+            &[note(0), note(1), note(2), note(3), note(4), note(5)],
+        )
+        .unwrap();
+        assert_eq!(db.delegation_phases(ROUND).unwrap().len(), 2);
+        db
+    }
+
+    /// Proposal 9 left the roster after bundle 0's vote confirmed while
+    /// bundle 1's vote for it was persisted but never dispatched.
+    fn seed_dropped_proposal_with_mixed_siblings(db: &VotingDb) {
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(1), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3)
+            .unwrap();
+        confirm_vote_fixture(db, 0, 9, 1);
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 1, 9, 1, &[0xCD; 16]).unwrap();
+        store_vote_recovery_fixture(db, 1, 9, 1, None);
+        assert_eq!(db.vote_phase(ROUND, 1, 9).unwrap(), VotePhase::Committed);
+    }
+
+    #[test]
+    fn a_committed_vote_for_a_dropped_proposal_does_not_hold_its_bundle() {
+        let db = db_with_two_bundles();
+        seed_dropped_proposal_with_mixed_siblings(&db);
+
+        let plan = resume_plan(&db, ROUND, &[1]).unwrap();
+        assert!(
+            plan.unrostered_intents.is_empty(),
+            "{:?}",
+            plan.unrostered_intents
+        );
+        assert!(
+            plan.next_steps.iter().any(|step| matches!(
+                step,
+                NextStep::CastVote {
+                    bundle_index: 1,
+                    proposal_id: 1,
+                    ..
+                }
+            )),
+            "bundle 1 must still be castable for the current roster: {:?}",
+            plan.next_steps
+        );
+    }
+
+    #[test]
+    fn a_committed_batch_with_a_dropped_member_is_retired_whole_and_recast() {
+        let db = db_with_two_bundles();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3)
+            .unwrap();
+        // Bundle 1's vote for proposal 9 confirmed; bundle 0 holds a
+        // committed, undispatched batch {1, 9}; then 9 left the roster.
+        confirm_vote_fixture(&db, 1, 9, 1);
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        store_two_action_batch_recovery_fixture_for(&db, (1, 0), (9, 1));
+        assert_eq!(db.vote_phase(ROUND, 0, 1).unwrap(), VotePhase::Committed);
+
+        let plan = resume_plan(&db, ROUND, &[1]).unwrap();
+        assert!(
+            !plan.next_steps.iter().any(|step| matches!(
+                step,
+                NextStep::AdvanceVoteBatch {
+                    bundle_index: 0,
+                    ..
+                }
+            )),
+            "the batch carrying a removed proposal must not be advanced: {:?}",
+            plan.next_steps
+        );
+        assert!(
+            plan.next_steps.iter().any(|step| matches!(
+                step,
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 1,
+                    choice: 0,
+                }
+            )),
+            "the rostered member is cast again: {:?}",
+            plan.next_steps
+        );
+
+        // The cast step's retirement clears both members.
+        assert_eq!(
+            db.retire_undispatched_votes_outside_roster(ROUND, 0, &[1])
+                .unwrap(),
+            vec![9]
+        );
+        assert_ne!(db.vote_phase(ROUND, 0, 1).unwrap(), VotePhase::Committed);
+        assert_ne!(db.vote_phase(ROUND, 0, 9).unwrap(), VotePhase::Committed);
+    }
+
+    #[test]
+    fn retiring_undispatched_votes_outside_the_roster_leaves_siblings_alone() {
+        let db = db_with_two_bundles();
+        seed_dropped_proposal_with_mixed_siblings(&db);
+
+        assert_eq!(
+            db.retire_undispatched_votes_outside_roster(ROUND, 1, &[1])
+                .unwrap(),
+            vec![9]
+        );
+        assert_ne!(db.vote_phase(ROUND, 1, 9).unwrap(), VotePhase::Committed);
+        assert_eq!(db.vote_phase(ROUND, 0, 9).unwrap(), VotePhase::Confirmed);
+        // Idempotent, and a rostered proposal is never touched.
+        assert!(db
+            .retire_undispatched_votes_outside_roster(ROUND, 1, &[1])
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .retire_undispatched_votes_outside_roster(ROUND, 0, &[9])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn an_unrostered_confirmed_vote_still_schedules_its_missing_shares() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        // Proposal 9 was voted and confirmed, then left the roster before
+        // its helper shares were delivered.
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3)
+            .unwrap();
+        confirm_vote_fixture(&db, 0, 9, 1);
+
+        let plan = resume_plan(&db, ROUND, &[1]).unwrap();
+        let share_steps = plan
+            .next_steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    NextStep::SubmitShares {
+                        bundle_index: 0,
+                        proposal_id: 9,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            share_steps, 2,
+            "the confirmed vote's missing shares must still be scheduled: {:?}",
+            plan.next_steps
+        );
+    }
+
+    #[test]
+    fn the_plan_reports_the_persisted_immediate_share_after_its_proposal_leaves_the_roster() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        // Proposal 1 is the lowest choice: its confirmed vote's plan carries
+        // the round-immediate designation.
+        confirm_vote_fixture(&db, 0, 1, 0);
+        let helpers = vec!["https://helper.example".to_string()];
+        let fleet = crate::helper::client::HelperFleetPreflight::from_readiness(&helpers, &helpers)
+            .unwrap();
+        crate::vote::CommittedVote::recover(&db, ROUND, 0, 1)
+            .unwrap()
+            .prepare_share_delivery(
+                &db,
+                crate::share_tracking::ShareDeliveryPlanningParams {
+                    fleet: &fleet,
+                    now_seconds: 10,
+                    vote_end_time_seconds: 100_000,
+                    last_moment_buffer_seconds: None,
+                    proposal_ids: &[1, 2],
+                },
+            )
+            .unwrap();
+        let persisted = ImmediateShareKey {
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+        };
+        assert_eq!(
+            resume_plan(&db, ROUND, &[1, 2])
+                .unwrap()
+                .immediate_share_key,
+            Some(persisted)
+        );
+
+        // The roster then drops proposal 1; the plans still designate it.
+        let plan = resume_plan(&db, ROUND, &[2]).unwrap();
+        assert_eq!(
+            plan.immediate_share_key,
+            Some(persisted),
+            "the plan must report the designation delivery will execute"
+        );
+        assert!(!plan.immediate_share_confirmed);
+    }
+
+    #[test]
+    fn an_intent_whose_vote_the_chain_lifecycle_owns_cannot_be_cleared() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3)
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 9, 1, &[0xCC; 16]).unwrap();
+        // Tracking on the chain lifecycle: no tx_hash projection yet, but the
+        // signed generation may already be on chain.
+        insert_in_flight_submission(&db, "tracking", "vote", Some(9), Some([0x5A; 32]));
+
+        let error = db
+            .clear_ballot_intent(ROUND, 9)
+            .expect_err("a tracked vote's intent must survive");
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("submission_managed"), "{error}");
+        assert_eq!(
+            db.ballot_intents(ROUND).unwrap(),
+            vec![(9, Decision::Choice(1))]
+        );
+    }
+
+    #[test]
     fn answered_but_uncast_proposal_yields_cast_then_delegate_prereq() {
+        let db = db_with_bundle();
+        for proposal_id in [1, 2, 3] {
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(1), 3)
+                .unwrap();
+        }
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(plan.pending_recovery);
+        // Bundle 0 is only Prepared, and every proposal needs casting on it, so
+        // the delegate prerequisite is emitted, ordered before the casts.
+        assert_eq!(
+            plan.next_steps,
+            vec![
+                NextStep::Delegate { bundle_index: 0 },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 1,
+                    choice: 1,
+                },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                    choice: 1,
+                },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 3,
+                    choice: 1,
+                },
+            ]
+        );
+        assert!(plan.open_proposals.is_empty());
+        assert_eq!(
+            plan.recovered_delegation_work,
+            vec![DelegationRecoveryWork {
+                kind: DelegationRecoveryWorkKind::Delegate,
+                bundle_index: 0,
+                phase: DelegationPhase::Prepared,
+                tx_hash: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_open_proposal_defers_casting_but_still_plans_the_delegate_prereq() {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
+
+        // Proposals 1 and 3 are undecided, so helper-share planning could not
+        // derive the round's immediate share yet. The cast is withheld, but
+        // delegation is a prerequisite either way and is still planned.
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
-        assert!(plan.pending_recovery);
-        // Bundle 0 is only Prepared, and proposal 2 needs casting on it, so the
-        // delegate prerequisite is emitted, ordered before the cast.
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::Delegate { bundle_index: 0 }]
+        );
+        // `open_proposals` is what surfaces the remaining decisions here;
+        // `needs_draft_setup` is suppressed by the pending `Delegate` step.
+        assert_eq!(plan.open_proposals, vec![1, 3]);
+        assert_eq!(
+            plan.recovered_delegation_work,
+            vec![DelegationRecoveryWork {
+                kind: DelegationRecoveryWorkKind::Delegate,
+                bundle_index: 0,
+                phase: DelegationPhase::Prepared,
+                tx_hash: None,
+            }]
+        );
+
+        // A skip is terminal, so completing the roster releases the cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert_eq!(
             plan.next_steps,
             vec![
@@ -2064,16 +2890,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(plan.open_proposals, vec![1, 3]);
-        assert_eq!(
-            plan.recovered_delegation_work,
-            vec![DelegationRecoveryWork {
-                kind: DelegationRecoveryWorkKind::Delegate,
-                bundle_index: 0,
-                phase: DelegationPhase::Prepared,
-                tx_hash: None,
-            }]
-        );
+        assert!(plan.open_proposals.is_empty());
     }
 
     #[test]
@@ -2347,12 +3164,12 @@ mod tests {
                 share_index: 0,
             },
         ] {
-            let kind = step.kind();
+            let kind = step.kind_view();
             let summary = summarize_plan_work(&[step], false);
-            assert!(summary.needs_vote_polling, "{kind}");
-            assert!(summary.has_remaining_vote_or_share_work, "{kind}");
-            assert!(summary.has_recoverable_vote_or_share_work, "{kind}");
-            assert!(!summary.needs_delegation_signing, "{kind}");
+            assert!(summary.needs_vote_polling, "{kind:?}");
+            assert!(summary.has_remaining_vote_or_share_work, "{kind:?}");
+            assert!(summary.has_recoverable_vote_or_share_work, "{kind:?}");
+            assert!(!summary.needs_delegation_signing, "{kind:?}");
         }
 
         // Share confirmation is always recoverable work, but only counts as
@@ -2470,6 +3287,54 @@ mod tests {
             crate::chain_submission::ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted
         );
         assert_eq!(diagnostic.message(), "submission has no usable hash");
+        // The wallet-facing phase cannot distinguish this from a healthy
+        // submission, so the status has to say so outright.
+        assert!(status.terminal);
+        assert_eq!(
+            crate::wire::WorkflowPhaseView::from(crate::phases::WorkflowPhase::for_delegation(
+                status.phase
+            )),
+            crate::wire::WorkflowPhaseView::SubmittedDelegation
+        );
+    }
+
+    #[test]
+    fn terminal_delegation_status_marks_only_ended_phases() {
+        let db = db_with_bundle();
+        assert!(
+            !resume_plan(&db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .delegation_statuses[0]
+                .terminal,
+            "a fresh bundle still has delegation work"
+        );
+
+        insert_in_flight_submission(&db, "rejected", "delegation", None, None);
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        let status = &plan.delegation_statuses[0];
+        assert_eq!(status.phase, DelegationPhase::SubmissionRejected);
+        assert!(status.terminal);
+        assert!(
+            plan.next_steps.is_empty(),
+            "a terminal delegation schedules no work: {:?}",
+            plan.next_steps
+        );
+    }
+
+    #[test]
+    fn in_flight_delegation_status_is_not_terminal() {
+        let db = db_with_bundle();
+        // Tracking carries a candidate hash by construction.
+        insert_in_flight_submission(&db, "tracking", "delegation", None, Some([0x77; 32]));
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        let status = &plan.delegation_statuses[0];
+
+        assert_eq!(status.phase, DelegationPhase::SubmissionManaged);
+        assert!(
+            !status.terminal,
+            "a submission the lifecycle still owns is not terminal"
+        );
     }
 
     #[test]
@@ -3216,6 +4081,9 @@ mod tests {
             .unwrap();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         store_two_action_batch_recovery_fixture(&db);
@@ -3254,6 +4122,9 @@ mod tests {
         db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
             .unwrap();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
             .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
@@ -3569,6 +4440,11 @@ mod tests {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
             .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
@@ -3721,6 +4597,11 @@ mod tests {
 
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
         assert_eq!(
@@ -3752,6 +4633,11 @@ mod tests {
         .unwrap();
 
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
             .unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xDD; 16]).unwrap();
 
@@ -3875,6 +4761,7 @@ mod tests {
                 phase: DelegationPhase::Confirmed,
                 tx_hash: Some("dtx".to_string()),
                 submission_diagnostic: None,
+                terminal: false,
             }]
         );
         assert!(plan.recovered_delegation_work.is_empty());
@@ -3903,6 +4790,11 @@ mod tests {
         );
 
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        // A terminal roster is a precondition for planning any cast.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
             .unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
@@ -4162,6 +5054,51 @@ mod tests {
             "expected ConfirmShare in steps, got: {:?}",
             plan.next_steps
         );
+    }
+
+    #[test]
+    fn unconfirmed_shares_are_reported_and_schedule_a_tracking_pass() {
+        let db = db_with_bundle();
+        assert!(
+            !resume_plan(&db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .has_unconfirmed_shares
+        );
+        assert_eq!(
+            crate::share::next_tracking_delay_for_round(
+                &db,
+                ROUND,
+                1_000,
+                crate::share::ShareTimingPolicy::default()
+            )
+            .unwrap(),
+            None
+        );
+
+        db.record_share_delegation(
+            ROUND,
+            0,
+            2,
+            0,
+            &["https://helper.example".to_string()],
+            &[0x44; 32],
+            0,
+        )
+        .unwrap();
+
+        // An accepted-but-unconfirmed share is not blocking, yet it still has
+        // to keep background tracking armed.
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(plan.has_unconfirmed_shares);
+        assert!(!plan.blocking_share_work);
+        assert!(crate::share::next_tracking_delay_for_round(
+            &db,
+            ROUND,
+            1_000,
+            crate::share::ShareTimingPolicy::default()
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]

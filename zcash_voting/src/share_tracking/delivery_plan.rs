@@ -5,7 +5,7 @@ use rusqlite::{named_params, Connection, OptionalExtension, TransactionBehavior}
 use crate::{
     helper::url::canonical_helper_url_list,
     round::VotingDb,
-    session::{classify_ballot_intents, Decision},
+    session::{classify_ballot_intents, intent_is_lifecycle_owned, Decision},
     share::ShareOperationScope,
     share_policy::{
         plan_share_submissions_with_preferred_servers, round_immediate_share_key,
@@ -36,9 +36,7 @@ pub(crate) fn prepare_share_delivery_plan(
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin helper-share plan transaction failed: {e}"),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("begin helper-share plan transaction failed", &e))?;
     let commitment_bundle_json: String = tx
         .query_row(
             "SELECT commitment_bundle_json FROM votes
@@ -88,8 +86,8 @@ pub(crate) fn prepare_share_delivery_plan(
     )? {
         validate_share_delivery_plan(&existing, payloads.len())?;
         validate_immediate_plan(&existing, immediate_position)?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("commit helper-share plan read transaction failed: {e}"),
+        tx.commit().map_err(|e| {
+            VotingError::from_sqlite("commit helper-share plan read transaction failed", &e)
         })?;
         return Ok(existing);
     }
@@ -190,9 +188,8 @@ pub(crate) fn prepare_share_delivery_plan(
     validate_share_delivery_plan(&persisted, payloads.len())?;
     validate_immediate_plan(&persisted, immediate_position)?;
     validate_round_immediate_plans(&tx, round_id, &wallet_id, immediate_key)?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit helper-share plan transaction failed: {e}"),
-    })?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("commit helper-share plan transaction failed", &e))?;
     Ok(persisted)
 }
 
@@ -223,7 +220,17 @@ fn derive_immediate_share(
             ),
         });
     }
-    let durable_roster = intents.keys().copied().collect::<BTreeSet<_>>();
+    // The durable roster must match the authenticated one, except for an
+    // intent the host cannot clear: a proposal that left the roster after its
+    // vote reached the chain lifecycle. The planner omits those the same way.
+    let mut durable_roster = BTreeSet::new();
+    for &proposal_id in intents.keys() {
+        if classification.roster.contains(&proposal_id)
+            || !intent_is_lifecycle_owned(conn, wallet_id, round_id, proposal_id)?
+        {
+            durable_roster.insert(proposal_id);
+        }
+    }
     if classification.roster != durable_roster {
         return Err(VotingError::InvalidInput {
             message: "proposal roster does not exactly match the round's durable ballot intents"
@@ -238,8 +245,19 @@ fn derive_immediate_share(
         });
     }
 
-    let immediate_key =
-        immediate_key_for_choices(conn, round_id, wallet_id, &classification.choice_proposals)?;
+    // The round-immediate designation is stable once a plan carries it. When
+    // the designated proposal has since left the roster (its vote reached
+    // the chain lifecycle, so its intent is retained above), recomputing the
+    // key from the reduced roster would name a second share and reject every
+    // plan that carries the first; keep the persisted designation instead.
+    let persisted_immediate = persisted_round_immediate_key(conn, round_id, wallet_id)?
+        .filter(|key| !classification.roster.contains(&key.proposal_id));
+    let immediate_key = match persisted_immediate {
+        Some(key) => Some(key),
+        None => {
+            immediate_key_for_choices(conn, round_id, wallet_id, &classification.choice_proposals)?
+        }
+    };
     let immediate_position =
         immediate_position_for_commitment(immediate_key, bundle_index, proposal_id, payloads)?;
 
@@ -349,6 +367,71 @@ fn load_ballot_intents_with_conn(
         intents.insert(proposal_id as u32, decision);
     }
     Ok(intents)
+}
+
+/// The round-immediate share the wallet's persisted plans for `round_id`
+/// designate, if any plan carries the marker. A consistent round has at most
+/// one; the first is returned so callers report what the plans will execute.
+pub(crate) fn persisted_round_immediate_key(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Option<ImmediateShareKey>, VotingError> {
+    Ok(marked_round_immediate_keys(conn, round_id, wallet_id)?
+        .into_iter()
+        .next())
+}
+
+/// The round-immediate shares marked in the wallet's persisted plans for
+/// `round_id`, in plan order; a consistent round has at most one.
+fn marked_round_immediate_keys(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<ImmediateShareKey>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, proposal_id, share_plans_json
+             FROM helper_share_plans
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        )
+        .map_err(|e| VotingError::from_sqlite("prepare round helper-share plans", &e))?;
+    let rows = stmt
+        .query_map(
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+            },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, i64>(1)? as u32,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("query round helper-share plans", &e))?;
+    let mut marked = Vec::new();
+    for row in rows {
+        let (bundle_index, proposal_id, plans_json) =
+            row.map_err(|e| VotingError::from_sqlite("read round helper-share plan", &e))?;
+        let plans: Vec<ShareSubmissionPlan> =
+            serde_json::from_str(&plans_json).map_err(|e| VotingError::InvalidInput {
+                message: format!("persisted helper-share plan is invalid JSON: {e}"),
+            })?;
+        marked.extend(
+            plans
+                .iter()
+                .enumerate()
+                .filter(|(_, plan)| plan.immediate)
+                .map(|(share_index, _)| ImmediateShareKey {
+                    bundle_index,
+                    proposal_id,
+                    share_index: share_index as u32,
+                }),
+        );
+    }
+    Ok(marked)
 }
 
 fn validate_round_immediate_plans(

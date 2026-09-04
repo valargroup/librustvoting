@@ -30,6 +30,7 @@ pub mod config;
 pub(crate) mod confirmation;
 pub mod delegate;
 pub mod delegation_capability;
+pub mod delegation_pipeline;
 mod delegation_proof_coordination;
 pub mod error;
 pub mod governance;
@@ -60,6 +61,7 @@ pub mod types;
 mod van_blinding;
 pub mod vote;
 pub mod vote_commitment;
+pub mod vote_work;
 pub mod wire;
 mod wire_codec;
 pub mod witness;
@@ -68,7 +70,8 @@ pub mod zkp2;
 
 pub use chain_submission::{
     AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
-    CandidateTransactionHash, CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainAdvanceOutcome,
+    ChainAdvancePolicy, ChainAdvanceRequest, ChainHttpRequest, ChainHttpResponse,
     ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
     ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
     ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
@@ -79,6 +82,12 @@ pub use chain_submission::{
     ChainSubmissionTarget, ChainTransport, ChainTransportError, ChainTransportFailureKind,
     ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
+pub use delegation_pipeline::{
+    start_proving_cache_warmup, DelegationDriver, DelegationPipeline, DelegationSigner,
+    KeystoneSignatureSource, SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport,
+    WalletDbOpener,
+};
+pub use error::{DelegationSetupField, VotingErrorKind, VotingErrorKindView, VotingErrorView};
 pub use helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
     ShareSubmissionStatus,
@@ -91,6 +100,26 @@ pub use http_transport::HyperTransport;
 pub use pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, ImtProofData, NegotiatedPirLayout,
     PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
+};
+pub use pir::{PirFleet, PirProofSource, PirSession};
+pub use transport::{
+    DirectRoute, PirHttpFailure, PirHttpFailurePhase, RouteError, RouteFuture, RouteHttp,
+    RoutePhase, RouteRequest, RouteResponse,
+};
+pub use vote::{
+    persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
+    PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
+};
+#[allow(deprecated)]
+pub use vote_work::VoteRecoveryExecutor;
+pub use vote_work::{
+    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter,
+    NoopVoteRecoveryProgressReporter, ProposalRosterEntry, RoundBinding, RoundExecutor,
+    RoundHostContext, RoundStepDisposition, RoundStepFailure, RoundStepFailureKind,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge, RoundStepProgressReporter,
+    VoteRecoveryAdvance, VoteRecoveryDisposition, VoteRecoveryFailure, VoteRecoveryFailureKind,
+    VoteRecoveryKey, VoteRecoveryProgress, VoteRecoveryProgressBridge,
+    VoteRecoveryProgressReporter, VoteRecoveryRequest, VoteShareDeliveryReport,
 };
 
 pub use delegation_capability::{

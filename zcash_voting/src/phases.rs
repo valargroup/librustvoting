@@ -179,23 +179,48 @@ impl DelegationPhase {
             Self::Confirmed => "confirmed",
         }
     }
+
+    /// Whether the bundle's durable generation already holds the ZKP #1
+    /// delegation proof.
+    ///
+    /// Every phase a bundle can reach after proving answers `true`, including
+    /// the lifecycle-owned and terminal submission phases: a submission row
+    /// only exists once a signed bundle carrying the proof was dispatched, and
+    /// the `chain_submissions` state overrides the artifact columns in
+    /// [`VotingDb::delegation_phase`]. Callers use this to reuse a persisted
+    /// proof instead of re-entering PIR.
+    ///
+    /// Exhaustive on purpose: a new phase must be classified here rather than
+    /// defaulting into "re-prove".
+    pub fn has_persisted_proof(self) -> bool {
+        match self {
+            Self::Proved
+            | Self::Submitted
+            | Self::SubmissionManaged
+            | Self::SubmittedWithoutHash
+            | Self::SubmissionRejected
+            | Self::Confirmed => true,
+            Self::Prepared | Self::PcztBuilt => false,
+        }
+    }
+}
+
+impl From<WorkflowPhase> for crate::wire::WorkflowPhaseView {
+    fn from(phase: WorkflowPhase) -> Self {
+        match phase {
+            WorkflowPhase::Prepared => Self::Prepared,
+            WorkflowPhase::Signed => Self::Signed,
+            WorkflowPhase::SubmittedDelegation => Self::SubmittedDelegation,
+            WorkflowPhase::SubmittedVote => Self::SubmittedVote,
+            WorkflowPhase::SubmittedShare => Self::SubmittedShare,
+            WorkflowPhase::SubmissionManaged => Self::SubmissionManaged,
+            WorkflowPhase::SubmissionRejected => Self::SubmissionRejected,
+            WorkflowPhase::Confirmed => Self::Confirmed,
+        }
+    }
 }
 
 impl WorkflowPhase {
-    /// Returns the stable string used by FFI layers and UI state machines.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Prepared => "prepared",
-            Self::Signed => "signed",
-            Self::SubmittedDelegation => "submitted_delegation",
-            Self::SubmittedVote => "submitted_vote",
-            Self::SubmittedShare => "submitted_share",
-            Self::SubmissionManaged => "submission_managed",
-            Self::SubmissionRejected => "submission_rejected",
-            Self::Confirmed => "confirmed",
-        }
-    }
-
     /// Converts a canonical delegation phase into the merged workflow phase.
     pub fn for_delegation(phase: DelegationPhase) -> Self {
         match phase {
@@ -289,9 +314,7 @@ impl VotingDb {
                 },
             )
             .optional()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to load delegation phase: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to load delegation phase", &e))?;
 
         phase.ok_or_else(|| VotingError::InvalidInput {
             message: format!("bundle not found for round {round_id} index {bundle_index}"),
@@ -346,8 +369,8 @@ impl VotingDb {
                    AND b.wallet_id = :wallet_id
                  ORDER BY b.bundle_index",
             )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to prepare delegation phases query: {e}"),
+            .map_err(|e| {
+                VotingError::from_sqlite("failed to prepare delegation phases query", &e)
             })?;
 
         let rows = stmt
@@ -368,13 +391,9 @@ impl VotingDb {
                     ))
                 },
             )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to query delegation phases: {e}"),
-            })?
+            .map_err(|e| VotingError::from_sqlite("failed to query delegation phases", &e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to read delegation phase row: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to read delegation phase row", &e))?;
 
         rows.into_iter()
             .map(|(bundle_index, phase, diagnostic_kind, diagnostic)| {
@@ -469,9 +488,7 @@ impl VotingDb {
                 },
             )
             .optional()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to load share phase: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to load share phase", &e))?;
 
         phase.ok_or_else(|| VotingError::InvalidInput {
             message: format!(
@@ -494,9 +511,7 @@ impl VotingDb {
                  WHERE round_id = :round_id AND wallet_id = :wallet_id
                  ORDER BY bundle_index, proposal_id, share_index",
             )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to prepare share phases query: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to prepare share phases query", &e))?;
 
         let rows = stmt
             .query_map(
@@ -514,13 +529,9 @@ impl VotingDb {
                     ))
                 },
             )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to query share phases: {e}"),
-            })?
+            .map_err(|e| VotingError::from_sqlite("failed to query share phases", &e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to read share phase row: {e}"),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to read share phase row", &e))?;
         Ok(rows)
     }
 }
@@ -534,6 +545,22 @@ struct VotePhaseEvidence {
     singleton_submission_state: Option<String>,
     singleton_diagnostic_kind: Option<String>,
     singleton_diagnostic: Option<String>,
+}
+
+/// Canonical phases of one proposal's votes, read on `conn` so a caller can
+/// evaluate them inside the same write transaction as a dependent change.
+pub(crate) fn vote_phases_for_proposal(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+) -> Result<Vec<(u32, VotePhase)>, VotingError> {
+    Ok(
+        load_vote_submission_statuses(conn, wallet_id, round_id, None, Some(proposal_id))?
+            .into_iter()
+            .map(|status| (status.bundle_index, status.phase))
+            .collect(),
+    )
 }
 
 /// Projects vote rows through their authoritative singleton or atomic-batch
@@ -662,6 +689,15 @@ fn authoritative_submission_phase(state: Option<&str>) -> Option<VotePhase> {
 
 #[cfg(test)]
 mod tests {
+    /// Serde label of the wire view, so the tests keep asserting the stable
+    /// strings hosts saw before the view became an enum.
+    fn label(phase: super::WorkflowPhase) -> String {
+        serde_json::to_value(crate::wire::WorkflowPhaseView::from(phase))
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
     use super::*;
     use crate::{round::RoundParams, storage::VotingDb, types::NoteInfo};
 
@@ -767,6 +803,106 @@ mod tests {
     }
 
     #[test]
+    fn every_post_proof_delegation_phase_reports_a_persisted_proof() {
+        // The lifecycle states override the artifact columns in
+        // `delegation_phase`, so a bundle whose proof is durably stored is
+        // reported as one of these rather than as `Proved`. Missing one makes
+        // callers re-prove and re-enter PIR for a proof they already hold.
+        for phase in [
+            DelegationPhase::Proved,
+            DelegationPhase::Submitted,
+            DelegationPhase::SubmissionManaged,
+            DelegationPhase::SubmittedWithoutHash,
+            DelegationPhase::SubmissionRejected,
+            DelegationPhase::Confirmed,
+        ] {
+            assert!(phase.has_persisted_proof(), "{phase:?}");
+        }
+        for phase in [DelegationPhase::Prepared, DelegationPhase::PcztBuilt] {
+            assert!(!phase.has_persisted_proof(), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn a_lifecycle_owned_bundle_still_reports_its_persisted_proof() {
+        // The regression this guards: a `chain_submissions` state hides the
+        // `Proved` projection, so a caller that only accepted
+        // `Proved | Submitted | Confirmed` re-proved a bundle it had already
+        // proved — and re-entered PIR to do it.
+        let db = db_with_bundle();
+        crate::storage::queries::store_proof(&db.conn(), ROUND_ID, WALLET_ID, 0, &[0xAC; 96])
+            .unwrap();
+        assert_eq!(
+            db.delegation_phase(ROUND_ID, 0).unwrap(),
+            DelegationPhase::Proved
+        );
+
+        for (state, expected) in [
+            ("submitting", DelegationPhase::SubmissionManaged),
+            ("tracking", DelegationPhase::SubmissionManaged),
+            ("recovering", DelegationPhase::SubmissionManaged),
+            (
+                "submitted_without_hash",
+                DelegationPhase::SubmittedWithoutHash,
+            ),
+            ("rejected", DelegationPhase::SubmissionRejected),
+        ] {
+            set_delegation_submission_state(&db, state);
+            let phase = db.delegation_phase(ROUND_ID, 0).unwrap();
+            assert_eq!(phase, expected);
+            assert!(phase.has_persisted_proof(), "{state}");
+        }
+    }
+
+    /// Replaces the bundle's authoritative delegation submission row with one
+    /// in `state`, so the lifecycle projection wins over the artifact columns.
+    fn set_delegation_submission_state(db: &VotingDb, state: &str) {
+        let conn = db.conn();
+        conn.execute(
+            "DELETE FROM chain_submissions
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND kind = 'delegation'",
+            named_params! { ":round_id": ROUND_ID, ":wallet_id": WALLET_ID },
+        )
+        .unwrap();
+        // The schema pins each state's evidence: `tracking` needs a candidate
+        // hash, and the terminal states need a stored diagnostic.
+        let (candidate_hash, tracking_started_at) = match state {
+            "tracking" => (Some(&[0x22u8; 32][..]), Some(9i64)),
+            _ => (None, None),
+        };
+        let diagnostic = match state {
+            "submitted_without_hash" => Some(("ambiguous_dispatch", "dispatch outcome unknown")),
+            "rejected" => Some(("chain_rejected", "vote chain rejected the generation")),
+            _ => None,
+        };
+        conn.execute(
+            "INSERT INTO chain_submissions
+                (identity_key, round_id, wallet_id, network, bundle_index, kind,
+                 proposal_id, ordered_batch_digest, generation_digest, state,
+                 candidate_transaction_hash, tracking_started_at,
+                 diagnostic_kind, diagnostic,
+                 committed_post_reservations, created_at, updated_at)
+             VALUES (:identity_key, :round_id, :wallet_id, 'testnet', 0, 'delegation',
+                     NULL, NULL, :generation_digest, :state,
+                     :candidate_hash, :tracking_started_at,
+                     :diagnostic_kind, :diagnostic, 1, 9, 9)",
+            named_params! {
+                ":identity_key": format!("{ROUND_ID}-delegation-{state}"),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+                ":generation_digest": &[0x11u8; 32][..],
+                ":state": state,
+                ":candidate_hash": candidate_hash,
+                ":tracking_started_at": tracking_started_at,
+                ":diagnostic_kind": diagnostic.map(|(kind, _)| kind),
+                ":diagnostic": diagnostic.map(|(_, message)| message),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn delegation_phases_are_sorted_by_bundle_index() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
@@ -841,65 +977,69 @@ mod tests {
     #[test]
     fn workflow_phase_mapping_and_strings_are_stable() {
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::Prepared).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::Prepared)),
             "prepared"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::PcztBuilt).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::PcztBuilt)),
             "signed"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::Proved).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::Proved)),
             "signed"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::SubmissionManaged).as_str(),
+            label(WorkflowPhase::for_delegation(
+                DelegationPhase::SubmissionManaged
+            )),
             "submission_managed"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::SubmissionRejected).as_str(),
+            label(WorkflowPhase::for_delegation(
+                DelegationPhase::SubmissionRejected
+            )),
             "submission_rejected"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::Submitted).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::Submitted)),
             "submitted_delegation"
         );
         assert_eq!(
-            WorkflowPhase::for_delegation(DelegationPhase::Confirmed).as_str(),
+            label(WorkflowPhase::for_delegation(DelegationPhase::Confirmed)),
             "confirmed"
         );
 
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::Prepared).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::Prepared)),
             "prepared"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::Committed).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::Committed)),
             "signed"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::Submitted).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::Submitted)),
             "submitted_vote"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::SubmissionManaged).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::SubmissionManaged)),
             "submission_managed"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::SubmissionRejected).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::SubmissionRejected)),
             "submission_rejected"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::Confirmed).as_str(),
+            label(WorkflowPhase::for_vote(VotePhase::Confirmed)),
             "confirmed"
         );
 
         assert_eq!(
-            WorkflowPhase::for_share(SharePhase::Submitted).as_str(),
+            label(WorkflowPhase::for_share(SharePhase::Submitted)),
             "submitted_share"
         );
         assert_eq!(
-            WorkflowPhase::for_share(SharePhase::Confirmed).as_str(),
+            label(WorkflowPhase::for_share(SharePhase::Confirmed)),
             "confirmed"
         );
     }

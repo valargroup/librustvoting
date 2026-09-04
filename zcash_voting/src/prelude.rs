@@ -6,7 +6,8 @@
 
 pub use crate::chain_submission::{
     AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
-    CandidateTransactionHash, CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainAdvanceOutcome,
+    ChainAdvancePolicy, ChainAdvanceRequest, ChainHttpRequest, ChainHttpResponse,
     ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
     ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
     ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
@@ -39,7 +40,14 @@ pub use crate::delegation_capability::{
     ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
-pub use crate::error::VotingError;
+pub use crate::delegation_pipeline::{
+    start_proving_cache_warmup, DelegationDriver, DelegationPipeline, DelegationSigner,
+    KeystoneSignatureSource, SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport,
+    WalletDbOpener,
+};
+pub use crate::error::{
+    DelegationSetupField, VotingError, VotingErrorKind, VotingErrorKindView, VotingErrorView,
+};
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
@@ -65,6 +73,7 @@ pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
 pub use crate::pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, select_pir_endpoint, PirEndpoint,
 };
+pub use crate::pir::{PirFleet, PirProofSource, PirSession};
 pub use crate::precompute::{
     note_witnesses, precompute_pir_proofs, precompute_snapshot_bundles, stored_note_witnesses,
     validate_cached_pir_proofs, verify_witness, PirPrecomputeReport,
@@ -120,6 +129,21 @@ pub use crate::vote::{
     SignedVoteCommitments, VanWitness, VoteBatchRecovery, VoteCommit, VoteCommitBatch,
     VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
     DEFAULT_BATCH_PROOF_CONCURRENCY, MAX_VOTE_BATCH_ACTIONS,
+};
+pub use crate::vote::{
+    persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
+    PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
+};
+#[allow(deprecated)]
+pub use crate::vote_work::VoteRecoveryExecutor;
+pub use crate::vote_work::{
+    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter,
+    NoopVoteRecoveryProgressReporter, ProposalRosterEntry, RoundBinding, RoundExecutor,
+    RoundHostContext, RoundStepDisposition, RoundStepFailure, RoundStepFailureKind,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge, RoundStepProgressReporter,
+    VoteRecoveryAdvance, VoteRecoveryDisposition, VoteRecoveryFailure, VoteRecoveryFailureKind,
+    VoteRecoveryKey, VoteRecoveryProgress, VoteRecoveryProgressBridge,
+    VoteRecoveryProgressReporter, VoteRecoveryRequest, VoteShareDeliveryReport,
 };
 pub use crate::wire::{
     DelegationSubmissionWire, SignedVoteBatchView, VoteCommitmentBatchWire, VoteCommitmentWire,
