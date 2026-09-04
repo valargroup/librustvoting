@@ -413,6 +413,14 @@ pub struct DelegationStatusView {
     pub tx_hash: Option<String>,
     #[serde(default)]
     pub submission_diagnostic: Option<SubmissionDiagnosticView>,
+    /// True when this bundle's delegation has ended and no further delegation
+    /// step will be planned for it; `submission_diagnostic` says why.
+    ///
+    /// Read this rather than inferring from `phase`: a dispatch that reached
+    /// the chain without a usable transaction hash reports the same phase as a
+    /// healthy submission, and retrying it would resubmit.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

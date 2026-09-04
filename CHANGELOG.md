@@ -28,6 +28,13 @@ This release is `zcash_voting` 4.0.0.
   or a stored or provided Keystone signature, so seed material never enters
   the crate. `start_proving_cache_warmup` starts the process-lifetime key
   warm-up once.
+- `DelegationStatus::terminal` (and its wire view) states outright that a
+  bundle's delegation has ended and no further step will be planned for it.
+  A host cannot derive this from the phase: the wallet-facing
+  `WorkflowPhaseView` reports a dispatch that reached the chain without a
+  usable transaction hash the same way it reports a healthy submission, and
+  retrying that would resubmit. `submission_diagnostic` says which terminal
+  outcome it was.
 - `RoundPlan::has_unconfirmed_shares` and
   `share::next_tracking_delay_for_round` let a host schedule background share
   tracking without holding durable share rows: the plan says whether any share

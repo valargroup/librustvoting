@@ -426,6 +426,15 @@ pub struct DelegationStatus {
     /// manual handling. May also be present while `SubmissionManaged`
     /// recovers from an ambiguous dispatch.
     pub submission_diagnostic: Option<ChainSubmissionDiagnostic>,
+    /// True when this bundle's delegation has ended and no further delegation
+    /// step will ever be planned for it.
+    ///
+    /// A terminal bundle needs manual handling, not a retry: it was either
+    /// rejected, or dispatched without a usable transaction hash and must not
+    /// be resubmitted. `submission_diagnostic` says which. Hosts cannot derive
+    /// this from `phase` alone, because the wallet-facing phase reports a
+    /// hashless dispatch and a healthy submission the same way.
+    pub terminal: bool,
 }
 
 /// Kind of vote recovery work grouped from `NextStep`s.
@@ -612,9 +621,27 @@ fn delegation_statuses(
                 phase: status.phase,
                 tx_hash: delegation_transaction_hash(db, round_id, status.bundle_index)?,
                 submission_diagnostic: status.diagnostic.clone(),
+                terminal: is_terminal_delegation_phase(status.phase),
             })
         })
         .collect()
+}
+
+/// Whether a delegation phase schedules no further work.
+///
+/// Exhaustive on purpose: a new phase must be classified here rather than
+/// defaulting into "retry", which for a hashless dispatch would resubmit a
+/// transaction that may already be on the chain.
+fn is_terminal_delegation_phase(phase: DelegationPhase) -> bool {
+    match phase {
+        DelegationPhase::SubmittedWithoutHash | DelegationPhase::SubmissionRejected => true,
+        DelegationPhase::Prepared
+        | DelegationPhase::PcztBuilt
+        | DelegationPhase::Proved
+        | DelegationPhase::Submitted
+        | DelegationPhase::SubmissionManaged
+        | DelegationPhase::Confirmed => false,
+    }
 }
 
 fn recovered_delegation_work_from_steps(
@@ -2042,6 +2069,7 @@ mod tests {
                 phase: DelegationPhase::Prepared,
                 tx_hash: None,
                 submission_diagnostic: None,
+                terminal: false,
             }]
         );
         assert!(!plan.blocking_recovery);
@@ -2481,6 +2509,51 @@ mod tests {
             crate::chain_submission::ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted
         );
         assert_eq!(diagnostic.message(), "submission has no usable hash");
+        // The wallet-facing phase cannot distinguish this from a healthy
+        // submission, so the status has to say so outright.
+        assert!(status.terminal);
+        assert_eq!(
+            crate::wire::WorkflowPhaseView::from(
+                crate::phases::WorkflowPhase::for_delegation(status.phase)
+            ),
+            crate::wire::WorkflowPhaseView::SubmittedDelegation
+        );
+    }
+
+    #[test]
+    fn terminal_delegation_status_marks_only_ended_phases() {
+        let db = db_with_bundle();
+        assert!(
+            !resume_plan(&db, ROUND, &[1, 2, 3]).unwrap().delegation_statuses[0].terminal,
+            "a fresh bundle still has delegation work"
+        );
+
+        insert_in_flight_submission(&db, "rejected", "delegation", None, None);
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        let status = &plan.delegation_statuses[0];
+        assert_eq!(status.phase, DelegationPhase::SubmissionRejected);
+        assert!(status.terminal);
+        assert!(
+            plan.next_steps.is_empty(),
+            "a terminal delegation schedules no work: {:?}",
+            plan.next_steps
+        );
+    }
+
+    #[test]
+    fn in_flight_delegation_status_is_not_terminal() {
+        let db = db_with_bundle();
+        // Tracking carries a candidate hash by construction.
+        insert_in_flight_submission(&db, "tracking", "delegation", None, Some([0x77; 32]));
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        let status = &plan.delegation_statuses[0];
+
+        assert_eq!(status.phase, DelegationPhase::SubmissionManaged);
+        assert!(
+            !status.terminal,
+            "a submission the lifecycle still owns is not terminal"
+        );
     }
 
     #[test]
@@ -3886,6 +3959,7 @@ mod tests {
                 phase: DelegationPhase::Confirmed,
                 tx_hash: Some("dtx".to_string()),
                 submission_diagnostic: None,
+                terminal: false,
             }]
         );
         assert!(plan.recovered_delegation_work.is_empty());

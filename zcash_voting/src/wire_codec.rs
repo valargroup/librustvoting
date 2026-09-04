@@ -784,6 +784,7 @@ impl From<session::DelegationStatus> for DelegationStatusView {
             phase: WorkflowPhase::for_delegation(status.phase).into(),
             tx_hash: status.tx_hash,
             submission_diagnostic: status.submission_diagnostic.map(Into::into),
+            terminal: status.terminal,
         }
     }
 }
@@ -2343,6 +2344,7 @@ mod tests {
                 phase: crate::phases::DelegationPhase::Submitted,
                 tx_hash: Some("delegation-tx".to_string()),
                 submission_diagnostic: None,
+                terminal: false,
             }],
             recovered_delegation_work: vec![
                 session::DelegationRecoveryWork {
