@@ -20,7 +20,7 @@ use zcash_voting::wire::{
     ConfigSwitchDecision, DynamicConfigMirrorFailure, ResolveVotingConfigOptions,
     ResolvedVotingConfig, ResolvedVotingConfigSummary,
 };
-use zcash_voting::{connect_pir_blocking, HyperTransport, PirClientBlocking};
+use zcash_voting::{HyperTransport, PirFleet};
 
 type RequestBody = Full<Bytes>;
 type HyperClient = Client<HttpsConnector<HttpConnector>, RequestBody>;
@@ -213,15 +213,14 @@ pub fn write_config_state(state_path: &Path, state: &StoredConfigState) -> Resul
 ///
 /// # Errors
 ///
-/// Returns an error if the layout handshake fails or the transport cannot
-/// complete client construction.
-pub fn connect_pir_from_resolved(
+/// Returns an error if the layout is unusable or the URL is empty.
+pub fn pir_fleet_from_resolved(
     resolved: &ResolvedVotingConfig,
     pir_server_url: &str,
-) -> Result<PirClientBlocking> {
-    connect_pir_blocking(
+) -> Result<PirFleet> {
+    PirFleet::new(
+        &[pir_server_url.to_string()],
         resolved.pir_layout,
-        pir_server_url,
         std::sync::Arc::new(HyperTransport::new()),
     )
     .map_err(|e| anyhow!("connect PIR from resolved config failed: {e}"))

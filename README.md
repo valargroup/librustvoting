@@ -221,6 +221,8 @@ upgrading the crate.
   `PirUnavailable`, `InsufficientEligibility`, ...) or `retryable`.
 - Replace hand-rolled Tor transports with one `RouteHttp` implementation and
   `HyperTransport::with_route`.
+- Replace `connect_pir_blocking` with `PirFleet::new` plus `with_failover`,
+  which orders endpoints and retries only retryable PIR failures.
 - Replace per-stage delegation orchestration with `DelegationPipeline` and
   `DelegationSigner`; keep only the seed-owning `SpendAuthSigner`.
 - Replace host sequencing of plan steps with `RoundExecutor::advance_next`;
