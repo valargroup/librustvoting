@@ -74,6 +74,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let plan = self.plan().map_err(|error| {
             self.step_voting_failure_after_chain(error, Some(step.clone()), chain_outcome.clone())
+                .with_share_deliveries(share_deliveries.clone())
         })?;
         Ok(RoundStepOutcome {
             step: Some(step),
@@ -94,6 +95,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let plan = self.plan().map_err(|error| {
             self.step_voting_failure_after_chain(error, step.clone(), chain_outcome.clone())
+                .with_share_deliveries(share_deliveries.clone())
         })?;
         Ok(RoundStepOutcome {
             step,
