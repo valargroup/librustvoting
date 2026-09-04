@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::round::VotingDb;
+use crate::round::{sidecar_registry_key, VotingDb};
 
 fn fresh_wallet_path(label: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -94,4 +94,19 @@ fn a_slow_open_of_one_path_does_not_block_another_path() {
     drop((quick, slow, holder));
     std::fs::remove_file(slow_sidecar).ok();
     std::fs::remove_file(VotingDb::wallet_sidecar_path(&quick_wallet)).ok();
+}
+
+#[test]
+fn a_bare_file_name_keys_the_same_connection_as_its_other_spellings() {
+    let bare = sidecar_registry_key(std::path::Path::new("wallet.sqlite.voting"));
+    let dotted = sidecar_registry_key(std::path::Path::new("./wallet.sqlite.voting"));
+    let absolute = sidecar_registry_key(
+        &std::env::current_dir()
+            .unwrap()
+            .join("wallet.sqlite.voting"),
+    );
+
+    assert!(bare.is_absolute(), "{}", bare.display());
+    assert_eq!(bare, dotted);
+    assert_eq!(bare, absolute);
 }
