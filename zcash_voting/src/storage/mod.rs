@@ -99,6 +99,8 @@ pub(crate) struct SidecarConnection {
     /// across separately opened handles; each in-memory database gets its
     /// own. Two sidecars that use the same wallet id stay distinct.
     id: u64,
+    /// The open span this connection belongs to; see [`OpenSidecar`].
+    epoch: u64,
     conn: Mutex<Connection>,
     chain_submission_coordination: crate::chain_submission::coordination::SubmissionCoordination,
 }
@@ -109,40 +111,59 @@ static NEXT_SIDECAR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static SIDECAR_IDS: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Live connections per sidecar id, so process-local caches keyed by the id
-/// can tell when a sidecar has no handle left through any connection.
-static OPEN_SIDECAR_CONNECTIONS: LazyLock<Mutex<HashMap<u64, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// One open span of a sidecar: the connections currently open on it and
+/// the epoch that span was given. A sidecar whose last connection closes and
+/// that is opened again starts a new epoch, so process-local caches that
+/// captured the old epoch see it as closed even though the path-derived id
+/// is the same; the file may have been replaced in between.
+struct OpenSidecar {
+    connections: usize,
+    epoch: u64,
+}
 
-fn note_sidecar_opened(id: u64) {
-    *OPEN_SIDECAR_CONNECTIONS
+/// Open sidecars by id, so process-local caches keyed by the id can tell
+/// when a sidecar has no handle left through any connection.
+static OPEN_SIDECARS: LazyLock<Mutex<HashMap<u64, OpenSidecar>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_SIDECAR_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Records one more connection to sidecar `id` and returns the epoch of the
+/// open span it belongs to.
+fn note_sidecar_opened(id: u64) -> u64 {
+    let mut open = OPEN_SIDECARS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(id)
-        .or_insert(0) += 1;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let span = open.entry(id).or_insert_with(|| OpenSidecar {
+        connections: 0,
+        epoch: NEXT_SIDECAR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    });
+    span.connections += 1;
+    span.epoch
 }
 
 impl Drop for SidecarConnection {
     fn drop(&mut self) {
-        let mut open = OPEN_SIDECAR_CONNECTIONS
+        let mut open = OPEN_SIDECARS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = open.get_mut(&self.id) {
-            *count -= 1;
-            if *count == 0 {
+        if let Some(span) = open.get_mut(&self.id) {
+            span.connections -= 1;
+            if span.connections == 0 {
                 open.remove(&self.id);
             }
         }
     }
 }
 
-/// Whether any connection to the sidecar with `id` is still open in this
-/// process, through any handle.
-pub(crate) fn sidecar_is_open(id: u64) -> bool {
-    OPEN_SIDECAR_CONNECTIONS
+/// Whether the sidecar with `id` is still open in the open span `epoch`,
+/// through any handle. False once its last connection closed, even if the
+/// same path has since been opened again.
+pub(crate) fn sidecar_is_open_in_epoch(id: u64, epoch: u64) -> bool {
+    OPEN_SIDECARS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains_key(&id)
+        .get(&id)
+        .is_some_and(|span| span.epoch == epoch)
 }
 
 /// The sidecar id for `path`: the id assigned to its canonical path, or a
@@ -229,10 +250,11 @@ impl VotingDb {
 
     pub(crate) fn from_connection(conn: Connection, path: &str) -> Self {
         let id = sidecar_id_for(path);
-        note_sidecar_opened(id);
+        let epoch = note_sidecar_opened(id);
         Self {
             inner: Arc::new(SidecarConnection {
                 id,
+                epoch,
                 conn: Mutex::new(conn),
                 chain_submission_coordination: Default::default(),
             }),
@@ -270,6 +292,12 @@ impl VotingDb {
     /// file within the process, unique per in-memory database.
     pub(crate) fn sidecar_id(&self) -> u64 {
         self.inner.id
+    }
+
+    /// The open span of the underlying sidecar; see
+    /// [`sidecar_is_open_in_epoch`].
+    pub(crate) fn sidecar_epoch(&self) -> u64 {
+        self.inner.epoch
     }
 
     /// Whether two handles share one underlying connection.

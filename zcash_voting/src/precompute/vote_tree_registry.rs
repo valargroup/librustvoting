@@ -10,7 +10,10 @@
 //! lands on the same state even when another executor synced in between.
 //!
 //! An entry lives while any connection to its sidecar is open, through any
-//! handle, not only the one that created it. A routed client
+//! handle, not only the one that created it. Once the last connection
+//! closes the entry is dead for good: reopening the same path starts a new
+//! open span, so a reopened (possibly replaced) file never inherits a stale
+//! tree or a stale route. A routed client
 //! additionally lives while some caller holds the transport it was built
 //! over or while it holds any round's tree state: a caller that moved its
 //! only transport clone into `sync_vote_tree_with` still needs that sync's
@@ -47,8 +50,11 @@ struct VoteTreeEntry {
     /// The sidecar the entry belongs to. Every connection to one sidecar
     /// file shares the id, so a handle opened separately on the same file
     /// keeps the entry alive after the handle that populated it is dropped;
-    /// once no connection to the sidecar is open the entry is unreachable.
+    /// once no connection to the sidecar is open the entry is unreachable,
+    /// and a later reopen of the path (a new `sidecar_epoch`) does not
+    /// revive it.
     sidecar_id: u64,
+    sidecar_epoch: u64,
     /// Tie-breaker for calls that name no transport: the client most recently
     /// handed out wins, so an unrouted call after a routed sync stays on the
     /// route rather than falling back to the direct transport.
@@ -57,7 +63,8 @@ struct VoteTreeEntry {
 
 impl VoteTreeEntry {
     fn is_reachable(&self) -> bool {
-        let connection_is_live = crate::storage::sidecar_is_open(self.sidecar_id);
+        let connection_is_live =
+            crate::storage::sidecar_is_open_in_epoch(self.sidecar_id, self.sidecar_epoch);
         let transport_is_held = self.transport.is_none() || self.sync.transport_is_shared();
         let holds_round_state = !self.sync.cached_rounds().is_empty();
         connection_is_live && (transport_is_held || holds_round_state)
@@ -114,6 +121,7 @@ fn new_entry(db: &VotingDb, transport: Option<Arc<dyn Transport>>) -> VoteTreeEn
         sync,
         transport: transport.as_ref().map(Arc::downgrade),
         sidecar_id: db.sidecar_id(),
+        sidecar_epoch: db.sidecar_epoch(),
         last_used: 0,
     }
 }

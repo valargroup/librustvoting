@@ -174,6 +174,13 @@ This release is `zcash_voting` 4.0.0.
   outcome, strongest state, delivery reports, refreshed plan) instead of only
   its message, and gains `routed_pir_fleet` for building the host's PIR fleet
   over the same route.
+- `VotingDb::ensure_round` refuses an existing round whose stored parameters
+  (snapshot height, election key, roots) differ from the supplied ones, not
+  only one stored for another network, so bundles are never set up under
+  parameters a later witness cannot validate.
+- Closing the last connection to a sidecar and reopening the same path starts
+  a new open span: vote-tree cache entries from before the close are dropped
+  instead of being inherited by the reopened, possibly replaced, file.
 - `DelegationPipeline` checks a persisted delegation setup against the
   pipeline's notes and target-bound hotkey before reusing it for signing, the
   same check a persisted proof already gets.

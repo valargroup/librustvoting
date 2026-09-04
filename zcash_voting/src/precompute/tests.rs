@@ -308,3 +308,33 @@ fn a_same_file_handle_keeps_the_tree_cache_after_its_opener_drops() {
     drop(survivor);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn reopening_a_closed_sidecar_starts_with_an_empty_tree_cache() {
+    let path = std::env::temp_dir().join(format!(
+        "zcash-voting-tree-cache-reopen-{}-{}.sqlite",
+        std::process::id(),
+        std::time::Instant::now().elapsed().as_nanos()
+    ));
+    let path = path.to_str().unwrap().to_string();
+    {
+        let first_open = VotingDb::open(&path).unwrap();
+        first_open.set_wallet_id("wallet-reopen");
+        sync_vote_tree(&first_open, ROUND_ID, NODE_URL).unwrap_err();
+        assert_eq!(
+            cached_vote_tree_rounds(&first_open),
+            vec![ROUND_ID.to_string()]
+        );
+    }
+    // Every handle is gone and the same path is opened again before any
+    // other registry access; the path-derived id is the same, the file may
+    // not be.
+    let reopened = VotingDb::open(&path).unwrap();
+    reopened.set_wallet_id("wallet-reopen");
+    assert!(
+        cached_vote_tree_rounds(&reopened).is_empty(),
+        "a reopened sidecar must not inherit the closed one's tree cache"
+    );
+    drop(reopened);
+    std::fs::remove_file(&path).ok();
+}
