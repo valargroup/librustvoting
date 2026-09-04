@@ -337,6 +337,35 @@ fn planning_rejects_incomplete_duplicate_and_omitting_rosters_before_persistence
     assert_eq!(stored, 0);
 }
 
+#[test]
+fn a_lifecycle_owned_intent_outside_the_roster_does_not_block_planning() {
+    let db = db_with_unique_recoverable_vote();
+    // Proposal 2 was voted and confirmed, then removed from the roster; its
+    // intent cannot be cleared and must not block the current roster.
+    seed_recoverable_vote_for_proposal(&db, 2, 1);
+    db.conn()
+        .execute(
+            "UPDATE votes SET tx_hash = 'aa' WHERE round_id = :round_id
+               AND wallet_id = :wallet_id AND bundle_index = 0 AND proposal_id = 2",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": db.wallet_id(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        db.vote_phase(ROUND_ID, 0, 2).unwrap(),
+        crate::phases::VotePhase::Confirmed
+    );
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+
+    committed
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1]))
+        .expect("a lifecycle-owned unrostered intent is not a roster mismatch");
+}
+
 #[tokio::test]
 async fn later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan() {
     let db = db_with_round_and_bundle();

@@ -76,6 +76,36 @@ pub(crate) fn classify_ballot_intents(
     })
 }
 
+/// Whether a vote in `phase` is owned or finished by the chain lifecycle:
+/// submitted, managed, hashless, rejected, or confirmed. Such a vote may be
+/// on chain, so the ballot intent behind it is locked: it cannot be cleared,
+/// and when its proposal leaves the roster it is not treated as an intent the
+/// host must resolve.
+pub(crate) fn vote_phase_is_lifecycle_owned(phase: VotePhase) -> bool {
+    matches!(
+        phase,
+        VotePhase::Submitted
+            | VotePhase::SubmissionManaged
+            | VotePhase::SubmittedWithoutHash
+            | VotePhase::SubmissionRejected
+            | VotePhase::Confirmed
+    )
+}
+
+/// Whether any vote for `proposal_id` is lifecycle-owned, read on `conn`.
+pub(crate) fn intent_is_lifecycle_owned(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+) -> Result<bool, VotingError> {
+    Ok(
+        crate::phases::vote_phases_for_proposal(conn, wallet_id, round_id, proposal_id)?
+            .into_iter()
+            .any(|(_, phase)| vote_phase_is_lifecycle_owned(phase)),
+    )
+}
+
 impl VotingDb {
     /// Record (insert or replace) the voter's decision for one proposal.
     ///
@@ -123,16 +153,7 @@ impl VotingDb {
             if let Some((bundle_index, phase)) =
                 crate::phases::vote_phases_for_proposal(tx, &wallet_id, round_id, proposal_id)?
                     .into_iter()
-                    .find(|(_, phase)| {
-                        matches!(
-                            phase,
-                            VotePhase::Submitted
-                                | VotePhase::SubmissionManaged
-                                | VotePhase::SubmittedWithoutHash
-                                | VotePhase::SubmissionRejected
-                                | VotePhase::Confirmed
-                        )
-                    })
+                    .find(|(_, phase)| vote_phase_is_lifecycle_owned(*phase))
             {
                 return Err(VotingError::InvalidInput {
                     message: format!(
@@ -653,6 +674,10 @@ pub struct RoundPlan {
     /// list, such as a decision recorded before a proposal was removed.
     /// Helper-plan derivation rejects them, so `CastVote` is withheld until
     /// the host clears them with `VotingDb::clear_ballot_intent`.
+    ///
+    /// An unrostered intent whose vote the chain lifecycle owns or has
+    /// finished is omitted: it cannot be cleared, its vote is still driven to
+    /// resolution, and it does not withhold casting for the current roster.
     pub unrostered_intents: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
     pub immediate_share_key: Option<ImmediateShareKey>,
@@ -1362,7 +1387,19 @@ pub fn resume_plan(
     let bundles: Vec<u32> = delegation.keys().copied().collect();
     let choice_proposals = intent_classification.choice_proposals;
     let open_proposals = intent_classification.open_proposals;
-    let unrostered_intents = intent_classification.unrostered_intents;
+    // An unrostered intent whose vote the chain lifecycle owns cannot be
+    // cleared (`clear_ballot_intent` refuses it), so it is not something the
+    // host can resolve: it is neither reported nor allowed to withhold
+    // casting. Helper-plan derivation applies the same rule.
+    let unrostered_intents: Vec<u32> = intent_classification
+        .unrostered_intents
+        .into_iter()
+        .filter(|proposal_id| {
+            !votes.iter().any(|(&(_, vote_proposal_id), &phase)| {
+                vote_proposal_id == *proposal_id && vote_phase_is_lifecycle_owned(phase)
+            })
+        })
+        .collect();
     // Casting derives the round's single immediate helper share from the
     // complete set of choices, so `CommittedVote::prepare_share_delivery`
     // rejects a roster that still holds an undecided proposal, and equally a
@@ -2364,6 +2401,33 @@ mod tests {
             .next_steps
             .iter()
             .any(|step| matches!(step, NextStep::CastVote { .. })));
+    }
+
+    #[test]
+    fn an_unrostered_intent_the_chain_lifecycle_owns_does_not_withhold_casting() {
+        let db = db_with_bundle();
+        for proposal_id in [1, 2, 3] {
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(1), 3)
+                .unwrap();
+        }
+        // Proposal 9 was voted and confirmed on chain, then left the roster.
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3)
+            .unwrap();
+        confirm_vote_fixture(&db, 0, 9, 1);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(
+            plan.unrostered_intents.is_empty(),
+            "an intent the host cannot clear is not reported as actionable: {:?}",
+            plan.unrostered_intents
+        );
+        assert!(
+            plan.next_steps
+                .iter()
+                .any(|step| matches!(step, NextStep::CastVote { .. })),
+            "casting for the current roster must not be withheld: {:?}",
+            plan.next_steps
+        );
     }
 
     #[test]

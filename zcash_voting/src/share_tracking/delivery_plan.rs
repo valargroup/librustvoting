@@ -5,7 +5,7 @@ use rusqlite::{named_params, Connection, OptionalExtension, TransactionBehavior}
 use crate::{
     helper::url::canonical_helper_url_list,
     round::VotingDb,
-    session::{classify_ballot_intents, Decision},
+    session::{classify_ballot_intents, intent_is_lifecycle_owned, Decision},
     share::ShareOperationScope,
     share_policy::{
         plan_share_submissions_with_preferred_servers, round_immediate_share_key,
@@ -220,7 +220,17 @@ fn derive_immediate_share(
             ),
         });
     }
-    let durable_roster = intents.keys().copied().collect::<BTreeSet<_>>();
+    // The durable roster must match the authenticated one, except for an
+    // intent the host cannot clear: a proposal that left the roster after its
+    // vote reached the chain lifecycle. The planner omits those the same way.
+    let mut durable_roster = BTreeSet::new();
+    for &proposal_id in intents.keys() {
+        if classification.roster.contains(&proposal_id)
+            || !intent_is_lifecycle_owned(conn, wallet_id, round_id, proposal_id)?
+        {
+            durable_roster.insert(proposal_id);
+        }
+    }
     if classification.roster != durable_roster {
         return Err(VotingError::InvalidInput {
             message: "proposal roster does not exactly match the round's durable ballot intents"
