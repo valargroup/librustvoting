@@ -8,7 +8,7 @@ use zcash_voting::prelude::{
     RoundHostContext, RoundPlan, RoundRecoverySnapshot, RoundStepDisposition, RoundStepOutcome,
     SignedVoteBatch, VotingDb,
 };
-use zcash_voting::HyperTransport;
+use zcash_voting::{HyperTransport, RouteHttp};
 
 /// Drives one round to its next idle point with the SDK-owned executor.
 ///
@@ -22,23 +22,35 @@ use zcash_voting::HyperTransport;
 /// terminal chain result (`ChainTerminal`) the plan deliberately schedules no
 /// retry and carries no vote diagnostic, so `RoundStepOutcome::chain_outcome`
 /// is the only place the rejection or hashless-submission diagnostic survives.
-pub async fn advance_round_until_idle(
+///
+/// `route` carries every voting-related request: helper POSTs, vote-chain
+/// calls, and vote-tree sync all run through it, so a wallet that requires
+/// Tor or another privacy route passes its executor once and nothing falls
+/// back to a direct connection. Pass `Arc::new(DirectRoute::default())` when
+/// no route is required.
+pub async fn advance_round_until_idle<R: RouteHttp>(
     voting_db: Arc<VotingDb>,
     network: Network,
     chain_endpoints: Vec<String>,
+    route: Arc<R>,
     binding: RoundBinding,
     host: RoundHostContext,
     control: &ChainSubmissionControl,
 ) -> Result<RoundStepOutcome> {
-    let helper_client = HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
-    let executor = RoundExecutor::new(
+    let helper_client = HelperClient::new(
+        Arc::new(HyperTransport::with_shared_route(Arc::clone(&route))),
+        HelperHealth::default(),
+    );
+    let executor = RoundExecutor::with_transport(
         voting_db,
+        HyperTransport::with_shared_route(Arc::clone(&route)),
         ChainSubmissionClientConfig::for_network(network, chain_endpoints),
         helper_client,
     )
     .map_err(|failure| anyhow::anyhow!(failure.message().to_string()))?
     .with_binding(binding)
-    .context("bind round executor")?;
+    .context("bind round executor")?
+    .with_tree_transport(Arc::new(HyperTransport::with_shared_route(route)));
     loop {
         let outcome = executor
             .advance_next(&host, control, &NoopRoundStepProgressReporter {})
