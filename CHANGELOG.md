@@ -155,6 +155,10 @@ This release is `zcash_voting` 4.0.0.
 - `VotingErrorView` carries `setup_field` for `SetupAlreadyPersisted`, so a
   wire consumer can tell a reusable sighash or effects conflict from a fatal
   padded-note-secrets conflict without parsing the message.
+- A wallet's vote-tree cache entry lives while any connection to its
+  sidecar file is open, not only the handle that populated it, so a second
+  `VotingDb::open` handle on the same file still finds a round the first one
+  synced after the first is dropped.
 - `DelegationPipeline` checks a persisted delegation setup against the
   pipeline's notes and target-bound hotkey before reusing it for signing, the
   same check a persisted proof already gets.

@@ -280,3 +280,31 @@ fn a_dropped_sidecar_connection_no_longer_retains_its_tree_cache() {
     assert!(cached_vote_tree_rounds(&other).is_empty());
     assert!(client.upgrade().is_none());
 }
+
+#[test]
+fn a_same_file_handle_keeps_the_tree_cache_after_its_opener_drops() {
+    let path = std::env::temp_dir().join(format!(
+        "zcash-voting-tree-cache-{}-{}.sqlite",
+        std::process::id(),
+        std::time::Instant::now().elapsed().as_nanos()
+    ));
+    let path = path.to_str().unwrap().to_string();
+    let opener = VotingDb::open(&path).unwrap();
+    opener.set_wallet_id("wallet-same-file");
+    let survivor = VotingDb::open(&path).unwrap();
+    survivor.set_wallet_id("wallet-same-file");
+    assert!(!opener.shares_connection_with(&survivor));
+
+    // The opener populates the cache and goes away; a witness through the
+    // other handle on the same file must still find the round.
+    sync_vote_tree(&opener, ROUND_ID, NODE_URL).unwrap_err();
+    drop(opener);
+    assert_eq!(
+        cached_vote_tree_rounds(&survivor),
+        vec![ROUND_ID.to_string()]
+    );
+
+    reset_vote_tree(&survivor, "").unwrap();
+    drop(survivor);
+    std::fs::remove_file(&path).ok();
+}

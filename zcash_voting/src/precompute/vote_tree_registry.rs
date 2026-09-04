@@ -1,6 +1,6 @@
 //! Process-local registry of the vote-tree clients a wallet has open.
 //!
-//! One [`crate::tree_sync::VoteTreeSync`] is kept per sidecar connection,
+//! One [`crate::tree_sync::VoteTreeSync`] is kept per sidecar,
 //! wallet id, and transport. Keying by transport means two executors for one
 //! wallet that bind different routes each keep their own client and their
 //! own synced tree state; neither one's sync discards the other's. Calls that
@@ -9,7 +9,8 @@
 //! holds the round, so a sync followed by a witness on the standalone path
 //! lands on the same state even when another executor synced in between.
 //!
-//! An entry lives while its sidecar connection has a handle. A routed client
+//! An entry lives while any connection to its sidecar is open, through any
+//! handle, not only the one that created it. A routed client
 //! additionally lives while some caller holds the transport it was built
 //! over or while it holds any round's tree state: a caller that moved its
 //! only transport clone into `sync_vote_tree_with` still needs that sync's
@@ -43,9 +44,11 @@ struct VoteTreeEntry {
     /// transport alive, so whether any caller still holds it is read off the
     /// client, not off this field.
     transport: Option<Weak<dyn Transport>>,
-    /// The sidecar connection the entry belongs to; a reopened sidecar gets a
-    /// new id, so an entry whose handles are all gone is unreachable.
-    connection: Weak<crate::storage::SidecarConnection>,
+    /// The sidecar the entry belongs to. Every connection to one sidecar
+    /// file shares the id, so a handle opened separately on the same file
+    /// keeps the entry alive after the handle that populated it is dropped;
+    /// once no connection to the sidecar is open the entry is unreachable.
+    sidecar_id: u64,
     /// Tie-breaker for calls that name no transport: the client most recently
     /// handed out wins, so an unrouted call after a routed sync stays on the
     /// route rather than falling back to the direct transport.
@@ -54,7 +57,7 @@ struct VoteTreeEntry {
 
 impl VoteTreeEntry {
     fn is_reachable(&self) -> bool {
-        let connection_is_live = self.connection.strong_count() > 0;
+        let connection_is_live = crate::storage::sidecar_is_open(self.sidecar_id);
         let transport_is_held = self.transport.is_none() || self.sync.transport_is_shared();
         let holds_round_state = !self.sync.cached_rounds().is_empty();
         connection_is_live && (transport_is_held || holds_round_state)
@@ -75,7 +78,7 @@ impl VoteTreeEntry {
     }
 }
 
-/// The sidecar connection plus the wallet id. Two independently opened
+/// The sidecar plus the wallet id. Two independently opened
 /// sidecars that use the same wallet id must not share tree state or each
 /// other's transport.
 pub(super) type WalletKey = (u64, String);
@@ -110,7 +113,7 @@ fn new_entry(db: &VotingDb, transport: Option<Arc<dyn Transport>>) -> VoteTreeEn
     VoteTreeEntry {
         sync,
         transport: transport.as_ref().map(Arc::downgrade),
-        connection: Arc::downgrade(&db.shared_connection()),
+        sidecar_id: db.sidecar_id(),
         last_used: 0,
     }
 }

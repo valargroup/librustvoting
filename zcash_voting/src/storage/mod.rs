@@ -109,6 +109,42 @@ static NEXT_SIDECAR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static SIDECAR_IDS: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Live connections per sidecar id, so process-local caches keyed by the id
+/// can tell when a sidecar has no handle left through any connection.
+static OPEN_SIDECAR_CONNECTIONS: LazyLock<Mutex<HashMap<u64, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn note_sidecar_opened(id: u64) {
+    *OPEN_SIDECAR_CONNECTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(id)
+        .or_insert(0) += 1;
+}
+
+impl Drop for SidecarConnection {
+    fn drop(&mut self) {
+        let mut open = OPEN_SIDECAR_CONNECTIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = open.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// Whether any connection to the sidecar with `id` is still open in this
+/// process, through any handle.
+pub(crate) fn sidecar_is_open(id: u64) -> bool {
+    OPEN_SIDECAR_CONNECTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&id)
+}
+
 /// The sidecar id for `path`: the id assigned to its canonical path, or a
 /// fresh one for an in-memory database.
 fn sidecar_id_for(path: &str) -> u64 {
@@ -187,9 +223,11 @@ impl VotingDb {
     }
 
     pub(crate) fn from_connection(conn: Connection, path: &str) -> Self {
+        let id = sidecar_id_for(path);
+        note_sidecar_opened(id);
         Self {
             inner: Arc::new(SidecarConnection {
-                id: sidecar_id_for(path),
+                id,
                 conn: Mutex::new(conn),
                 chain_submission_coordination: Default::default(),
             }),
