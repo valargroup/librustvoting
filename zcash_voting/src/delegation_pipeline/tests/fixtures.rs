@@ -69,6 +69,14 @@ fn bundle_note() -> NoteInfo {
 /// A pipeline bound to an in-memory sidecar whose round row and bundle 0
 /// already exist.
 pub(super) fn pipeline_with_round() -> DelegationPipeline<NoWalletDatabase> {
+    pipeline_with_anchor_tree_state(Vec::new()).unwrap()
+}
+
+/// [`pipeline_with_round`] with the host-supplied anchor tree state bytes,
+/// returning the constructor's verdict on them.
+pub(super) fn pipeline_with_anchor_tree_state(
+    anchor_tree_state_bytes: Vec<u8>,
+) -> Result<DelegationPipeline<NoWalletDatabase>, VotingError> {
     let voting_db = Arc::new(VotingDb::open_in_memory().unwrap());
     voting_db.set_wallet_id(WALLET_ID);
     queries::insert_round(
@@ -85,7 +93,7 @@ pub(super) fn pipeline_with_round() -> DelegationPipeline<NoWalletDatabase> {
         network: Network::Testnet,
         round_params: round_params(),
         resolved_round_name: "pipeline test round".to_string(),
-        anchor_tree_state_bytes: Vec::new(),
+        anchor_tree_state_bytes,
         branch_id_provider: LightwalletdBranchIdProvider::for_height(
             Network::Testnet,
             SNAPSHOT_HEIGHT,
@@ -101,5 +109,4 @@ pub(super) fn pipeline_with_round() -> DelegationPipeline<NoWalletDatabase> {
         BundlePolicy::default(),
         None,
     )
-    .unwrap()
 }

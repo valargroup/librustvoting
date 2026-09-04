@@ -88,6 +88,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
                 message: "account_uuid must not be empty".to_string(),
             });
         }
+        bundle_setup::decode_anchor_tree_state(&lwd.anchor_tree_state_bytes)?;
         let wallet_id = voting_db.wallet_id();
         let voting_db = Arc::new(voting_db.scoped(&wallet_id));
         Ok(Self {

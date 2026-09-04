@@ -26,6 +26,19 @@ pub struct VotingEligibilityReport {
     pub privacy_trim_dropped_value_zatoshi: u64,
 }
 
+/// Decodes the anchor tree state a host fetched from lightwalletd.
+///
+/// The bytes are caller-supplied network output, so a decode failure is
+/// [`VotingError::InvalidInput`]: the host refetches its tree state rather
+/// than treating the failure as an SDK invariant violation. The pipeline
+/// constructor runs this check so a malformed anchor is refused before any
+/// stage starts.
+pub(super) fn decode_anchor_tree_state(bytes: &[u8]) -> Result<TreeState, VotingError> {
+    TreeState::decode(bytes).map_err(|e| VotingError::InvalidInput {
+        message: format!("delegation anchor tree state bytes do not decode: {e}"),
+    })
+}
+
 impl<W: WalletDbOpener> DelegationPipeline<W> {
     pub(super) fn hotkey(&self) -> Result<&VotingHotkey, VotingError> {
         self.hotkey
@@ -36,11 +49,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     }
 
     pub(super) fn anchor_tree_state(&self) -> Result<TreeState, VotingError> {
-        TreeState::decode(self.lwd.anchor_tree_state_bytes.as_slice()).map_err(|e| {
-            VotingError::Internal {
-                message: format!("failed to decode delegation anchor tree state: {e}"),
-            }
-        })
+        decode_anchor_tree_state(&self.lwd.anchor_tree_state_bytes)
     }
 
     /// Ensures the round row exists and returns its display context.
