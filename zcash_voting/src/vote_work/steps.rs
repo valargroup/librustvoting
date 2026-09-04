@@ -192,6 +192,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
             return self.step_cancelled(&scope, ledger);
         }
         progress.report(RoundStepProgress::Selected(scope.step.clone()));
+        // The callback runs host code that may cancel or switch epochs; do
+        // not start proving, prompt a signer, or touch durable state for a
+        // step the host ended at this boundary.
+        if scope.interrupted() {
+            return self.step_cancelled(&scope, ledger);
+        }
 
         match obligation.clone() {
             Obligation::Delegate { bundle_index } => {
