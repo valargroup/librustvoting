@@ -136,7 +136,14 @@ pub fn sync_vote_tree(db: &VotingDb, round_id: &str, node_url: &str) -> Result<u
 /// from scratch; the clients of other transports, and their synced state,
 /// are untouched. Pass the same transport on every call for a wallet to keep
 /// the incremental state; hosts that clone one `Arc` per wallet already do.
-/// A client is dropped once every clone of its transport is gone.
+///
+/// A routed client is retained after every caller-owned clone of its
+/// transport is gone for as long as it holds any round's tree state, so a
+/// sync followed by [`van_witness`] works even when the transport was moved
+/// into the call. Until that state is dropped, an unrouted [`sync_vote_tree`]
+/// for one of its rounds continues on it. To release the route, reset its
+/// rounds with [`reset_vote_tree`] (a round id, or `""` for the wallet); the
+/// client is also dropped when the last connection to the sidecar closes.
 pub fn sync_vote_tree_with(
     db: &VotingDb,
     round_id: &str,
