@@ -468,8 +468,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
     ///
     /// Returns [`VotingError::InvalidInput`] for a non-canonical round id, a
     /// network other than the chain client's or than the network the wallet
-    /// already stores this round under, an empty roster, or a repeated
-    /// proposal id. The network is checked here because chain identity
+    /// already stores this round under, an empty roster, a repeated
+    /// proposal id, or a hotkey secret that does not reconstruct. The network is checked here because chain identity
     /// derivation would otherwise reject it only after proving and helper
     /// plans had already been persisted.
     pub fn with_binding(mut self, binding: RoundBinding) -> Result<Self, VotingError> {
@@ -486,6 +486,11 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // be rejected by prepare_vote_work after CastVote had synced and
         // cached a tree from the binding's node fleet; refuse it up front.
         self.ensure_stored_round_network(&binding.round_id, "the binding")?;
+        // A malformed hotkey secret would otherwise be discovered only after
+        // CastVote had synced the tree and generated a witness.
+        if let Some(secret) = binding.hotkey_secret.as_ref() {
+            crate::VotingHotkey::from_stored_secret(secret, binding.network)?;
+        }
         if binding.proposals.is_empty() {
             return Err(VotingError::InvalidInput {
                 message: "round binding requires a nonempty proposal roster".to_string(),

@@ -1486,4 +1486,22 @@ mod round_executor {
         assert!(other_sidecar.is_some());
         drop(first);
     }
+
+    #[test]
+    fn a_binding_with_a_malformed_hotkey_secret_is_refused() {
+        let (executor, _) = bound_executor_unbound(host_database());
+        let error = executor
+            .with_binding(RoundBinding {
+                round_id: ROUND_ID.to_string(),
+                network: Network::Testnet,
+                proposals: vec![ProposalRosterEntry {
+                    proposal_id: 1,
+                    num_options: 2,
+                }],
+                hotkey_secret: Some(zeroize::Zeroizing::new(vec![0x21; 63])),
+            })
+            .err()
+            .expect("a 63-byte hotkey secret cannot reconstruct a hotkey");
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+    }
 }
