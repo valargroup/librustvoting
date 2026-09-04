@@ -102,21 +102,23 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         })
     }
 
-    /// The pipeline's own wallet-scoped handle over the sidecar connection.
+    /// A handle on the pipeline's sidecar connection, scoped to its wallet.
     ///
-    /// Re-scoping this handle with `set_wallet_id` makes every later stage
-    /// fail with [`VotingError::InvalidInput`]; see [`Self::wallet_id`].
-    pub fn voting_db(&self) -> &Arc<VotingDb> {
-        &self.voting_db
+    /// Each call returns a fresh handle over the same connection. The
+    /// pipeline's own handle is never handed out, so re-scoping the returned
+    /// one with `set_wallet_id` cannot move a running stage's persistence to
+    /// another wallet.
+    pub fn voting_db(&self) -> Arc<VotingDb> {
+        Arc::new(self.voting_db.scoped(&self.wallet_id))
     }
 
     /// The handle every stage persists through, verified to still select the
     /// wallet captured at construction.
     ///
-    /// The handle is reachable through [`Self::voting_db`] and its wallet is
-    /// publicly mutable, so each stage re-checks it instead of trusting the
-    /// captured id: a re-scoped pipeline fails closed rather than persisting
-    /// one wallet's delegation state under another wallet's scope.
+    /// The handle is private, so this check cannot fail through the public
+    /// API; it guards the invariant against internal misuse and fails with
+    /// [`VotingError::InvalidInput`] rather than persisting one wallet's
+    /// delegation state under another wallet's scope.
     pub(super) fn scoped_voting_db(&self) -> Result<&Arc<VotingDb>, VotingError> {
         let current = self.voting_db.wallet_id();
         if current != self.wallet_id {

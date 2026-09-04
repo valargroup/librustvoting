@@ -159,43 +159,24 @@ fn software_and_stored_signers_write_no_keystone_row() {
 }
 
 #[test]
-fn a_re_scoped_pipeline_handle_fails_every_stage_closed() {
+fn re_scoping_a_handle_from_voting_db_does_not_reach_the_pipeline() {
     let pipeline = pipeline_with_round();
     pipeline
         .voting_db()
         .store_keystone_signature(ROUND_ID, 0, &[0x33; 64], &[0x44; 32], &[0x55; 32])
         .unwrap();
+
+    let handle = pipeline.voting_db();
+    handle.set_wallet_id("some-other-wallet");
+
+    // The pipeline never hands out its own handle, so the re-scope is
+    // confined to the caller's copy and every stage still runs under the
+    // captured wallet.
+    assert_eq!(pipeline.voting_db().wallet_id(), "pipeline-wallet");
+    assert!(handle.shares_connection_with(&pipeline.voting_db()));
     assert!(pipeline
         .keystone_signature(0, &KeystoneSignatureSource::Stored)
         .is_ok());
-
-    pipeline.voting_db().set_wallet_id("some-other-wallet");
-
-    for (stage, outcome) in [
-        (
-            "keystone_signature",
-            pipeline
-                .keystone_signature(0, &KeystoneSignatureSource::Stored)
-                .map(|_| ()),
-        ),
-        (
-            "has_persisted_proof",
-            pipeline.has_persisted_proof(0).map(|_| ()),
-        ),
-        ("ensure_round", pipeline.ensure_round().map(|_| ())),
-    ] {
-        let error = outcome.expect_err(stage);
-        assert!(
-            matches!(error, VotingError::InvalidInput { .. }),
-            "{stage}: {error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("scoped to wallet pipeline-wallet"),
-            "{stage}: {error}"
-        );
-    }
-    // The captured identity the executor checks is unchanged.
+    assert!(!pipeline.has_persisted_proof(0).unwrap());
     assert_eq!(pipeline.wallet_id(), "pipeline-wallet");
 }
