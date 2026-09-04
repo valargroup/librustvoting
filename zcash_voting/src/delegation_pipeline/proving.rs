@@ -52,7 +52,11 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     ///
     /// Setup is write-once. When a prior attempt already persisted the
     /// sighash and effects, the stored values are kept and no PCZT bytes are
-    /// returned; signing then runs against the stored sighash.
+    /// returned; signing then runs against the stored sighash. Before the
+    /// stored setup is reused it is checked against this pipeline's notes and
+    /// target-bound hotkey, the same check a persisted proof gets: a setup
+    /// persisted for other notes or another target must not be signed as if
+    /// it were this bundle's.
     fn ensure_setup(
         &self,
         prepared: &PreparedDelegationBundle,
@@ -63,7 +67,10 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
             Err(VotingError::SetupAlreadyPersisted {
                 field: DelegationSetupField::PcztSighash | DelegationSetupField::Tx1Effects,
                 ..
-            }) => Ok(Vec::new()),
+            }) => {
+                prepared.validate_persisted_proof(self.scoped_voting_db()?)?;
+                Ok(Vec::new())
+            }
             Err(error) => Err(error),
         }
     }
