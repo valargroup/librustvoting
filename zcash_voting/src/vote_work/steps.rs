@@ -38,6 +38,7 @@ const PROVING_STACK_BYTES: usize = 64 * 1024 * 1024;
 impl<T: ChainTransport> RoundExecutor<T> {
     /// Plans the bound round from durable state.
     pub fn plan(&self) -> Result<RoundPlan, VotingError> {
+        self.wallet_scope()?;
         let binding = self.binding()?;
         resume_plan(&self.database, &binding.round_id, &binding.proposal_ids())
     }
@@ -49,6 +50,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// resolved against the roster first and then written in one transaction,
     /// so a rejected batch leaves durable intent unchanged.
     pub fn set_ballot_intents(&self, intents: &[BallotIntent]) -> Result<RoundPlan, VotingError> {
+        self.wallet_scope()?;
         let binding = self.binding()?;
         let resolved = intents
             .iter()
@@ -98,6 +100,10 @@ impl<T: ChainTransport> RoundExecutor<T> {
         control: &ChainSubmissionControl,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
+        let wallet_id = self
+            .wallet_scope()
+            .map(str::to_string)
+            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
         let round_id = self
             .binding()
             .map(|binding| binding.round_id.clone())
@@ -108,18 +114,17 @@ impl<T: ChainTransport> RoundExecutor<T> {
             }
             _ => None,
         };
-        let Some(_guard) =
-            round_lock::acquire(self.database.wallet_id(), &round_id, scope, control)
-                .await
-                .map_err(|message| {
-                    self.step_failure(
-                        RoundStepFailureKind::InvariantViolation,
-                        Some(step.clone()),
-                        None,
-                        None,
-                        message,
-                    )
-                })?
+        let Some(_guard) = round_lock::acquire(wallet_id, &round_id, scope, control)
+            .await
+            .map_err(|message| {
+                self.step_failure(
+                    RoundStepFailureKind::InvariantViolation,
+                    Some(step.clone()),
+                    None,
+                    None,
+                    message,
+                )
+            })?
         else {
             return self.step_cancelled(Some(step), None, Vec::new(), None);
         };

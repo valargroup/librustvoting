@@ -67,6 +67,11 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `RoundExecutor` freezes the wallet it is constructed for: it works on its
+  own handle over the shared sidecar connection, so a host `set_wallet_id`
+  cannot retarget a waiting or running step, and every operation fails with
+  `InvalidInput` if the executor's own handle is re-scoped.
+
 - A host-provided Keystone signature (`KeystoneSignatureSource::Provided`) is
   persisted under its bundle as soon as the signed payload verifies, so a
   `Delegate` step cancelled before chain dispatch, or a restart, resumes

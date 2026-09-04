@@ -111,16 +111,27 @@ mod round_executor {
     }
 
     fn executor() -> RoundExecutor<HyperTransport> {
+        executor_over(host_database()).0
+    }
+
+    /// The host's own handle: wallet "wallet" with one bundle in the round.
+    fn host_database() -> Arc<crate::round::VotingDb> {
         let database = Arc::new(crate::round::VotingDb::open_in_memory().unwrap());
         database.set_wallet_id("wallet");
         database
             .create_round(Network::Testnet, &round_params(), None)
             .unwrap();
         database.ensure_bundles(ROUND_ID, &[note()]).unwrap();
+        database
+    }
+
+    fn executor_over(
+        database: Arc<crate::round::VotingDb>,
+    ) -> (RoundExecutor<HyperTransport>, Arc<crate::round::VotingDb>) {
         let helper_client =
             HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
-        RoundExecutor::new(
-            database,
+        let executor = RoundExecutor::new(
+            Arc::clone(&database),
             ChainSubmissionClientConfig::for_network(
                 Network::Testnet,
                 vec!["http://chain.invalid".to_string()],
@@ -143,7 +154,8 @@ mod round_executor {
             ],
             hotkey_secret: None,
         })
-        .unwrap()
+        .unwrap();
+        (executor, database)
     }
 
     fn host() -> RoundHostContext {
@@ -529,5 +541,59 @@ mod round_executor {
             .expect("a cancelled Delegate step still hands back the signed bundle");
         assert_eq!(signed.bundle_index, 0);
         assert_eq!(signed.submission.spend_auth_sig, [0x68; 64]);
+    }
+
+    #[tokio::test]
+    async fn a_host_wallet_switch_does_not_retarget_a_bound_executor() {
+        let (executor, host_handle) = executor_over(host_database());
+        let bound_plan = executor.plan().unwrap();
+        assert!(!bound_plan.delegation_statuses.is_empty());
+
+        // The host moves its own handle to an account with no state in this round.
+        host_handle.set_wallet_id("other-wallet");
+
+        assert_eq!(executor.database().wallet_id(), "wallet");
+        assert!(executor.database().shares_connection_with(&host_handle));
+        let plan_after_switch = executor.plan().unwrap();
+        assert_eq!(
+            plan_after_switch.delegation_statuses,
+            bound_plan.delegation_statuses
+        );
+        let control = ChainSubmissionControl::new(1);
+        let outcome = executor
+            .advance_next(&host(), &control, &NoopRoundStepProgressReporter {})
+            .await
+            .unwrap();
+        assert_eq!(outcome.disposition, RoundStepDisposition::NoWork);
+    }
+
+    #[tokio::test]
+    async fn re_scoping_the_executor_handle_fails_closed() {
+        let executor = executor();
+        executor.database().set_wallet_id("other-wallet");
+
+        let error = executor
+            .plan()
+            .expect_err("a re-scoped executor handle must not plan");
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("scoped to wallet wallet"),
+            "{error}"
+        );
+
+        let control = ChainSubmissionControl::new(1);
+        let failure = executor
+            .advance_next(&host(), &control, &NoopRoundStepProgressReporter {})
+            .await
+            .expect_err("a re-scoped executor handle must not run steps");
+        assert_eq!(failure.kind, RoundStepFailureKind::InvalidInput);
+
+        let failure = executor
+            .set_ballot_intents(&[BallotIntent {
+                proposal_id: 1,
+                decision: Decision::Skipped,
+            }])
+            .expect_err("a re-scoped executor handle must not record intents");
+        assert!(matches!(failure, VotingError::InvalidInput { .. }));
     }
 }

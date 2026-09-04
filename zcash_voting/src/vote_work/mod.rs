@@ -381,6 +381,9 @@ pub struct VoteRecoveryFailure {
 /// off the async runtime. Delegation steps lock per bundle so bundles prove
 /// concurrently; chain and share steps lock per round.
 pub struct RoundExecutor<T> {
+    /// Wallet the executor was constructed for. Every operation runs against
+    /// this scope; see [`Self::wallet_scope`].
+    wallet_id: String,
     database: Arc<VotingDb>,
     chain_client: ChainSubmissionClient<T>,
     helper_client: HelperClient,
@@ -399,8 +402,10 @@ impl RoundExecutor<HyperTransport> {
         chain_config: ChainSubmissionClientConfig,
         helper_client: HelperClient,
     ) -> Result<Self, ChainSubmissionFailure> {
+        let (wallet_id, database) = freeze_wallet_scope(&database);
         let chain_client = ChainSubmissionClient::new(Arc::clone(&database), chain_config)?;
         Ok(Self {
+            wallet_id,
             database,
             chain_client,
             helper_client,
@@ -413,20 +418,25 @@ impl RoundExecutor<HyperTransport> {
 impl<T: ChainTransport> RoundExecutor<T> {
     /// Constructs an executor with an injected chain transport.
     ///
-    /// Both planning and chain advancement are permanently bound to
-    /// `database`; callers cannot compose clients backed by different wallets.
+    /// Both planning and chain advancement are permanently bound to the
+    /// wallet `database` is scoped to at construction. The executor works on
+    /// its own handle over the same connection, so a later `set_wallet_id`
+    /// on the host's handle cannot retarget in-flight or later work; callers
+    /// cannot compose clients backed by different wallets.
     pub fn with_transport(
         database: Arc<VotingDb>,
         chain_transport: T,
         chain_config: ChainSubmissionClientConfig,
         helper_client: HelperClient,
     ) -> Result<Self, ChainSubmissionFailure> {
+        let (wallet_id, database) = freeze_wallet_scope(&database);
         let chain_client = ChainSubmissionClient::with_transport(
             Arc::clone(&database),
             chain_transport,
             chain_config,
         )?;
         Ok(Self {
+            wallet_id,
             database,
             chain_client,
             helper_client,
@@ -451,8 +461,33 @@ impl<T: ChainTransport> RoundExecutor<T> {
         self
     }
 
+    /// The executor's own wallet-scoped handle.
+    ///
+    /// It shares the connection with the handle passed at construction but is
+    /// frozen to that wallet. Re-scoping it makes every later operation fail
+    /// closed; see [`Self::wallet_scope`].
     pub fn database(&self) -> &Arc<VotingDb> {
         &self.database
+    }
+
+    /// The wallet every operation is scoped to.
+    ///
+    /// The executor captured this id at construction and keys its locks,
+    /// plans, and persistence by it. If the handle returned by
+    /// [`Self::database`] has since been re-scoped, this fails with
+    /// [`VotingError::InvalidInput`] rather than letting work for one wallet
+    /// run under another wallet's lock and binding.
+    pub(super) fn wallet_scope(&self) -> Result<&str, VotingError> {
+        let current = self.database.wallet_id();
+        if current != self.wallet_id {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "round executor is scoped to wallet {} but its database handle now selects wallet {current}",
+                    self.wallet_id
+                ),
+            });
+        }
+        Ok(&self.wallet_id)
     }
 
     fn binding(&self) -> Result<&RoundBinding, VotingError> {
@@ -462,6 +497,14 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 message: "round executor is not bound to a round; call with_binding".to_string(),
             })
     }
+}
+
+/// Captures the wallet `database` currently selects and returns a handle
+/// over the same connection that only the executor holds.
+fn freeze_wallet_scope(database: &VotingDb) -> (String, Arc<VotingDb>) {
+    let wallet_id = database.wallet_id();
+    let scoped = Arc::new(database.scoped(&wallet_id));
+    (wallet_id, scoped)
 }
 
 #[cfg(test)]
