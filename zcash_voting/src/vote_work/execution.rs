@@ -221,10 +221,19 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 vote.bundle_index(),
                 vote.proposal_id(),
             )
-            .map_err(|error| self.voting_failure(error, Some(work.clone()), request))?;
+            .map_err(|error| {
+                self.voting_failure_after_chain(
+                    error,
+                    Some(work.clone()),
+                    chain_outcome.clone(),
+                    request,
+                )
+            })?;
             let vote = vote
                 .confirmed(&self.database)
-                .map_err(|error| self.voting_failure(error, Some(work.clone()), request))?
+                .map_err(|error| {
+                    self.voting_failure_after_chain(error, Some(work.clone()), chain_outcome.clone(), request)
+                })?
                 .ok_or_else(|| {
                     self.failure(
                         VoteRecoveryFailureKind::InvariantViolation,
@@ -247,7 +256,14 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     &cancel,
                 )
                 .await
-                .map_err(|error| self.voting_failure(error, Some(work.clone()), request))?;
+                .map_err(|error| {
+                    self.voting_failure_after_chain(
+                        error,
+                        Some(work.clone()),
+                        chain_outcome.clone(),
+                        request,
+                    )
+                })?;
             let report = VoteShareDeliveryReport {
                 vote: vote_key(vote.vote()),
                 delivery,
@@ -372,6 +388,19 @@ impl<T: ChainTransport> RoundExecutor<T> {
         work: Option<crate::session::VoteRecoveryWork>,
         request: VoteRecoveryRequest<'_>,
     ) -> VoteRecoveryFailure {
+        self.voting_failure_after_chain(error, work, None, request)
+    }
+
+    /// [`Self::voting_failure`] for an error raised after the chain already
+    /// produced `chain_outcome`, which stays on the failure so a durable
+    /// confirmation is not lost behind a later delivery error.
+    fn voting_failure_after_chain(
+        &self,
+        error: VotingError,
+        work: Option<crate::session::VoteRecoveryWork>,
+        chain_outcome: Option<ChainSubmissionResult>,
+        request: VoteRecoveryRequest<'_>,
+    ) -> VoteRecoveryFailure {
         let kind = match error.kind() {
             VotingErrorKind::InvalidInput
             | VotingErrorKind::InsufficientEligibility
@@ -384,7 +413,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             | VotingErrorKind::ProofFailed
             | VotingErrorKind::Internal => VoteRecoveryFailureKind::InvariantViolation,
         };
-        self.failure(kind, work, None, None, error.to_string(), request)
+        self.failure(kind, work, None, chain_outcome, error.to_string(), request)
     }
 
     fn chain_failure(
