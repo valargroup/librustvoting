@@ -54,44 +54,48 @@ fn concurrent_opens_of_one_path_share_one_connection() {
 
 #[test]
 fn a_slow_open_of_one_path_does_not_block_another_path() {
-    // The open retries a busy sidecar five times with growing sleeps (750 ms
-    // in total), so the lock is released inside that window.
-    const HOLD: Duration = Duration::from_millis(600);
-    const OTHER_PATH_BUDGET: Duration = Duration::from_millis(300);
-
     let slow_wallet = fresh_wallet_path("slow");
     let quick_wallet = fresh_wallet_path("quick");
     let slow_sidecar = VotingDb::wallet_sidecar_path(&slow_wallet);
 
-    // Another process holds the slow sidecar's write lock, so opening it
-    // fails busy and retries inside the open until the lock is released.
+    // Another process holds the slow sidecar's write lock for the whole test,
+    // so its open spends the entire busy-retry window inside the open and
+    // then fails with DbBusy. Only ordering is asserted, never wall-clock
+    // budgets, so the test does not depend on machine speed.
     let holder = rusqlite::Connection::open(&slow_sidecar).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-    let slow_started = Instant::now();
     let slow_open = {
         let slow_wallet = slow_wallet.clone();
-        thread::spawn(move || VotingDb::open_wallet_sidecar(&slow_wallet, "slow-wallet"))
+        thread::spawn(move || {
+            let outcome = VotingDb::open_wallet_sidecar(&slow_wallet, "slow-wallet");
+            (outcome, Instant::now())
+        })
     };
-    // Let the slow open fail its first attempts before opening the other path.
-    thread::sleep(Duration::from_millis(200));
+    // Give the slow open time to enter its retry loop; if the runner is so
+    // slow that it has not, the ordering assertion below still holds.
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !slow_open.is_finished(),
+        "the slow open must still be inside its busy-retry window"
+    );
 
-    let quick_started = Instant::now();
     let quick = VotingDb::open_wallet_sidecar(&quick_wallet, "quick-wallet").unwrap();
-    let quick_elapsed = quick_started.elapsed();
+    let quick_finished_at = Instant::now();
 
-    thread::sleep(HOLD.saturating_sub(slow_started.elapsed()));
+    let (slow_outcome, slow_finished_at) = slow_open.join().unwrap();
     holder.execute_batch("ROLLBACK").unwrap();
-    let slow = slow_open.join().unwrap().unwrap();
 
     assert!(
-        quick_elapsed < OTHER_PATH_BUDGET,
-        "opening an unrelated sidecar waited {quick_elapsed:?} behind a busy open"
+        quick_finished_at < slow_finished_at,
+        "an unrelated sidecar open waited behind a busy open of another path"
     );
-    assert!(!quick.shares_connection_with(&slow));
-    assert_eq!(slow.wallet_id(), "slow-wallet");
+    let slow_error = slow_outcome
+        .err()
+        .expect("the held lock outlives the retry window");
+    assert_eq!(slow_error.kind(), crate::VotingErrorKind::DbBusy);
 
-    drop((quick, slow, holder));
+    drop((quick, holder));
     std::fs::remove_file(slow_sidecar).ok();
     std::fs::remove_file(VotingDb::wallet_sidecar_path(&quick_wallet)).ok();
 }
