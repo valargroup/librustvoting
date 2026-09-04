@@ -90,9 +90,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// Runs one planned step by one bounded pass.
     ///
     /// The step is re-validated against a fresh plan under the lock; a step
-    /// another pass already completed returns `NoWork`. `Delegate` and
-    /// `AdvanceDelegation` lock their bundle; every other step locks the
-    /// round.
+    /// another pass already completed returns `NoWork`. A step whose bundle
+    /// still has a delegation step ahead of it in the plan fails with
+    /// `InvalidInput` naming that prerequisite, before any lock-scoped work
+    /// or network I/O; run the prerequisite first or use `advance_next`.
+    /// `Delegate` and `AdvanceDelegation` lock their bundle; every other step
+    /// locks the round.
     pub async fn advance_step(
         &self,
         step: NextStep,
@@ -134,6 +137,17 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
         if !plan.next_steps.contains(&step) {
             return Ok(self.no_work(Some(step), plan));
+        }
+        if let Some(prerequisite) = crate::session::blocking_prerequisite(&plan.next_steps, &step) {
+            return Err(self.step_failure(
+                RoundStepFailureKind::InvalidInput,
+                Some(step.clone()),
+                None,
+                None,
+                format!(
+                    "{step:?} requires {prerequisite:?} to complete first; run that step or advance_next"
+                ),
+            ));
         }
         if control.is_cancelled() {
             return self.step_cancelled(Some(step), None, Vec::new(), None);

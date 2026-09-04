@@ -596,4 +596,48 @@ mod round_executor {
             .expect_err("a re-scoped executor handle must not record intents");
         assert!(matches!(failure, VotingError::InvalidInput { .. }));
     }
+
+    #[tokio::test]
+    async fn a_cast_vote_selected_ahead_of_its_delegation_is_rejected_before_any_work() {
+        let executor = executor();
+        executor
+            .set_ballot_intents(&[
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Choice(0),
+                },
+                BallotIntent {
+                    proposal_id: 2,
+                    decision: Decision::Skipped,
+                },
+            ])
+            .unwrap();
+        let cast = NextStep::CastVote {
+            bundle_index: 0,
+            proposal_id: 1,
+            choice: 0,
+        };
+        let plan = executor.plan().unwrap();
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::Delegate { bundle_index: 0 }, cast.clone()]
+        );
+
+        // The only node URL is unreachable, so reaching tree sync would fail
+        // with a transport error rather than InvalidInput.
+        let control = ChainSubmissionControl::new(1);
+        let failure = executor
+            .advance_step(
+                cast.clone(),
+                &host(),
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .expect_err("a step with an unresolved delegation prerequisite must not run");
+
+        assert_eq!(failure.kind, RoundStepFailureKind::InvalidInput);
+        assert_eq!(failure.step, Some(cast));
+        assert!(failure.message.contains("Delegate"), "{}", failure.message);
+    }
 }

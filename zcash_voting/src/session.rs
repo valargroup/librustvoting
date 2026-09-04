@@ -669,6 +669,39 @@ fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
     }
 }
 
+/// The earlier step in `steps` that must clear before `step` can run.
+///
+/// Plans are rank-ordered, but rank is proposal-primary and says nothing about
+/// per-bundle dependencies. Vote and share work for a bundle requires that
+/// bundle's delegation to be confirmed, so while `steps` still holds a
+/// `Delegate`, `AdvanceDelegation`, or `AdvanceImportedDelegation` for the
+/// same bundle, that step is the blocking prerequisite. Delegation steps and
+/// steps on other bundles have none.
+pub(crate) fn blocking_prerequisite<'a>(
+    steps: &'a [NextStep],
+    step: &NextStep,
+) -> Option<&'a NextStep> {
+    let dependent_bundle = match step {
+        NextStep::Delegate { .. }
+        | NextStep::AdvanceDelegation { .. }
+        | NextStep::AdvanceImportedDelegation { .. } => return None,
+        NextStep::CastVote { bundle_index, .. }
+        | NextStep::AdvanceVote { bundle_index, .. }
+        | NextStep::AdvanceVoteBatch { bundle_index, .. }
+        | NextStep::SubmitShares { bundle_index, .. }
+        | NextStep::ConfirmShare { bundle_index, .. } => *bundle_index,
+    };
+    steps.iter().find(|candidate| {
+        matches!(
+            candidate,
+            NextStep::Delegate { bundle_index }
+                | NextStep::AdvanceDelegation { bundle_index }
+                | NextStep::AdvanceImportedDelegation { bundle_index }
+                if *bundle_index == dependent_bundle
+        )
+    })
+}
+
 fn missing_recovery_field(message: String) -> VotingError {
     VotingError::Internal { message }
 }
@@ -2164,6 +2197,47 @@ mod tests {
         assert_eq!(plan.primary_action, RoundPlanAction::Idle);
         assert!(plan.recovered_delegation_work.is_empty());
         assert!(plan.recovered_vote_work.is_empty());
+    }
+
+    #[test]
+    fn a_bundles_delegation_step_blocks_its_own_vote_and_share_steps_only() {
+        let delegate = NextStep::Delegate { bundle_index: 0 };
+        let advance = NextStep::AdvanceDelegation { bundle_index: 1 };
+        let cast_zero = NextStep::CastVote {
+            bundle_index: 0,
+            proposal_id: 1,
+            choice: 1,
+        };
+        let cast_one = NextStep::CastVote {
+            bundle_index: 1,
+            proposal_id: 1,
+            choice: 1,
+        };
+        let cast_two = NextStep::CastVote {
+            bundle_index: 2,
+            proposal_id: 1,
+            choice: 1,
+        };
+        let share_one = NextStep::ConfirmShare {
+            bundle_index: 1,
+            proposal_id: 1,
+            share_index: 0,
+        };
+        let steps = vec![
+            delegate.clone(),
+            advance.clone(),
+            cast_zero.clone(),
+            cast_one.clone(),
+            cast_two.clone(),
+            share_one.clone(),
+        ];
+
+        assert_eq!(blocking_prerequisite(&steps, &cast_zero), Some(&delegate));
+        assert_eq!(blocking_prerequisite(&steps, &cast_one), Some(&advance));
+        assert_eq!(blocking_prerequisite(&steps, &share_one), Some(&advance));
+        assert_eq!(blocking_prerequisite(&steps, &cast_two), None);
+        assert_eq!(blocking_prerequisite(&steps, &delegate), None);
+        assert_eq!(blocking_prerequisite(&steps, &advance), None);
     }
 
     #[test]

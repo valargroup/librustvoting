@@ -67,6 +67,11 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `RoundExecutor::advance_step` rejects a step whose bundle still has a
+  `Delegate`, `AdvanceDelegation`, or `AdvanceImportedDelegation` step ahead
+  of it in the plan with `InvalidInput`, before any lock-scoped work or
+  network I/O. `advance_next` is unaffected: it always runs the plan head.
+
 - `RoundExecutor` freezes the wallet it is constructed for: it works on its
   own handle over the shared sidecar connection, so a host `set_wallet_id`
   cannot retarget a waiting or running step, and every operation fails with
