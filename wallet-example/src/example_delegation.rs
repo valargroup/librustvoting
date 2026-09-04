@@ -19,9 +19,7 @@ use zcash_voting::prelude::{
     PreparedSigner, RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey, VotingHotkeyTargetV1,
 };
 use zcash_voting::wire::PirLayout;
-use zcash_voting::{
-    BundlePolicy, HyperTransport, PirFleet, VotingRoundParams,
-};
+use zcash_voting::{BundlePolicy, HyperTransport, PirFleet, VotingRoundParams};
 use zip32::{fingerprint::SeedFingerprint, AccountId};
 
 /// Inputs for preparing one reusable delegation bundle context.

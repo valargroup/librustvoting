@@ -115,20 +115,20 @@ impl VotingDb {
     /// or a proposal whose vote is on or past the chain lifecycle.
     pub fn clear_ballot_intent(&self, round_id: &str, proposal_id: u32) -> Result<(), VotingError> {
         validate_proposal_id(proposal_id)?;
-        if let Some((bundle_index, _, phase)) = self
-            .vote_phases(round_id)?
-            .into_iter()
-            .find(|(_, vote_proposal, phase)| {
-                *vote_proposal == proposal_id
-                    && matches!(
-                        phase,
-                        VotePhase::Submitted
-                            | VotePhase::SubmissionManaged
-                            | VotePhase::SubmittedWithoutHash
-                            | VotePhase::SubmissionRejected
-                            | VotePhase::Confirmed
-                    )
-            })
+        if let Some((bundle_index, _, phase)) =
+            self.vote_phases(round_id)?
+                .into_iter()
+                .find(|(_, vote_proposal, phase)| {
+                    *vote_proposal == proposal_id
+                        && matches!(
+                            phase,
+                            VotePhase::Submitted
+                                | VotePhase::SubmissionManaged
+                                | VotePhase::SubmittedWithoutHash
+                                | VotePhase::SubmissionRejected
+                                | VotePhase::Confirmed
+                        )
+                })
         {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -2337,7 +2337,8 @@ mod tests {
                 .unwrap();
         }
         // A decision recorded for a proposal the roster no longer lists.
-        db.set_ballot_intent(ROUND, 9, Decision::Choice(0), 3).unwrap();
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(0), 3)
+            .unwrap();
 
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert_eq!(plan.unrostered_intents, vec![9]);
@@ -2350,7 +2351,10 @@ mod tests {
             "casting must wait until the durable intents exactly match the roster: {:?}",
             plan.next_steps
         );
-        assert_eq!(plan.next_steps, vec![NextStep::Delegate { bundle_index: 0 }]);
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::Delegate { bundle_index: 0 }]
+        );
 
         db.clear_ballot_intent(ROUND, 9).unwrap();
         db.clear_ballot_intent(ROUND, 9).unwrap();
@@ -2365,7 +2369,8 @@ mod tests {
     #[test]
     fn an_intent_whose_vote_the_chain_lifecycle_owns_cannot_be_cleared() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3).unwrap();
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3)
+            .unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 9, 1, &[0xCC; 16]).unwrap();
         // Tracking on the chain lifecycle: no tx_hash projection yet, but the
         // signed generation may already be on chain.
@@ -2871,9 +2876,9 @@ mod tests {
         // submission, so the status has to say so outright.
         assert!(status.terminal);
         assert_eq!(
-            crate::wire::WorkflowPhaseView::from(
-                crate::phases::WorkflowPhase::for_delegation(status.phase)
-            ),
+            crate::wire::WorkflowPhaseView::from(crate::phases::WorkflowPhase::for_delegation(
+                status.phase
+            )),
             crate::wire::WorkflowPhaseView::SubmittedDelegation
         );
     }
@@ -2882,7 +2887,10 @@ mod tests {
     fn terminal_delegation_status_marks_only_ended_phases() {
         let db = db_with_bundle();
         assert!(
-            !resume_plan(&db, ROUND, &[1, 2, 3]).unwrap().delegation_statuses[0].terminal,
+            !resume_plan(&db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .delegation_statuses[0]
+                .terminal,
             "a fresh bundle still has delegation work"
         );
 
@@ -4636,9 +4644,11 @@ mod tests {
     #[test]
     fn unconfirmed_shares_are_reported_and_schedule_a_tracking_pass() {
         let db = db_with_bundle();
-        assert!(!resume_plan(&db, ROUND, &[1, 2, 3])
-            .unwrap()
-            .has_unconfirmed_shares);
+        assert!(
+            !resume_plan(&db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .has_unconfirmed_shares
+        );
         assert_eq!(
             crate::share::next_tracking_delay_for_round(
                 &db,
