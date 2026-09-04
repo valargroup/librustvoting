@@ -150,3 +150,30 @@ fn a_retained_tree_handle_keeps_its_round_state_when_the_wallet_rebinds() {
     assert_eq!(tree.cached_rounds(), vec![ROUND_ID.to_string()]);
     reset_vote_tree(&db, "").unwrap();
 }
+
+#[test]
+fn two_sidecars_with_one_wallet_id_keep_separate_tree_state_and_routes() {
+    let first_sidecar = db("wallet-shared-name");
+    let second_sidecar = db("wallet-shared-name");
+    let routed = CountingTransport::new();
+    // The first sidecar binds a routed client and creates the round's state.
+    sync_vote_tree_with(&first_sidecar, ROUND_ID, NODE_URL, routed.clone()).unwrap_err();
+    assert_eq!(routed.requests(), 1);
+
+    // An unrouted sync on the other sidecar must neither reuse that route nor
+    // see that round state.
+    assert!(super::cached_vote_tree_rounds(&second_sidecar).is_empty());
+    sync_vote_tree(&second_sidecar, ROUND_ID, NODE_URL).unwrap_err();
+    assert_eq!(
+        routed.requests(),
+        1,
+        "the second sidecar must not travel the first sidecar's route"
+    );
+    assert!(!std::sync::Arc::ptr_eq(
+        &vote_tree_sync_for(&first_sidecar, None).unwrap(),
+        &vote_tree_sync_for(&second_sidecar, None).unwrap()
+    ));
+
+    reset_vote_tree(&first_sidecar, "").unwrap();
+    reset_vote_tree(&second_sidecar, "").unwrap();
+}

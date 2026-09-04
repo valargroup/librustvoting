@@ -91,9 +91,15 @@ pub struct KeystoneSignatureBatchResult {
 /// In-process writers serialize on the connection mutex, so SQLite reports
 /// `SQLITE_BUSY` only when another process holds the file.
 pub(crate) struct SidecarConnection {
+    /// Process-unique identity of this connection, so caches keyed by wallet
+    /// id can tell two sidecars that use the same wallet id apart.
+    id: u64,
     conn: Mutex<Connection>,
     chain_submission_coordination: crate::chain_submission::coordination::SubmissionCoordination,
 }
+
+static NEXT_SIDECAR_CONNECTION_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 /// Database handle for voting state: a shared SQLite connection plus a
 /// wallet identifier that scopes all round data to a single wallet.
@@ -139,6 +145,7 @@ impl VotingDb {
     pub(crate) fn from_connection(conn: Connection) -> Self {
         Self {
             inner: Arc::new(SidecarConnection {
+                id: NEXT_SIDECAR_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 conn: Mutex::new(conn),
                 chain_submission_coordination: Default::default(),
             }),
@@ -163,6 +170,11 @@ impl VotingDb {
     /// instead of opening a connection per account.
     pub fn scoped(&self, wallet_id: &str) -> Self {
         Self::from_shared(Arc::clone(&self.inner), wallet_id)
+    }
+
+    /// Process-unique identity of the underlying sidecar connection.
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.inner.id
     }
 
     /// Whether two handles share one underlying connection.

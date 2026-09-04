@@ -68,7 +68,17 @@ impl BoundVoteTreeSync {
     }
 }
 
-static VOTE_TREE_SYNCS: OnceLock<Mutex<HashMap<String, BoundVoteTreeSync>>> = OnceLock::new();
+/// Registry key: the sidecar connection plus the wallet id. Two independently
+/// opened sidecars that use the same wallet id must not share tree state or
+/// each other's transport.
+type VoteTreeCacheKey = (u64, String);
+
+fn vote_tree_cache_key(db: &VotingDb) -> VoteTreeCacheKey {
+    (db.connection_id(), db.wallet_id())
+}
+
+static VOTE_TREE_SYNCS: OnceLock<Mutex<HashMap<VoteTreeCacheKey, BoundVoteTreeSync>>> =
+    OnceLock::new();
 
 /// Result of PIR precomputation for one delegation bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,7 +221,7 @@ pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError>
     if round_id.is_empty() {
         // An account-wide reset also forgets the transport the client was
         // created with, so the next sync can bind a different one.
-        let wallet_id = db.wallet_id();
+        let wallet_id = vote_tree_cache_key(db);
         let mut guard = VOTE_TREE_SYNCS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -259,7 +269,7 @@ pub fn reset_voting_session_state(db: &VotingDb, round_id: &str) -> Result<(), V
 /// its first sync attempt until [`reset_vote_tree`] drops it, so a host can
 /// see what a reset would discard.
 pub fn cached_vote_tree_rounds(db: &VotingDb) -> Vec<String> {
-    let wallet_id = db.wallet_id();
+    let wallet_id = vote_tree_cache_key(db);
     VOTE_TREE_SYNCS
         .get()
         .and_then(|registry| registry.lock().ok())
@@ -278,7 +288,7 @@ fn vote_tree_sync_for(
     db: &VotingDb,
     transport: Option<Arc<dyn vote_commitment_tree_client::transport::Transport>>,
 ) -> Result<Arc<crate::tree_sync::VoteTreeSync>, VotingError> {
-    let wallet_id = db.wallet_id();
+    let wallet_id = vote_tree_cache_key(db);
     let mut guard = VOTE_TREE_SYNCS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
