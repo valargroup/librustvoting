@@ -176,3 +176,24 @@ fn an_empty_wallet_id_is_refused_before_the_sidecar_is_opened() {
         "a refused open must not create the sidecar file"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_to_an_existing_sidecar_shares_its_identity() {
+    let wallet_path = fresh_wallet_path("symlink-target");
+    let sidecar = VotingDb::wallet_sidecar_path(&wallet_path);
+    // Create the sidecar first; a link can only be resolved once it exists.
+    let by_path = VotingDb::open(sidecar.to_str().unwrap()).unwrap();
+    let link = fresh_wallet_path("symlink-link").with_extension("voting.link");
+    std::fs::remove_file(&link).ok();
+    std::os::unix::fs::symlink(&sidecar, &link).unwrap();
+
+    let by_link = VotingDb::open(link.to_str().unwrap()).unwrap();
+    assert_eq!(
+        by_path.sidecar_id(),
+        by_link.sidecar_id(),
+        "the real path and a symlink to it name one durable database"
+    );
+    assert_eq!(sidecar_registry_key(&link), sidecar_registry_key(&sidecar));
+    std::fs::remove_file(&link).ok();
+}

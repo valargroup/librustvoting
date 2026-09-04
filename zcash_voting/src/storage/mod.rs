@@ -160,11 +160,16 @@ fn sidecar_id_for(path: &str) -> u64 {
         .or_insert_with(fresh)
 }
 
-/// The canonical identity of a sidecar path: its parent directory
-/// canonicalized (symlinks and `..` resolved) plus the file name, so every
-/// spelling of one file maps to one key. The file itself need not exist yet.
-/// A parent that cannot be canonicalized keeps the path as given.
+/// The canonical identity of a sidecar path, so every spelling of one file
+/// maps to one key. An existing file is canonicalized in full, so a symlink
+/// to the sidecar and its real path share an identity. A file not created
+/// yet has its parent directory canonicalized (symlinks and `..` resolved)
+/// with the file name appended; a parent that cannot be canonicalized keeps
+/// the path as given.
 pub(crate) fn sidecar_registry_key(sidecar_path: &Path) -> PathBuf {
+    if let Ok(existing) = sidecar_path.canonicalize() {
+        return existing;
+    }
     match (sidecar_path.parent(), sidecar_path.file_name()) {
         (Some(parent), Some(file_name)) => {
             let parent = if parent.as_os_str().is_empty() {
