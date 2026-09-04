@@ -82,7 +82,7 @@ Each unit has a **lifecycle position**, an exhaustive coarsening of
 | Uncast | `Prepared`, or no row | Nothing durable the chain could have seen. |
 | Undispatched | `Committed` | Proof, recovery bundle and signature are durable; no POST reserved. The wallet owns it: it may be retired or recast. |
 | OnWire | `Submitted`, `SubmissionManaged` | A POST was reserved or dispatched. The chain lifecycle owns it: it is driven to resolution whatever the ballot or roster now say. |
-| Terminal | `SubmittedWithoutHash`, `SubmissionRejected` | The lifecycle ended without a confirmation. No step is planned; the unit still holds its bundle against a fresh cast. |
+| Terminal | `SubmittedWithoutHash`, `SubmissionRejected` | The lifecycle ended without a confirmation. No step is planned. A hashless dispatch may have landed, so it holds its bundle against a fresh cast; a rejected vote spent nothing and holds nothing. |
 | Confirmed | `Confirmed` | The vote has a tree position; its helper shares are owed. |
 
 A unit is **lifecycle-owned** when its position is OnWire, Terminal, or
@@ -109,12 +109,12 @@ canonical obligations are:
 |---|---|---|
 | `Delegate` | bundle | bundle index |
 | `AdvanceDelegation` | bundle | bundle index, whether the delegation is a structurally imported capability, phase, tx hash |
-| `Retire` | vote unit | unit id, every member, the reason (`LeftRoster` with the departed proposals, or `StaleIntent`) |
+| `Retire` | vote unit | unit id and every member; an undispatched unit a member of which left the roster |
 | `Cast` | bundle | every draft `(proposal_id, choice)` the bundle must cast, the units to retire first, the delegation prerequisite if any |
 | `ReconcileChain` | vote unit | unit id, ordered member proposals, phase, tx hash, the delegation prerequisite if any |
 | `Deliver` | confirmed vote | vote key, tree position, the share indexes owed, whether a durable helper plan already exists |
 | `Confirm` | share | share key |
-| `Blocked` | bundle cast | the reason the host must resolve: open ballot, unrostered intents, bundle held by an on-wire or terminal unit, bundle held by a managed or terminal delegation |
+| `Blocked` | bundle cast | the reason the host must resolve: an open ballot, or unrostered intents to clear |
 
 An obligation carries everything its execution needs. The executor never
 rescans the plan for sibling steps, never re-derives batch membership from an
@@ -139,11 +139,11 @@ It has no clock and no network. The per-unit rule is one exhaustive match:
 |---|---|---|---|
 | Undispatched | Rostered | Agrees | `ReconcileChain` |
 | Undispatched | Rostered | Unrecorded | none; the unit holds its bundle |
-| Undispatched | Rostered | Conflicts | `Retire { StaleIntent }`; the cast pass recasts |
-| Undispatched | LeftRoster | any | `Retire { LeftRoster }` for the whole unit; the cast pass recasts the rostered members |
+| Undispatched | Rostered | Conflicts | singleton: none, and it holds nothing; the cast pass recasts and the persisted cast replaces the row. Batch: invariant violation, since the intent write path clears an unsubmitted batch whole |
+| Undispatched | LeftRoster | any | `Retire` for the whole unit; the cast pass recasts the rostered members |
 | OnWire | any | Agrees, Unrecorded | `ReconcileChain` |
 | OnWire | any | Conflicts | invariant violation |
-| Terminal | any | Agrees, Unrecorded | none; recorded as a terminal unit |
+| Terminal | any | Agrees, Unrecorded | none |
 | Terminal | any | Conflicts | invariant violation |
 | Confirmed | any | Agrees, Unrecorded | per member: `Deliver` for missing or not-yet-accepted shares, `Confirm` for accepted `Submitted` shares |
 | Confirmed | any | Conflicts | invariant violation |
@@ -168,12 +168,15 @@ The consequences that follow, and that tests pin:
 ### Cast gating
 
 For each bundle and each rostered proposal with a `Choice` intent that no
-live unit covers with the same choice (a unit being retired is not live), a
-cast is due. It is `Cast` when the ballot is **terminal** (no open proposal
-and no unrostered intent to clear) and the bundle is not held; otherwise it is
-`Blocked` with the first applicable reason. A bundle is **held** by an
-Undispatched-Agrees or OnWire or Terminal unit, or by a delegation in
-`SubmissionManaged`, `SubmittedWithoutHash` or `SubmissionRejected`.
+live unit covers with the same choice (a unit being retired, and a stale
+singleton, are not live), a cast is due. A bundle is **held** by a live unit
+in `Committed`, `Submitted`, `SubmissionManaged` or `SubmittedWithoutHash`, or
+by a delegation in `SubmissionManaged`, `SubmittedWithoutHash` or
+`SubmissionRejected`; a due cast on a held bundle plans nothing at all, not
+even the delegation prerequisite, because nothing can be cast there until the
+holder resolves. On a free bundle the cast is `Cast` when the ballot is
+**terminal** (no open proposal and no unrostered intent to clear) and
+otherwise `Blocked` with the reason.
 
 `Blocked` is never projected as a `NextStep`; the plan reports it through
 `open_proposals`, `unrostered_intents` and the absence of a cast step.
@@ -306,9 +309,9 @@ Conformance is demonstrated by behavior. Tests cover:
   violation;
 - an unrostered intent covered by a lifecycle-owned unit is neither reported
   nor blocks casting; one that is not covered blocks casting until cleared;
-- a cast is `Blocked` while a proposal is open, while an unrostered intent is
-  clearable, and while the bundle is held by an on-wire, terminal, or
-  undispatched-agreeing unit or a managed or terminal delegation;
+- a cast is `Blocked` while a proposal is open or an unrostered intent is
+  clearable, and plans nothing while the bundle is held by a live committed,
+  on-wire or hashless unit or a managed or terminal delegation;
 - mixed-phase batches, a vote claimed by two batches, a missing batch member,
   and conflicting batch hashes are invariant violations with the existing
   messages;

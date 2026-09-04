@@ -59,7 +59,7 @@ pub(crate) struct RoundSnapshot {
     /// `(bundle, proposal, share, phase)` per helper-share row.
     pub(crate) share_phases: Vec<(u32, u32, u32, SharePhase)>,
     pub(crate) intents: BTreeMap<u32, Decision>,
-    lifecycle_hashes: LifecycleTransactionHashes,
+    pub(crate) lifecycle_hashes: LifecycleTransactionHashes,
     /// The immediate share a persisted helper plan designates, if any.
     pub(crate) persisted_immediate_share: Option<ImmediateShareKey>,
 }
@@ -181,6 +181,43 @@ impl RoundSnapshot {
                 },
             )
             .or_else(|| self.vote_tx_hash(bundle_index, anchor_proposal_id))
+    }
+
+    /// The confirmed tree position of one vote that holds a recovery bundle.
+    ///
+    /// `None` when the vote holds no recovery material at all; a recovery
+    /// bundle stored without a position is an internal error, because
+    /// assuming position zero would name a real leaf.
+    pub(crate) fn confirmed_tree_position(
+        &self,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<Option<u64>, VotingError> {
+        let Some(vote) = self.votes.get(&(bundle_index, proposal_id)) else {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "failed to get commitment bundle: vote not found for round={}, bundle={bundle_index}, proposal={proposal_id}",
+                    self.round_id
+                ),
+            });
+        };
+        match (&vote.recovery, vote.vc_tree_position) {
+            (Some(_), Some(position)) => {
+                u64::try_from(position)
+                    .map(Some)
+                    .map_err(|_| VotingError::Internal {
+                        message: format!(
+                            "stored vc_tree_position must be non-negative, got {position}"
+                        ),
+                    })
+            }
+            (Some(_), None) => Err(VotingError::Internal {
+                message:
+                    "commitment bundle is stored without vc_tree_position; refusing to assume position 0"
+                        .to_string(),
+            }),
+            (None, _) => Ok(None),
+        }
     }
 
     /// The persisted recovery bundles on `bundle_index`, in proposal order.

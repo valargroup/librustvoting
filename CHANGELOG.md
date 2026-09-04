@@ -80,7 +80,12 @@ This release is `zcash_voting` 4.0.0.
   alone. It previously assembled the plan from more than a dozen separate
   reads, so a concurrent write (a tracking pass, an intent write from
   another handle, a chain confirmation) could land between two of them and
-  the plan could describe a round state that never existed.
+  the plan could describe a round state that never existed. The plan is now
+  derived by one classifier over that snapshot: votes are grouped into the
+  units the chain dispatches (a singleton or one atomic batch), each unit is
+  placed by its lifecycle position, roster relation and ballot relation, and
+  the resulting obligations are projected into `next_steps` and the plan's
+  flags. The rule is specified in `docs/round_orchestration_invariants.md`.
 - `RoundExecutor::plan` revalidates the stored round's network on every call,
   and `CastVote` checks that the bound hotkey is the bundle's confirmed
   delegation target before the first tree request.
