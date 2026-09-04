@@ -243,6 +243,26 @@ tokio::task_local! {
     static DIRECT_CONNECT_DEADLINE: Option<tokio::time::Instant>;
 }
 
+/// Upper bound on how far ahead of the SDK backstop the direct route abandons
+/// connection setup, so a stalled connect is classified before the backstop
+/// can. See [`direct_connect_deadline`].
+const DIRECT_CONNECT_DEADLINE_LEAD: Duration = Duration::from_millis(25);
+
+/// The instant at which the direct route abandons connection setup for a
+/// request whose backstop fires at `backstop` after `timeout`.
+///
+/// The lead is a quarter of the timeout, capped at
+/// [`DIRECT_CONNECT_DEADLINE_LEAD`], so short test timeouts keep most of
+/// their budget for the connection while production timeouts of seconds get
+/// the full 25 ms.
+fn direct_connect_deadline(
+    backstop: tokio::time::Instant,
+    timeout: Duration,
+) -> tokio::time::Instant {
+    let lead = DIRECT_CONNECT_DEADLINE_LEAD.min(timeout / 4);
+    backstop.checked_sub(lead).unwrap_or(backstop)
+}
+
 /// Applies the in-flight request deadline to connection setup.
 ///
 /// Wrapping the complete TCP+TLS connector matters: a stalled TLS handshake
@@ -383,11 +403,19 @@ impl RouteHttp for DirectRoute {
                         RouteError::before_dispatch(format!("build HTTP request: {error}"))
                     })?;
             let max_response_bytes = request.max_response_bytes;
-            let deadline = tokio::time::Instant::now().checked_add(request.timeout);
-            // The SDK enforces `request.timeout` around this future, and a
-            // deadline it observes is classified by the dispatch hook. The
-            // connector reads the same deadline so connection setup fails as
-            // a connect error instead.
+            // The SDK transport sets the connection-setup deadline before it
+            // polls this future, so that connection setup fails as a connect
+            // error before the SDK backstop fires. A caller driving the route
+            // directly gets the same lead derived from `request.timeout`.
+            let deadline = DIRECT_CONNECT_DEADLINE
+                .try_with(|deadline| *deadline)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    tokio::time::Instant::now()
+                        .checked_add(request.timeout)
+                        .map(|backstop| direct_connect_deadline(backstop, request.timeout))
+                });
             DIRECT_CONNECT_DEADLINE
                 .scope(deadline, async move {
                     // Hyper offers no hook between connection setup and the first
@@ -521,15 +549,25 @@ impl<R: RouteHttp> HyperTransport<R> {
         external: Option<&(dyn Fn() + Send + Sync)>,
     ) -> std::result::Result<RouteResponse, RoutedFailure> {
         let dispatched = AtomicBool::new(false);
-        let timeout = request.timeout;
         let on_dispatch = || {
             dispatched.store(true, Ordering::Release);
             if let Some(external) = external {
                 external();
             }
         };
-        let outcome =
-            tokio::time::timeout(timeout, self.route.execute(request, &on_dispatch)).await;
+        // One absolute deadline for the backstop and for the direct route's
+        // connection setup, derived before the route is polled. The direct
+        // route gives up on connection setup slightly before the backstop, so
+        // a stalled connect is reported as a definite pre-dispatch failure
+        // rather than reaching the backstop after the dispatch marker is set.
+        let backstop = tokio::time::Instant::now() + request.timeout;
+        let connect_deadline = direct_connect_deadline(backstop, request.timeout);
+        let outcome = DIRECT_CONNECT_DEADLINE
+            .scope(
+                Some(connect_deadline),
+                tokio::time::timeout_at(backstop, self.route.execute(request, &on_dispatch)),
+            )
+            .await;
         let dispatched = dispatched.load(Ordering::Acquire);
         match outcome {
             Ok(Ok(response)) => Ok(response),

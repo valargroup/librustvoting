@@ -249,3 +249,17 @@ fn tree_transport_reports_route_failures_as_request_errors() {
     );
     let _ = Method::GET;
 }
+
+#[test]
+fn the_connect_deadline_leads_the_backstop_by_a_bounded_fraction_of_the_timeout() {
+    use super::super::{direct_connect_deadline, DIRECT_CONNECT_DEADLINE_LEAD};
+    let backstop = tokio::time::Instant::now() + Duration::from_secs(60);
+
+    let long = direct_connect_deadline(backstop, Duration::from_secs(5));
+    assert_eq!(backstop - long, DIRECT_CONNECT_DEADLINE_LEAD);
+
+    let short = direct_connect_deadline(backstop, Duration::from_millis(24));
+    assert_eq!(backstop - short, Duration::from_millis(6));
+
+    assert!(long < backstop && short < backstop);
+}

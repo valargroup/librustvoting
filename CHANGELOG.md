@@ -68,6 +68,15 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `HyperTransport` derives one absolute deadline per request before polling
+  the route; the direct route abandons connection setup a bounded lead ahead
+  of that backstop, so a stalled TCP or TLS connect is reported as a definite
+  pre-dispatch failure instead of an ambiguous timeout.
+- `CastVote` syncs, resets, and generates the VAN witness on one retained
+  tree handle, so another executor rebinding the wallet's tree transport
+  between those calls cannot hand the witness a client missing the synced
+  round state.
+
 - `RoundExecutor` steps capture the host's operation epoch on entry and treat
   an epoch change like cancellation at every boundary where a step decides to
   continue, including before helper preflight; a session or account switch
