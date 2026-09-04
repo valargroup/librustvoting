@@ -805,7 +805,8 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
 /// episode on the pass that produced them; `policy.max_passes` bounds the
 /// passes. Cancellation, or an operation epoch other than `entry_epoch`, is
 /// observed before every pass and during the repoll wait and ends the
-/// episode as `Cancelled`.
+/// episode as `Cancelled`; so is a pass that fails after the host moved on,
+/// since the coordinator refuses a stale epoch inside the pass.
 async fn run_episode<F, Fut>(
     policy: &ChainAdvancePolicy,
     control: &ChainSubmissionControl,
@@ -824,7 +825,16 @@ where
             return Ok(ChainAdvanceOutcome::Cancelled);
         }
         passes += 1;
-        let result = pass(recovery).await?;
+        let result = match pass(recovery).await {
+            Ok(result) => result,
+            // An epoch change between the boundary check and the pass is
+            // refused inside the pass; a host that moved on ends the episode
+            // as cancelled whatever the timing, never as a failed step.
+            Err(_) if interrupted(control, entry_epoch) => {
+                return Ok(ChainAdvanceOutcome::Cancelled)
+            }
+            Err(failure) => return Err(failure),
+        };
         let pending = match result {
             ChainSubmissionResult::Confirmed(confirmation) => {
                 return Ok(ChainAdvanceOutcome::Confirmed(confirmation))

@@ -1249,6 +1249,10 @@ Tests cover:
 - `an_epoch_change_or_cancellation_between_passes_ends_the_episode`: an
   epoch change during the repoll wait, a stale entry epoch, or cancellation
   ends the episode as `Cancelled` without another pass.
+- `a_pass_refused_for_a_stale_epoch_ends_the_episode_as_cancelled`: an epoch
+  change admitted past the boundary check and refused inside the pass ends
+  the episode as `Cancelled`, not as a failed step; a pass that fails while
+  the host is still on the episode's epoch is reported as its failure.
 - `chain_failures_classify_by_dispatch_and_mark_the_dispatch_handle` and
   `helper_failures_classify_by_dispatch_and_phase`: a `RouteHttp` failure
   before the dispatch hook is `definitely_unsent`; after it is

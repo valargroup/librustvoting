@@ -126,8 +126,8 @@ mod episode {
     };
     use crate::chain_submission::{
         result::ValidatedChainSubmissionConfirmation, CandidateTransactionHash,
-        ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind, ChainSubmissionPending,
-        ChainSubmissionResult,
+        ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind, ChainSubmissionFailure,
+        ChainSubmissionFailureKind, ChainSubmissionPending, ChainSubmissionResult,
     };
 
     fn tracking() -> ChainSubmissionResult {
@@ -361,5 +361,41 @@ mod episode {
         let (outcome, modes) = run(&policy(), &cancelled, vec![tracking()]).await;
         assert!(matches!(outcome, ChainAdvanceOutcome::Cancelled));
         assert!(modes.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_refused_for_a_stale_epoch_ends_the_episode_as_cancelled() {
+        // The epoch changes after the boundary check admits the pass; the
+        // coordinator refuses the stale epoch inside it. That is the host
+        // moving on, not a failed step.
+        let control = ChainSubmissionControl::new(1);
+        let passes = Arc::new(Mutex::new(0usize));
+        let outcome = run_episode(&policy(), &control, 1, |_mode| {
+            *passes.lock().unwrap() += 1;
+            control.set_operation_epoch(2);
+            async {
+                Err(ChainSubmissionFailure::without_state(
+                    ChainSubmissionFailureKind::InvalidInput,
+                    "host operation epoch changed before chain submission",
+                ))
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ChainAdvanceOutcome::Cancelled));
+        assert_eq!(*passes.lock().unwrap(), 1);
+
+        // A pass that fails while the host is still on this epoch is a
+        // failure the caller must see.
+        let steady = ChainSubmissionControl::new(1);
+        let error = run_episode(&policy(), &steady, 1, |_mode| async {
+            Err(ChainSubmissionFailure::without_state(
+                ChainSubmissionFailureKind::Transport,
+                "chain unreachable",
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ChainSubmissionFailureKind::Transport);
     }
 }
