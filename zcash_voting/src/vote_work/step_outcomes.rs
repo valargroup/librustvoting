@@ -72,9 +72,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
         share_deliveries: Vec<VoteShareDeliveryReport>,
         delegation: Option<crate::delegate::SignedDelegationBundle>,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        let plan = self
-            .plan()
-            .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+        let plan = self.plan().map_err(|error| {
+            self.step_voting_failure_after_chain(error, Some(step.clone()), chain_outcome.clone())
+        })?;
         Ok(RoundStepOutcome {
             step: Some(step),
             disposition,
@@ -92,9 +92,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
         share_deliveries: Vec<VoteShareDeliveryReport>,
         delegation: Option<crate::delegate::SignedDelegationBundle>,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        let plan = self
-            .plan()
-            .map_err(|error| self.step_voting_failure(error, step.clone()))?;
+        let plan = self.plan().map_err(|error| {
+            self.step_voting_failure_after_chain(error, step.clone(), chain_outcome.clone())
+        })?;
         Ok(RoundStepOutcome {
             step,
             disposition: RoundStepDisposition::Cancelled,
