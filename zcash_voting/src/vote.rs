@@ -710,11 +710,6 @@ pub struct VoteCommitBatch<'a> {
     pub stages: &'a dyn crate::types::VoteCommitStageReporter,
 }
 
-/// Builds one signed singleton vote commitment under the historical batch name.
-///
-/// `drafts` must contain exactly one item because multiple singleton proofs from
-/// one witness would spend the same current VAN. Use
-/// [`commit_atomic_vote_batch`] for multiple proposals.
 /// A committed vote whose chain confirmation is durable.
 ///
 /// Only a confirmed vote can submit helper shares, because the share payloads
@@ -909,6 +904,11 @@ pub fn persist_prepared_vote_work(
     }
 }
 
+/// Builds one signed singleton vote commitment under the historical batch name.
+///
+/// `drafts` must contain exactly one item because multiple singleton proofs from
+/// one witness would spend the same current VAN. Use
+/// [`commit_atomic_vote_batch`] for multiple proposals.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_batch(
     db: &VotingDb,
