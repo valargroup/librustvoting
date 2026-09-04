@@ -8,9 +8,10 @@ use crate::{
 };
 
 use super::{
-    round_lock, RoundExecutor, VoteRecoveryAdvance, VoteRecoveryDisposition, VoteRecoveryFailure,
-    VoteRecoveryFailureKind, VoteRecoveryKey, VoteRecoveryProgress, VoteRecoveryProgressReporter,
-    VoteRecoveryRequest, VoteShareDeliveryReport,
+    round_lock, step_control::StepControl, RoundExecutor, VoteRecoveryAdvance,
+    VoteRecoveryDisposition, VoteRecoveryFailure, VoteRecoveryFailureKind, VoteRecoveryKey,
+    VoteRecoveryProgress, VoteRecoveryProgressReporter, VoteRecoveryRequest,
+    VoteShareDeliveryReport,
 };
 
 impl<T: ChainTransport> RoundExecutor<T> {
@@ -20,12 +21,16 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// from a fresh [`crate::session::RoundPlan`], persists complete helper
     /// plans before any chain POST, and submits shares only after durable chain
     /// confirmation. Reinvoke after `Pending` according to host scheduling.
+    /// The operation epoch is captured on entry; cancellation or an epoch
+    /// change is observed at every boundary and ends the pass as `Cancelled`.
     pub async fn advance(
         &self,
         request: VoteRecoveryRequest<'_>,
         control: &ChainSubmissionControl,
         progress: &dyn VoteRecoveryProgressReporter,
     ) -> Result<VoteRecoveryAdvance, VoteRecoveryFailure> {
+        let step_control = StepControl::capture(control);
+        let control = &step_control;
         let wallet_id = self
             .wallet_scope()
             .map(str::to_string)
@@ -42,18 +47,19 @@ impl<T: ChainTransport> RoundExecutor<T> {
             });
         };
 
-        let Some(_round_guard) = round_lock::acquire(wallet_id, request.round_id, None, control)
-            .await
-            .map_err(|message| {
-                self.failure(
-                    VoteRecoveryFailureKind::InvariantViolation,
-                    Some(work.clone()),
-                    None,
-                    None,
-                    message,
-                    request,
-                )
-            })?
+        let Some(_round_guard) =
+            round_lock::acquire(wallet_id, request.round_id, None, control.chain())
+                .await
+                .map_err(|message| {
+                    self.failure(
+                        VoteRecoveryFailureKind::InvariantViolation,
+                        Some(work.clone()),
+                        None,
+                        None,
+                        message,
+                        request,
+                    )
+                })?
         else {
             return self.cancelled(Some(work), None, request);
         };
@@ -71,7 +77,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 round_plan: locked_plan,
             });
         };
-        if control.is_cancelled() {
+        if control.interrupted() {
             return self.cancelled(Some(work), None, request);
         }
         progress.report(VoteRecoveryProgress::Selected(work.clone()));
@@ -84,7 +90,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .preflight_fleet(request.configured_helper_urls)
             .await
             .map_err(|error| self.voting_failure(error, Some(work.clone()), request))?;
-        if control.is_cancelled() {
+        if control.interrupted() {
             return self.cancelled(Some(work), None, request);
         }
 
@@ -118,7 +124,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                                 proposal_id: work.proposal_id,
                             },
                             ChainRecoveryMode::ExactTree,
-                            control,
+                            control.chain(),
                         )
                         .await
                 }
@@ -146,7 +152,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                                     .collect(),
                             },
                             ChainRecoveryMode::ExactTree,
-                            control,
+                            control.chain(),
                         )
                         .await
                 }
@@ -194,7 +200,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
 
         let mut deliveries = Vec::with_capacity(votes.len());
         for vote in votes {
-            if control.is_cancelled() {
+            if control.interrupted() {
                 return self.advance_result(
                     work,
                     VoteRecoveryDisposition::Cancelled,
@@ -225,7 +231,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                         request,
                     )
                 })?;
-            let cancel = || control.is_cancelled();
+            let cancel = || control.interrupted();
             let delivery = vote
                 .submit_prepared_shares(
                     &self.database,

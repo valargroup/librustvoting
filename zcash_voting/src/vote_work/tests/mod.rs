@@ -66,6 +66,27 @@ async fn no_persisted_vote_work_returns_without_network_io() {
     assert!(outcome.round_plan.open_proposals.contains(&1));
 }
 
+#[test]
+fn step_control_treats_an_epoch_change_like_cancellation() {
+    use super::step_control::StepControl;
+    use crate::ChainSubmissionControl;
+
+    let control = ChainSubmissionControl::new(3);
+    let captured = StepControl::capture(&control);
+    assert!(!captured.interrupted());
+
+    control.set_operation_epoch(4);
+    assert!(captured.interrupted(), "a later epoch invalidates the pass");
+    assert!(!control.is_cancelled());
+
+    // A pass captured under the new epoch is live until cancelled.
+    let recaptured = StepControl::capture(&control);
+    assert!(!recaptured.interrupted());
+    control.cancel();
+    assert!(recaptured.interrupted());
+    assert!(std::ptr::eq(recaptured.chain(), &control));
+}
+
 mod round_executor {
     use std::{sync::Arc, time::Duration};
 
