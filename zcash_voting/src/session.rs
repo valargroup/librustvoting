@@ -5,7 +5,7 @@
 //! APIs in `crate::phases`. The wallet executes each step with its own
 //! network/proof/sign plumbing.
 
-use rusqlite::{named_params, OptionalExtension};
+use rusqlite::named_params;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -100,34 +100,52 @@ impl VotingDb {
     /// A decision that survives a roster change refers to a proposal the
     /// authenticated configuration no longer lists; the planner reports it in
     /// `RoundPlan::unrostered_intents` and withholds `CastVote` until it is
-    /// cleared. Clearing an intent that does not exist is not an error. An
-    /// intent whose vote is already submitted cannot be cleared.
+    /// cleared. Clearing an intent that does not exist is not an error.
+    ///
+    /// The canonical vote phase decides whether clearing is allowed. A vote
+    /// for the proposal that the chain lifecycle owns or has finished
+    /// (submitted, managed, hashless, rejected, or confirmed) may already be
+    /// on chain, so its intent cannot be cleared. A vote that is signed but
+    /// not dispatched has its unsubmitted recovery invalidated, exactly as a
+    /// changed intent does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] for an out-of-range proposal id
+    /// or a proposal whose vote is on or past the chain lifecycle.
     pub fn clear_ballot_intent(&self, round_id: &str, proposal_id: u32) -> Result<(), VotingError> {
         validate_proposal_id(proposal_id)?;
+        if let Some((bundle_index, _, phase)) = self
+            .vote_phases(round_id)?
+            .into_iter()
+            .find(|(_, vote_proposal, phase)| {
+                *vote_proposal == proposal_id
+                    && matches!(
+                        phase,
+                        VotePhase::Submitted
+                            | VotePhase::SubmissionManaged
+                            | VotePhase::SubmittedWithoutHash
+                            | VotePhase::SubmissionRejected
+                            | VotePhase::Confirmed
+                    )
+            })
+        {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "round {round_id} bundle {bundle_index} proposal {proposal_id} vote is {} on the chain lifecycle; its intent cannot be cleared",
+                    phase.as_str()
+                ),
+            });
+        }
         let wallet_id = self.wallet_id();
         self.write_transaction("clear_ballot_intent transaction failed", |tx| {
-            let submitted: Option<i64> = tx
-                .query_row(
-                    "SELECT bundle_index FROM votes
-                     WHERE round_id = :round_id AND wallet_id = :wallet_id
-                       AND proposal_id = :proposal_id AND tx_hash IS NOT NULL
-                     LIMIT 1",
-                    named_params! {
-                        ":round_id": round_id,
-                        ":wallet_id": wallet_id,
-                        ":proposal_id": proposal_id as i64,
-                    },
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| VotingError::from_sqlite("check submitted vote before clearing intent", &e))?;
-            if let Some(bundle_index) = submitted {
-                return Err(VotingError::InvalidInput {
-                    message: format!(
-                        "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote; its intent cannot be cleared"
-                    ),
-                });
-            }
+            crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
+                tx,
+                &wallet_id,
+                round_id,
+                proposal_id,
+                None,
+            )?;
             tx.execute(
                 "DELETE FROM ballot_intent
                  WHERE round_id = :round_id AND wallet_id = :wallet_id AND proposal_id = :proposal_id",
@@ -2342,6 +2360,26 @@ mod tests {
             .next_steps
             .iter()
             .any(|step| matches!(step, NextStep::CastVote { .. })));
+    }
+
+    #[test]
+    fn an_intent_whose_vote_the_chain_lifecycle_owns_cannot_be_cleared() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 9, 1, &[0xCC; 16]).unwrap();
+        // Tracking on the chain lifecycle: no tx_hash projection yet, but the
+        // signed generation may already be on chain.
+        insert_in_flight_submission(&db, "tracking", "vote", Some(9), Some([0x5A; 32]));
+
+        let error = db
+            .clear_ballot_intent(ROUND, 9)
+            .expect_err("a tracked vote's intent must survive");
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("submission_managed"), "{error}");
+        assert_eq!(
+            db.ballot_intents(ROUND).unwrap(),
+            vec![(9, Decision::Choice(1))]
+        );
     }
 
     #[test]

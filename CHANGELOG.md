@@ -69,6 +69,13 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `VotingDb::clear_ballot_intent` decides from the canonical vote phase: an
+  intent whose vote the chain lifecycle owns or has finished cannot be
+  cleared, and a signed but undispatched vote has its recovery invalidated.
+- `CastVote` validates the complete vote-tree node list before any sync:
+  every URL must be an http or https URL with a host, and on Mainnet every
+  URL must use HTTPS.
+
 - Every bounded chain pass started by `advance_until_terminal_in_epoch`, and
   by the round executor's recovery driver, captures its operation under the
   caller's entry epoch, so an epoch change between the caller's check and
