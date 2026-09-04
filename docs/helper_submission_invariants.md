@@ -308,9 +308,20 @@ Regression coverage:
    index 0 of the lowest voted proposal ID in the highest eligible bundle
    index. Bundles are value-descending, so this is the lowest-value eligible
    bundle.
-4. The immediate designation is derived from durable ballot choices and is
-   stable across restart and vote completion. Skipped proposals do not
-   participate.
+4. The immediate designation is derived from durable ballot choices the
+   first time the designated vote's own plan is prepared, and is then durable
+   state of its own (`round_immediate_share`, schema version 20): stable
+   across restart and vote completion, written once in the plan's
+   transaction, never updated, voided only with the undispatched generation
+   it was made for. Skipped proposals do not participate. Every later plan
+   reads the row and never re-derives it, so a designated proposal that
+   leaves the authenticated roster after its vote reached the chain lifecycle
+   keeps the designation and planning for the remaining roster names no
+   second share (`derive_immediate_share`, regression tests
+   `a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster`,
+   `the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it`,
+   `the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation`,
+   `a_later_lower_choice_does_not_move_the_designation_or_block_its_submission`).
 5. `immediate = true` and `submit_at = 0` are not equivalent. Last-moment and
    single-share planning can assign `submit_at = 0` to undesignated shares,
    but the designated immediate share MUST always have `submit_at = 0`.
@@ -366,9 +377,42 @@ ready list to be a distinct subset of that fleet.
 `CommittedVote::prepare_share_delivery` consumes that validated snapshot.
 It also consumes the complete proposal-id roster from the authenticated round
 configuration. The roster must be nonempty, distinct, and exactly match the
-round's durable terminal ballot intents. The SDK combines those intents with
-the durable bundle set to derive the single immediate share; the host does not
-select an immediate share index.
+round's durable terminal decisions. Those decisions are the recorded ballot
+intents plus, for a vote the chain lifecycle owns or has finished that has no
+intent of its own, its stored choice: such a vote is the wallet's transaction
+whatever the ballot says, its shares are owed, and its choice stands
+(`durable_decisions`, regression test
+`a_lifecycle_owned_vote_without_an_intent_still_plans_and_delivers_its_shares`).
+The SDK combines those decisions with the durable bundle set to seed the
+single immediate share the first time; the host does not select an immediate
+share index.
+
+The planner carries the other half of that contract: `resume_plan` does not
+emit `NextStep::CastVote` while any roster proposal still lacks a terminal
+decision, nor while a durable intent exists for a proposal outside the roster,
+except an intent whose vote the chain lifecycle owns or has finished: that
+intent cannot be cleared, so it is neither reported nor allowed to withhold
+casting, and helper planning tolerates it when comparing the durable roster
+(`intent_is_lifecycle_owned`). Its vote is still advanced, its confirmed
+vote's missing shares are still scheduled as `SubmitShares`, and a committed
+but undispatched vote for such a proposal is retired by `CastVote` before the
+bundle is cast again (regression tests
+`an_unrostered_intent_the_chain_lifecycle_owns_does_not_withhold_casting`,
+`an_unrostered_submitted_vote_is_still_advanced`,
+`an_unrostered_confirmed_vote_still_schedules_its_missing_shares`,
+`a_committed_vote_for_a_dropped_proposal_does_not_hold_its_bundle`,
+`a_lifecycle_owned_intent_outside_the_roster_does_not_block_planning`).
+Casting persists the vote before the immediate share is derived, so planning a
+cast against a ballot that does not exactly match the roster would advertise a
+step that can only fail after a ZKP #2 proof and a durable write. The remaining
+proposals are reported through `RoundPlan::open_proposals` and the extra
+intents through `RoundPlan::unrostered_intents`, which the host clears with
+`VotingDb::clear_ballot_intent`; the bundle's `Delegate` prerequisite and the
+advancement of votes already on the wire are unaffected.
+Enforcement: `roster_is_terminal` in
+[`resume_plan`](../zcash_voting/src/session.rs) and
+`derive_immediate_share` in
+[`share_tracking/delivery_plan.rs`](../zcash_voting/src/share_tracking/delivery_plan.rs).
 Low-level pure planners remain implementation tools, not the wallet lifecycle
 boundary.
 
@@ -588,7 +632,7 @@ report invalid or unfinished entries as not ready.
 | Concurrent status GETs per share | 4 (from `SHARE_STATUS_MAX_CONCURRENT_POLLS`) | `poll_share_helpers` |
 | Total status quorum search for one share | 10 seconds (from `SHARE_STATUS_POLL_BUDGET_MILLISECONDS`) | `poll_share_helpers` |
 | One helper POST | 30 seconds | `HelperClient` |
-| Concurrent initial POSTs across the process | 16 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `CommittedVote::submit_prepared_shares` |
+| Concurrent initial POSTs across the process | 16 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `ConfirmedVote::submit_prepared_shares` |
 | Total initial fan-out per share | 60 seconds | committed share delivery |
 | Minimum budget to start an initial POST | 1 second | committed share delivery |
 | Retry backoffs | 200 ms, then 600 ms | `HelperClient::with_retry` |
@@ -732,7 +776,7 @@ plan validates against its own persisted planning fleet. Existing round plans
 are checked so roster drift cannot create a second or conflicting immediate
 designation.
 
-`CommittedVote::submit_prepared_shares` is the delivery boundary. It loads that
+`ConfirmedVote::submit_prepared_shares` is the delivery boundary. It loads that
 plan, requires the plan's exact current committed-vote generation, binds the
 submitting handle to that generation, validates the immutable plan against its
 persisted planning fleet, and separately validates the complete current fleet.
@@ -991,6 +1035,27 @@ For each unconfirmed share, `track_pending_shares` computes timing and current
 definite placement from the intersection of durable state and the currently
 configured helper set.
 
+Resumed vote work (`AdvanceVote`, `AdvanceVoteBatch`, and the recovery
+driver's equivalents) reconciles the chain before any helper-plan
+preparation. The plan was made durable at cast time, or the vote predates
+plans, and an open ballot must not keep an already-dispatched vote from being
+polled or recovered; each vote's plan is loaded or created after confirmation,
+right before its shares are delivered. A fresh `CastVote` still makes its
+plans durable before the broadcast (regression test
+`a_dispatched_vote_is_reconciled_before_its_ballot_is_terminal`).
+`RoundPlan::immediate_share_key` reports the designation a persisted plan
+carries whenever one exists (regression test
+`the_plan_reports_the_persisted_immediate_share_after_its_proposal_leaves_the_roster`).
+
+A share row with no accepted helper (`sent_to_urls` empty: every initial POST
+failed definitely, or a reservation was cleared before dispatch) is
+`RoundPlan::blocking_share_work`. The planner still lists it as
+`NextStep::ConfirmShare` but classifies it as `SubmitShares` recovery work,
+and `RoundExecutor::advance_step` runs that delivery from the durable plan
+instead of the focused confirmation poll, which could never confirm a share
+no helper holds (regression test
+`a_blocking_confirm_share_step_delivers_before_polling`).
+
 ### Replenishment and ordering
 
 1. Under-placement starts replenishment immediately; it does not wait for the
@@ -1188,8 +1253,14 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
    schedule already delivered to an accepted helper.
 9. Immediate overdue recovery sets durable `submit_at` to zero. Early
    replenishment leaves it unchanged.
-10. Share writes and confirmation MUST match the current durable ballot intent.
-   Changing or skipping that intent clears stale share rows.
+10. Share writes and confirmation MUST match the current durable decision for
+   the proposal. Changing or skipping a recorded intent clears stale share
+   rows. A delivery pass whose every eligible POST for some share ended
+   ambiguously reports the step as pending rather than advanced: no helper
+   definitely holds that share, the ambiguous helpers are excluded from the
+   next initial pass, and only tracking can classify them, so rerunning
+   delivery at once would make no progress
+   (`a_share_every_helper_answered_ambiguously_waits_for_tracking_rather_than_advancing`).
 11. Pending rounds are wallet-scoped and remain discoverable until every share
     is confirmed.
 12. An asynchronous submission or tracking pass captures its wallet scope
@@ -1234,7 +1305,14 @@ the embedded recovery proposal to the durable key,
 `share_tracking/tests/initial_delivery.rs` for identity-bound confirmation and
 placement updates, and
 `changed_choice_ignores_stale_share_confirmations` and
-`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
+`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`. Active
+chain-generation preservation is covered by
+`active_singleton_generation_locks_intent_and_recovery_material` and
+`active_batch_generation_locks_every_member_intent`; both reject the intent
+change before vote recovery or helper-delivery rows can be cleared. A rejected
+atomic batch retains the same protection because its authoritative member
+roster still depends on those recovery rows; this is covered by
+`rejected_vote_batch_never_reschedules_its_members`.
 
 ### Configuration and migration
 
@@ -1376,17 +1454,20 @@ host wallet:
    helper ordering. Hosts do not supply randomness to the planning lifecycle.
 4. **Lifecycle.** The host owns the timer, app-lock and round-expiry behavior,
    invokes `track_pending_shares`, and supplies cancellation.
-5. **Initial delivery invocation.** The host obtains `HelperFleetPreflight`
-   from the SDK, calls
-   `prepare_share_delivery` with the complete proposal roster from the
-   authenticated round configuration, and waits for chain confirmation when
-   necessary. It then recovers a fresh `CommittedVote` and calls
-   `submit_prepared_shares`. It supplies the complete current configured fleet
-   and cancellation signal. The SDK validates the stored plan against its
-   original planning fleet while limiting delivery to that current fleet. The
-   host does not select the immediate share, serialize plans, select helpers,
-   derive targets, expose share payloads, filter missing shares, or replan
-   after restart.
+5. **Initial delivery invocation.** Supported wallet integrations bind a
+   `RoundExecutor` to the complete proposal roster from the authenticated round
+   configuration and call `advance_next` or `advance_step` with the complete
+   current configured fleet, timing, and cancellation. The executor obtains
+   `HelperFleetPreflight`, prepares every affected delivery plan, advances the
+   chain until confirmation is durable, recovers fresh `CommittedVote` handles,
+   converts them to `ConfirmedVote`, and submits the prepared shares. Lower-level
+   integrations may perform that exact sequence directly; submission is only
+   offered on `ConfirmedVote`, which only the durable confirmation produces. The SDK
+   validates the stored plan against its original planning fleet while limiting
+   delivery to the current fleet. The host does not interpret recovery steps,
+   select atomic-batch members, select the immediate share, serialize plans,
+   select helpers, derive targets, expose share payloads, filter missing shares,
+   or replan after restart.
 6. **Helper-operator trust.** The protocol assumes that the authority supplying
    the wallet's helper configuration is trusted to choose independent operators
    and govern changes. URLs are endpoint identities, not authenticated operator
@@ -1408,7 +1489,7 @@ host wallet:
 `share_server_selection_policy` describes a two-second preflight soft window,
 a 30-second hard deadline, and 16 concurrent POSTs.
 `HelperClient::preflight_fleet` enforces both windows and derives the readiness
-target internally. `CommittedVote::submit_prepared_shares` enforces the
+target internally. `ConfirmedVote::submit_prepared_shares` enforces the
 process-wide 16-POST ceiling with a shared semaphore. Complete-plan persistence
 lets the SDK validate commitment-wide quota, current-fleet compatibility, and
 restart reuse before network dispatch. These are enforced behavior, not host

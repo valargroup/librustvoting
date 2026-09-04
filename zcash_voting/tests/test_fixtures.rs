@@ -10,8 +10,8 @@ use zcash_voting::{
     storage::RoundPhase,
     types::{EncryptedShare, Network, NoteInfo},
     vote::{
-        insert_recovery_fixture, record_submission, record_vc_position, recovery_bundle,
-        serialize_recovery, CommittedVote, VoteRecoveryBundle,
+        insert_recovery_fixture, recovery_bundle, serialize_recovery, CommittedVote,
+        VoteRecoveryBundle,
     },
     HelperClient, HelperFuture, HelperHealth, HelperResponse, HelperTransport,
     HelperTransportError, BALLOT_DIVISOR,
@@ -146,23 +146,22 @@ fn downstream_fixture_seeds_committed_state_and_uses_public_lifecycle() {
     let committed = CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     assert_eq!(committed.proposal_id(), 1);
     assert_eq!(stored.encrypted_shares.len(), 1);
+}
 
-    record_submission(&db, ROUND_ID, 0, 1, "vote-tx").unwrap();
-    assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Submitted);
-
-    record_vc_position(&db, ROUND_ID, 0, 1, 789).unwrap();
-    assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Confirmed);
-    assert_eq!(
-        stored_confirmation_fields(&db),
-        (Some("vote-tx".to_string()), Some(789))
-    );
-    assert_eq!(
-        recovery_bundle(&db, ROUND_ID, 0, 1)
-            .unwrap()
-            .unwrap()
-            .vc_tree_position,
-        789
-    );
+/// Projects a submitted or confirmed vote directly into the domain columns.
+///
+/// Downstream builds have no writer for these columns: the chain lifecycle
+/// is the only production author, and the crate-private test writers are not
+/// exposed by `test-fixtures`. The guards under test only read the columns.
+fn project_vote_confirmation(db: &VotingDb, tx_hash: Option<&str>, vc_tree_position: Option<i64>) {
+    db.conn()
+        .execute(
+            "UPDATE votes SET tx_hash = ?3, vc_tree_position = ?4
+             WHERE round_id = ?1 AND wallet_id = ?2
+               AND bundle_index = 0 AND proposal_id = 1",
+            (ROUND_ID, WALLET_ID, tx_hash, vc_tree_position),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -194,7 +193,8 @@ fn downstream_fixture_does_not_repair_a_submitted_vote() {
     let db = db_with_bundle();
     let fixture = recovery_fixture();
     insert_recovery_fixture(&db, &fixture).unwrap();
-    record_submission(&db, ROUND_ID, 0, 1, "vote-tx").unwrap();
+    project_vote_confirmation(&db, Some("vote-tx"), None);
+    assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Submitted);
     db.conn()
         .execute(
             "UPDATE votes SET commitment_bundle_json = NULL
@@ -220,9 +220,10 @@ fn downstream_fixture_does_not_repair_a_submitted_vote() {
 #[test]
 fn downstream_fixture_does_not_reset_a_recorded_position() {
     let db = db_with_bundle();
-    let fixture = recovery_fixture();
+    let mut fixture = recovery_fixture();
+    fixture.vc_tree_position = 789;
     insert_recovery_fixture(&db, &fixture).unwrap();
-    record_vc_position(&db, ROUND_ID, 0, 1, 789).unwrap();
+    project_vote_confirmation(&db, None, Some(789));
 
     let err = insert_recovery_fixture(&db, &fixture).unwrap_err();
 

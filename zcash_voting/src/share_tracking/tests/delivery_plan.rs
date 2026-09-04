@@ -220,6 +220,34 @@ fn complete_plan_is_persisted_and_reused() {
 }
 
 #[test]
+fn planning_rejects_a_roster_with_an_undecided_proposal() {
+    // The round's single immediate share is derived from the complete set of
+    // choices, so an open proposal has to be refused before any plan is
+    // written. `resume_plan` withholds `NextStep::CastVote` until then.
+    let db = db_with_unique_recoverable_vote();
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+
+    let error = committed
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), crate::VotingErrorKind::InvalidInput);
+    assert!(
+        error.to_string().contains("terminal decisions"),
+        "unexpected error: {error}"
+    );
+    let stored: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM helper_share_plans", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored, 0);
+}
+
+#[test]
 fn complete_roster_derives_exactly_one_round_immediate_share() {
     let db = db_with_unique_recoverable_vote();
     seed_recoverable_vote_for_proposal(&db, 2, 1);
@@ -309,8 +337,75 @@ fn planning_rejects_incomplete_duplicate_and_omitting_rosters_before_persistence
     assert_eq!(stored, 0);
 }
 
+#[test]
+fn a_lifecycle_owned_intent_outside_the_roster_does_not_block_planning() {
+    let db = db_with_unique_recoverable_vote();
+    // Proposal 2 was voted and confirmed, then removed from the roster; its
+    // intent cannot be cleared and must not block the current roster.
+    seed_recoverable_vote_for_proposal(&db, 2, 1);
+    db.conn()
+        .execute(
+            "UPDATE votes SET tx_hash = 'aa' WHERE round_id = :round_id
+               AND wallet_id = :wallet_id AND bundle_index = 0 AND proposal_id = 2",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": db.wallet_id(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        db.vote_phase(ROUND_ID, 0, 2).unwrap(),
+        crate::phases::VotePhase::Confirmed
+    );
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+
+    committed
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1]))
+        .expect("a lifecycle-owned unrostered intent is not a roster mismatch");
+}
+
+#[test]
+fn a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster() {
+    let db = db_with_round_and_bundle();
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    seed_recoverable_vote_for_proposal(&db, 2, 1);
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+
+    // Proposal 1 is the lowest chosen proposal, so its plan carries the
+    // round-immediate share.
+    let first = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let first_plan = first
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap();
+    assert!(first_plan.share_plans[0].immediate);
+
+    // Its vote confirms on chain, and the roster then drops proposal 1.
+    db.conn()
+        .execute(
+            "UPDATE votes SET tx_hash = 'aa' WHERE round_id = :round_id
+               AND wallet_id = :wallet_id AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": db.wallet_id(),
+            },
+        )
+        .unwrap();
+
+    let second = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 2).unwrap();
+    let second_plan = second
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[2]))
+        .expect("the persisted designation is kept rather than recomputed");
+    assert!(
+        second_plan.share_plans.iter().all(|plan| !plan.immediate),
+        "the round still has exactly one immediate share"
+    );
+}
+
 #[tokio::test]
-async fn later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan() {
+async fn a_later_lower_choice_does_not_move_the_designation_or_block_its_submission() {
     let db = db_with_round_and_bundle();
     seed_recoverable_vote_for_proposal(&db, 2, 1);
     let configured = helpers(3);
@@ -321,29 +416,197 @@ async fn later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan(
         .unwrap();
     assert!(original.share_plans[0].immediate);
 
+    // A lower choice recorded after the designation does not move it: the
+    // designated shares still submit against the plan they were made with.
     db.set_ballot_intent(ROUND_ID, 1, crate::session::Decision::Choice(0), 3)
         .unwrap();
     let transport = Arc::new(MockTransport::default());
-    let error = second
-        .submit_prepared_shares(
+    second
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
             &never_cancel(),
         )
         .await
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("does not match durable ballot intent"));
-    assert!(transport.calls().is_empty());
+        .expect("submission validates the plan against the durable designation");
+    assert!(
+        !transport.calls().is_empty(),
+        "the designated share reaches the helpers"
+    );
 
-    let error = second
+    // Against the complete roster, proposal 2 keeps the immediate share and
+    // proposal 1's plan names none.
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    let reloaded = second
         .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("does not match durable ballot intent"));
+        .expect("the durable designation still names proposal 2");
+    assert!(reloaded.share_plans[0].immediate);
+    let first = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let first_plan = first
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap();
+    assert!(first_plan.share_plans.iter().all(|plan| !plan.immediate));
+    assert_eq!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &db.wallet_id())
+            .unwrap()
+            .map(|key| key.proposal_id),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn a_lifecycle_owned_vote_without_an_intent_still_plans_and_delivers_its_shares() {
+    // The confirmed vote's intent row is gone (a legacy round, or a host that
+    // never recorded one); the vote is on chain, so its shares are owed and
+    // its stored choice is the decision planning derives from.
+    let db = db_with_round_and_bundle();
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    db.conn()
+        .execute(
+            "UPDATE votes SET tx_hash = 'aa' WHERE round_id = :round_id
+               AND wallet_id = :wallet_id AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": db.wallet_id() },
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "DELETE FROM ballot_intent WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": db.wallet_id() },
+        )
+        .unwrap();
+    assert!(db.ballot_intents(ROUND_ID).unwrap().is_empty());
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+
+    let plan = committed
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1]))
+        .expect("the stored choice of a lifecycle-owned vote stands as its decision");
+    assert!(plan.share_plans[0].immediate);
+
+    let transport = Arc::new(MockTransport::default());
+    committed
+        .submit_prepared_shares_unchecked(
+            &db,
+            &client_with(transport.clone()),
+            submission_params(&configured),
+            &never_cancel(),
+        )
+        .await
+        .expect("submission applies the same decision");
+    assert!(!transport.calls().is_empty());
+}
+
+#[test]
+fn the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it() {
+    let db = db_with_round_and_bundle();
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    seed_recoverable_vote_for_proposal(&db, 2, 1);
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+
+    // Proposal 2's plan is prepared first. Proposal 1 owns the designation,
+    // so nothing is written yet and proposal 2's shares are not immediate.
+    let second = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 2).unwrap();
+    let second_plan = second
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap();
+    assert!(second_plan.share_plans.iter().all(|plan| !plan.immediate));
+    assert_eq!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &db.wallet_id())
+            .unwrap(),
+        None
+    );
+
+    let first = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let first_plan = first
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap();
+    assert!(first_plan.share_plans[0].immediate);
+    let designation =
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &db.wallet_id())
+            .unwrap()
+            .expect("the designated vote's plan designates the round's share");
+    assert_eq!(
+        (
+            designation.bundle_index,
+            designation.proposal_id,
+            designation.share_index
+        ),
+        (0, 1, 0)
+    );
+
+    // A later plan for the same vote reads the row and writes nothing new.
+    let reloaded = first
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap();
+    assert_eq!(reloaded.share_plans, first_plan.share_plans);
+}
+
+#[test]
+fn the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation() {
+    let db = db_with_round_and_bundle();
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    // The vote is committed but not yet confirmed: no tree position in the
+    // row, position zero in the recovery JSON, as a fresh cast persists it.
+    db.conn()
+        .execute(
+            "UPDATE votes
+                SET commitment_bundle_json = json_set(commitment_bundle_json, '$.vc_tree_position', 0),
+                    vc_tree_position = NULL
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": db.wallet_id() },
+        )
+        .unwrap();
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let first = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    first
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1]))
+        .unwrap();
+    let wallet_id = db.wallet_id();
+    assert!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &wallet_id)
+            .unwrap()
+            .is_some()
+    );
+
+    // Confirmation fills the tree position in the row and the JSON alike;
+    // the generation is the same, so the designation stays.
+    db.conn()
+        .execute(
+            "UPDATE votes
+                SET commitment_bundle_json = json_set(commitment_bundle_json, '$.vc_tree_position', 7),
+                    vc_tree_position = 7
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": wallet_id },
+        )
+        .unwrap();
+    assert!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &wallet_id)
+            .unwrap()
+            .is_some()
+    );
+
+    // A re-proved vote is another generation: the designation made for the
+    // old one goes with it, as its plan does.
+    db.conn()
+        .execute(
+            "UPDATE votes SET commitment_bundle_json = '{\"vc_tree_position\":7,\"regenerated\":true}',
+                              vc_tree_position = NULL
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": wallet_id },
+        )
+        .unwrap();
+    assert_eq!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &wallet_id).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -429,7 +692,7 @@ async fn stale_handle_cannot_submit_same_commitment_replacement_plan() {
     let transport = Arc::new(MockTransport::default());
 
     let error = stale_handle
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -438,7 +701,7 @@ async fn stale_handle_cannot_submit_same_commitment_replacement_plan() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(matches!(error.error, VotingError::InvalidInput { .. }));
     assert!(error
         .to_string()
         .contains("committed vote changed before helper-share submission"));
@@ -468,7 +731,7 @@ async fn same_commitment_replacement_after_plan_load_stops_every_post() {
     };
 
     let error = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -477,7 +740,7 @@ async fn same_commitment_replacement_after_plan_load_stops_every_post() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(matches!(error.error, VotingError::InvalidInput { .. }));
     assert!(transport.calls().is_empty());
     assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
 }
@@ -502,7 +765,7 @@ async fn delayed_immediate_plan_is_rejected_before_network() {
     let transport = Arc::new(MockTransport::default());
     queue_successes(&transport, &configured, plan.share_plans.len());
     let error = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -545,7 +808,7 @@ async fn prepared_batch_stays_bound_to_its_starting_wallet() {
     };
 
     let report = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport),
             submission_params(&configured),
@@ -592,7 +855,7 @@ async fn preconfirmation_plan_survives_confirmation_restart_and_submission() {
     let transport = Arc::new(MockTransport::default());
     queue_successes(&transport, &configured, prepared.share_plans.len());
     let report = committed_after
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -630,7 +893,7 @@ async fn preconfirmation_handle_is_stale_after_confirmation_transition() {
 
     let transport = Arc::new(MockTransport::default());
     let error = committed_before
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -639,7 +902,7 @@ async fn preconfirmation_handle_is_stale_after_confirmation_transition() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(matches!(error.error, VotingError::InvalidInput { .. }));
     assert!(error
         .to_string()
         .contains("recover the current committed vote"));
@@ -675,7 +938,7 @@ async fn restart_resumes_with_a_replaced_helper_without_contacting_the_removed_t
     queue_successes(&transport, &drifted, plan.share_plans.len());
 
     let report = recovered
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&drifted),
@@ -712,7 +975,7 @@ async fn fleet_reordering_preserves_persisted_fleet_identity() {
     queue_successes(&transport, &configured, plan.share_plans.len());
 
     let report = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&reordered),
@@ -751,7 +1014,7 @@ async fn restart_after_fleet_expansion_preserves_the_original_target() {
     queue_successes(&transport, &expanded, plan.share_plans.len());
 
     let report = recovered
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&expanded),
@@ -793,7 +1056,7 @@ async fn restart_after_fleet_contraction_clamps_delivery_to_current_helpers() {
     queue_successes(&transport, &contracted, plan.share_plans.len());
 
     let report = recovered
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&contracted),
@@ -837,7 +1100,7 @@ async fn one_helper_fleet_is_planned_and_submitted_by_the_sdk() {
     queue_successes(&transport, &configured, plan.share_plans.len());
 
     let report = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport),
             submission_params(&configured),
@@ -867,7 +1130,7 @@ async fn every_payload_is_validated_before_the_first_post() {
     queue_successes(&transport, &configured, 2);
 
     let error = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport.clone()),
             submission_params(&configured),
@@ -876,7 +1139,7 @@ async fn every_payload_is_validated_before_the_first_post() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(matches!(error.error, VotingError::InvalidInput { .. }));
     assert!(transport.calls().is_empty());
     assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
 }
@@ -899,7 +1162,7 @@ async fn restart_reuses_the_plan_and_resumes_definite_delivery_deficits() {
         );
     }
     let first = committed
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(failing_transport),
             submission_params(&configured),
@@ -917,7 +1180,7 @@ async fn restart_reuses_the_plan_and_resumes_definite_delivery_deficits() {
     let transport = Arc::new(MockTransport::default());
     queue_successes(&transport, &configured, plan.share_plans.len());
     let resumed = recovered
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &db,
             &client_with(transport),
             submission_params(&configured),
@@ -962,7 +1225,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
     replace_stored_share_plans(&strict_db, &concentrated);
     let strict_transport = Arc::new(MockTransport::default());
     let error = strict
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &strict_db,
             &client_with(strict_transport.clone()),
             submission_params(&configured),
@@ -1002,7 +1265,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
     replace_stored_share_plans(&legacy_db, &concentrated);
     let legacy_transport = Arc::new(MockTransport::default());
     let error = legacy
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &legacy_db,
             &client_with(legacy_transport.clone()),
             submission_params(&configured),
@@ -1017,7 +1280,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
     let valid_legacy_transport = Arc::new(MockTransport::default());
     queue_successes(&valid_legacy_transport, &configured, 16);
     let report = legacy
-        .submit_prepared_shares(
+        .submit_prepared_shares_unchecked(
             &legacy_db,
             &client_with(valid_legacy_transport),
             submission_params(&configured),
@@ -1076,7 +1339,7 @@ async fn global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_share
         let queued_finished = queued_finished.clone();
         async move {
             let result = queued_vote
-                .submit_prepared_shares(
+                .submit_prepared_shares_unchecked(
                     queued_db_ref,
                     queued_client,
                     submission_params(queued_configured),
@@ -1105,7 +1368,7 @@ async fn global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_share
     };
 
     let (saturating_report, queued_report, ()) = tokio::join!(
-        saturating.submit_prepared_shares(
+        saturating.submit_prepared_shares_unchecked(
             &saturating_db,
             &client,
             submission_params(&configured),

@@ -144,12 +144,15 @@ locally constructed, or conflicting state is rejected without mutation.
 
 ## Confirmation and voting
 
-After broadcast, the voter queries the existing transaction-status API by
-the package's transaction hash and passes its `delegate_vote` event to
-`confirm_delegation_submission`. The existing confirmation path rejects a hash
-that differs from the package and records the public `leaf_index`.
-Use the package's canonical lowercase hash for both the status lookup and the
-confirmation call; do not substitute a differently rendered broadcast result.
+After broadcast, the voter calls
+`ChainSubmissionClient::advance_imported_delegation` for the imported bundle.
+On the first call, the lifecycle atomically adopts the package's stored
+transaction hash into a poll-only submission generation. It then polls
+transaction status, parses the `delegate_vote` event, and records the public
+`leaf_index` atomically. The voter supplies no signer, hash, request body, or
+events, and this path never dispatches or retries a POST. A committed failure
+is a terminal `SubmissionRejected` result rather than a hashless local-retry
+state.
 
 The voter MUST record confirmation for every bundle in an imported package
 before creating its first vote commitment. The library enforces this barrier

@@ -320,9 +320,7 @@ fn record_impl(
     let wallet_id = db.wallet_id();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin recovered share transaction failed: {e}"),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("begin recovered share transaction failed", &e))?;
     let bundle =
         crate::vote::recovery_bundle_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?
             .ok_or_else(|| VotingError::InvalidInput {
@@ -347,15 +345,14 @@ fn record_impl(
         &nullifier,
         submit_at,
     )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit recovered share transaction failed: {e}"),
-    })
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("commit recovered share transaction failed", &e))
 }
 
 /// Records a helper-share submission for integration-test fixture setup.
 ///
 /// Production callers submit through
-/// [`crate::vote::CommittedVote::submit_prepared_shares`], which owns the
+/// [`crate::vote::ConfirmedVote::submit_prepared_shares`], which owns the
 /// journal-before-dispatch lifecycle. This lower-level entry point exists only
 /// for the `test-fixtures` feature so integration tests can seed durable state
 /// without opening a network connection.
@@ -487,7 +484,7 @@ pub(crate) fn record_delivery(
 ///
 /// This bypasses network dispatch and is unavailable without the
 /// `test-fixtures` feature. Production callers must use
-/// [`crate::vote::CommittedVote::submit_prepared_shares`].
+/// [`crate::vote::ConfirmedVote::submit_prepared_shares`].
 #[cfg(feature = "test-fixtures")]
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
@@ -817,6 +814,67 @@ pub fn pending_rounds(db: &VotingDb) -> Result<Vec<PendingShareRound>, VotingErr
             })
             .collect()
     })
+}
+
+/// One pending share round together with the wallet it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingShareRoundForAccount {
+    /// Wallet identifier the round is scoped to.
+    pub wallet_id: String,
+    /// Stable vote-round identifier.
+    pub round_id: String,
+    /// Opaque caller context stored when the round was first created.
+    pub session_json: Option<String>,
+}
+
+/// Lists pending share rounds for several wallets through one open sidecar.
+///
+/// `wallet_ids` are deduplicated and visited in sorted order; within one
+/// wallet rounds keep the newest-first order of [`pending_rounds`]. The
+/// handle's own wallet id is not consulted.
+pub fn pending_rounds_for_accounts(
+    db: &VotingDb,
+    wallet_ids: &[&str],
+) -> Result<Vec<PendingShareRoundForAccount>, VotingError> {
+    let mut wallet_ids: Vec<&str> = wallet_ids
+        .iter()
+        .copied()
+        .filter(|wallet_id| !wallet_id.is_empty())
+        .collect();
+    wallet_ids.sort_unstable();
+    wallet_ids.dedup();
+    let mut rounds = Vec::new();
+    for wallet_id in wallet_ids {
+        let scoped = db.scoped(wallet_id)?;
+        for round in pending_rounds(&scoped)? {
+            rounds.push(PendingShareRoundForAccount {
+                wallet_id: wallet_id.to_string(),
+                round_id: round.round_id,
+                session_json: round.session_json,
+            });
+        }
+    }
+    Ok(rounds)
+}
+
+/// Seconds until this round's next helper-share tracking pass should run.
+///
+/// Returns `None` when the round has no unconfirmed shares left, which is also
+/// the signal to stop background tracking. Reading the rows here keeps durable
+/// share records inside the crate: a host that computed this itself would have
+/// to carry them across its boundary just to hand them back.
+pub fn next_tracking_delay_for_round(
+    db: &VotingDb,
+    round_id: &str,
+    now_seconds: u64,
+    policy: ShareTimingPolicy,
+) -> Result<Option<u64>, VotingError> {
+    let shares = db.get_unconfirmed_delegations(round_id)?;
+    Ok(policy::next_tracking_delay_seconds(
+        &shares,
+        now_seconds,
+        policy,
+    ))
 }
 
 /// Re-reads whether one helper-share record is durably confirmed.
@@ -1395,6 +1453,29 @@ mod tests {
 
         confirm(&db, ROUND_ID, 0, 1, 1).unwrap();
         assert!(pending_rounds(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_rounds_for_accounts_scopes_each_wallet_through_one_handle() {
+        let session_json = r#"{"vote_end_time":4102444800}"#;
+        let db = db_with_vote_recovery_and_session(Some(session_json));
+        let urls = vec!["https://helper.example".to_string()];
+        record(&db, ROUND_ID, 0, 1, 0, &urls, 99).unwrap();
+
+        let rounds =
+            pending_rounds_for_accounts(&db, &["zzz-wallet", WALLET_ID, WALLET_ID, ""]).unwrap();
+        assert_eq!(
+            rounds,
+            vec![PendingShareRoundForAccount {
+                wallet_id: WALLET_ID.to_string(),
+                round_id: ROUND_ID.to_string(),
+                session_json: Some(session_json.to_string()),
+            }]
+        );
+        assert_eq!(db.wallet_id(), WALLET_ID);
+        assert!(pending_rounds_for_accounts(&db, &["zzz-wallet"])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

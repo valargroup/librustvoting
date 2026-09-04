@@ -4,7 +4,11 @@
 //! ownership in [`VotingDb`] while hiding the low-level query helpers that back
 //! the SQLite schema.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
 use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -205,6 +209,93 @@ pub fn quantized_bundle_set_weight(bundles: &[Vec<NoteInfo>]) -> Result<u64, Vot
     })
 }
 
+/// One sidecar path's registry state.
+///
+/// `opener` serializes the slow open (busy timeout, migrations, retry sleeps)
+/// for this path alone, so the registry mutex is only ever held to look an
+/// entry up or record a result and never across SQLite work.
+struct SidecarRegistryEntry {
+    opener: Arc<Mutex<()>>,
+    shared: Weak<crate::storage::SidecarConnection>,
+}
+
+impl SidecarRegistryEntry {
+    /// An entry is live while a handle on its connection exists or while a
+    /// caller is inside its open.
+    fn is_live(&self) -> bool {
+        self.shared.strong_count() > 0 || Arc::strong_count(&self.opener) > 1
+    }
+}
+
+type SidecarRegistry = Mutex<HashMap<PathBuf, SidecarRegistryEntry>>;
+
+fn sidecar_registry() -> &'static SidecarRegistry {
+    static REGISTRY: OnceLock<SidecarRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_sidecar_registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, SidecarRegistryEntry>>
+{
+    sidecar_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Finds or creates the registry entry for `key`, returning its per-path
+/// opener lock and the shared connection if one is already open.
+fn registered_sidecar(
+    key: &Path,
+) -> (
+    Arc<Mutex<()>>,
+    Option<Arc<crate::storage::SidecarConnection>>,
+) {
+    let mut registry = lock_sidecar_registry();
+    registry.retain(|_, entry| entry.is_live());
+    let entry = registry
+        .entry(key.to_path_buf())
+        .or_insert_with(|| SidecarRegistryEntry {
+            opener: Arc::new(Mutex::new(())),
+            shared: Weak::new(),
+        });
+    (Arc::clone(&entry.opener), entry.shared.upgrade())
+}
+
+/// The shared connection for `key`, if one is open.
+fn registered_sidecar_connection(key: &Path) -> Option<Arc<crate::storage::SidecarConnection>> {
+    lock_sidecar_registry()
+        .get(key)
+        .and_then(|entry| entry.shared.upgrade())
+}
+
+/// Records the connection an open produced for `key`.
+fn register_sidecar_connection(key: &Path, shared: &Arc<crate::storage::SidecarConnection>) {
+    if let Some(entry) = lock_sidecar_registry().get_mut(key) {
+        entry.shared = Arc::downgrade(shared);
+    }
+}
+
+pub(crate) use crate::storage::sidecar_registry_key;
+
+/// Opening runs migrations, which need the write lock. Another process
+/// finishing its own open can hold that lock briefly, so retry a bounded
+/// number of times before reporting [`VotingError::DbBusy`].
+fn open_connection_with_busy_retry(path: &str) -> Result<rusqlite::Connection, VotingError> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        match VotingDb::open_connection(path) {
+            Ok(conn) => return Ok(conn),
+            Err(error)
+                if error.kind() == crate::VotingErrorKind::DbBusy && attempt < MAX_ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl VotingDb {
     /// Returns the sidecar voting DB path for a wallet DB path.
     ///
@@ -217,14 +308,55 @@ impl VotingDb {
     }
 
     /// Opens the voting sidecar database for `wallet_db_path` and binds `wallet_id`.
+    ///
+    /// One connection is kept per sidecar path for as long as any handle on
+    /// it is alive; later calls for the same path, for any wallet id, share
+    /// that connection through [`VotingDb::scoped`]. In-process writers then
+    /// serialize on the connection instead of contending for the SQLite file
+    /// lock, and hosts no longer need their own per-path write locks. A
+    /// `SQLITE_BUSY` from another process past the busy timeout surfaces as
+    /// [`VotingError::DbBusy`].
+    ///
+    /// Concurrent opens of one path serialize on that path alone: a slow open
+    /// of one sidecar (busy timeout, migrations, retries) never delays an
+    /// open of a different sidecar.
+    ///
+    /// An empty `wallet_id` is refused with [`VotingError::InvalidInput`]
+    /// before anything is opened: every wallet-scoped row is keyed by the id,
+    /// so an empty scope would silently read and write no wallet's state.
     pub fn open_wallet_sidecar(
         wallet_db_path: &Path,
         wallet_id: &str,
-    ) -> Result<Self, VotingError> {
+    ) -> Result<Arc<Self>, VotingError> {
+        if wallet_id.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "wallet id must not be empty".to_string(),
+            });
+        }
         let sidecar_path = Self::wallet_sidecar_path(wallet_db_path);
-        let db = Self::open_path(&sidecar_path)?;
+        let key = sidecar_registry_key(&sidecar_path);
+        let (opener, shared) = registered_sidecar(&key);
+        if let Some(shared) = shared {
+            return Ok(Arc::new(Self::from_shared(shared, wallet_id)));
+        }
+        let _opening = opener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A contender may have finished the same open while this caller
+        // waited for the path's opener lock.
+        if let Some(shared) = registered_sidecar_connection(&key) {
+            return Ok(Arc::new(Self::from_shared(shared, wallet_id)));
+        }
+        let path = sidecar_path
+            .to_str()
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "voting database path is not valid UTF-8".to_string(),
+            })?;
+        let conn = open_connection_with_busy_retry(path)?;
+        let db = Self::from_connection(conn, path);
         db.set_wallet_id(wallet_id);
-        Ok(db)
+        register_sidecar_connection(&key, &db.shared_connection());
+        Ok(Arc::new(db))
     }
 
     /// Opens or creates a voting database at `path` and runs migrations.
@@ -263,6 +395,13 @@ impl VotingDb {
     ///
     /// Existing rounds are left unchanged. `session_json` is stored only on the
     /// first insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when the round already exists for
+    /// another network or with different parameters (snapshot height,
+    /// election key, or roots): the stored parameters bind the round's
+    /// bundles and proofs, so a caller holding others must not build on it.
     pub fn ensure_round(
         &self,
         network: Network,
@@ -273,13 +412,25 @@ impl VotingDb {
         if self.has_round(&params.vote_round_id)? {
             let conn = self.conn();
             let wallet_id = self.wallet_id();
-            let stored_network =
-                queries::load_round_network(&conn, &params.vote_round_id, &wallet_id)?;
+            let (stored, stored_network) =
+                queries::load_round_params_with_network(&conn, &params.vote_round_id, &wallet_id)?;
             if stored_network != network {
                 return Err(VotingError::InvalidInput {
                     message: format!(
                         "round {} exists for network {:?}, not {:?}",
                         params.vote_round_id, stored_network, network
+                    ),
+                });
+            }
+            // The stored parameters bind every bundle, witness, and proof of
+            // the round. A caller holding different ones for the same id is
+            // working from another snapshot; setting up bundles under the
+            // stored ones would persist rows no later witness can validate.
+            if stored != *params {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "round {} exists with different parameters: stored snapshot height {} and roots differ from the supplied snapshot height {}",
+                        params.vote_round_id, stored.snapshot_height, params.snapshot_height
                     ),
                 });
             }
@@ -602,6 +753,14 @@ fn round_eligible_weight(
 }
 
 #[cfg(test)]
+#[path = "tests/sidecar_registry.rs"]
+mod sidecar_registry_tests;
+
+#[cfg(test)]
+#[path = "tests/ensure_round.rs"]
+mod ensure_round_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -652,6 +811,17 @@ mod tests {
         assert_eq!(db.wallet_id(), "wallet-sidecar");
         assert!(db.list_rounds().unwrap().is_empty());
         assert!(sidecar.exists());
+
+        let other = VotingDb::open_wallet_sidecar(&wallet_path, "other-wallet").unwrap();
+        assert!(db.shares_connection_with(&other));
+        assert_eq!(other.wallet_id(), "other-wallet");
+        assert_eq!(db.wallet_id(), "wallet-sidecar");
+
+        drop(other);
+        drop(db);
+        let reopened = VotingDb::open_wallet_sidecar(&wallet_path, "wallet-sidecar").unwrap();
+        assert_eq!(reopened.wallet_id(), "wallet-sidecar");
+        drop(reopened);
 
         std::fs::remove_file(sidecar).ok();
     }
@@ -1303,6 +1473,44 @@ mod tests {
                 .unwrap(),
             BundlePolicy::default()
         );
+    }
+
+    #[test]
+    fn delete_skipped_bundles_preserves_chain_submission_evidence_atomically() {
+        let db = test_db("wallet-protected-prune");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, generation_digest, state, committed_post_reservations,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', ?4,
+                         'submitting', 1, 10, 10)",
+                rusqlite::params![
+                    vec![0x61_u8; 32],
+                    ROUND_ID,
+                    "wallet-protected-prune",
+                    vec![0x62_u8; 32]
+                ],
+            )
+            .unwrap();
+
+        let bundles_before = db.get_bundle_count(ROUND_ID).unwrap();
+        let error = db.delete_skipped_bundles(ROUND_ID, 0).unwrap_err();
+        assert!(matches!(error, crate::VotingError::Busy { .. }));
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), bundles_before);
+        let submissions: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM chain_submissions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(submissions, 1);
     }
 
     #[test]

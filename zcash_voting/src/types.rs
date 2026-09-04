@@ -24,7 +24,7 @@ pub use crate::wire::VotingRoundParams;
 pub const MIN_PROPOSAL_ID: u32 = 1;
 
 /// Highest valid on-chain proposal identifier supported by the vote circuit.
-pub const MAX_PROPOSAL_ID: u32 = 15;
+pub const MAX_PROPOSAL_ID: u32 = 50;
 
 /// Minimum number of options a proposal can declare.
 pub const MIN_VOTE_OPTIONS: u32 = 2;
@@ -34,22 +34,220 @@ pub const MAX_VOTE_OPTIONS: u32 = 8;
 
 pub(crate) const REGTEST_NU6_3_ACTIVATION_HEIGHT: u32 = 10;
 
+/// Delegation setup field that write-once persistence refuses to overwrite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DelegationSetupField {
+    PaddedNoteSecrets,
+    PcztSighash,
+    Tx1Effects,
+    /// Exact serialized PCZT for a later external signing request.
+    DelegationPczt,
+}
+
+impl DelegationSetupField {
+    /// Durable column name, matching the wording of the earlier text-only error.
+    pub fn column_name(self) -> &'static str {
+        match self {
+            Self::PaddedNoteSecrets => "padded_note_secrets",
+            Self::PcztSighash => "pczt_sighash",
+            Self::Tx1Effects => "tx1_effects",
+            Self::DelegationPczt => "delegation_pczt",
+        }
+    }
+}
+
+impl fmt::Display for DelegationSetupField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.column_name())
+    }
+}
+
+/// Stable category of a [`VotingError`].
+///
+/// Hosts branch on this instead of parsing error text. The enum is
+/// non-exhaustive so new categories can be added without breaking hosts; a
+/// host must keep a fallback arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum VotingErrorKind {
+    InvalidInput,
+    KeystoneSignatureConflict,
+    ProofFailed,
+    Busy,
+    Storage,
+    Internal,
+    InsufficientEligibility,
+    NoSpendableNotes,
+    SetupAlreadyPersisted,
+    DelegationReconciliationRequired,
+    DbBusy,
+    PirUnavailable,
+}
+
+fn insufficient_eligibility_message(
+    required_weight_zatoshi: &u64,
+    selected_weight_zatoshi: &u64,
+    selected_notes: &u32,
+    snapshot_height: &Option<u64>,
+) -> String {
+    let suffix = snapshot_height
+        .map(|height| format!(" at snapshot height {height}"))
+        .unwrap_or_default();
+    format!(
+        "minimum voting eligibility requires at least one eligible voting bundle with {required_weight_zatoshi} zatoshi voting weight; selected {selected_notes} distinct notes across eligible bundles with {selected_weight_zatoshi} zatoshi eligible bundle weight{suffix}"
+    )
+}
+
+fn pir_endpoint_suffix(endpoint: &Option<String>) -> String {
+    endpoint
+        .as_deref()
+        .map(|endpoint| format!(" at {endpoint}"))
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Error)]
 pub enum VotingError {
+    /// Legacy setup cannot produce the exact original Keystone signing request.
+    #[error("delegation for round={round_id}, bundle={bundle_index} needs reconciliation before a new Keystone signing request can be created")]
+    DelegationReconciliationRequired { round_id: String, bundle_index: u32 },
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
     #[error("Keystone signature conflict for bundle {bundle_index}")]
     KeystoneSignatureConflict { bundle_index: u32 },
-    /// Persisted delegation signing state cannot be rebuilt until its possible
-    /// on-chain submission has been reconciled.
-    #[error(
-        "Delegation state requires reconciliation before Keystone signing for round {round_id}, bundle {bundle_index}"
-    )]
-    DelegationReconciliationRequired { round_id: String, bundle_index: u32 },
     #[error("Proof generation failed: {message}")]
     ProofFailed { message: String },
+    #[error("Voting state is busy: {message}")]
+    Busy { message: String },
+    /// A durable-state read or write failed before its result could be interpreted.
+    #[error("Storage error: {message}")]
+    Storage { message: String },
     #[error("Internal error: {message}")]
     Internal { message: String },
+    /// The planned note set does not reach the minimum voting weight.
+    #[error("{}", insufficient_eligibility_message(.required_weight_zatoshi, .selected_weight_zatoshi, .selected_notes, .snapshot_height))]
+    InsufficientEligibility {
+        required_weight_zatoshi: u64,
+        selected_weight_zatoshi: u64,
+        /// Snapshot height the check was evaluated at, when the caller knows it.
+        snapshot_height: Option<u64>,
+        /// Note slots one bundle must fill before it carries voting weight.
+        bundle_note_slots: u32,
+        /// Distinct notes that survived bundle planning.
+        selected_notes: u32,
+    },
+    /// The account holds no spendable Orchard notes at the round snapshot.
+    #[error("no spendable voting notes at snapshot height {snapshot_height}")]
+    NoSpendableNotes { snapshot_height: u64 },
+    /// Delegation setup is write-once and a differing value already exists.
+    ///
+    /// Callers that only need the persisted setup may treat this as success
+    /// and reuse the stored artifacts.
+    #[error("refusing to overwrite {field} for round={round_id}, bundle={bundle_index}")]
+    SetupAlreadyPersisted {
+        round_id: String,
+        bundle_index: u32,
+        field: DelegationSetupField,
+    },
+    /// SQLite reported the sidecar database busy or locked past its timeout.
+    #[error("Voting database is busy: {message}")]
+    DbBusy { message: String },
+    /// A PIR endpoint could not serve a request.
+    ///
+    /// `retryable` is true for connection, timeout, transient-status, and
+    /// body-read failures where another endpoint or a later attempt may
+    /// succeed. It is false for layout or content failures.
+    #[error("PIR unavailable{}: {message}", pir_endpoint_suffix(.endpoint))]
+    PirUnavailable {
+        endpoint: Option<String>,
+        http_status: Option<u16>,
+        retryable: bool,
+        message: String,
+    },
+}
+
+impl VotingError {
+    /// Stable category of this error.
+    pub fn kind(&self) -> VotingErrorKind {
+        match self {
+            Self::InvalidInput { .. } => VotingErrorKind::InvalidInput,
+            Self::KeystoneSignatureConflict { .. } => VotingErrorKind::KeystoneSignatureConflict,
+            Self::ProofFailed { .. } => VotingErrorKind::ProofFailed,
+            Self::Busy { .. } => VotingErrorKind::Busy,
+            Self::Storage { .. } => VotingErrorKind::Storage,
+            Self::Internal { .. } => VotingErrorKind::Internal,
+            Self::InsufficientEligibility { .. } => VotingErrorKind::InsufficientEligibility,
+            Self::NoSpendableNotes { .. } => VotingErrorKind::NoSpendableNotes,
+            Self::SetupAlreadyPersisted { .. } => VotingErrorKind::SetupAlreadyPersisted,
+            Self::DelegationReconciliationRequired { .. } => {
+                VotingErrorKind::DelegationReconciliationRequired
+            }
+            Self::DbBusy { .. } => VotingErrorKind::DbBusy,
+            Self::PirUnavailable { .. } => VotingErrorKind::PirUnavailable,
+        }
+    }
+
+    /// Whether repeating the same operation later, or against another
+    /// endpoint, has a reasonable chance of succeeding.
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Busy { .. }
+                | Self::DbBusy { .. }
+                | Self::PirUnavailable {
+                    retryable: true,
+                    ..
+                }
+        )
+    }
+
+    /// Attaches the snapshot height to an eligibility failure that was
+    /// evaluated without one. Other errors are returned unchanged.
+    pub fn with_snapshot_height(self, height: u64) -> Self {
+        match self {
+            Self::InsufficientEligibility {
+                required_weight_zatoshi,
+                selected_weight_zatoshi,
+                snapshot_height: None,
+                bundle_note_slots,
+                selected_notes,
+            } => Self::InsufficientEligibility {
+                required_weight_zatoshi,
+                selected_weight_zatoshi,
+                snapshot_height: Some(height),
+                bundle_note_slots,
+                selected_notes,
+            },
+            other => other,
+        }
+    }
+
+    /// Classifies a SQLite failure, keeping `context` in the message.
+    pub(crate) fn from_sqlite(context: &str, error: &rusqlite::Error) -> Self {
+        let message = format!("{context}: {error}");
+        if is_sqlite_busy(error) {
+            Self::DbBusy { message }
+        } else {
+            Self::Storage { message }
+        }
+    }
+}
+
+pub(crate) fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+impl From<rusqlite::Error> for VotingError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::from_sqlite("sqlite", &error)
+    }
 }
 
 /// Zcash network selector used by wallet-facing voting APIs.
@@ -62,6 +260,22 @@ pub enum Network {
     Testnet,
     Mainnet,
     Regtest,
+}
+
+impl Network {
+    /// Vote-chain deployment identifier conventionally paired with this
+    /// network: `zvote-1` for mainnet and `svote-1` for the shared
+    /// staging chain used by testnet and regtest wallets.
+    ///
+    /// This is a convention, not an authenticated value; a deployment that
+    /// rotates chain ids must supply the id from configuration through
+    /// [`crate::ChainSubmissionClientConfig::with_vote_chain_id`].
+    pub fn default_vote_chain_id(self) -> &'static str {
+        match self {
+            Self::Mainnet => "zvote-1",
+            Self::Testnet | Self::Regtest => "svote-1",
+        }
+    }
 }
 
 impl Parameters for Network {
@@ -1153,6 +1367,8 @@ pub fn validate_notes_for_round(notes: &[NoteInfo]) -> Result<(), VotingError> {
 
 #[cfg(test)]
 mod tests {
+    mod error_kind;
+
     use super::*;
     use crate::governance::BALLOT_DIVISOR;
     use orchard::note::{ExtractedNoteCommitment, NoteVersion, Rho};

@@ -12,17 +12,14 @@ use zcash_voting::prelude::{
     export_delegation_capability, gather_delegation_lwd_inputs, import_delegation_capability,
     prepare_delegation_bundle as prepare_bundle_state,
     prepare_delegation_bundle_for_target as prepare_target_bundle_state, spend_auth_signature,
-    DelegationAccountKeys, DelegationCapabilityDigest, DelegationKeys, DelegationProofOutcome,
-    DelegationSigningRequest, DelegationSubmission, ExportedDelegationCapability,
-    ImportDelegationCapabilityParams, KeystoneSigningRequest, Network, NoopProgressReporter,
-    PrepareDelegationBundleForTargetParams, PrepareDelegationBundleParams,
-    PreparedDelegationBundle, PreparedDelegationReport, PreparedSigner,
-    RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey, VotingHotkeyTargetV1,
+    DelegationAccountKeys, DelegationCapabilityDigest, DelegationKeys, DelegationSigningRequest,
+    DelegationSubmission, ExportedDelegationCapability, ImportDelegationCapabilityParams,
+    KeystoneSigningRequest, Network, NoopProgressReporter, PrepareDelegationBundleForTargetParams,
+    PrepareDelegationBundleParams, PreparedDelegationBundle, PreparedDelegationReport,
+    PreparedSigner, RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey, VotingHotkeyTargetV1,
 };
 use zcash_voting::wire::PirLayout;
-use zcash_voting::{
-    connect_pir_blocking, BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams,
-};
+use zcash_voting::{BundlePolicy, HyperTransport, PirFleet, VotingRoundParams};
 use zip32::{fingerprint::SeedFingerprint, AccountId};
 
 /// Inputs for preparing one reusable delegation bundle context.
@@ -280,9 +277,8 @@ where
     C: std::borrow::Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    prepared
-        .precompute(voting_db, wallet_db, &pir_client)
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| prepared.precompute(voting_db, wallet_db, session))
         .context("precompute delegation bundle")
 }
 
@@ -322,14 +318,16 @@ pub fn warm_pir_proof_cache_for_notes(
     pir_layout: PirLayout,
     pir_server_url: &str,
 ) -> Result<zcash_voting::PirCachePrecomputeResult> {
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    zcash_voting::prelude::precompute_pir_proofs(
-        voting_db,
-        notes,
-        bundle_policy,
-        network,
-        &pir_client,
-    )
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| {
+        zcash_voting::prelude::precompute_pir_proofs(
+            voting_db,
+            notes,
+            bundle_policy,
+            network,
+            session,
+        )
+    })
     .context("warm PIR proof cache")
 }
 
@@ -361,95 +359,83 @@ pub fn precompute_snapshot_bundles(
     pir_layout: PirLayout,
     pir_server_url: &str,
 ) -> Result<zcash_voting::prelude::SnapshotBundlePrecomputeReport> {
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    zcash_voting::prelude::precompute_snapshot_bundles(
-        voting_db,
-        round_id,
-        notes,
-        bundle_policy,
-        &pir_client,
-        network,
-    )
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| {
+        zcash_voting::prelude::precompute_snapshot_bundles(
+            voting_db,
+            round_id,
+            notes,
+            bundle_policy,
+            session,
+            network,
+        )
+    })
     .context("precompute snapshot bundles")
 }
 
-/// Ensures one delegation proof and signs it in wallet-owned code.
+/// Proves one precomputed delegation bundle and signs it in wallet-owned code.
 ///
 /// The returned `DelegationSubmission` contains the chain-ready fields for the
-/// selected bundle. Persisted witnesses, padded-note secrets, setup, PIR rows,
-/// and proof are reused across retries.
+/// selected bundle. The function expects the target bundle's witnesses,
+/// padded-note secrets, and PIR rows to have been warmed by
+/// `precompute_delegation_bundle`.
 ///
 /// # Errors
 ///
 /// Returns an error if setup/proof generation fails, PIR access fails, signing
 /// fails, or submission fields cannot be assembled.
-pub fn prove_and_submit_delegation_bundle<C, P, CL, R>(
+pub fn prove_and_submit_delegation_bundle(
     voting_db: &VotingDb,
-    wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
     prepared: &PreparedDelegationBundle,
     pir_layout: PirLayout,
     pir_server_url: &str,
     seed: &[u8],
-) -> Result<DelegationSubmission>
-where
-    C: std::borrow::Borrow<rusqlite::Connection>,
-    P: Parameters,
-{
+) -> Result<DelegationSubmission> {
     let progress = NoopProgressReporter;
-    let pczt_bytes = if voting_db
-        .has_persisted_delegation_proof(&prepared.round_id, prepared.bundle_index)
-        .context("check persisted delegation proof")?
-    {
-        Vec::new()
-    } else {
-        let pir_client = connect_pir(pir_layout, pir_server_url)?;
-        match prepared
-            .ensure_proof(voting_db, wallet_db, &pir_client, &progress)
-            .context("ensure delegation proof")?
-        {
-            DelegationProofOutcome::Generated { setup, .. } => {
-                setup.map(|setup| setup.pczt_bytes).unwrap_or_default()
-            }
-            DelegationProofOutcome::Reused => Vec::new(),
-        }
-    };
+    let delegation_setup = prepared
+        .setup(voting_db, &progress)
+        .context("setup delegation bundle")?;
     let signing_request = prepared
         .signing_request(voting_db)
         .context("load delegation signing request")?;
     let (sig, sighash) = example_sign_delegation_request(seed, signing_request)?;
 
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| prepared.prove(voting_db, session, &progress))
+        .context("prove delegation bundle")?;
+
     prepared
         .signed_bundle(
             voting_db,
-            pczt_bytes,
+            delegation_setup.pczt_bytes,
             PreparedSigner::signature(sig, sighash),
         )
         .map(|bundle| bundle.submission)
         .context("assemble signed delegation submission")
 }
 
-/// Builds or reloads TX1 and the redacted Keystone signing request for a bundle.
+/// Builds TX1, the redacted Keystone signing transaction for one bundle.
 ///
 /// TX1 is a consensus-shaped Zcash PCZT used to obtain a ZIP-244 SpendAuth
 /// signature. It is not the vote-chain delegation submission and must never be
 /// broadcast to the Zcash network. The returned request includes signer-facing
-/// redacted PCZT bytes, display metadata, bundle weights, and the exact
-/// crate-persisted setup needed to verify and submit the later signed PCZT.
+/// redacted PCZT bytes, display metadata, bundle weights, and the local setup
+/// needed to verify and submit the later signed PCZT.
 ///
 /// # Errors
 ///
-/// Returns an error if PCZT setup or durable reload fails, redaction fails, or
-/// bundle weight cannot be calculated.
+/// Returns an error if PCZT setup fails, redaction fails, or bundle weight
+/// cannot be calculated.
 pub fn build_keystone_delegation_request(
     voting_db: &VotingDb,
     prepared: &PreparedDelegationBundle,
 ) -> Result<KeystoneSigningRequest> {
-    // Ensure the full governance PCZT exists, then reload that exact request.
-    // The signer receives only its redacted view.
+    // Build the full governance PCZT. The signer only receives the redacted
+    // bytes, but the complete setup is needed for later proof/submission checks.
     let progress = NoopProgressReporter;
     prepared
         .keystone_request(voting_db, &progress)
-        .context("build or reload Keystone delegation request")
+        .context("build Keystone delegation request")
 }
 
 /// Proves a bundle and assembles a submission from a Keystone-signed PCZT.
@@ -462,31 +448,20 @@ pub fn build_keystone_delegation_request(
 ///
 /// Returns an error if proof generation fails, PIR access fails, the signature
 /// cannot be extracted, or submission fields cannot be assembled.
-pub fn prove_and_submit_keystone_delegation_bundle<C, P, CL, R>(
+pub fn prove_and_submit_keystone_delegation_bundle(
     voting_db: &VotingDb,
-    wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
     prepared: &PreparedDelegationBundle,
     pir_layout: PirLayout,
     pir_server_url: &str,
     keystone_request: &KeystoneSigningRequest,
     signed_pczt_bytes: &[u8],
-) -> Result<DelegationSubmission>
-where
-    C: std::borrow::Borrow<rusqlite::Connection>,
-    P: Parameters,
-{
-    // Reuse a proof completed during warmup without requiring PIR to remain
-    // available after Keystone returns the signed PCZT.
+) -> Result<DelegationSubmission> {
+    // Generate the proof using warmed witnesses and PIR rows, without
+    // rebuilding the PCZT that Keystone already signed.
     let progress = NoopProgressReporter;
-    if !voting_db
-        .has_persisted_delegation_proof(&prepared.round_id, prepared.bundle_index)
-        .context("check persisted delegation proof")?
-    {
-        let pir_client = connect_pir(pir_layout, pir_server_url)?;
-        prepared
-            .ensure_proof(voting_db, wallet_db, &pir_client, &progress)
-            .context("ensure delegation proof")?;
-    }
+    let pir = pir_fleet(pir_layout, pir_server_url)?;
+    pir.with_failover(|session| prepared.prove(voting_db, session, &progress))
+        .context("prove delegation bundle")?;
 
     // Pair Keystone's SpendAuth signature with the original setup sighash.
     let action_index = usize::try_from(keystone_request.action_index)
@@ -535,7 +510,15 @@ fn example_sign_delegation_request(
     Ok(((&sig).into(), request.sighash))
 }
 
-fn connect_pir(pir_layout: PirLayout, pir_server_url: &str) -> Result<PirClientBlocking> {
-    connect_pir_blocking(pir_layout, pir_server_url, Arc::new(HyperTransport::new()))
-        .context("connect to PIR server")
+/// One-endpoint PIR fleet.
+///
+/// A wallet with several PIR endpoints passes them all and gets ordered
+/// failover; this example takes a single URL from the command line.
+fn pir_fleet(pir_layout: PirLayout, pir_server_url: &str) -> Result<PirFleet> {
+    PirFleet::new(
+        &[pir_server_url.to_string()],
+        pir_layout,
+        Arc::new(HyperTransport::new()),
+    )
+    .context("connect to PIR server")
 }

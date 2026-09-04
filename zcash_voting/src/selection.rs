@@ -407,9 +407,7 @@ where
             .then_with(|| a.output_index.cmp(&b.output_index))
     });
     if notes.is_empty() {
-        return Err(VotingError::InvalidInput {
-            message: format!("no spendable voting notes at snapshot height {snapshot_height}"),
-        });
+        return Err(VotingError::NoSpendableNotes { snapshot_height });
     }
 
     Ok(notes)

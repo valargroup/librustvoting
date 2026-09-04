@@ -110,6 +110,32 @@ and carry inline test modules and mixed responsibilities. They are legacy, not
 the pattern; do not copy their layout into new code, and do not reformat them
 wholesale as a side effect of an unrelated change.
 
+## Release branches
+
+`main` is the development line for the next release. Each shipped major series
+is maintained on a `release/vMAJOR.x` branch, currently `release/v3.x`.
+
+Do not push a fix directly to a maintenance branch. Land it on `main` first,
+then apply the `A:backport/v3.x` label so Mergify opens a reviewed backport PR.
+Only semver-compatible changes may be backported.
+
+Read [`docs/release-branches.md`](docs/release-branches.md) before deciding
+which branch a change targets, applying a backport label, or cutting a new
+maintenance line. It is the source of truth for the branching and release
+process; keep it updated in the same change whenever that process changes.
+
+## Round orchestration
+
+Before changing round planning (`zcash_voting/src/session.rs`,
+`zcash_voting/src/round_planning/`) or vote-work execution
+(`zcash_voting/src/vote_work/`), read and follow
+[`docs/round_orchestration_invariants.md`](docs/round_orchestration_invariants.md).
+It is the review specification for how durable state and the authenticated
+roster become obligations, how those are executed, and which identities are
+durable. Update it and its named conformance tests in the same change whenever
+behavior intentionally changes, and report any conflict between a requested
+change and the specification before implementing it.
+
 ## Helper-share submission
 
 Before changing helper-share planning, submission, transport, persistence,
