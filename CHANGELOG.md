@@ -113,6 +113,14 @@ This release is `zcash_voting` 4.0.0.
 
 - The wallet example's `advance_round_until_idle` takes a `RouteHttp`
   executor and routes helper, vote-chain, and vote-tree traffic through it.
+- The wallet example's `advance_round_until_idle` takes the caller's
+  `HelperHealth`, so helper failures and cooldowns observed in one call steer
+  helper selection in the next instead of resetting per call.
+- `VotingDb::open_wallet_sidecar` refuses an empty wallet id with
+  `InvalidInput` before opening the sidecar.
+- `DelegationPipeline` checks a persisted delegation setup against the
+  pipeline's notes and target-bound hotkey before reusing it for signing, the
+  same check a persisted proof already gets.
 - `RoundExecutor::advance` rejects a round the wallet stores under a network
   other than the chain client's before helper preflight or any plan write.
 - A caller queued for a round lock stops waiting when the host moves to

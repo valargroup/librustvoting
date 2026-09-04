@@ -29,6 +29,11 @@ use zcash_voting::{HelperTransport, HyperTransport, RouteHttp};
 /// back to a direct connection. Pass `Arc::new(DirectRoute::default())` when
 /// no route is required.
 ///
+/// `helper_health` is the wallet's helper score table. It is caller-owned so
+/// that failures and cooldowns observed in one call still steer helper
+/// selection in the next: a wallet that schedules this helper repeatedly
+/// keeps one `HelperHealth` per wallet and passes a clone each time.
+///
 /// `host` is called before every step so each pass sees the current time and
 /// fleet: a long proof can cross the last-moment or vote-end boundary, and the
 /// following `CastVote` must plan against the clock it actually runs under.
@@ -40,6 +45,7 @@ pub async fn advance_round_until_idle<R: RouteHttp>(
     network: Network,
     chain_endpoints: Vec<String>,
     route: Arc<R>,
+    helper_health: HelperHealth,
     binding: RoundBinding,
     host: impl Fn() -> RoundHostContext,
     control: &ChainSubmissionControl,
@@ -48,7 +54,7 @@ pub async fn advance_round_until_idle<R: RouteHttp>(
     // and the vote tree; each `HyperTransport` owns worker threads.
     let transport = Arc::new(HyperTransport::with_shared_route(route));
     let helper_transport: Arc<dyn HelperTransport> = transport.clone();
-    let helper_client = HelperClient::new(helper_transport, HelperHealth::default());
+    let helper_client = HelperClient::new(helper_transport, helper_health);
     let executor = RoundExecutor::with_transport(
         voting_db,
         Arc::clone(&transport),
