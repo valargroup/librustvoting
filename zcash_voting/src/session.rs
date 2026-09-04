@@ -274,9 +274,7 @@ fn write_ballot_intent_in_tx(
             ":now": now,
         },
     )
-    .map_err(|e| VotingError::Internal {
-        message: format!("set_ballot_intent failed: {e}"),
-    })?;
+    .map_err(|e| VotingError::from_sqlite("set_ballot_intent", &e))?;
     if skipped_bool {
         tx.execute(
             "DELETE FROM share_delegations
@@ -313,9 +311,7 @@ fn write_ballot_intent_in_tx(
     } else {
         Ok(0)
     }
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear stale share delegations: {e}"),
-    })?;
+    .map_err(|e| VotingError::from_sqlite("clear stale share delegations", &e))?;
     Ok(())
 }
 
