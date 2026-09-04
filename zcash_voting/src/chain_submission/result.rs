@@ -359,7 +359,7 @@ pub struct ChainSubmissionFailure {
 
 #[allow(dead_code, reason = "constructed by protocol and coordinator phases")]
 impl ChainSubmissionFailure {
-    pub(super) fn without_state(
+    pub(crate) fn without_state(
         kind: ChainSubmissionFailureKind,
         redacted_message: impl AsRef<str>,
     ) -> Self {

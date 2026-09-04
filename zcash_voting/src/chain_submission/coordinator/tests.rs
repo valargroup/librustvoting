@@ -4585,3 +4585,41 @@ fn derived_imported_delegation(identity: ChainSubmissionIdentity) -> DerivedChai
         vec![],
     )
 }
+
+#[tokio::test]
+async fn a_pass_bound_to_an_earlier_epoch_is_refused_under_the_current_one() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    let control = ManualControl::default();
+    // The host moved on to epoch 1; the caller's work began under epoch 0.
+    control.epoch.store(1, Ordering::SeqCst);
+
+    let failure = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    )
+    .advance_in_epoch(
+        StoreAdvancementRequest::vote(identity.clone()),
+        ChainRecoveryMode::StatusOnly,
+        &control,
+        0,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::InvalidInput);
+    assert!(
+        failure.message().contains("operation epoch changed"),
+        "{}",
+        failure.message()
+    );
+    assert!(
+        transport.methods().is_empty(),
+        "no request may be sent for the stale epoch: {:?}",
+        transport.methods()
+    );
+}

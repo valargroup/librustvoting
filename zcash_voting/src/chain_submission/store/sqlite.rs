@@ -385,7 +385,7 @@ fn normalize_abandoned(
 
 impl ChainSubmissionStore for SqliteChainSubmissionStore {
     fn coordination(&self) -> &SubmissionCoordination {
-        &self.db.chain_submission_coordination
+        self.db.chain_submission_coordination()
     }
 
     fn admit(
