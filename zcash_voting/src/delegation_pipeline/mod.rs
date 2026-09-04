@@ -42,7 +42,12 @@ pub use signing::{DelegationSigner, KeystoneSignatureSource, SpendAuthSigner};
 pub use wallet_access::{SqliteWalletDbOpener, WalletDbOpener};
 
 /// One account's delegation work for one round.
+///
+/// The wallet is captured at construction: the pipeline works on its own
+/// handle over the sidecar connection it was given, so a later
+/// `set_wallet_id` on the host's handle cannot retarget delegation work.
 pub struct DelegationPipeline<W: WalletDbOpener> {
+    wallet_id: String,
     voting_db: Arc<VotingDb>,
     wallet: W,
     lwd: DelegationLwdInputs,
@@ -83,7 +88,10 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
                 message: "account_uuid must not be empty".to_string(),
             });
         }
+        let wallet_id = voting_db.wallet_id();
+        let voting_db = Arc::new(voting_db.scoped(&wallet_id));
         Ok(Self {
+            wallet_id,
             voting_db,
             wallet,
             lwd,
@@ -94,8 +102,14 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         })
     }
 
+    /// The pipeline's own wallet-scoped handle over the sidecar connection.
     pub fn voting_db(&self) -> &Arc<VotingDb> {
         &self.voting_db
+    }
+
+    /// The wallet every stage is scoped to, captured at construction.
+    pub fn wallet_id(&self) -> &str {
+        &self.wallet_id
     }
 
     pub fn round_id(&self) -> &str {

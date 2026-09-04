@@ -395,6 +395,28 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 "delegation driver is bound to a different round",
             ));
         }
+        if inputs.driver.wallet_id() != self.wallet_id {
+            return Err(self.step_failure(
+                RoundStepFailureKind::InvalidInput,
+                Some(step.clone()),
+                None,
+                None,
+                format!(
+                    "delegation driver is scoped to wallet {} but the executor to wallet {}",
+                    inputs.driver.wallet_id(),
+                    self.wallet_id
+                ),
+            ));
+        }
+        if !inputs.driver.shares_database_with(&self.database) {
+            return Err(self.step_failure(
+                RoundStepFailureKind::InvalidInput,
+                Some(step.clone()),
+                None,
+                None,
+                "delegation driver persists into a different voting database than the executor",
+            ));
+        }
         Ok(inputs)
     }
 

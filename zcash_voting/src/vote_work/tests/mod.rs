@@ -451,11 +451,21 @@ mod round_executor {
     /// payload is signed and before chain dispatch.
     struct CancelAfterSigningDriver {
         control: ChainSubmissionControl,
+        wallet_id: String,
+        database: Arc<crate::round::VotingDb>,
     }
 
     impl DelegationDriver for CancelAfterSigningDriver {
         fn round_id(&self) -> &str {
             ROUND_ID
+        }
+
+        fn wallet_id(&self) -> &str {
+            &self.wallet_id
+        }
+
+        fn shares_database_with(&self, database: &crate::round::VotingDb) -> bool {
+            self.database.shares_connection_with(database)
         }
 
         fn prove_and_sign_blocking(
@@ -498,11 +508,17 @@ mod round_executor {
         }
     }
 
-    fn host_with_delegation(control: &ChainSubmissionControl) -> RoundHostContext {
+    fn host_with_delegation(
+        control: &ChainSubmissionControl,
+        driver_wallet_id: &str,
+        database: &Arc<crate::round::VotingDb>,
+    ) -> RoundHostContext {
         RoundHostContext {
             delegation: Some(DelegationStepInputs {
                 driver: Arc::new(CancelAfterSigningDriver {
                     control: control.clone(),
+                    wallet_id: driver_wallet_id.to_string(),
+                    database: Arc::clone(database),
                 }),
                 signer: DelegationSigner::Keystone(KeystoneSignatureSource::Provided {
                     sig: vec![0x68; 64],
@@ -555,7 +571,7 @@ mod round_executor {
         let outcome = executor
             .advance_step(
                 step.clone(),
-                &host_with_delegation(&control),
+                &host_with_delegation(&control, "wallet", executor.database()),
                 &control,
                 &NoopRoundStepProgressReporter {},
             )
@@ -807,6 +823,77 @@ mod round_executor {
         .await;
         assert_eq!(requests, 2, "both nodes are tried in order");
     }
+
+    fn decided_ballot(executor: &RoundExecutor<HyperTransport>) {
+        executor
+            .set_ballot_intents(&[
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Choice(0),
+                },
+                BallotIntent {
+                    proposal_id: 2,
+                    decision: Decision::Skipped,
+                },
+            ])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_driver_scoped_to_another_wallet_is_refused_before_proving() {
+        let executor = executor();
+        decided_ballot(&executor);
+        let control = ChainSubmissionControl::new(1);
+        let step = NextStep::Delegate { bundle_index: 0 };
+
+        let failure = executor
+            .advance_step(
+                step.clone(),
+                &host_with_delegation(&control, "other-wallet", executor.database()),
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .expect_err("a driver for another wallet must not run under this wallet's lock");
+
+        assert_eq!(failure.kind, RoundStepFailureKind::InvalidInput);
+        assert!(
+            failure.message.contains("other-wallet"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            !control.is_cancelled(),
+            "the driver must not have been invoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_over_another_database_is_refused_before_proving() {
+        let executor = executor();
+        decided_ballot(&executor);
+        let control = ChainSubmissionControl::new(1);
+        let foreign = host_database_for("wallet");
+
+        let failure = executor
+            .advance_step(
+                NextStep::Delegate { bundle_index: 0 },
+                &host_with_delegation(&control, "wallet", &foreign),
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .expect_err("a driver over another sidecar must not run");
+
+        assert_eq!(failure.kind, RoundStepFailureKind::InvalidInput);
+        assert!(
+            failure.message.contains("different voting database"),
+            "{}",
+            failure.message
+        );
+        assert!(!control.is_cancelled());
+    }
+
     #[test]
     fn a_binding_requires_a_nonempty_distinct_roster() {
         let binding = |proposals: Vec<ProposalRosterEntry>| RoundBinding {

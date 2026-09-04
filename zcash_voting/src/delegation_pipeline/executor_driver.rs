@@ -3,6 +3,7 @@
 use crate::{
     delegate::{PreparedSigner, SignedDelegationBundle},
     pir::PirFleet,
+    round::VotingDb,
     types::{DelegationProgressReporter, VotingError},
 };
 
@@ -15,6 +16,18 @@ use super::{DelegationPipeline, DelegationSigner, WalletDbOpener};
 pub trait DelegationDriver: Send + Sync {
     /// Round the driver is bound to.
     fn round_id(&self) -> &str;
+
+    /// Wallet the driver captured at construction.
+    ///
+    /// The round executor refuses a driver whose wallet differs from its own
+    /// frozen scope, so delegation work cannot be persisted under one
+    /// wallet while another wallet's bundle lock is held.
+    fn wallet_id(&self) -> &str;
+
+    /// Whether the driver persists into the same sidecar connection as
+    /// `database`. The executor requires this together with a matching
+    /// wallet id before invoking any delegation stage.
+    fn shares_database_with(&self, database: &VotingDb) -> bool;
 
     /// Proves and signs one bundle on the calling thread.
     ///
@@ -43,6 +56,14 @@ pub trait DelegationDriver: Send + Sync {
 impl<W: WalletDbOpener> DelegationDriver for DelegationPipeline<W> {
     fn round_id(&self) -> &str {
         DelegationPipeline::round_id(self)
+    }
+
+    fn wallet_id(&self) -> &str {
+        DelegationPipeline::wallet_id(self)
+    }
+
+    fn shares_database_with(&self, database: &VotingDb) -> bool {
+        self.voting_db.shares_connection_with(database)
     }
 
     fn prove_and_sign_blocking(
