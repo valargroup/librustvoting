@@ -82,3 +82,21 @@ fn an_unknown_error_kind_deserializes_as_other() {
     assert_eq!(view.kind, VotingErrorKindView::Other);
     assert_eq!(view.message, known.message);
 }
+
+#[test]
+fn an_unknown_kind_with_a_new_structured_field_still_parses() {
+    let known = VotingError::Busy {
+        message: "busy".to_string(),
+    }
+    .to_view();
+    let json = serde_json::to_string(&known).unwrap().replace(
+        "\"kind\":\"busy\"",
+        "\"kind\":\"quota_exhausted\",\"quota_remaining\":0",
+    );
+
+    let view: crate::wire::VotingErrorView = serde_json::from_str(&json)
+        .expect("a field added for a newer category must not reject the payload");
+
+    assert_eq!(view.kind, VotingErrorKindView::Other);
+    assert_eq!(view.message, known.message);
+}

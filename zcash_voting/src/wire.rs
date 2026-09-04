@@ -535,8 +535,11 @@ pub enum VotingErrorKindView {
 /// `snapshot_height`, the weight fields, and the note counts for
 /// `InsufficientEligibility` and `NoSpendableNotes`; `http_status` and
 /// `endpoint` for `PirUnavailable`.
+///
+/// Unknown fields are accepted on purpose: a newer crate may add a structured
+/// field for a category an older host reads as `Other`, and the whole payload
+/// must still parse for that fallback to mean anything.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VotingErrorView {
     pub kind: VotingErrorKindView,
     pub retryable: bool,
