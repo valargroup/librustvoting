@@ -69,6 +69,17 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `RoundExecutor` proving threads keep the step's round or bundle lock until
+  they finish persisting, so dropping a step future mid-proof cannot let a
+  new pass start a competing proof.
+- `RoundExecutor::with_binding` also rejects a binding whose network differs
+  from the network the wallet already stores the round under.
+- A helper-delivery error raised after the chain confirmed a vote keeps the
+  confirmation in `RoundStepFailure::chain_outcome`.
+- `PirFleet` fails over only on retryable `PirUnavailable` errors; local
+  `Busy` and `DbBusy` contention is returned to the caller for an
+  operation-level retry instead of being repeated against every endpoint.
+
 - `ChainSubmissionClient` captures its wallet at construction and works on
   a private scoped handle; `ChainSubmissionClient::wallet_id` reports it. A
   host re-scoping the handle it passed no longer moves a later pass of an

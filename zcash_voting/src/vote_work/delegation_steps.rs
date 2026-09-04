@@ -9,6 +9,7 @@ use crate::{
 };
 
 use super::{
+    round_lock::HeldRoundLock,
     step_control::StepControl,
     steps::{persisted_policy, PROVING_STACK_BYTES},
     RoundExecutor, RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome,
@@ -21,6 +22,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         step: NextStep,
         bundle_index: u32,
         host: &RoundHostContext,
+        lock: &HeldRoundLock,
         control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
@@ -30,10 +32,15 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let driver = Arc::clone(&inputs.driver);
         let signer = inputs.signer.clone();
         let pir = Arc::clone(&inputs.pir);
+        // The prover keeps the bundle lock until it has finished persisting,
+        // even if this future is dropped, so no second pass can start a
+        // competing proof for the same bundle meanwhile.
+        let held_lock = Arc::clone(lock);
         std::thread::Builder::new()
             .name("voting-delegation-step".to_string())
             .stack_size(PROVING_STACK_BYTES)
             .spawn(move || {
+                let _held_lock = held_lock;
                 let reporter = DelegationProgressBridge::new(move |progress| {
                     let _ = progress_tx.send(progress);
                 });

@@ -11,6 +11,8 @@
 //! (helper plans, chain advancement, share delivery and confirmation), and
 //! `step_outcomes` (outcome construction and failure projection).
 
+use std::sync::Arc;
+
 use crate::{
     session::{resume_plan, NextStep, RoundPlan, VoteRecoveryWorkKind},
     share_tracking::ShareKey,
@@ -129,7 +131,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             }
             _ => None,
         };
-        let Some(_guard) = round_lock::acquire(wallet_id, &round_id, scope, control.chain())
+        let Some(guard) = round_lock::acquire(wallet_id, &round_id, scope, control.chain())
             .await
             .map_err(|message| {
                 self.step_failure(
@@ -143,6 +145,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
         else {
             return self.step_cancelled(Some(step), None, Vec::new(), None);
         };
+        // Proving threads share this lock so it survives a dropped future for
+        // as long as a detached prover keeps working on the round.
+        let lock: round_lock::HeldRoundLock = Arc::new(guard);
 
         let plan = self
             .plan()
@@ -168,7 +173,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
 
         match step.clone() {
             NextStep::Delegate { bundle_index } => {
-                self.run_delegate(step, bundle_index, host, control, progress)
+                self.run_delegate(step, bundle_index, host, &lock, control, progress)
                     .await
             }
             NextStep::AdvanceDelegation { bundle_index } => {
@@ -193,7 +198,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 self.chain_step_outcome(step, outcome, None, progress)
             }
             NextStep::CastVote { bundle_index, .. } => {
-                self.run_cast_vote(step, bundle_index, &plan, host, control, progress)
+                self.run_cast_vote(step, bundle_index, &plan, host, &lock, control, progress)
                     .await
             }
             NextStep::AdvanceVote {

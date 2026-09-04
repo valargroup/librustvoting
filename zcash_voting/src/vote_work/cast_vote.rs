@@ -15,18 +15,20 @@ use crate::{
 };
 
 use super::{
-    execution::bounded_message, step_control::StepControl, steps::PROVING_STACK_BYTES,
-    RoundExecutor, RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome,
-    RoundStepProgress, RoundStepProgressReporter,
+    execution::bounded_message, round_lock::HeldRoundLock, step_control::StepControl,
+    steps::PROVING_STACK_BYTES, RoundExecutor, RoundHostContext, RoundStepFailure,
+    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
 };
 
 impl<T: ChainTransport> RoundExecutor<T> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_cast_vote(
         &self,
         step: NextStep,
         bundle_index: u32,
         plan: &RoundPlan,
         host: &RoundHostContext,
+        lock: &HeldRoundLock,
         control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
@@ -157,10 +159,15 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let db = Arc::clone(&self.database);
         let max_proof_concurrency = host.max_proof_concurrency.max(1);
+        // The prover keeps the round lock until persistence has finished,
+        // even if this future is dropped, so a new pass cannot observe the
+        // old CastVote plan and start a competing proof meanwhile.
+        let held_lock = Arc::clone(lock);
         std::thread::Builder::new()
             .name("voting-vote-commit".to_string())
             .stack_size(PROVING_STACK_BYTES)
             .spawn(move || {
+                let _held_lock = held_lock;
                 let result = (|| {
                     let hotkey =
                         VotingHotkey::from_stored_secret(hotkey_secret.as_slice(), network)?;

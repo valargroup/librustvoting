@@ -18,6 +18,11 @@ type RoundLockKey = (String, String, Option<u32>);
 static ROUND_LOCKS: LazyLock<Mutex<HashMap<RoundLockKey, Weak<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// A held round or bundle lock shared between a step future and a proving
+/// thread it detaches, so the lock outlives a dropped future for as long as
+/// the thread keeps working.
+pub(super) type HeldRoundLock = Arc<OwnedMutexGuard<()>>;
+
 pub(super) async fn acquire(
     wallet_id: String,
     round_id: &str,
