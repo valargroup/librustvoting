@@ -442,6 +442,35 @@ pub struct PreparedDelegationBundle {
     pub round_name: String,
 }
 
+impl DelegationLwdInputs {
+    /// Builds delegation inputs from an anchor tree state the host already
+    /// fetched over its own lightwalletd route.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when the round params are invalid
+    /// or no consensus branch id is known for the snapshot height.
+    pub fn from_anchor_tree_state(
+        network: Network,
+        round_params: crate::VotingRoundParams,
+        round_name: &str,
+        anchor_tree_state: &zcash_client_backend::proto::service::TreeState,
+    ) -> Result<Self, VotingError> {
+        use prost::Message as _;
+        crate::validate_round_params(&round_params)?;
+        let resolved_round_name = crate::round::delegation_round_name(&round_params, round_name);
+        let branch_id_provider =
+            LightwalletdBranchIdProvider::for_height(network, round_params.snapshot_height)?;
+        Ok(Self {
+            network,
+            round_params,
+            resolved_round_name,
+            anchor_tree_state_bytes: anchor_tree_state.encode_to_vec(),
+            branch_id_provider,
+        })
+    }
+}
+
 /// Validates round params and resolves lightwalletd anchor and branch state.
 pub async fn gather_delegation_lwd_inputs(
     params: ResolveDelegationLwdParams<'_>,
@@ -897,7 +926,7 @@ impl PreparedDelegationBundle {
         &self,
         voting_db: &VotingDb,
         wallet_db: &WalletDb<C, P, CL, R>,
-        pir_client: &pir_client::PirClientBlocking,
+        pir_client: &dyn crate::pir::PirProofSource,
     ) -> Result<PreparedDelegationReport, VotingError>
     where
         C: Borrow<rusqlite::Connection>,
@@ -938,7 +967,7 @@ impl PreparedDelegationBundle {
     pub fn prove(
         &self,
         voting_db: &VotingDb,
-        pir_client: &pir_client::PirClientBlocking,
+        pir_client: &dyn crate::pir::PirProofSource,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationProof, VotingError> {
         self.ensure_proof(voting_db, pir_client, stages)
@@ -958,7 +987,7 @@ impl PreparedDelegationBundle {
     pub fn ensure_proof(
         &self,
         voting_db: &VotingDb,
-        pir_client: &pir_client::PirClientBlocking,
+        pir_client: &dyn crate::pir::PirProofSource,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationProofCompletion, VotingError> {
         crate::delegate::ensure_proof(
@@ -969,6 +998,24 @@ impl PreparedDelegationBundle {
             &self.delegation_keys,
             pir_client,
             stages,
+        )
+    }
+
+    /// Checks that this bundle's notes and keys are the ones a persisted
+    /// proof was generated for, without touching PIR.
+    ///
+    /// Reusing a persisted proof is only correct for the same bundle notes
+    /// and the same target-bound hotkey. A pipeline constructed with another
+    /// same-network hotkey would otherwise be handed the stored delegation
+    /// for the original target. Fails with [`VotingError::InvalidInput`] on a
+    /// note, network, round, or target mismatch.
+    pub fn validate_persisted_proof(&self, voting_db: &VotingDb) -> Result<(), VotingError> {
+        validate_persisted_proof_reuse(
+            voting_db,
+            &self.round_id,
+            self.bundle_index,
+            &self.bundle_note_infos,
+            &self.delegation_keys,
         )
     }
 
@@ -1185,7 +1232,7 @@ pub fn prove(
     bundle_index: u32,
     notes: &[NoteInfo],
     keys: &DelegationKeys,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProof, VotingError> {
     ensure_proof(db, round_id, bundle_index, notes, keys, pir_client, stages)
@@ -1211,10 +1258,11 @@ pub fn ensure_proof(
     bundle_index: u32,
     notes: &[NoteInfo],
     keys: &DelegationKeys,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProofCompletion, VotingError> {
-    let identity = DelegationProofIdentity::new(db.wallet_id(), round_id, bundle_index);
+    let identity =
+        DelegationProofIdentity::new(db.sidecar_id(), db.wallet_id(), round_id, bundle_index);
     with_live_progress(stages, |progress| {
         crate::delegation_proof_coordination::coordinate(
             identity,
@@ -1247,7 +1295,7 @@ fn generate_and_persist_proof(
     identity: &DelegationProofIdentity,
     notes: &[NoteInfo],
     keys: &DelegationKeys,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProof, VotingError> {
     stages.on_progress(DelegationProgress::ProofStarting);
@@ -1265,23 +1313,33 @@ fn generate_and_persist_proof(
     })
 }
 
+/// Validates that `notes` and `keys` match the durable bundle a persisted
+/// proof belongs to; see [`PreparedDelegationBundle::validate_persisted_proof`].
+pub fn validate_persisted_proof_reuse(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+) -> Result<(), VotingError> {
+    let identity =
+        DelegationProofIdentity::new(db.sidecar_id(), db.wallet_id(), round_id, bundle_index);
+    db.validate_delegation_proof_inputs(&identity, notes, keys)?;
+    db.validate_delegation_proof_target(&identity, keys)
+}
+
 fn load_persisted_proof(
     db: &VotingDb,
     identity: &DelegationProofIdentity,
 ) -> Result<Option<DelegationProof>, VotingError> {
-    if !matches!(
-        db.delegation_phase_for_wallet(
+    if !db
+        .delegation_phase_for_wallet(
             identity.wallet_id(),
             identity.round_id(),
             identity.bundle_index(),
-        )?,
-        DelegationPhase::Proved
-            | DelegationPhase::Submitted
-            | DelegationPhase::SubmissionManaged
-            | DelegationPhase::SubmittedWithoutHash
-            | DelegationPhase::SubmissionRejected
-            | DelegationPhase::Confirmed
-    ) {
+        )?
+        .has_persisted_proof()
+    {
         return Ok(None);
     }
 
