@@ -219,19 +219,23 @@ fn a_round_reset_clears_the_round_on_every_client() {
 }
 
 #[test]
-fn a_transport_nobody_holds_releases_its_client() {
-    let db = db("wallet-dropped-transport");
-    let routed = CountingTransport::new();
-    sync_vote_tree_with(&db, ROUND_ID, NODE_URL, routed.clone()).unwrap_err();
+fn a_moved_transport_keeps_its_synced_client_until_the_round_is_reset() {
+    let db = db("wallet-moved-transport");
+    // The caller's only clone moves into the call, as a one-shot host does.
+    sync_vote_tree_with(&db, ROUND_ID, NODE_URL, CountingTransport::new()).unwrap_err();
+
+    // The synced state must still be there for the witness that follows.
     assert_eq!(cached_vote_tree_rounds(&db), vec![ROUND_ID.to_string()]);
+    let holder = vote_tree_for_round(&db, ROUND_ID).unwrap();
+    assert_eq!(holder.cached_rounds(), vec![ROUND_ID.to_string()]);
+    let client = Arc::downgrade(&holder);
+    drop(holder);
 
-    drop(routed);
-
-    assert!(
-        cached_vote_tree_rounds(&db).is_empty(),
-        "a client over a transport no caller can name again is pruned"
-    );
-    reset_vote_tree(&db, "").unwrap();
+    // Once its rounds are reset, nothing can name the client again and the
+    // next registry access prunes it.
+    reset_vote_tree(&db, ROUND_ID).unwrap();
+    assert!(cached_vote_tree_rounds(&db).is_empty());
+    assert!(client.upgrade().is_none());
 }
 
 #[test]

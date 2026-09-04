@@ -9,10 +9,12 @@
 //! holds the round, so a sync followed by a witness on the standalone path
 //! lands on the same state even when another executor synced in between.
 //!
-//! An entry lives while its sidecar connection has a handle and, for a routed
-//! client, while some caller still holds the transport it was built over. A
-//! transport nobody holds can never be named again, so its client is pruned
-//! on the next registry access rather than retained for the process.
+//! An entry lives while its sidecar connection has a handle. A routed client
+//! additionally lives while some caller holds the transport it was built
+//! over or while it holds any round's tree state: a caller that moved its
+//! only transport clone into `sync_vote_tree_with` still needs that sync's
+//! state for `van_witness`. Once its rounds are reset and nothing can name
+//! its transport again, the client is pruned on the next registry access.
 //!
 //! The registry mutex is a leaf: it is never held across a sync, a round
 //! lock, or any other lock.
@@ -54,7 +56,8 @@ impl VoteTreeEntry {
     fn is_reachable(&self) -> bool {
         let connection_is_live = self.connection.strong_count() > 0;
         let transport_is_held = self.transport.is_none() || self.sync.transport_is_shared();
-        connection_is_live && transport_is_held
+        let holds_round_state = !self.sync.cached_rounds().is_empty();
+        connection_is_live && (transport_is_held || holds_round_state)
     }
 
     fn routes_over(&self, requested: &Arc<dyn Transport>) -> bool {
