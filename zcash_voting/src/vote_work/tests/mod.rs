@@ -480,13 +480,29 @@ mod round_executor {
     struct CancelAfterSigningDriver {
         control: ChainSubmissionControl,
         interrupt: Interrupt,
+        network: Network,
         wallet_id: String,
         database: Arc<crate::round::VotingDb>,
+    }
+
+    impl CancelAfterSigningDriver {
+        fn apply_interrupt(&self) {
+            match self.interrupt {
+                Interrupt::Cancel => self.control.cancel(),
+                Interrupt::NewOperationEpoch => self
+                    .control
+                    .set_operation_epoch(self.control.operation_epoch() + 1),
+            }
+        }
     }
 
     impl DelegationDriver for CancelAfterSigningDriver {
         fn round_id(&self) -> &str {
             ROUND_ID
+        }
+
+        fn network(&self) -> Network {
+            self.network
         }
 
         fn wallet_id(&self) -> &str {
@@ -505,12 +521,7 @@ mod round_executor {
             progress: &dyn DelegationProgressReporter,
         ) -> Result<SignedDelegationBundle, VotingError> {
             progress.on_progress(DelegationProgress::PayloadReady);
-            match self.interrupt {
-                Interrupt::Cancel => self.control.cancel(),
-                Interrupt::NewOperationEpoch => self
-                    .control
-                    .set_operation_epoch(self.control.operation_epoch() + 1),
-            }
+            self.apply_interrupt();
             Ok(SignedDelegationBundle {
                 submission: DelegationSubmission {
                     proof: vec![0x61; 96],
@@ -538,6 +549,7 @@ mod round_executor {
             _bundle_index: u32,
             _signer: &DelegationSigner,
         ) -> Result<[u8; 64], VotingError> {
+            self.apply_interrupt();
             Ok([0x68; 64])
         }
     }
@@ -556,11 +568,28 @@ mod round_executor {
         driver_wallet_id: &str,
         database: &Arc<crate::round::VotingDb>,
     ) -> RoundHostContext {
+        host_with_driver(
+            control,
+            interrupt,
+            Network::Testnet,
+            driver_wallet_id,
+            database,
+        )
+    }
+
+    fn host_with_driver(
+        control: &ChainSubmissionControl,
+        interrupt: Interrupt,
+        network: Network,
+        driver_wallet_id: &str,
+        database: &Arc<crate::round::VotingDb>,
+    ) -> RoundHostContext {
         RoundHostContext {
             delegation: Some(DelegationStepInputs {
                 driver: Arc::new(CancelAfterSigningDriver {
                     control: control.clone(),
                     interrupt,
+                    network,
                     wallet_id: driver_wallet_id.to_string(),
                     database: Arc::clone(database),
                 }),
@@ -615,7 +644,7 @@ mod round_executor {
         let outcome = executor
             .advance_step(
                 step.clone(),
-                &host_with_delegation(&control, "wallet", executor.database()),
+                &host_with_delegation(&control, "wallet", &executor.database()),
                 &control,
                 &NoopRoundStepProgressReporter {},
             )
@@ -656,35 +685,24 @@ mod round_executor {
     }
 
     #[tokio::test]
-    async fn re_scoping_the_executor_handle_fails_closed() {
+    async fn re_scoping_a_handle_from_database_does_not_reach_the_executor() {
         let executor = executor();
-        executor.database().set_wallet_id("other-wallet");
+        let handle = executor.database();
+        handle.set_wallet_id("other-wallet");
 
-        let error = executor
-            .plan()
-            .expect_err("a re-scoped executor handle must not plan");
-        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
-        assert!(
-            error.to_string().contains("scoped to wallet wallet"),
-            "{error}"
-        );
-
+        // The executor never hands out its own handle, so the re-scope is
+        // confined to the caller's copy.
+        assert_eq!(executor.database().wallet_id(), "wallet");
+        assert!(handle.shares_connection_with(&executor.database()));
+        let plan = executor.plan().unwrap();
+        assert!(!plan.delegation_statuses.is_empty());
         let control = ChainSubmissionControl::new(1);
-        let failure = executor
+        let outcome = executor
             .advance_next(&host(), &control, &NoopRoundStepProgressReporter {})
             .await
-            .expect_err("a re-scoped executor handle must not run steps");
-        assert_eq!(failure.kind, RoundStepFailureKind::InvalidInput);
-
-        let failure = executor
-            .set_ballot_intents(&[BallotIntent {
-                proposal_id: 1,
-                decision: Decision::Skipped,
-            }])
-            .expect_err("a re-scoped executor handle must not record intents");
-        assert!(matches!(failure, VotingError::InvalidInput { .. }));
+            .unwrap();
+        assert_eq!(outcome.disposition, RoundStepDisposition::NoWork);
     }
-
     #[tokio::test]
     async fn a_cast_vote_selected_ahead_of_its_delegation_is_rejected_before_any_work() {
         let executor = executor();
@@ -849,8 +867,8 @@ mod round_executor {
             failure.kind
         );
 
-        let cached = crate::precompute::has_cached_round_tree(executor.database(), ROUND_ID);
-        crate::precompute::reset_vote_tree(executor.database(), "").unwrap();
+        let cached = crate::precompute::has_cached_round_tree(&executor.database(), ROUND_ID);
+        crate::precompute::reset_vote_tree(&executor.database(), "").unwrap();
         assert!(
             !cached,
             "a failed sync must not leave the round's tree client behind"
@@ -906,7 +924,7 @@ mod round_executor {
         let failure = executor
             .advance_step(
                 step.clone(),
-                &host_with_delegation(&control, "other-wallet", executor.database()),
+                &host_with_delegation(&control, "other-wallet", &executor.database()),
                 &control,
                 &NoopRoundStepProgressReporter {},
             )
@@ -1009,7 +1027,7 @@ mod round_executor {
                     &control,
                     Interrupt::NewOperationEpoch,
                     "wallet",
-                    executor.database(),
+                    &executor.database(),
                 ),
                 &control,
                 &NoopRoundStepProgressReporter {},
@@ -1053,8 +1071,8 @@ mod round_executor {
             .await
             .expect("a cancelled step is an outcome, not a failure");
 
-        let cached = crate::precompute::has_cached_round_tree(executor.database(), ROUND_ID);
-        crate::precompute::reset_vote_tree(executor.database(), "").unwrap();
+        let cached = crate::precompute::has_cached_round_tree(&executor.database(), ROUND_ID);
+        crate::precompute::reset_vote_tree(&executor.database(), "").unwrap();
         assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
         assert_eq!(outcome.step, Some(cast));
         assert_eq!(
@@ -1082,5 +1100,70 @@ mod round_executor {
             .expect("the chain client is configured for Testnet");
         assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("Mainnet"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_driver_for_another_network_is_refused_before_proving() {
+        let executor = executor();
+        decided_ballot(&executor);
+        let control = ChainSubmissionControl::new(1);
+
+        let failure = executor
+            .advance_step(
+                NextStep::Delegate { bundle_index: 0 },
+                &host_with_driver(
+                    &control,
+                    Interrupt::Cancel,
+                    Network::Mainnet,
+                    "wallet",
+                    &executor.database(),
+                ),
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .expect_err("a Mainnet driver must not prove for a Testnet binding");
+
+        assert_eq!(failure.kind, RoundStepFailureKind::InvalidInput);
+        assert!(failure.message.contains("Mainnet"), "{}", failure.message);
+        assert!(
+            !control.is_cancelled(),
+            "the driver must not have been invoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_epoch_change_during_resigning_stops_delegation_advancement() {
+        let executor = executor();
+        // A submitted delegation with no confirmed position plans as
+        // AdvanceDelegation.
+        executor
+            .database()
+            .store_delegation_tx_hash(ROUND_ID, 0, "dtx")
+            .unwrap();
+        let step = NextStep::AdvanceDelegation { bundle_index: 0 };
+        assert!(executor.plan().unwrap().next_steps.contains(&step));
+        let control = ChainSubmissionControl::new(7);
+
+        let outcome = executor
+            .advance_step(
+                step.clone(),
+                &host_with_interrupting_delegation(
+                    &control,
+                    Interrupt::NewOperationEpoch,
+                    "wallet",
+                    &executor.database(),
+                ),
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .expect("an interrupted step is an outcome, not a chain failure");
+
+        // The chain endpoint is unreachable, so reaching it would have failed
+        // with a transport error; the epoch check must come first.
+        assert_eq!(control.operation_epoch(), 8);
+        assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
+        assert_eq!(outcome.step, Some(step));
     }
 }

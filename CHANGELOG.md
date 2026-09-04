@@ -68,6 +68,21 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- **Breaking:** `RoundExecutor::database` returns a fresh wallet-scoped
+  `Arc<VotingDb>` over the executor's connection instead of a reference to
+  its internal handle, so re-scoping the returned handle cannot move a
+  running step's persistence to another wallet.
+- **Breaking:** `DelegationDriver` gains `network`; `RoundExecutor` refuses a
+  driver whose network differs from its binding before proving.
+- `ChainSubmissionClient::advance_until_terminal_in_epoch` runs an episode
+  that belongs to work begun earlier under a given epoch; the round executor
+  uses it so an epoch change during proving or re-signing ends the step as
+  `Cancelled` instead of being recaptured by the chain episode.
+- Reusing a persisted delegation proof through `DelegationPipeline` first
+  validates the bundle notes and the target-bound hotkey
+  (`PreparedDelegationBundle::validate_persisted_proof`), without touching
+  PIR.
+
 - `ChainSubmissionClient::advance_until_terminal` and the persisted-vote
   recovery driver `RoundExecutor::advance` capture the operation epoch on
   entry; an epoch change is observed like cancellation between passes,

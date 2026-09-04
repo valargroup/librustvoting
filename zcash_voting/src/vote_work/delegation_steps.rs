@@ -91,10 +91,11 @@ impl<T: ChainTransport> RoundExecutor<T> {
         };
         let outcome = self
             .chain_client
-            .advance_until_terminal(
+            .advance_until_terminal_in_epoch(
                 ChainAdvanceRequest::Delegation(request),
                 &host.chain_policy,
                 control.chain(),
+                control.entry_epoch(),
             )
             .await
             .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;
@@ -132,10 +133,11 @@ impl<T: ChainTransport> RoundExecutor<T> {
         };
         let outcome = self
             .chain_client
-            .advance_until_terminal(
+            .advance_until_terminal_in_epoch(
                 ChainAdvanceRequest::Delegation(request),
                 &persisted_policy(host),
                 control.chain(),
+                control.entry_epoch(),
             )
             .await
             .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;
@@ -156,10 +158,23 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 "delegation steps require RoundHostContext::delegation",
             )
         })?;
-        let round_id = self
+        let binding = self
             .binding()
-            .map(|binding| binding.round_id.clone())
             .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
+        let round_id = binding.round_id.clone();
+        if inputs.driver.network() != binding.network {
+            return Err(self.step_failure(
+                RoundStepFailureKind::InvalidInput,
+                Some(step.clone()),
+                None,
+                None,
+                format!(
+                    "delegation driver network {:?} does not match the round binding network {:?}",
+                    inputs.driver.network(),
+                    binding.network
+                ),
+            ));
+        }
         if inputs.driver.round_id() != round_id {
             return Err(self.step_failure(
                 RoundStepFailureKind::InvalidInput,

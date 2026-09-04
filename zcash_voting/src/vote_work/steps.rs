@@ -166,10 +166,11 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 };
                 let outcome = self
                     .chain_client
-                    .advance_until_terminal(
+                    .advance_until_terminal_in_epoch(
                         ChainAdvanceRequest::ImportedDelegation(request),
                         &persisted_policy(host),
                         control.chain(),
+                        control.entry_epoch(),
                     )
                     .await
                     .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;

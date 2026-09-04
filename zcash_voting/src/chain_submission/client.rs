@@ -695,14 +695,28 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         policy: &ChainAdvancePolicy,
         control: &ChainSubmissionControl,
     ) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure> {
+        self.advance_until_terminal_in_epoch(request, policy, control, control.operation_epoch())
+            .await
+    }
+
+    /// [`Self::advance_until_terminal`] for an episode that belongs to work
+    /// begun earlier under `entry_epoch`.
+    ///
+    /// A caller that proved or signed before reaching the chain passes the
+    /// epoch it captured at its own entry, so a host epoch change during that
+    /// work is observed here instead of being recaptured as the episode's
+    /// own. The episode ends as `Cancelled` if the control's epoch differs
+    /// from `entry_epoch` at any pass boundary or during the repoll wait.
+    pub async fn advance_until_terminal_in_epoch(
+        &self,
+        request: ChainAdvanceRequest,
+        policy: &ChainAdvancePolicy,
+        control: &ChainSubmissionControl,
+        entry_epoch: u64,
+    ) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure> {
         let mut recovery = policy.initial_recovery_mode;
         let mut escalated = recovery == ChainRecoveryMode::ExactTree;
         let mut passes = 0usize;
-        // The episode belongs to the epoch it started under. A host that
-        // moves to another epoch mid-episode (session or account switch) has
-        // invalidated this invocation, so a later pass must not capture the
-        // new epoch as if it were its own.
-        let entry_epoch = control.operation_epoch();
         loop {
             if interrupted(control, entry_epoch) {
                 return Ok(ChainAdvanceOutcome::Cancelled);

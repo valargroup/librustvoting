@@ -29,9 +29,15 @@ impl<'a> StepControl<'a> {
         self.control.is_cancelled() || self.control.operation_epoch() != self.entry_epoch
     }
 
-    /// The underlying control for chain submission and lock acquisition,
-    /// which capture and enforce the epoch themselves.
+    /// The underlying control for lock acquisition and chain submission.
+    /// Chain episodes must also receive [`Self::entry_epoch`] so they do not
+    /// recapture a newer epoch as their own.
     pub(super) fn chain(&self) -> &'a ChainSubmissionControl {
         self.control
+    }
+
+    /// The operation epoch the step began under.
+    pub(super) fn entry_epoch(&self) -> u64 {
+        self.entry_epoch
     }
 }

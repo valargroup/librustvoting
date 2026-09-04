@@ -512,22 +512,23 @@ impl<T: ChainTransport> RoundExecutor<T> {
         self
     }
 
-    /// The executor's own wallet-scoped handle.
+    /// A handle on the executor's sidecar connection, scoped to its wallet.
     ///
-    /// It shares the connection with the handle passed at construction but is
-    /// frozen to that wallet. Re-scoping it makes every later operation fail
-    /// closed; see [`Self::wallet_scope`].
-    pub fn database(&self) -> &Arc<VotingDb> {
-        &self.database
+    /// Each call returns a fresh handle over the same connection. The
+    /// executor's own handle is never handed out, so re-scoping the returned
+    /// one with `set_wallet_id` cannot move a running step's persistence to
+    /// another wallet.
+    pub fn database(&self) -> Arc<VotingDb> {
+        Arc::new(self.database.scoped(&self.wallet_id))
     }
 
     /// The wallet every operation is scoped to.
     ///
     /// The executor captured this id at construction and keys its locks,
-    /// plans, and persistence by it. If the handle returned by
-    /// [`Self::database`] has since been re-scoped, this fails with
-    /// [`VotingError::InvalidInput`] rather than letting work for one wallet
-    /// run under another wallet's lock and binding.
+    /// plans, and persistence by it. Its internal handle is private, so this
+    /// check cannot fail through the public API; it guards the invariant
+    /// against internal misuse and fails with [`VotingError::InvalidInput`]
+    /// rather than letting work for one wallet run under another's lock.
     pub(super) fn wallet_scope(&self) -> Result<&str, VotingError> {
         let current = self.database.wallet_id();
         if current != self.wallet_id {

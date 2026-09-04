@@ -4,7 +4,7 @@ use crate::{
     delegate::{PreparedSigner, SignedDelegationBundle},
     pir::PirFleet,
     round::VotingDb,
-    types::{DelegationProgressReporter, VotingError},
+    types::{DelegationProgressReporter, Network, VotingError},
 };
 
 use super::{DelegationPipeline, DelegationSigner, WalletDbOpener};
@@ -16,6 +16,13 @@ use super::{DelegationPipeline, DelegationSigner, WalletDbOpener};
 pub trait DelegationDriver: Send + Sync {
     /// Round the driver is bound to.
     fn round_id(&self) -> &str;
+
+    /// Network the driver's round and hotkey belong to.
+    ///
+    /// The executor refuses a driver whose network differs from its binding,
+    /// so a proof for one network is never generated and persisted against a
+    /// chain client configured for another.
+    fn network(&self) -> Network;
 
     /// Wallet the driver captured at construction.
     ///
@@ -56,6 +63,10 @@ pub trait DelegationDriver: Send + Sync {
 impl<W: WalletDbOpener> DelegationDriver for DelegationPipeline<W> {
     fn round_id(&self) -> &str {
         DelegationPipeline::round_id(self)
+    }
+
+    fn network(&self) -> Network {
+        DelegationPipeline::network(self)
     }
 
     fn wallet_id(&self) -> &str {

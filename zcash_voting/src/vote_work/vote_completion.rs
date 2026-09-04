@@ -152,7 +152,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
             };
             let outcome = self
                 .chain_client
-                .advance_until_terminal(request, policy, control.chain())
+                .advance_until_terminal_in_epoch(
+                    request,
+                    policy,
+                    control.chain(),
+                    control.entry_epoch(),
+                )
                 .await
                 .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;
             let result = outcome.clone().into_result();
