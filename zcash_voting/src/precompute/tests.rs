@@ -138,15 +138,15 @@ fn a_retained_tree_handle_keeps_its_round_state_when_the_wallet_rebinds() {
     // The sync fails at the transport but has already created the round's
     // client on this handle, which is the state a witness needs.
     tree.sync(&db, ROUND_ID, NODE_URL).unwrap_err();
-    assert!(tree.has_round_client(ROUND_ID));
+    assert_eq!(tree.cached_rounds(), vec![ROUND_ID.to_string()]);
 
     // Another executor for the same wallet binds a different transport.
     let second = CountingTransport::new();
     let replacement = vote_tree_sync_for(&db, Some(second.clone())).unwrap();
     assert!(!Arc::ptr_eq(&tree, &replacement));
-    assert!(!replacement.has_round_client(ROUND_ID));
+    assert!(replacement.cached_rounds().is_empty());
 
     // The retained handle is unaffected by the wallet-wide rebinding.
-    assert!(tree.has_round_client(ROUND_ID));
+    assert_eq!(tree.cached_rounds(), vec![ROUND_ID.to_string()]);
     reset_vote_tree(&db, "").unwrap();
 }

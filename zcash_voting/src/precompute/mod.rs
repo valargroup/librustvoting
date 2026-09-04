@@ -253,13 +253,12 @@ pub fn reset_voting_session_state(db: &VotingDb, round_id: &str) -> Result<(), V
 /// Returns the wallet's tree client, creating or rebinding it so the returned
 /// client actually routes over `transport`.
 ///
-/// Whether the wallet's cached tree sync still holds a client for `round_id`.
+/// Rounds whose vote tree the wallet currently holds in memory.
 ///
-/// Observes only; it never creates the wallet's sync. A round client exists
-/// from the first sync attempt until [`reset_vote_tree`] drops it. Test-only:
-/// production code has no reason to look at the cache without syncing.
-#[cfg(test)]
-pub(crate) fn has_cached_round_tree(db: &VotingDb, round_id: &str) -> bool {
+/// Observes only; it never creates the wallet's sync. A round appears from
+/// its first sync attempt until [`reset_vote_tree`] drops it, so a host can
+/// see what a reset would discard.
+pub fn cached_vote_tree_rounds(db: &VotingDb) -> Vec<String> {
     let wallet_id = db.wallet_id();
     VOTE_TREE_SYNCS
         .get()
@@ -267,9 +266,9 @@ pub(crate) fn has_cached_round_tree(db: &VotingDb, round_id: &str) -> bool {
         .and_then(|registry| {
             registry
                 .get(&wallet_id)
-                .map(|bound| bound.sync.has_round_client(round_id))
+                .map(|bound| bound.sync.cached_rounds())
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
 }
 
 /// A cached client built over a different transport is replaced rather than

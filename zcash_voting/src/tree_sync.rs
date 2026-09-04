@@ -523,13 +523,17 @@ impl VoteTreeSync {
         Ok(VanWitness::from((path, anchor_height)))
     }
 
-    /// Whether a round currently has an in-memory tree client, synced or not.
-    #[cfg(test)]
-    pub(crate) fn has_round_client(&self, round_id: &str) -> bool {
+    /// Rounds that currently hold in-memory tree state on this sync, synced
+    /// or partially synced.
+    ///
+    /// A diagnostic for hosts accounting for memory or deciding what
+    /// [`Self::reset`] would drop; a round appears from its first sync attempt
+    /// until it is reset.
+    pub fn cached_rounds(&self) -> Vec<String> {
         self.clients
             .lock()
-            .map(|clients| clients.contains_key(round_id))
-            .unwrap_or(false)
+            .map(|clients| clients.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Drop the in-memory TreeClient for a round so the next `sync` call

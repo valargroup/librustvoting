@@ -935,7 +935,8 @@ mod round_executor {
             failure.kind
         );
 
-        let cached = crate::precompute::has_cached_round_tree(&executor.database(), ROUND_ID);
+        let cached = crate::precompute::cached_vote_tree_rounds(&executor.database())
+            .contains(&ROUND_ID.to_string());
         crate::precompute::reset_vote_tree(&executor.database(), "").unwrap();
         assert!(
             !cached,
@@ -1139,7 +1140,8 @@ mod round_executor {
             .await
             .expect("a cancelled step is an outcome, not a failure");
 
-        let cached = crate::precompute::has_cached_round_tree(&executor.database(), ROUND_ID);
+        let cached = crate::precompute::cached_vote_tree_rounds(&executor.database())
+            .contains(&ROUND_ID.to_string());
         crate::precompute::reset_vote_tree(&executor.database(), "").unwrap();
         assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
         assert_eq!(outcome.step, Some(cast));
