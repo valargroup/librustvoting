@@ -384,7 +384,7 @@ pub(crate) fn remove_attempting_server_for_generation(
 ///
 /// This raw SQL helper is crate-internal because callers must provide a
 /// nullifier that matches the persisted vote recovery bundle. Wallet
-/// integrations should use `CommittedVote::submit_prepared_shares`, which
+/// integrations should use `ConfirmedVote::submit_prepared_shares`, which
 /// derives that nullifier and owns journal-before-dispatch ordering.
 ///
 /// All reported helper URLs must canonicalize. Existing evidence is merged

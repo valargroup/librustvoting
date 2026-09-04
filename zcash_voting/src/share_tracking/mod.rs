@@ -195,7 +195,7 @@ pub struct ResubmittedShare {
 
 /// Results of an initial fan-out across helper servers.
 ///
-/// [`crate::vote::CommittedVote::submit_prepared_shares`] journals every
+/// [`crate::vote::ConfirmedVote::submit_prepared_shares`] journals every
 /// attempt and outcome before this report is returned, so callers must not
 /// treat it as pending persistence.
 /// Outcome-unknown attempts do not count toward `target_count` because the
