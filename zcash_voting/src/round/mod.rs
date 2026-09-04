@@ -209,11 +209,69 @@ pub fn quantized_bundle_set_weight(bundles: &[Vec<NoteInfo>]) -> Result<u64, Vot
     })
 }
 
-type SidecarRegistry = Mutex<HashMap<PathBuf, Weak<crate::storage::SidecarConnection>>>;
+/// One sidecar path's registry state.
+///
+/// `opener` serializes the slow open (busy timeout, migrations, retry sleeps)
+/// for this path alone, so the registry mutex is only ever held to look an
+/// entry up or record a result and never across SQLite work.
+struct SidecarRegistryEntry {
+    opener: Arc<Mutex<()>>,
+    shared: Weak<crate::storage::SidecarConnection>,
+}
+
+impl SidecarRegistryEntry {
+    /// An entry is live while a handle on its connection exists or while a
+    /// caller is inside its open.
+    fn is_live(&self) -> bool {
+        self.shared.strong_count() > 0 || Arc::strong_count(&self.opener) > 1
+    }
+}
+
+type SidecarRegistry = Mutex<HashMap<PathBuf, SidecarRegistryEntry>>;
 
 fn sidecar_registry() -> &'static SidecarRegistry {
     static REGISTRY: OnceLock<SidecarRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_sidecar_registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, SidecarRegistryEntry>>
+{
+    sidecar_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Finds or creates the registry entry for `key`, returning its per-path
+/// opener lock and the shared connection if one is already open.
+fn registered_sidecar(
+    key: &Path,
+) -> (
+    Arc<Mutex<()>>,
+    Option<Arc<crate::storage::SidecarConnection>>,
+) {
+    let mut registry = lock_sidecar_registry();
+    registry.retain(|_, entry| entry.is_live());
+    let entry = registry
+        .entry(key.to_path_buf())
+        .or_insert_with(|| SidecarRegistryEntry {
+            opener: Arc::new(Mutex::new(())),
+            shared: Weak::new(),
+        });
+    (Arc::clone(&entry.opener), entry.shared.upgrade())
+}
+
+/// The shared connection for `key`, if one is open.
+fn registered_sidecar_connection(key: &Path) -> Option<Arc<crate::storage::SidecarConnection>> {
+    lock_sidecar_registry()
+        .get(key)
+        .and_then(|entry| entry.shared.upgrade())
+}
+
+/// Records the connection an open produced for `key`.
+fn register_sidecar_connection(key: &Path, shared: &Arc<crate::storage::SidecarConnection>) {
+    if let Some(entry) = lock_sidecar_registry().get_mut(key) {
+        entry.shared = Arc::downgrade(shared);
+    }
 }
 
 /// Canonical registry key: the parent directory is resolved when it exists so
@@ -269,17 +327,26 @@ impl VotingDb {
     /// lock, and hosts no longer need their own per-path write locks. A
     /// `SQLITE_BUSY` from another process past the busy timeout surfaces as
     /// [`VotingError::DbBusy`].
+    ///
+    /// Concurrent opens of one path serialize on that path alone: a slow open
+    /// of one sidecar (busy timeout, migrations, retries) never delays an
+    /// open of a different sidecar.
     pub fn open_wallet_sidecar(
         wallet_db_path: &Path,
         wallet_id: &str,
     ) -> Result<Arc<Self>, VotingError> {
         let sidecar_path = Self::wallet_sidecar_path(wallet_db_path);
         let key = sidecar_registry_key(&sidecar_path);
-        let mut registry = sidecar_registry()
+        let (opener, shared) = registered_sidecar(&key);
+        if let Some(shared) = shared {
+            return Ok(Arc::new(Self::from_shared(shared, wallet_id)));
+        }
+        let _opening = opener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.retain(|_, shared| shared.strong_count() > 0);
-        if let Some(shared) = registry.get(&key).and_then(Weak::upgrade) {
+        // A contender may have finished the same open while this caller
+        // waited for the path's opener lock.
+        if let Some(shared) = registered_sidecar_connection(&key) {
             return Ok(Arc::new(Self::from_shared(shared, wallet_id)));
         }
         let path = sidecar_path
@@ -290,7 +357,7 @@ impl VotingDb {
         let conn = open_connection_with_busy_retry(path)?;
         let db = Self::from_connection(conn);
         db.set_wallet_id(wallet_id);
-        registry.insert(key, Arc::downgrade(&db.shared_connection()));
+        register_sidecar_connection(&key, &db.shared_connection());
         Ok(Arc::new(db))
     }
 
@@ -667,6 +734,10 @@ fn round_eligible_weight(
 
     Ok(total.map(|v| v as u64))
 }
+
+#[cfg(test)]
+#[path = "tests/sidecar_registry.rs"]
+mod sidecar_registry_tests;
 
 #[cfg(test)]
 mod tests {

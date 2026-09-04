@@ -68,6 +68,10 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `VotingDb::open_wallet_sidecar` serializes concurrent opens per sidecar
+  path only. A slow open of one sidecar (busy timeout, migrations, busy
+  retries) no longer delays opening a different sidecar.
+
 - `CastVote` drops the round's cached vote tree after every failed node
   sync, including the last node's and a cancelled attempt's, so a partially
   appended or root-mismatched tree cannot poison the next node or the next
