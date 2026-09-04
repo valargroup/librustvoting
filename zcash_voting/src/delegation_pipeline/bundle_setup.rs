@@ -46,7 +46,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     /// Ensures the round row exists and returns its display context.
     pub fn ensure_round(&self) -> Result<DelegationRoundContext, VotingError> {
         delegate::ensure_round_context(
-            &self.voting_db,
+            self.scoped_voting_db()?,
             self.lwd.network,
             &self.lwd.round_params,
             &self.lwd.resolved_round_name,
@@ -74,7 +74,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     pub fn setup_bundles(&self) -> Result<BundleLayout, VotingError> {
         self.ensure_round()?;
         let notes = self.select_notes()?;
-        self.voting_db
+        self.scoped_voting_db()?
             .ensure_bundles_with_skipped_suffix_with_policy(
                 self.round_id(),
                 &notes,
@@ -90,7 +90,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     pub fn eligibility(&self) -> Result<VotingEligibilityReport, VotingError> {
         let notes = self.select_notes()?;
         let policy = self
-            .voting_db
+            .scoped_voting_db()?
             .effective_bundle_policy(self.round_id(), self.bundle_policy)?;
         let (eligibility, plan) =
             crate::note_bundling::minimum_voting_eligibility_and_plan_for_notes(&notes, policy)?;

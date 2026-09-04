@@ -72,7 +72,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     ) -> Result<PreparedSigner, VotingError> {
         match signer {
             DelegationSigner::Software(signer) => {
-                let request = prepared.signing_request(&self.voting_db)?;
+                let request = prepared.signing_request(self.scoped_voting_db()?)?;
                 let sig = signer.sign(request)?;
                 Ok(PreparedSigner::signature(sig, request.sighash))
             }
@@ -92,7 +92,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
             }
             KeystoneSignatureSource::Stored => {
                 let record = self
-                    .voting_db
+                    .scoped_voting_db()?
                     .get_keystone_signatures(self.round_id())?
                     .into_iter()
                     .find(|record| record.bundle_index == bundle_index)
@@ -124,7 +124,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         ) {
             return Ok(());
         }
-        self.voting_db.store_keystone_signature(
+        self.scoped_voting_db()?.store_keystone_signature(
             self.round_id(),
             signed.bundle_index,
             &signed.submission.spend_auth_sig,

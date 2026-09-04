@@ -22,7 +22,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         let hotkey = self.hotkey()?;
         let wallet = self.wallet.open_for_read()?;
         delegate::prepare_delegation_bundle(
-            &self.voting_db,
+            self.scoped_voting_db()?,
             &wallet,
             PrepareDelegationBundleParams {
                 lwd: self.lwd.clone(),
@@ -43,7 +43,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     /// PIR. See [`crate::phases::DelegationPhase::has_persisted_proof`].
     pub fn has_persisted_proof(&self, bundle_index: u32) -> Result<bool, VotingError> {
         Ok(self
-            .voting_db
+            .scoped_voting_db()?
             .delegation_phase(self.round_id(), bundle_index)?
             .has_persisted_proof())
     }
@@ -58,7 +58,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         prepared: &PreparedDelegationBundle,
         progress: &dyn DelegationProgressReporter,
     ) -> Result<Vec<u8>, VotingError> {
-        match prepared.setup(&self.voting_db, progress) {
+        match prepared.setup(self.scoped_voting_db()?, progress) {
             Ok(setup) => Ok(setup.pczt_bytes),
             Err(VotingError::SetupAlreadyPersisted {
                 field: DelegationSetupField::PcztSighash | DelegationSetupField::Tx1Effects,
@@ -76,7 +76,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     ) -> Result<PreparedDelegationReport, VotingError> {
         let prepared = self.prepare(bundle_index)?;
         let wallet = self.wallet.open_for_read()?;
-        pir.with_failover(|session| prepared.precompute(&self.voting_db, &wallet, session))
+        pir.with_failover(|session| prepared.precompute(self.scoped_voting_db()?, &wallet, session))
     }
 
     /// Generates or reuses the bundle's durable proof without signing.
@@ -107,9 +107,9 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         let wallet = self.wallet.open_for_read()?;
         pir.with_failover(|session| {
             let source: &dyn PirProofSource = session;
-            prepared.precompute(&self.voting_db, &wallet, source)?;
+            prepared.precompute(self.scoped_voting_db()?, &wallet, source)?;
             prepared
-                .ensure_proof(&self.voting_db, source, progress)
+                .ensure_proof(self.scoped_voting_db()?, source, progress)
                 .map(|completion| completion.status)
         })
     }
@@ -120,7 +120,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         bundle_index: u32,
     ) -> Result<KeystoneSigningRequest, VotingError> {
         let prepared = self.prepare(bundle_index)?;
-        prepared.keystone_request(&self.voting_db, &NoopProgressReporter)
+        prepared.keystone_request(self.scoped_voting_db()?, &NoopProgressReporter)
     }
 
     /// Proves and signs one bundle, blocking the current thread.
@@ -157,7 +157,8 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
 
         progress.on_progress(DelegationProgress::SigningPayload);
         let prepared_signer = self.spend_auth_signature(&prepared, bundle_index, signer)?;
-        let signed = prepared.signed_bundle(&self.voting_db, pczt_bytes, prepared_signer)?;
+        let signed =
+            prepared.signed_bundle(self.scoped_voting_db()?, pczt_bytes, prepared_signer)?;
         self.retain_provided_keystone_signature(signer, &signed)?;
         progress.on_progress(DelegationProgress::PayloadReady);
         Ok(signed)
