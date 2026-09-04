@@ -33,8 +33,42 @@ use crate::{delegate::PreparedDelegationReport, round::BundleLayout, types::Netw
 
 pub use crate::vote::VanWitness;
 
-static VOTE_TREE_SYNCS: OnceLock<Mutex<HashMap<String, Arc<crate::tree_sync::VoteTreeSync>>>> =
-    OnceLock::new();
+/// One wallet's process-local tree client together with the transport it was
+/// built over, so a later call asking for a different route is not silently
+/// served the old one.
+struct BoundVoteTreeSync {
+    sync: Arc<crate::tree_sync::VoteTreeSync>,
+    /// The host transport the client was created with, or `None` for the SDK's
+    /// direct HTTP transport.
+    transport: Option<Arc<dyn vote_commitment_tree_client::transport::Transport>>,
+}
+
+impl BoundVoteTreeSync {
+    /// Whether this client may serve a call that asked for `requested`.
+    ///
+    /// A request that names a transport is only satisfied by a client built
+    /// over that same transport; anything else would route the wallet's
+    /// vote-tree traffic somewhere the caller did not ask for. A request that
+    /// names none accepts any cached client: it means "no particular route",
+    /// and rebinding it to the direct transport would both downgrade an
+    /// established private route and discard the synced tree state that
+    /// `generate_van_witness` needs.
+    fn honors(
+        &self,
+        requested: Option<&Arc<dyn vote_commitment_tree_client::transport::Transport>>,
+    ) -> bool {
+        match (requested, &self.transport) {
+            (None, _) => true,
+            (Some(requested), Some(bound)) => std::ptr::eq(
+                Arc::as_ptr(requested) as *const (),
+                Arc::as_ptr(bound) as *const (),
+            ),
+            (Some(_), None) => false,
+        }
+    }
+}
+
+static VOTE_TREE_SYNCS: OnceLock<Mutex<HashMap<String, BoundVoteTreeSync>>> = OnceLock::new();
 
 /// Result of PIR precomputation for one delegation bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,16 +154,24 @@ pub fn verify_witness(witness: &WitnessData) -> Result<(), VotingError> {
 ///
 /// For each confirmed bundle that has not yet submitted a vote, this also
 /// verifies that the confirmed event position contains its delegation VAN.
+///
+/// This asks for no particular route, so it reuses the wallet's existing tree
+/// client when there is one. A client a host bound to its own transport keeps
+/// that transport: this call never downgrades a routed wallet to the direct
+/// HTTP transport. Use [`sync_vote_tree_with`] to require a specific route.
 pub fn sync_vote_tree(db: &VotingDb, round_id: &str, node_url: &str) -> Result<u32, VotingError> {
     vote_tree_sync_for(db, None)?.sync(db, round_id, node_url)
 }
 
-/// Same as [`sync_vote_tree`], but the wallet's tree client is created over
-/// `transport` when it does not exist yet.
+/// Same as [`sync_vote_tree`], but the wallet's tree client routes over
+/// `transport`.
 ///
-/// The process keeps one tree client per wallet; once created, it keeps its
-/// transport until [`reset_vote_tree`] with an empty round id or process
-/// exit. Pass the same transport on every call for a wallet.
+/// The process keeps one tree client per wallet. When that client was built
+/// over a different transport — the direct HTTP transport, or another host
+/// transport — it is replaced, so the sync always travels the route this call
+/// asked for. Replacing drops the client's synced tree state, and this call
+/// resyncs it. Pass the same transport on every call for a wallet to keep the
+/// incremental state; hosts that clone one `Arc` per wallet already do.
 pub fn sync_vote_tree_with(
     db: &VotingDb,
     round_id: &str,
@@ -161,8 +203,8 @@ pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError>
             .map_err(|e| VotingError::Internal {
                 message: format!("vote tree sync registry lock poisoned: {e}"),
             })?;
-        if let Some(sync) = guard.remove(&wallet_id) {
-            sync.reset("")?;
+        if let Some(bound) = guard.remove(&wallet_id) {
+            bound.sync.reset("")?;
         }
         return Ok(());
     }
@@ -193,6 +235,12 @@ pub fn reset_voting_session_state(db: &VotingDb, round_id: &str) -> Result<(), V
     Ok(())
 }
 
+/// Returns the wallet's tree client, creating or rebinding it so the returned
+/// client actually routes over `transport`.
+///
+/// A cached client built over a different transport is replaced rather than
+/// reused; its synced tree state is dropped and the caller resyncs. Passing
+/// `None` never replaces a cached client.
 fn vote_tree_sync_for(
     db: &VotingDb,
     transport: Option<Arc<dyn vote_commitment_tree_client::transport::Transport>>,
@@ -204,15 +252,23 @@ fn vote_tree_sync_for(
         .map_err(|e| VotingError::Internal {
             message: format!("vote tree sync registry lock poisoned: {e}"),
         })?;
-    Ok(guard
-        .entry(wallet_id)
-        .or_insert_with(|| {
-            Arc::new(match transport {
-                Some(transport) => crate::tree_sync::VoteTreeSync::with_transport(transport),
-                None => crate::tree_sync::VoteTreeSync::new(),
-            })
-        })
-        .clone())
+    if let Some(bound) = guard.get(&wallet_id) {
+        if bound.honors(transport.as_ref()) {
+            return Ok(Arc::clone(&bound.sync));
+        }
+    }
+    let sync = Arc::new(match &transport {
+        Some(transport) => crate::tree_sync::VoteTreeSync::with_transport(Arc::clone(transport)),
+        None => crate::tree_sync::VoteTreeSync::new(),
+    });
+    guard.insert(
+        wallet_id,
+        BoundVoteTreeSync {
+            sync: Arc::clone(&sync),
+            transport,
+        },
+    );
+    Ok(sync)
 }
 
 /// Fetches and persists PIR-backed IMT non-membership proofs for one bundle.
@@ -1423,3 +1479,6 @@ mod session_reset_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

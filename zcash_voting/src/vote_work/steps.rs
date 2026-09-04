@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use crate::{
-    delegate::DelegationProgress,
     session::{resume_plan, NextStep, RoundPlan, VoteRecoveryWork, VoteRecoveryWorkKind},
     share_tracking::{
         confirm_pending_share, ShareConfirmationParams, ShareDeliveryPlanningParams,
@@ -282,11 +281,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 progress: update,
             });
         }
+        // The driver emits `PayloadReady` itself and the drain above forwards
+        // it, so reporting one here would deliver the terminal event twice.
         let signed = signed.map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        progress.report(RoundStepProgress::Delegation {
-            bundle_index,
-            progress: DelegationProgress::PayloadReady,
-        });
         if control.is_cancelled() {
             // The signed payload is durable; the next pass re-dispatches it
             // through AdvanceDelegation without proving again.

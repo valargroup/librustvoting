@@ -486,6 +486,12 @@ pub trait DelegationDriver: Send + Sync {
     fn round_id(&self) -> &str;
 
     /// Proves and signs one bundle on the calling thread.
+    ///
+    /// Reports the full progress sequence through `progress`, ending in
+    /// [`DelegationProgress::PayloadReady`] on success. That event is the
+    /// driver's to emit: the round executor forwards what it receives and adds
+    /// no terminal event of its own, so an implementation that stays silent
+    /// leaves hosts without a completion signal.
     fn prove_and_sign_blocking(
         &self,
         bundle_index: u32,
