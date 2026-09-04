@@ -108,6 +108,21 @@ async fn helper_failures_classify_by_dispatch_and_phase() {
         Err(HelperTransportError::Ambiguous(_))
     ));
 
+    // A custom executor that called the hook and then reports a pre-dispatch
+    // failure is still possibly dispatched: bytes may have left before it
+    // decided on the phase, and only the direct route, whose client fuses
+    // connection setup with the first write, has that phase honored.
+    let hooked_then_before = transport(
+        true,
+        Err(RouteError::before_dispatch("proxy closed the stream")),
+    );
+    assert!(matches!(
+        hooked_then_before
+            .post_json("https://h", b"{}".to_vec(), Duration::from_secs(1))
+            .await,
+        Err(HelperTransportError::Ambiguous(_))
+    ));
+
     let ok = transport(true, Ok(200));
     let response = ok.get("https://h", Duration::from_secs(1)).await.unwrap();
     assert!(response.is_success());

@@ -587,9 +587,12 @@ allowed only for the same semantic generation.
 executor. The executor calls the dispatch hook immediately before request
 bytes can reach a network stack; the SDK treats any failure or deadline it
 observes after that call as `possibly_dispatched` and before it as
-`definitely_unsent`, and an executor's own failure carries the phase it
-reports. An executor must fail closed when its route is unavailable and must
-never fall back to a direct connection.
+`definitely_unsent`. An executor's post-dispatch phase is honored even without
+the hook; a `BeforeDispatch` phase reported after the hook is honored only
+from an executor that declares `hook_precedes_connection_setup` (the SDK's
+`DirectRoute`, whose Hyper client fuses connection setup with the first write
+and reports connect failures distinctly). An executor must fail closed when
+its route is unavailable and must never fall back to a direct connection.
 
 ## Reconciliation and retry
 

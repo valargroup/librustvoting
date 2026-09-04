@@ -226,7 +226,14 @@ pub type RouteFuture<'a> =
 ///   work the SDK cannot cancel. The SDK enforces `timeout` around the whole
 ///   call and classifies its own deadline by whether the hook was called.
 /// - Report `phase` truthfully. It is consulted for failures the dispatch hook
-///   cannot classify, such as a body-read failure after headers arrived.
+///   cannot classify, such as a body-read failure after headers arrived. A
+///   `BeforeDispatch` phase reported after the hook was called is not
+///   honored: the hook already said bytes may have left, and the SDK keeps
+///   the more conservative answer. The one exception is an executor whose
+///   HTTP client fuses connection setup with the first write and therefore
+///   must call the hook before it can tell that connection setup failed; it
+///   says so through [`RouteHttp::hook_precedes_connection_setup`], and
+///   only then is its `BeforeDispatch` honored after the hook.
 /// - Never follow redirects. Return a 3xx response as received. The SDK
 ///   records helper acceptance against the configured URL and rejects
 ///   vote-chain redirects; a client that followed a 307 or 308 would deliver
@@ -238,6 +245,17 @@ pub trait RouteHttp: Send + Sync + 'static {
         request: RouteRequest<'a>,
         on_dispatch: &'a (dyn Fn() + Send + Sync),
     ) -> RouteFuture<'a>;
+
+    /// Whether this executor must call `on_dispatch` before it can tell that
+    /// connection setup failed, because its client fuses connection setup
+    /// with the first write. Only such an executor has a `BeforeDispatch`
+    /// failure honored after the hook; it must then report `BeforeDispatch`
+    /// only for failures its client attributes to connection setup, never
+    /// for one that may have followed a write. The default is `false`: any
+    /// failure after the hook is possibly dispatched.
+    fn hook_precedes_connection_setup(&self) -> bool {
+        false
+    }
 }
 
 tokio::task_local! {
@@ -466,6 +484,13 @@ impl RouteHttp for DirectRoute {
                 .await
         })
     }
+
+    /// Hyper's pooled client offers no hook between connection setup and the
+    /// first write, so the hook is called before both and connect failures,
+    /// which Hyper reports distinctly, are honored as pre-dispatch.
+    fn hook_precedes_connection_setup(&self) -> bool {
+        true
+    }
 }
 
 /// Failure of one routed request with the SDK's own dispatch observation.
@@ -576,15 +601,27 @@ impl<R: RouteHttp> HyperTransport<R> {
         let dispatched = dispatched.load(Ordering::Acquire);
         match outcome {
             Ok(Ok(response)) => Ok(response),
-            // The executor's phase is authoritative for its own failures: a
-            // connect refusal reported as pre-dispatch stays definite even if
-            // the executor had to call the hook early, as the direct route
-            // does. The hook decides only failures the executor never saw.
-            Ok(Err(error)) => Err(RoutedFailure {
-                dispatched: error.phase != RoutePhase::BeforeDispatch,
-                timed_out: false,
-                error,
-            }),
+            // A post-dispatch phase is the executor's own admission that
+            // bytes may have left, hook or not. A pre-dispatch phase after
+            // the hook is trusted only from an executor whose client fuses
+            // connection setup with the first write and so had to call the
+            // hook early (the direct route): its connect failures are
+            // reported distinctly and stay definite. Any other executor's
+            // failure after the hook is possibly dispatched, as the hook
+            // contract promises.
+            Ok(Err(error)) => {
+                let dispatched = match error.phase {
+                    RoutePhase::BeforeDispatch => {
+                        dispatched && !self.route.hook_precedes_connection_setup()
+                    }
+                    RoutePhase::AfterDispatch | RoutePhase::ResponseRead => true,
+                };
+                Err(RoutedFailure {
+                    dispatched,
+                    timed_out: false,
+                    error,
+                })
+            }
             Err(_) => Err(RoutedFailure {
                 dispatched,
                 timed_out: true,
