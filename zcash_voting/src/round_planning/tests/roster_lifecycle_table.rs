@@ -159,6 +159,34 @@ fn an_undispatched_unit_with_a_departed_member_is_retired_whole_and_the_rest_rec
 }
 
 #[test]
+fn an_undispatched_batch_holds_until_the_ballot_agrees_with_every_member() {
+    // Only proposal 1 has an intent; proposal 2 is still open. The batch is
+    // one envelope, so it is not dispatched on one member's agreement.
+    let partly_decided = snapshot()
+        .bundle(0, DelegationPhase::Confirmed)
+        .batch(0, &[(1, 0), (2, 1)], VotePhase::Committed)
+        .intent(1, Decision::Choice(0))
+        .build();
+    let obligations = classified(&partly_decided, &[1, 2]);
+    assert!(
+        reconciles(&obligations).is_empty(),
+        "an undecided member holds the batch: {obligations:?}"
+    );
+    assert!(
+        casts(&obligations).is_empty(),
+        "the batch still holds its bundle"
+    );
+
+    let decided = snapshot()
+        .bundle(0, DelegationPhase::Confirmed)
+        .batch(0, &[(1, 0), (2, 1)], VotePhase::Committed)
+        .intent(1, Decision::Choice(0))
+        .intent(2, Decision::Choice(1))
+        .build();
+    assert_eq!(reconciles(&classified(&decided, &[1, 2])).len(), 1);
+}
+
+#[test]
 fn an_on_wire_vote_survives_leaving_the_roster_and_losing_its_intent() {
     for phase in [VotePhase::Submitted, VotePhase::SubmissionManaged] {
         let unrostered = snapshot()

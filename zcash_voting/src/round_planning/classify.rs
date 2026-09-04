@@ -353,7 +353,27 @@ pub(crate) fn classify(
                 LifecyclePosition::Confirmed => {
                     deliver(&mut obligations, bundle_index, proposal_id)?
                 }
-                LifecyclePosition::Undispatched | LifecyclePosition::OnWire => {
+                LifecyclePosition::Undispatched => {
+                    // A unit is dispatched whole, so it is dispatched only
+                    // when the ballot agrees with every member. A batch a
+                    // member of which is still undecided holds its bundle and
+                    // waits; the on-wire pass below owns nothing here.
+                    let unit = unit_of(bundle_index, proposal_id);
+                    let every_member_agrees = unit.members.iter().all(|member| {
+                        roster.contains(&member.proposal_id)
+                            && snapshot
+                                .votes
+                                .get(&(bundle_index, member.proposal_id))
+                                .is_some_and(|member_vote| {
+                                    ballot_relation(intents, member.proposal_id, member_vote.choice)
+                                        == BallotRelation::Agrees
+                                })
+                    });
+                    if every_member_agrees {
+                        reconcile(&mut obligations, unit)?
+                    }
+                }
+                LifecyclePosition::OnWire => {
                     reconcile(&mut obligations, unit_of(bundle_index, proposal_id))?
                 }
                 LifecyclePosition::Terminal | LifecyclePosition::Uncast => {}

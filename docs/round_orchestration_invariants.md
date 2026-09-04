@@ -138,7 +138,7 @@ It has no clock and no network. The per-unit rule is one exhaustive match:
 | Lifecycle | Roster | Ballot | Obligation |
 |---|---|---|---|
 | Undispatched | Rostered | Agrees | `ReconcileChain` |
-| Undispatched | Rostered | Unrecorded | none; the unit holds its bundle |
+| Undispatched | Rostered | Unrecorded | none; the unit holds its bundle. For a batch, `Agrees` means every member agrees: one undecided member holds the whole batch (`an_undispatched_batch_holds_until_the_ballot_agrees_with_every_member`) |
 | Undispatched | Rostered | Conflicts | singleton: none, and it holds nothing; the cast pass recasts and the persisted cast replaces the row. Batch: invariant violation, since the intent write path clears an unsubmitted batch whole |
 | Undispatched | LeftRoster | any | `Retire` for the whole unit; the cast pass recasts the rostered members |
 | OnWire | any | Agrees, Unrecorded | `ReconcileChain` |
