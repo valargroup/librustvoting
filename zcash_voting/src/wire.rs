@@ -514,6 +514,10 @@ pub enum VotingErrorKindView {
     SetupAlreadyPersisted,
     DbBusy,
     PirUnavailable,
+    /// Any category this host does not know. Serde deserializes unknown
+    /// category strings into it, so a newer crate can add kinds without
+    /// breaking an older host's view.
+    #[serde(other)]
     Other,
 }
 

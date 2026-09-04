@@ -68,6 +68,14 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `wire::VotingErrorKindView::Other` is a Serde catch-all: an error category
+  added by a newer crate deserializes into it instead of failing an older
+  host's `VotingErrorView` parse.
+- PIR connect failures that carry a typed `PirHttpFailure` keep its
+  retryability even when the response body echoes a layout or poly_len
+  mismatch message, so `PirFleet` still fails over on a retryable status.
+  Text matching applies only to errors without typed transport metadata.
+
 - `ChainSubmissionClient::advance_until_terminal` observes cancellation
   during the `pending_repoll` wait between passes, within 25 ms, instead of
   only at the start of the next pass.

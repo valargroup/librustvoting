@@ -1431,6 +1431,24 @@ mod tests {
         assert_eq!(round_trip, pir);
     }
 
+    #[test]
+    fn an_unknown_error_kind_deserializes_as_other() {
+        let known = VotingError::Busy {
+            message: "busy".to_string(),
+        }
+        .to_view();
+        let json = serde_json::to_string(&known).unwrap().replace(
+            "\"kind\":\"busy\"",
+            "\"kind\":\"kind_added_after_this_host_shipped\"",
+        );
+
+        let view: crate::wire::VotingErrorView = serde_json::from_str(&json)
+            .expect("a category this host does not know must still parse");
+
+        assert_eq!(view.kind, VotingErrorKindView::Other);
+        assert_eq!(view.message, known.message);
+    }
+
     use super::*;
     use crate::vote::SignedVoteCommitment;
     use crate::VotingHotkey;
