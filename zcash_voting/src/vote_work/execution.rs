@@ -238,11 +238,13 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     chain_outcome.clone(),
                     request,
                 )
+                .with_share_deliveries(deliveries.clone())
             })?;
             let vote = vote
                 .confirmed(&self.database)
                 .map_err(|error| {
                     self.voting_failure_after_chain(error, Some(work.clone()), chain_outcome.clone(), request)
+                        .with_share_deliveries(deliveries.clone())
                 })?
                 .ok_or_else(|| {
                     self.failure(
@@ -253,6 +255,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                         "vote was reported confirmed but its recovery material has no tree position",
                         request,
                     )
+                    .with_share_deliveries(deliveries.clone())
                 })?;
             let cancel = || control.interrupted();
             let delivery = vote
