@@ -546,6 +546,10 @@ pub struct VotingErrorView {
     pub retryable: bool,
     pub message: String,
     pub bundle_index: Option<u32>,
+    /// For `SetupAlreadyPersisted`, the setup column that already held a
+    /// value. Sighash and effects conflicts are reusable after validation;
+    /// a padded-note-secrets conflict is not.
+    pub setup_field: Option<DelegationSetupFieldView>,
     pub snapshot_height: Option<u64>,
     pub required_weight_zatoshi: Option<u64>,
     pub selected_weight_zatoshi: Option<u64>,
@@ -553,6 +557,15 @@ pub struct VotingErrorView {
     pub selected_notes: Option<u32>,
     pub http_status: Option<u16>,
     pub endpoint: Option<String>,
+}
+
+/// Wire form of [`crate::types::DelegationSetupField`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationSetupFieldView {
+    PaddedNoteSecrets,
+    PcztSighash,
+    Tx1Effects,
 }
 
 /// One pending helper-share round for one wallet, as returned by

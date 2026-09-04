@@ -29,9 +29,9 @@ use crate::{
         ChainSubmissionFailureStateView, ChainSubmissionOutcomeKind, ChainSubmissionOutcomeView,
         ChainSubmissionStateEvidenceView, ChainSubmissionStateView, CompletedVoteChoiceView,
         CompletedVoteDisplayView, DelegationPirPrecomputeResultView, DelegationProgressKind,
-        DelegationRecoveryView, DelegationRecoveryWorkView, DelegationStatusView,
-        DelegationSubmissionWire, NextStepView, PendingShareRoundView, RoundPlanView,
-        RoundRecoveryStateView, RoundStepDispositionView, RoundStepFailureKindView,
+        DelegationRecoveryView, DelegationRecoveryWorkView, DelegationSetupFieldView,
+        DelegationStatusView, DelegationSubmissionWire, NextStepView, PendingShareRoundView,
+        RoundPlanView, RoundRecoveryStateView, RoundStepDispositionView, RoundStepFailureKindView,
         RoundStepFailureView, RoundStepOutcomeView, RoundStepProgressKind, RoundStepProgressView,
         ShareBatchDeliveryReportView, ShareDelegationRecordView, ShareDeliveryOutcomeView,
         ShareKeyView, ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteBatchView,
@@ -1289,6 +1289,7 @@ impl From<&VotingError> for VotingErrorView {
             retryable: error.retryable(),
             message: error.to_string(),
             bundle_index: None,
+            setup_field: None,
             snapshot_height: None,
             required_weight_zatoshi: None,
             selected_weight_zatoshi: None,
@@ -1317,8 +1318,13 @@ impl From<&VotingError> for VotingErrorView {
             VotingError::NoSpendableNotes { snapshot_height } => {
                 view.snapshot_height = Some(*snapshot_height);
             }
-            VotingError::SetupAlreadyPersisted { bundle_index, .. } => {
+            VotingError::SetupAlreadyPersisted {
+                bundle_index,
+                field,
+                ..
+            } => {
                 view.bundle_index = Some(*bundle_index);
+                view.setup_field = Some((*field).into());
             }
             VotingError::PirUnavailable {
                 endpoint,
@@ -1331,6 +1337,17 @@ impl From<&VotingError> for VotingErrorView {
             _ => {}
         }
         view
+    }
+}
+
+impl From<crate::types::DelegationSetupField> for DelegationSetupFieldView {
+    fn from(field: crate::types::DelegationSetupField) -> Self {
+        use crate::types::DelegationSetupField as F;
+        match field {
+            F::PaddedNoteSecrets => Self::PaddedNoteSecrets,
+            F::PcztSighash => Self::PcztSighash,
+            F::Tx1Effects => Self::Tx1Effects,
+        }
     }
 }
 

@@ -100,3 +100,33 @@ fn an_unknown_kind_with_a_new_structured_field_still_parses() {
     assert_eq!(view.kind, VotingErrorKindView::Other);
     assert_eq!(view.message, known.message);
 }
+
+#[test]
+fn a_setup_conflict_names_its_field_on_the_wire() {
+    use crate::{types::DelegationSetupField, wire::DelegationSetupFieldView};
+
+    let view = VotingError::SetupAlreadyPersisted {
+        round_id: "r".to_string(),
+        bundle_index: 3,
+        field: DelegationSetupField::PaddedNoteSecrets,
+    }
+    .to_view();
+    assert_eq!(view.bundle_index, Some(3));
+    assert_eq!(
+        view.setup_field,
+        Some(DelegationSetupFieldView::PaddedNoteSecrets)
+    );
+
+    let json = serde_json::to_string(&view).unwrap();
+    assert!(
+        json.contains(r#""setup_field":"padded_note_secrets""#),
+        "{json}"
+    );
+    let decoded: crate::wire::VotingErrorView = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.setup_field, view.setup_field);
+
+    // A payload from an SDK that predates the field still parses.
+    let legacy = json.replace(r#""setup_field":"padded_note_secrets","#, "");
+    let decoded: crate::wire::VotingErrorView = serde_json::from_str(&legacy).unwrap();
+    assert_eq!(decoded.setup_field, None);
+}
