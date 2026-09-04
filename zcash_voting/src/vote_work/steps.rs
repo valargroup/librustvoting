@@ -34,6 +34,10 @@ impl<T: ChainTransport> RoundExecutor<T> {
     pub fn plan(&self) -> Result<RoundPlan, VotingError> {
         self.wallet_scope()?;
         let binding = self.binding()?;
+        // The round may have been created after binding through a handle
+        // from `database()`; a network mismatch must fail before any step
+        // syncs and caches a tree for it.
+        self.ensure_stored_round_network(&binding.round_id, "the binding")?;
         resume_plan(&self.database, &binding.round_id, &binding.proposal_ids())
     }
 
