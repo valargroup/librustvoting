@@ -390,6 +390,8 @@ pub struct RoundExecutor<T> {
     /// Wallet the executor was constructed for. Every operation runs against
     /// this scope; see [`Self::wallet_scope`].
     wallet_id: String,
+    /// Network of the chain client; a binding for another network is refused.
+    chain_network: Network,
     database: Arc<VotingDb>,
     chain_client: ChainSubmissionClient<T>,
     helper_client: HelperClient,
@@ -409,9 +411,11 @@ impl RoundExecutor<HyperTransport> {
         helper_client: HelperClient,
     ) -> Result<Self, ChainSubmissionFailure> {
         let (wallet_id, database) = freeze_wallet_scope(&database);
+        let chain_network = chain_config.network;
         let chain_client = ChainSubmissionClient::new(Arc::clone(&database), chain_config)?;
         Ok(Self {
             wallet_id,
+            chain_network,
             database,
             chain_client,
             helper_client,
@@ -436,6 +440,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         helper_client: HelperClient,
     ) -> Result<Self, ChainSubmissionFailure> {
         let (wallet_id, database) = freeze_wallet_scope(&database);
+        let chain_network = chain_config.network;
         let chain_client = ChainSubmissionClient::with_transport(
             Arc::clone(&database),
             chain_transport,
@@ -443,6 +448,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         )?;
         Ok(Self {
             wallet_id,
+            chain_network,
             database,
             chain_client,
             helper_client,
@@ -460,10 +466,21 @@ impl<T: ChainTransport> RoundExecutor<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`VotingError::InvalidInput`] for a non-canonical round id, an
-    /// empty roster, or a repeated proposal id.
+    /// Returns [`VotingError::InvalidInput`] for a non-canonical round id, a
+    /// network other than the chain client's, an empty roster, or a repeated
+    /// proposal id. The network is checked here because chain identity
+    /// derivation would otherwise reject it only after proving and helper
+    /// plans had already been persisted.
     pub fn with_binding(mut self, binding: RoundBinding) -> Result<Self, VotingError> {
         crate::types::validate_vote_round_id_hex(&binding.round_id)?;
+        if binding.network != self.chain_network {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "round binding network {:?} does not match the chain client network {:?}",
+                    binding.network, self.chain_network
+                ),
+            });
+        }
         if binding.proposals.is_empty() {
             return Err(VotingError::InvalidInput {
                 message: "round binding requires a nonempty proposal roster".to_string(),

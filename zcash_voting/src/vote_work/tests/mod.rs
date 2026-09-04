@@ -731,9 +731,11 @@ mod round_executor {
 
     /// A vote-tree transport with no reachable node: every request fails
     /// after being counted, so a sync creates the round's tree client and then
-    /// errors out of it.
+    /// errors out of it. It can also cancel the host control from inside the
+    /// request, modelling a cancellation that arrives while a sync is in flight.
     struct UnreachableTreeTransport {
         requests: std::sync::atomic::AtomicUsize,
+        cancel_on_request: Option<ChainSubmissionControl>,
     }
 
     impl vote_commitment_tree_client::transport::Transport for UnreachableTreeTransport {
@@ -746,6 +748,9 @@ mod round_executor {
         > {
             self.requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(control) = &self.cancel_on_request {
+                control.cancel();
+            }
             Err(
                 vote_commitment_tree_client::transport::TransportError::Request(
                     "node unreachable".to_string(),
@@ -758,6 +763,13 @@ mod round_executor {
     /// decided, so `CastVote` is the plan head and reaches tree sync.
     fn executor_ready_to_cast(
         wallet_id: &str,
+    ) -> (RoundExecutor<HyperTransport>, Arc<UnreachableTreeTransport>) {
+        executor_ready_to_cast_with(wallet_id, None)
+    }
+
+    fn executor_ready_to_cast_with(
+        wallet_id: &str,
+        cancel_on_request: Option<ChainSubmissionControl>,
     ) -> (RoundExecutor<HyperTransport>, Arc<UnreachableTreeTransport>) {
         let database = host_database_for(wallet_id);
         // A confirmed delegation carries its VAN commitment; the tree sync
@@ -807,6 +819,7 @@ mod round_executor {
             .unwrap();
         let transport = Arc::new(UnreachableTreeTransport {
             requests: std::sync::atomic::AtomicUsize::new(0),
+            cancel_on_request,
         });
         let executor = executor.with_tree_transport(transport.clone());
         (executor, transport)
@@ -1010,5 +1023,64 @@ mod round_executor {
         assert_eq!(control.operation_epoch(), 8);
         assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
         assert!(outcome.delegation.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_sync_that_fails_after_cancellation_reports_cancelled_not_a_transport_error() {
+        let control = ChainSubmissionControl::new(1);
+        let (executor, transport) =
+            executor_ready_to_cast_with("wallet-cancel-in-flight", Some(control.clone()));
+        let cast = NextStep::CastVote {
+            bundle_index: 0,
+            proposal_id: 1,
+            choice: 0,
+        };
+        let host = RoundHostContext {
+            vote_tree_node_urls: vec![
+                "http://node-a.invalid".to_string(),
+                "http://node-b.invalid".to_string(),
+            ],
+            ..host()
+        };
+
+        let outcome = executor
+            .advance_step(
+                cast.clone(),
+                &host,
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .expect("a cancelled step is an outcome, not a failure");
+
+        let cached = crate::precompute::has_cached_round_tree(executor.database(), ROUND_ID);
+        crate::precompute::reset_vote_tree(executor.database(), "").unwrap();
+        assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
+        assert_eq!(outcome.step, Some(cast));
+        assert_eq!(
+            transport.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second node must not be tried after cancellation"
+        );
+        assert!(!cached, "the poisoned tree is still reset before returning");
+    }
+
+    #[test]
+    fn a_binding_for_another_network_is_refused() {
+        let (executor, _) = bound_executor_unbound(host_database());
+        let error = executor
+            .with_binding(RoundBinding {
+                round_id: ROUND_ID.to_string(),
+                network: Network::Mainnet,
+                proposals: vec![ProposalRosterEntry {
+                    proposal_id: 1,
+                    num_options: 2,
+                }],
+                hotkey_secret: None,
+            })
+            .err()
+            .expect("the chain client is configured for Testnet");
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("Mainnet"), "{error}");
     }
 }
