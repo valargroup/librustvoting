@@ -49,7 +49,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         };
 
         let Some(_round_guard) =
-            round_lock::acquire(wallet_id, request.round_id, None, control.chain())
+            round_lock::acquire(wallet_id, request.round_id, None, control.chain(), control.entry_epoch())
                 .await
                 .map_err(|message| {
                     self.failure(

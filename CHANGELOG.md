@@ -69,6 +69,20 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- The wallet example's `advance_round_until_idle` takes a `RouteHttp`
+  executor and routes helper, vote-chain, and vote-tree traffic through it.
+- `RoundExecutor::advance` rejects a round the wallet stores under a network
+  other than the chain client's before helper preflight or any plan write.
+- A caller queued for a round lock stops waiting when the host moves to
+  another operation epoch, not only on cancellation.
+- `VotingDb::clear_ballot_intent` evaluates the vote phase inside its write
+  transaction.
+- `wire::VotingErrorView` accepts unknown fields so the `Other` category
+  fallback also survives new structured fields.
+- The in-memory vote-tree cache is keyed by sidecar connection as well as
+  wallet id, so two sidecars sharing a wallet id keep separate tree state and
+  transports.
+
 - A failed vote-tree sync resets the round's cached tree inside the detached
   blocking work, holding the round lock, so cleanup happens even when the
   step future is dropped mid-sync.

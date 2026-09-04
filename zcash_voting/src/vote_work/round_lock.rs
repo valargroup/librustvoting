@@ -23,11 +23,16 @@ static ROUND_LOCKS: LazyLock<Mutex<HashMap<RoundLockKey, Weak<AsyncMutex<()>>>>>
 /// the thread keeps working.
 pub(super) type HeldRoundLock = Arc<OwnedMutexGuard<()>>;
 
+/// Acquires the lock for `(wallet, round, bundle)`, returning `None` if the
+/// host cancels or moves to another operation epoch than `entry_epoch` while
+/// the caller is queued. A stale caller therefore stops waiting instead of
+/// holding its place behind a long-running proof.
 pub(super) async fn acquire(
     wallet_id: String,
     round_id: &str,
     bundle_index: Option<u32>,
     control: &ChainSubmissionControl,
+    entry_epoch: u64,
 ) -> Result<Option<OwnedMutexGuard<()>>, String> {
     let key = (wallet_id, round_id.to_string(), bundle_index);
     let lock = {
@@ -47,7 +52,7 @@ pub(super) async fn acquire(
     let pending = lock.lock_owned();
     tokio::pin!(pending);
     loop {
-        if control.is_cancelled() {
+        if control.is_cancelled() || control.operation_epoch() != entry_epoch {
             return Ok(None);
         }
         tokio::select! {

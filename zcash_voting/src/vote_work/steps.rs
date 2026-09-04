@@ -131,17 +131,23 @@ impl<T: ChainTransport> RoundExecutor<T> {
             }
             _ => None,
         };
-        let Some(guard) = round_lock::acquire(wallet_id, &round_id, scope, control.chain())
-            .await
-            .map_err(|message| {
-                self.step_failure(
-                    RoundStepFailureKind::InvariantViolation,
-                    Some(step.clone()),
-                    None,
-                    None,
-                    message,
-                )
-            })?
+        let Some(guard) = round_lock::acquire(
+            wallet_id,
+            &round_id,
+            scope,
+            control.chain(),
+            control.entry_epoch(),
+        )
+        .await
+        .map_err(|message| {
+            self.step_failure(
+                RoundStepFailureKind::InvariantViolation,
+                Some(step.clone()),
+                None,
+                None,
+                message,
+            )
+        })?
         else {
             return self.step_cancelled(Some(step), None, Vec::new(), None);
         };
