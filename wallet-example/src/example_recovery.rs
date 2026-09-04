@@ -5,8 +5,8 @@ use zcash_voting::prelude::{
     recover_atomic_vote_batch, resume_plan, round_snapshot, ChainSubmissionClientConfig,
     ChainSubmissionControl, CommittedVote, HelperClient, HelperHealth, Network, NextStep,
     NoopRoundStepProgressReporter, ProposalRosterEntry, RoundBinding, RoundExecutor,
-    RoundHostContext, RoundPlan, RoundRecoverySnapshot, RoundStepDisposition, SignedVoteBatch,
-    VotingDb,
+    RoundHostContext, RoundPlan, RoundRecoverySnapshot, RoundStepDisposition, RoundStepOutcome,
+    SignedVoteBatch, VotingDb,
 };
 use zcash_voting::HyperTransport;
 
@@ -17,6 +17,11 @@ use zcash_voting::HyperTransport;
 /// `Pending`. The executor owns step interpretation, helper-plan persistence,
 /// chain advancement, confirmation, and share delivery; the host supplies
 /// transports, the fleet, timing, and cancellation.
+///
+/// The last step's full outcome is returned rather than only its plan. After a
+/// terminal chain result (`ChainTerminal`) the plan deliberately schedules no
+/// retry and carries no vote diagnostic, so `RoundStepOutcome::chain_outcome`
+/// is the only place the rejection or hashless-submission diagnostic survives.
 pub async fn advance_round_until_idle(
     voting_db: Arc<VotingDb>,
     network: Network,
@@ -24,7 +29,7 @@ pub async fn advance_round_until_idle(
     binding: RoundBinding,
     host: RoundHostContext,
     control: &ChainSubmissionControl,
-) -> Result<RoundPlan> {
+) -> Result<RoundStepOutcome> {
     let helper_client = HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
     let executor = RoundExecutor::new(
         voting_db,
@@ -42,7 +47,7 @@ pub async fn advance_round_until_idle(
         if outcome.disposition == RoundStepDisposition::Advanced {
             continue;
         }
-        return Ok(outcome.plan);
+        return Ok(outcome);
     }
 }
 
