@@ -5,7 +5,8 @@ use rusqlite::{named_params, Connection, OptionalExtension, TransactionBehavior}
 use crate::{
     helper::url::canonical_helper_url_list,
     round::VotingDb,
-    session::{classify_ballot_intents, intent_is_lifecycle_owned, Decision},
+    round_planning::intent_is_lifecycle_owned,
+    session::{classify_ballot_intents, load_ballot_intents, Decision},
     share::ShareOperationScope,
     share_policy::{
         plan_share_submissions_with_preferred_servers, round_immediate_share_key,
@@ -210,7 +211,9 @@ fn derive_immediate_share(
         });
     }
 
-    let intents = load_ballot_intents_with_conn(conn, round_id, wallet_id)?;
+    let intents: BTreeMap<u32, Decision> = load_ballot_intents(conn, round_id, wallet_id)?
+        .into_iter()
+        .collect();
     let classification = classify_ballot_intents(proposal_ids, &intents)?;
     if !classification.open_proposals.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -245,19 +248,28 @@ fn derive_immediate_share(
         });
     }
 
-    // The round-immediate designation is stable once a plan carries it. When
-    // the designated proposal has since left the roster (its vote reached
-    // the chain lifecycle, so its intent is retained above), recomputing the
-    // key from the reduced roster would name a second share and reject every
-    // plan that carries the first; keep the persisted designation instead.
-    let persisted_immediate = persisted_round_immediate_key(conn, round_id, wallet_id)?
-        .filter(|key| !classification.roster.contains(&key.proposal_id));
-    let immediate_key = match persisted_immediate {
+    // The round-immediate designation is durable once made: it is read from
+    // its own row and never re-derived while that row exists, so a designated
+    // proposal that later leaves the roster keeps it and no plan names a
+    // second one. Derivation from the complete ballot only seeds it, the
+    // first time the designated vote's own plan is prepared, in this
+    // transaction.
+    let existing = super::immediate_designation::round_immediate_share(conn, round_id, wallet_id)?;
+    let immediate_key = match existing {
         Some(key) => Some(key),
         None => {
             immediate_key_for_choices(conn, round_id, wallet_id, &classification.choice_proposals)?
         }
     };
+    if existing.is_none() {
+        if let Some(key) = immediate_key {
+            if key.bundle_index == bundle_index && key.proposal_id == proposal_id {
+                super::immediate_designation::designate_round_immediate_share(
+                    conn, round_id, wallet_id, key,
+                )?;
+            }
+        }
+    }
     let immediate_position =
         immediate_position_for_commitment(immediate_key, bundle_index, proposal_id, payloads)?;
 
@@ -316,122 +328,6 @@ fn immediate_position_for_commitment(
         }
         _ => Ok(None),
     }
-}
-
-fn load_ballot_intents_with_conn(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-) -> Result<BTreeMap<u32, Decision>, VotingError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT proposal_id, skipped, choice FROM ballot_intent
-             WHERE round_id = :round_id AND wallet_id = :wallet_id
-             ORDER BY proposal_id",
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("prepare helper-share ballot intents failed: {e}"),
-        })?;
-    let rows = stmt
-        .query_map(
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-            },
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            },
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("query helper-share ballot intents failed: {e}"),
-        })?;
-
-    let mut intents = BTreeMap::new();
-    for row in rows {
-        let (proposal_id, skipped, choice) = row.map_err(|e| VotingError::Internal {
-            message: format!("read helper-share ballot intent failed: {e}"),
-        })?;
-        let decision = if skipped != 0 {
-            Decision::Skipped
-        } else {
-            Decision::Choice(choice.ok_or_else(|| VotingError::Internal {
-                message: format!(
-                    "chosen proposal {proposal_id} is missing its durable ballot choice"
-                ),
-            })? as u32)
-        };
-        intents.insert(proposal_id as u32, decision);
-    }
-    Ok(intents)
-}
-
-/// The round-immediate share the wallet's persisted plans for `round_id`
-/// designate, if any plan carries the marker. A consistent round has at most
-/// one; the first is returned so callers report what the plans will execute.
-pub(crate) fn persisted_round_immediate_key(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-) -> Result<Option<ImmediateShareKey>, VotingError> {
-    Ok(marked_round_immediate_keys(conn, round_id, wallet_id)?
-        .into_iter()
-        .next())
-}
-
-/// The round-immediate shares marked in the wallet's persisted plans for
-/// `round_id`, in plan order; a consistent round has at most one.
-fn marked_round_immediate_keys(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-) -> Result<Vec<ImmediateShareKey>, VotingError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT bundle_index, proposal_id, share_plans_json
-             FROM helper_share_plans
-             WHERE round_id = :round_id AND wallet_id = :wallet_id",
-        )
-        .map_err(|e| VotingError::from_sqlite("prepare round helper-share plans", &e))?;
-    let rows = stmt
-        .query_map(
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-            },
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u32,
-                    row.get::<_, i64>(1)? as u32,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .map_err(|e| VotingError::from_sqlite("query round helper-share plans", &e))?;
-    let mut marked = Vec::new();
-    for row in rows {
-        let (bundle_index, proposal_id, plans_json) =
-            row.map_err(|e| VotingError::from_sqlite("read round helper-share plan", &e))?;
-        let plans: Vec<ShareSubmissionPlan> =
-            serde_json::from_str(&plans_json).map_err(|e| VotingError::InvalidInput {
-                message: format!("persisted helper-share plan is invalid JSON: {e}"),
-            })?;
-        marked.extend(
-            plans
-                .iter()
-                .enumerate()
-                .filter(|(_, plan)| plan.immediate)
-                .map(|(share_index, _)| ImmediateShareKey {
-                    bundle_index,
-                    proposal_id,
-                    share_index: share_index as u32,
-                }),
-        );
-    }
-    Ok(marked)
 }
 
 fn validate_round_immediate_plans(
@@ -556,7 +452,9 @@ pub(crate) fn load_share_delivery_plan(
     })?;
     validate_current_helper_fleet(current_fleet)?;
     validate_share_delivery_plan(&plan, payloads.len())?;
-    let intents = load_ballot_intents_with_conn(&conn, round_id, scope.wallet_id())?;
+    let intents: BTreeMap<u32, Decision> = load_ballot_intents(&conn, round_id, scope.wallet_id())?
+        .into_iter()
+        .collect();
     if !matches!(intents.get(&proposal_id), Some(Decision::Choice(_))) {
         return Err(VotingError::InvalidInput {
             message: format!(

@@ -1101,6 +1101,32 @@ round id, or a vote claimed by two batches is an invariant error rather than a
 silently different phase. Session plans emit no submit, poll, or reconstruction
 step for a lifecycle-owned or terminal row.
 
+## Version 19 to version 20
+
+Version 20 adds `round_immediate_share`: one row per wallet and round naming
+the helper share submitted immediately. Version 19 carried that designation
+only as an `immediate` marker inside the designated vote's persisted helper
+plan, and every reader re-derived or rescanned it; a designated proposal that
+later left the roster had to be special-cased so a plan for the remaining
+roster would not name a second share. The row is written once, in the same
+transaction as the designated vote's own plan, and is immutable
+(`round_immediate_share_immutable`). It is voided with the undispatched
+generation it was made for, on the same condition that clears the vote's
+helper plan (`clear_round_immediate_share_on_vote_generation_change`), and
+cascades with the vote row. Confirmation does not void it.
+
+The `19 -> 20` step creates the table and its triggers and adopts the first
+marked plan of each round as its designation, always at domain share index 0
+(`v19_immediate_markers_backfill_to_v20`). Every other row is preserved
+byte for byte. Fresh and incrementally migrated version-20 schemas must match
+(`migrate_from_launch_version_matches_a_fresh_schema`). The planner reads the
+row through its round snapshot and derives a designation from the ballot only
+while no row exists; helper-plan preparation reads the row and never
+re-derives once it exists
+(`the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it`,
+`the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation`,
+`a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster`).
+
 ## Removed legacy APIs
 
 The public API does not expose:

@@ -47,6 +47,19 @@ fn without_chain_submissions(schema: &str) -> String {
     schema[..start].to_string()
 }
 
+/// Strips the round immediate-share designation added at version 20.
+fn without_round_immediate_share(schema: &str) -> String {
+    let start = schema
+        .find("-- Round-wide immediate helper share designation")
+        .expect("schema must contain the designation added at version 20");
+    schema[..start].to_string()
+}
+
+/// The complete version-19 schema: everything but the designation row.
+fn v19_schema() -> String {
+    without_round_immediate_share(include_str!("001_init.sql"))
+}
+
 fn v16_schema() -> String {
     without_helper_share_plans(&without_chain_submissions(include_str!("001_init.sql")))
 }
@@ -751,9 +764,9 @@ fn stale_current_schema_is_rejected() {
         .unwrap();
 
     let error = migrate(&mut conn).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("unsupported chain-submission schema for version 19"));
+    assert!(error.to_string().contains(&format!(
+        "unsupported chain-submission schema for version {CURRENT_VERSION}"
+    )));
 }
 
 #[test]
@@ -768,9 +781,9 @@ fn current_fingerprint_rejects_missing_columns_indexes_and_triggers() {
             .unwrap();
         let error = migrate(&mut conn).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("unsupported chain-submission schema for version 19"),
+            error.to_string().contains(&format!(
+                "unsupported chain-submission schema for version {CURRENT_VERSION}"
+            )),
             "{error}"
         );
     }
@@ -924,6 +937,7 @@ fn migrate_from_launch_version_matches_a_fresh_schema() {
         "bundles",
         "votes",
         "helper_share_plans",
+        "round_immediate_share",
         "share_delegations",
         "pir_proof_cache",
         "chain_submissions",
@@ -947,6 +961,16 @@ fn migrate_from_launch_version_matches_a_fresh_schema() {
         ),
         "migrated and fresh schemas must install the same plan lifecycle trigger"
     );
+    for trigger in [
+        "round_immediate_share_immutable",
+        "clear_round_immediate_share_on_vote_generation_change",
+    ] {
+        assert_eq!(
+            schema_sql(&migrated, "trigger", trigger),
+            schema_sql(&fresh, "trigger", trigger),
+            "migrated and fresh schemas must install the same designation trigger {trigger}"
+        );
+    }
     assert_eq!(
         chain_submission_schema_fingerprint(&migrated).unwrap(),
         chain_submission_schema_fingerprint(&fresh).unwrap(),
@@ -1121,6 +1145,77 @@ fn migrate_from_v14_creates_pir_proof_cache_and_preserves_state() {
             [],
         )
         .unwrap();
+}
+
+#[test]
+fn v19_immediate_markers_backfill_to_v20() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&v19_schema()).unwrap();
+    conn.pragma_update(None, "user_version", 19).unwrap();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    queries::insert_bundle(&conn, ROUND, "wallet", 0, &[1]).unwrap();
+    for proposal_id in [1u32, 2] {
+        queries::store_vote(&conn, ROUND, "wallet", 0, proposal_id, 0, &[0xCA; 32]).unwrap();
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json = '{\"vc_tree_position\":0}'
+             WHERE round_id = ?1 AND wallet_id = 'wallet' AND bundle_index = 0 AND proposal_id = ?2",
+            rusqlite::params![ROUND, proposal_id],
+        )
+        .unwrap();
+    }
+    // Only proposal 1's plan carries the version-19 marker, on its first share.
+    for (proposal_id, plans) in [
+        (
+            1,
+            r#"[{"immediate":true,"submit_at":0},{"immediate":false,"submit_at":9}]"#,
+        ),
+        (
+            2,
+            r#"[{"immediate":false,"submit_at":5},{"immediate":false,"submit_at":9}]"#,
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO helper_share_plans
+             (round_id, wallet_id, bundle_index, proposal_id, commitment_bundle_json,
+              configured_server_urls_json, share_plans_json, format_version,
+              placement_guarantee, created_at)
+             VALUES (?1, 'wallet', 0, ?2, '{\"vc_tree_position\":0}', '[]', ?3, 1, 'strict', 42)",
+            rusqlite::params![ROUND, proposal_id, plans],
+        )
+        .unwrap();
+    }
+
+    migrate(&mut conn).unwrap();
+
+    let designation: (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT bundle_index, proposal_id, share_index, designated_at
+             FROM round_immediate_share WHERE round_id = ?1 AND wallet_id = 'wallet'",
+            [ROUND],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(designation, (0, 1, 0, 42));
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM round_immediate_share", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 1, "one designation per round");
+    let error = conn
+        .execute(
+            "UPDATE round_immediate_share SET proposal_id = 2 WHERE round_id = ?1",
+            [ROUND],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("immutable"), "{error}");
 }
 
 #[test]

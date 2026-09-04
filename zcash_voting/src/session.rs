@@ -76,20 +76,6 @@ pub(crate) use crate::round_planning::vote_phase_is_lifecycle_owned;
 #[cfg(test)]
 pub(crate) use crate::round_planning::{blocking_prerequisite, summarize_plan_work};
 
-/// Whether any vote for `proposal_id` is lifecycle-owned, read on `conn`.
-pub(crate) fn intent_is_lifecycle_owned(
-    conn: &rusqlite::Connection,
-    wallet_id: &str,
-    round_id: &str,
-    proposal_id: u32,
-) -> Result<bool, VotingError> {
-    Ok(
-        crate::phases::vote_phases_for_proposal(conn, wallet_id, round_id, proposal_id)?
-            .into_iter()
-            .any(|(_, phase)| vote_phase_is_lifecycle_owned(phase)),
-    )
-}
-
 impl VotingDb {
     /// Record (insert or replace) the voter's decision for one proposal.
     ///
@@ -398,7 +384,9 @@ pub(crate) fn load_ballot_intents(
                     let decision = if skipped != 0 {
                         Decision::Skipped
                     } else {
-                        Decision::Choice(choice.unwrap_or(0) as u32)
+                        Decision::Choice(choice.ok_or_else(|| {
+                            rusqlite::Error::InvalidQuery
+                        })? as u32)
                     };
                     Ok((pid, decision))
                 },
@@ -716,11 +704,10 @@ pub struct RoundPlan {
     /// resolution, and it does not withhold casting for the current roster.
     pub unrostered_intents: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
-    /// The round's single immediate helper-share submission, if designated.
     ///
-    /// Reports the designation a persisted helper plan carries whenever one
-    /// exists, since that plan is what delivery executes; only while no plan
-    /// exists is it derived from the current ballot choices.
+    /// Reports the round's durable designation whenever one exists, since
+    /// that is what delivery executes; only while none exists is it derived
+    /// from the current ballot choices.
     pub immediate_share_key: Option<ImmediateShareKey>,
     /// True when the designated immediate share has durable helper-quorum confirmation.
     pub immediate_share_confirmed: bool,

@@ -452,17 +452,17 @@ pub(crate) fn os_random_bytes(len: usize) -> Vec<u8> {
 mod configured_fleet;
 mod confirmation;
 mod delivery_plan;
+mod immediate_designation;
 mod initial_delivery;
 mod recovery;
 
-pub(crate) use delivery_plan::{
-    load_share_delivery_plan, persisted_round_immediate_key, prepare_share_delivery_plan,
-};
+pub(crate) use delivery_plan::{load_share_delivery_plan, prepare_share_delivery_plan};
 
 use configured_fleet::ConfiguredHelperFleet;
 #[cfg(test)]
 use confirmation::{finish_expired_polls, poll_share_helpers_with_budget};
 use confirmation::{poll_share_helpers, ShareStatusOutcome};
+pub(crate) use immediate_designation::round_immediate_share;
 pub(crate) use initial_delivery::submit_committed_share_to_helpers;
 #[cfg(test)]
 use initial_delivery::submit_share_to_helpers;

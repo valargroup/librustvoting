@@ -337,13 +337,18 @@ Conformance is demonstrated by behavior. Tests cover:
 
 ### Designation
 
-- the first delivery plan for a round designates the immediate share in the
-  same transaction and a second writer observes it;
-- a designation survives its proposal leaving the roster and a restart;
+- the designated vote's own plan writes the designation in its transaction
+  and every later plan reads it
+  (`the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it`);
+- a designation survives its proposal leaving the roster
+  (`a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster`)
+  and a lower choice recorded afterwards
+  (`later_lower_choice_blocks_stale_submission_but_keeps_the_first_designation`);
 - a designation is voided with the undispatched generation it was made for
-  and is not voided by confirmation;
-- a version 19 sidecar with a marked plan backfills exactly one designation
-  row.
+  and is not voided by confirmation
+  (`the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation`);
+- a version 19 sidecar with a marked plan backfills exactly one immutable
+  designation row (`v19_immediate_markers_backfill_to_v20`).
 
 ### Executor
 

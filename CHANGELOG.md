@@ -55,6 +55,14 @@ This release is `zcash_voting` 4.0.0.
 - `VotingError::kind`, `VotingError::retryable`, and the new variants
   `InsufficientEligibility`, `NoSpendableNotes`, `SetupAlreadyPersisted`,
   `DbBusy`, and `PirUnavailable`, with `wire::VotingErrorView` for hosts.
+- Schema version 20: `round_immediate_share` holds the round's immediate
+  helper-share designation as a row of its own, written once in the same
+  transaction as the designated vote's helper plan, immutable, and voided
+  only with the undispatched generation it was made for. Version-19
+  databases adopt the marker their persisted plans carried. The planner and
+  helper-plan preparation read the row and never re-derive a designation
+  once it exists, so a designated proposal that leaves the roster, or a lower
+  choice recorded afterwards, cannot move it or name a second share.
 - `VotingDb::open_wallet_sidecar` shares one connection per sidecar path and
   returns `Arc<VotingDb>`; `VotingDb::scoped` reads another wallet through the
   same connection; `share::pending_rounds_for_accounts` lists pending share
@@ -249,9 +257,9 @@ This release is `zcash_voting` 4.0.0.
   the designated proposal leaves the roster after its vote reached the chain
   lifecycle, instead of recomputing it from the reduced roster and rejecting
   the plans that carry it.
-- `RoundPlan::immediate_share_key` reports the designation a persisted helper
-  plan carries whenever one exists, so it matches what delivery executes after
-  a roster change.
+- `RoundPlan::immediate_share_key` reports the round's durable designation
+  whenever one exists, so it matches what delivery executes after a roster
+  change; it is derived from the ballot only while no designation exists.
 - Resumed vote work reconciles the chain before any helper-plan preparation;
   plans are loaded or created after confirmation, right before delivery, so
   an open ballot no longer blocks polling or recovery of a dispatched vote.

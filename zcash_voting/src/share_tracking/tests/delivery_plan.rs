@@ -405,7 +405,7 @@ fn a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster() 
 }
 
 #[tokio::test]
-async fn later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan() {
+async fn later_lower_choice_blocks_stale_submission_but_keeps_the_first_designation() {
     let db = db_with_round_and_bundle();
     seed_recoverable_vote_for_proposal(&db, 2, 1);
     let configured = helpers(3);
@@ -433,12 +433,129 @@ async fn later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan(
         .contains("does not match durable ballot intent"));
     assert!(transport.calls().is_empty());
 
-    let error = second
+    // The designation was made when proposal 2's plan was prepared and is
+    // durable: the lower choice recorded afterwards does not move it, so
+    // proposal 2 keeps the immediate share and proposal 1 gets none.
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    let reloaded = second
         .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("does not match durable ballot intent"));
+        .expect("the durable designation still names proposal 2");
+    assert!(reloaded.share_plans[0].immediate);
+    let first = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let first_plan = first
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap();
+    assert!(first_plan.share_plans.iter().all(|plan| !plan.immediate));
+}
+
+#[test]
+fn the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it() {
+    let db = db_with_round_and_bundle();
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    seed_recoverable_vote_for_proposal(&db, 2, 1);
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+
+    // Proposal 2's plan is prepared first. Proposal 1 owns the designation,
+    // so nothing is written yet and proposal 2's shares are not immediate.
+    let second = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 2).unwrap();
+    let second_plan = second
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap();
+    assert!(second_plan.share_plans.iter().all(|plan| !plan.immediate));
+    assert_eq!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &db.wallet_id())
+            .unwrap(),
+        None
+    );
+
+    let first = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let first_plan = first
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap();
+    assert!(first_plan.share_plans[0].immediate);
+    let designation =
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &db.wallet_id())
+            .unwrap()
+            .expect("the designated vote's plan designates the round's share");
+    assert_eq!(
+        (
+            designation.bundle_index,
+            designation.proposal_id,
+            designation.share_index
+        ),
+        (0, 1, 0)
+    );
+
+    // A later plan for the same vote reads the row and writes nothing new.
+    let reloaded = first
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1, 2]))
+        .unwrap();
+    assert_eq!(reloaded.share_plans, first_plan.share_plans);
+}
+
+#[test]
+fn the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation() {
+    let db = db_with_round_and_bundle();
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    // The vote is committed but not yet confirmed: no tree position in the
+    // row, position zero in the recovery JSON, as a fresh cast persists it.
+    db.conn()
+        .execute(
+            "UPDATE votes
+                SET commitment_bundle_json = json_set(commitment_bundle_json, '$.vc_tree_position', 0),
+                    vc_tree_position = NULL
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": db.wallet_id() },
+        )
+        .unwrap();
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let first = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    first
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1]))
+        .unwrap();
+    let wallet_id = db.wallet_id();
+    assert!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &wallet_id)
+            .unwrap()
+            .is_some()
+    );
+
+    // Confirmation fills the tree position in the row and the JSON alike;
+    // the generation is the same, so the designation stays.
+    db.conn()
+        .execute(
+            "UPDATE votes
+                SET commitment_bundle_json = json_set(commitment_bundle_json, '$.vc_tree_position', 7),
+                    vc_tree_position = 7
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": wallet_id },
+        )
+        .unwrap();
+    assert!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &wallet_id)
+            .unwrap()
+            .is_some()
+    );
+
+    // A re-proved vote is another generation: the designation made for the
+    // old one goes with it, as its plan does.
+    db.conn()
+        .execute(
+            "UPDATE votes SET commitment_bundle_json = '{\"vc_tree_position\":7,\"regenerated\":true}',
+                              vc_tree_position = NULL
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! { ":round_id": ROUND_ID, ":wallet_id": wallet_id },
+        )
+        .unwrap();
+    assert_eq!(
+        crate::share_tracking::round_immediate_share(&db.conn(), ROUND_ID, &wallet_id).unwrap(),
+        None
+    );
 }
 
 #[test]

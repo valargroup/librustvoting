@@ -61,6 +61,21 @@ pub(crate) fn vote_phase_is_lifecycle_owned(phase: VotePhase) -> bool {
     LifecyclePosition::of(Some(phase)).is_lifecycle_owned()
 }
 
+/// Whether any vote for `proposal_id` is lifecycle-owned, read on `conn` so
+/// a write path can decide inside its own transaction.
+pub(crate) fn intent_is_lifecycle_owned(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+) -> Result<bool, crate::types::VotingError> {
+    Ok(
+        crate::phases::vote_phases_for_proposal(conn, wallet_id, round_id, proposal_id)?
+            .into_iter()
+            .any(|(_, phase)| vote_phase_is_lifecycle_owned(phase)),
+    )
+}
+
 /// Whether a live vote in `phase` reserves its bundle against a fresh cast:
 /// anything the chain may still act on, plus a hashless dispatch that may
 /// have landed. A rejected vote spent nothing and reserves nothing.

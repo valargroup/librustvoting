@@ -13,7 +13,7 @@ use crate::phases::{
 };
 use crate::session::{load_ballot_intents, Decision};
 use crate::share_policy::ImmediateShareKey;
-use crate::share_tracking::persisted_round_immediate_key;
+use crate::share_tracking::round_immediate_share;
 use crate::storage::queries;
 use crate::types::{ShareDelegationRecord, VotingError};
 use crate::vote::{parse_recovery, VoteRecoveryBundle};
@@ -60,7 +60,7 @@ pub(crate) struct RoundSnapshot {
     pub(crate) share_phases: Vec<(u32, u32, u32, SharePhase)>,
     pub(crate) intents: BTreeMap<u32, Decision>,
     pub(crate) lifecycle_hashes: LifecycleTransactionHashes,
-    /// The immediate share a persisted helper plan designates, if any.
+    /// The round's durable immediate-share designation, if made.
     pub(crate) persisted_immediate_share: Option<ImmediateShareKey>,
 }
 
@@ -125,7 +125,7 @@ pub(crate) fn load_round_snapshot(
         .into_iter()
         .collect();
     let lifecycle_hashes = lifecycle_transaction_hashes(tx, wallet_id, round_id)?;
-    let persisted_immediate_share = persisted_round_immediate_key(tx, round_id, wallet_id)?;
+    let persisted_immediate_share = round_immediate_share(tx, round_id, wallet_id)?;
     Ok(RoundSnapshot {
         round_id: round_id.to_string(),
         delegations,

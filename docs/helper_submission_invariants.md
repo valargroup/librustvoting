@@ -308,13 +308,20 @@ Regression coverage:
    index 0 of the lowest voted proposal ID in the highest eligible bundle
    index. Bundles are value-descending, so this is the lowest-value eligible
    bundle.
-4. The immediate designation is derived from durable ballot choices and is
-   stable across restart and vote completion. Skipped proposals do not
-   participate. Once a persisted plan carries the designation it is also
-   kept when the designated proposal leaves the authenticated roster after
-   its vote reached the chain lifecycle; planning for the remaining roster
-   does not recompute it (`derive_immediate_share`, regression test
-   `a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster`).
+4. The immediate designation is derived from durable ballot choices the
+   first time the designated vote's own plan is prepared, and is then durable
+   state of its own (`round_immediate_share`, schema version 20): stable
+   across restart and vote completion, written once in the plan's
+   transaction, never updated, voided only with the undispatched generation
+   it was made for. Skipped proposals do not participate. Every later plan
+   reads the row and never re-derives it, so a designated proposal that
+   leaves the authenticated roster after its vote reached the chain lifecycle
+   keeps the designation and planning for the remaining roster names no
+   second share (`derive_immediate_share`, regression tests
+   `a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster`,
+   `the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it`,
+   `the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation`,
+   `later_lower_choice_blocks_stale_submission_but_keeps_the_first_designation`).
 5. `immediate = true` and `submit_at = 0` are not equivalent. Last-moment and
    single-share planning can assign `submit_at = 0` to undesignated shares,
    but the designated immediate share MUST always have `submit_at = 0`.

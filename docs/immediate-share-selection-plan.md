@@ -49,10 +49,11 @@ work.
 The host may consume `immediate_share_key` only after every proposal has a
 terminal `Choice` or `Skipped` decision and the user has confirmed submission.
 At that point the set of voted proposals is complete, so the lowest voted
-proposal cannot change. Restarts after final submission therefore derive the
-same key. Integrations that submit proposals incrementally do not satisfy this
-contract and must persist the first designation or otherwise prevent a second
-immediate submission.
+proposal cannot change. The SDK persists the designation the first time the
+designated vote's helper plan is prepared (`round_immediate_share`), and every
+later plan and every `RoundPlan` reads that row rather than re-deriving; a
+choice recorded afterwards, or a proposal leaving the roster, cannot move it.
+The provisional key is therefore only a display value until that point.
 
 The selector should accept the highest eligible bundle index directly instead
 of converting it to a bundle count and subtracting one again.

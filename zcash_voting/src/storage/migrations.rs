@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 19;
+const CURRENT_VERSION: u32 = 20;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -129,11 +129,18 @@ END;",
         18,
         include_str!("migrations/003_hashless_submission.sql"),
     ),
+    // v20 makes the round's immediate helper-share designation a row of its
+    // own, adopted from the version-19 plan markers.
+    (
+        19,
+        include_str!("migrations/004_round_immediate_share.sql"),
+    ),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
 DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
+DROP TABLE IF EXISTS round_immediate_share;
 DROP TABLE IF EXISTS helper_share_plans;
 DROP TABLE IF EXISTS chain_submissions;
 DROP TABLE IF EXISTS share_delegations;
@@ -225,8 +232,9 @@ fn verify_current_chain_submission_schema(conn: &Connection) -> Result<(), Votin
     if chain_submission_schema_fingerprint(conn)? != chain_submission_schema_fingerprint(&expected)?
     {
         return Err(VotingError::Internal {
-            message: "database uses an unsupported chain-submission schema for version 19"
-                .to_string(),
+            message: format!(
+                "database uses an unsupported chain-submission schema for version {CURRENT_VERSION}"
+            ),
         });
     }
     Ok(())
