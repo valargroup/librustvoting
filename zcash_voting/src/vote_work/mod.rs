@@ -5,9 +5,13 @@
 //! durable round plan and the ordering between helper-plan persistence, chain
 //! advancement, confirmation, and helper-share delivery.
 
+mod cast_vote;
+mod delegation_steps;
 mod execution;
 mod round_lock;
+mod step_outcomes;
 mod steps;
+mod vote_completion;
 
 use std::sync::Arc;
 
