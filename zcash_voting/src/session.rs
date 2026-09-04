@@ -491,14 +491,17 @@ pub struct DelegationStatus {
     /// manual handling. May also be present while `SubmissionManaged`
     /// recovers from an ambiguous dispatch.
     pub submission_diagnostic: Option<ChainSubmissionDiagnostic>,
-    /// True when this bundle's delegation has ended and no further delegation
-    /// step will ever be planned for it.
+    /// True when this bundle's delegation ended without a confirmation and no
+    /// further delegation step will ever be planned for it: a terminal
+    /// failure, not a terminal state.
     ///
-    /// A terminal bundle needs manual handling, not a retry: it was either
+    /// Such a bundle needs manual handling, not a retry: it was either
     /// rejected, or dispatched without a usable transaction hash and must not
-    /// be resubmitted. `submission_diagnostic` says which. Hosts cannot derive
-    /// this from `phase` alone, because the wallet-facing phase reports a
-    /// hashless dispatch and a healthy submission the same way.
+    /// be resubmitted. `submission_diagnostic` says which. A `Confirmed`
+    /// bundle is not terminal in this sense: it succeeded, and `phase` says
+    /// so. Hosts cannot derive the failure from `phase` alone, because the
+    /// wallet-facing phase reports a hashless dispatch and a healthy
+    /// submission the same way.
     pub terminal: bool,
 }
 
@@ -726,6 +729,9 @@ fn delegation_statuses(
 }
 
 /// Whether a delegation phase schedules no further work.
+///
+/// Whether a delegation ended without a confirmation and will never be
+/// planned again; `Confirmed` is a success, not a terminal failure.
 ///
 /// Exhaustive on purpose: a new phase must be classified here rather than
 /// defaulting into "retry", which for a hashless dispatch would resubmit a

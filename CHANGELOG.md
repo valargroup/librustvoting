@@ -30,7 +30,8 @@ This release is `zcash_voting` 4.0.0.
   the crate. `start_proving_cache_warmup` starts the process-lifetime key
   warm-up once.
 - `DelegationStatus::terminal` (and its wire view) states outright that a
-  bundle's delegation has ended and no further step will be planned for it.
+  bundle's delegation ended without a confirmation and no further step will
+  be planned for it; a confirmed bundle is a success, not terminal.
   A host cannot derive this from the phase: the wallet-facing
   `WorkflowPhaseView` reports a dispatch that reached the chain without a
   usable transaction hash the same way it reports a healthy submission, and
@@ -67,6 +68,21 @@ This release is `zcash_voting` 4.0.0.
   round step outcome, failure, and progress views, and `PendingShareRoundView`.
 
 ### Changed
+
+- Every bounded chain pass started by `advance_until_terminal_in_epoch`, and
+  by the round executor's recovery driver, captures its operation under the
+  caller's entry epoch, so an epoch change between the caller's check and
+  the pass is refused by the coordinator instead of being adopted.
+- **Breaking:** `DelegationPipeline::voting_db` returns a fresh wallet-scoped
+  `Arc<VotingDb>` instead of a reference to the pipeline's handle.
+- **Breaking:** `DelegationDriver` gains `delegation_target`; the executor
+  refuses a driver whose hotkey target differs from the one derived from
+  `RoundBinding::hotkey_secret` before proving.
+- `RoundPlan::unrostered_intents` (and its wire view) lists durable ballot
+  intents for proposals outside the authenticated roster; `CastVote` is
+  withheld while any exist, and `VotingDb::clear_ballot_intent` removes one.
+- The `RouteHttp` contract now states that implementations must not follow
+  redirects.
 
 - **Breaking:** `RoundExecutor::database` returns a fresh wallet-scoped
   `Arc<VotingDb>` over the executor's connection instead of a reference to
