@@ -1402,6 +1402,7 @@ pub fn resume_plan(
     let intent_classification = classify_ballot_intents(proposal_ids, &intents)?;
 
     let bundles: Vec<u32> = delegation.keys().copied().collect();
+    let roster = intent_classification.roster;
     let choice_proposals = intent_classification.choice_proposals;
     let open_proposals = intent_classification.open_proposals;
     // An unrostered intent whose vote the chain lifecycle owns cannot be
@@ -1576,12 +1577,14 @@ pub fn resume_plan(
 
     // Advancement for votes already on the wire does not depend on ballot
     // intent. A lifecycle-owned or submitted vote whose proposal has no
-    // recorded intent is still the wallet's transaction and must be driven to
+    // recorded intent, or whose intent survives for a proposal the roster no
+    // longer lists, is still the wallet's transaction and must be driven to
     // resolution; a skipped or differing intent was rejected above as a
-    // conflict, so only intent-less proposals reach this pass.
+    // conflict, and rostered proposals were planned above, so only
+    // intent-less and unrostered proposals reach this pass.
     for (&vote_key, &phase) in &votes {
         let (b, pid) = vote_key;
-        if intents.contains_key(&pid)
+        if (intents.contains_key(&pid) && roster.contains(&pid))
             || !matches!(phase, VotePhase::Submitted | VotePhase::SubmissionManaged)
         {
             continue;
@@ -2443,6 +2446,34 @@ mod tests {
                 .iter()
                 .any(|step| matches!(step, NextStep::CastVote { .. })),
             "casting for the current roster must not be withheld: {:?}",
+            plan.next_steps
+        );
+    }
+
+    #[test]
+    fn an_unrostered_submitted_vote_is_still_advanced() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(1), 3)
+            .unwrap();
+        // Proposal 9 was voted and is tracking on chain, then left the roster.
+        db.set_ballot_intent(ROUND, 9, Decision::Choice(1), 3)
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 9, 1, &[0xCC; 16]).unwrap();
+        insert_in_flight_submission(&db, "tracking", "vote", Some(9), Some([0x5A; 32]));
+
+        let plan = resume_plan(&db, ROUND, &[1]).unwrap();
+        assert!(
+            plan.next_steps.iter().any(|step| matches!(
+                step,
+                NextStep::AdvanceVote {
+                    bundle_index: 0,
+                    proposal_id: 9
+                } | NextStep::AdvanceVoteBatch {
+                    bundle_index: 0,
+                    proposal_id: 9
+                }
+            )),
+            "the on-chain submission for a dropped proposal must still be driven to resolution: {:?}",
             plan.next_steps
         );
     }
