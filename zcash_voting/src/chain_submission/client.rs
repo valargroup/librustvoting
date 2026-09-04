@@ -656,6 +656,54 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .await
     }
 
+    /// One bounded pass of `request` for work begun earlier under
+    /// `entry_epoch`; see [`Self::advance_until_terminal_in_epoch`].
+    async fn advance_pass_in_epoch(
+        &self,
+        request: &ChainAdvanceRequest,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+        entry_epoch: u64,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let advancement = match request {
+            ChainAdvanceRequest::Delegation(inner) => StoreAdvancementRequest::delegation(
+                self.identity(
+                    inner.vote_round_id,
+                    inner.bundle_index,
+                    ChainSubmissionTarget::Delegation,
+                )?,
+                inner.spend_auth_signature,
+            ),
+            ChainAdvanceRequest::ImportedDelegation(inner) => {
+                StoreAdvancementRequest::imported_delegation(self.identity(
+                    inner.vote_round_id,
+                    inner.bundle_index,
+                    ChainSubmissionTarget::Delegation,
+                )?)
+            }
+            ChainAdvanceRequest::Vote(inner) => StoreAdvancementRequest::vote(self.identity(
+                inner.vote_round_id,
+                inner.bundle_index,
+                ChainSubmissionTarget::Vote {
+                    proposal_id: inner.proposal_id,
+                },
+            )?),
+            ChainAdvanceRequest::VoteBatch(inner) => StoreAdvancementRequest::vote_batch(
+                self.identity(
+                    inner.vote_round_id,
+                    inner.bundle_index,
+                    ChainSubmissionTarget::VoteBatch {
+                        ordered_batch_digest: inner.ordered_batch_digest,
+                    },
+                )?,
+                inner.ordered_proposal_ids.clone(),
+            )?,
+        };
+        self.coordinator
+            .advance_in_epoch(advancement, recovery, control, entry_epoch)
+            .await
+    }
+
     fn identity(
         &self,
         vote_round_id: [u8; 32],
@@ -706,7 +754,10 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// epoch it captured at its own entry, so a host epoch change during that
     /// work is observed here instead of being recaptured as the episode's
     /// own. The episode ends as `Cancelled` if the control's epoch differs
-    /// from `entry_epoch` at any pass boundary or during the repoll wait.
+    /// from `entry_epoch` at any pass boundary or during the repoll wait, and
+    /// every bounded pass captures its operation under `entry_epoch`, so a
+    /// change between the boundary check and the pass is caught by the
+    /// coordinator rather than adopted.
     pub async fn advance_until_terminal_in_epoch(
         &self,
         request: ChainAdvanceRequest,
@@ -722,22 +773,18 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
                 return Ok(ChainAdvanceOutcome::Cancelled);
             }
             passes += 1;
-            let result = match &request {
-                ChainAdvanceRequest::Delegation(inner) => {
-                    self.advance_delegation_with_recovery(*inner, recovery, control)
-                        .await?
-                }
-                ChainAdvanceRequest::ImportedDelegation(inner) => {
-                    self.advance_imported_delegation(*inner, control).await?
-                }
-                ChainAdvanceRequest::Vote(inner) => {
-                    self.advance_vote_with_recovery(*inner, recovery, control)
-                        .await?
-                }
-                ChainAdvanceRequest::VoteBatch(inner) => {
-                    self.advance_vote_batch_with_recovery(inner.clone(), recovery, control)
-                        .await?
-                }
+            let result = if let ChainAdvanceRequest::ImportedDelegation(_) = &request {
+                // Imported delegations carry no recovery mode.
+                self.advance_pass_in_epoch(
+                    &request,
+                    ChainRecoveryMode::StatusOnly,
+                    control,
+                    entry_epoch,
+                )
+                .await?
+            } else {
+                self.advance_pass_in_epoch(&request, recovery, control, entry_epoch)
+                    .await?
             };
             let pending = match result {
                 ChainSubmissionResult::Confirmed(confirmation) => {

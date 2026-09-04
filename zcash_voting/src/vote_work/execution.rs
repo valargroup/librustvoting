@@ -2,9 +2,10 @@ use crate::{
     session::{resume_plan, VoteRecoveryWorkKind},
     share_tracking::{ShareDeliveryPlanningParams, ShareDeliverySubmissionParams},
     vote::{recover_atomic_vote_batch, CommittedVote},
-    AdvanceVote, AdvanceVoteBatch, ChainRecoveryMode, ChainSubmissionControl,
-    ChainSubmissionFailure, ChainSubmissionFailureKind, ChainSubmissionResult, ChainTransport,
-    VotingError, VotingErrorKind, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
+    AdvanceVote, AdvanceVoteBatch, ChainAdvanceOutcome, ChainAdvancePolicy, ChainAdvanceRequest,
+    ChainRecoveryMode, ChainSubmissionControl, ChainSubmissionFailure, ChainSubmissionFailureKind,
+    ChainSubmissionResult, ChainTransport, VotingError, VotingErrorKind,
+    MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
 
 use super::{
@@ -114,20 +115,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
         if !matches!(work.kind, VoteRecoveryWorkKind::SubmitShares) {
             let round_id = parse_round_id(request.round_id)
                 .map_err(|error| self.voting_failure(error, Some(work.clone()), request))?;
-            let outcome = match work.kind {
-                VoteRecoveryWorkKind::AdvanceVote => {
-                    self.chain_client
-                        .advance_vote_with_recovery(
-                            AdvanceVote {
-                                vote_round_id: round_id,
-                                bundle_index: work.bundle_index,
-                                proposal_id: work.proposal_id,
-                            },
-                            ChainRecoveryMode::ExactTree,
-                            control.chain(),
-                        )
-                        .await
-                }
+            let chain_request = match work.kind {
+                VoteRecoveryWorkKind::AdvanceVote => ChainAdvanceRequest::Vote(AdvanceVote {
+                    vote_round_id: round_id,
+                    bundle_index: work.bundle_index,
+                    proposal_id: work.proposal_id,
+                }),
                 VoteRecoveryWorkKind::AdvanceVoteBatch => {
                     let batch = batch.as_ref().ok_or_else(|| {
                         self.failure(
@@ -139,26 +132,37 @@ impl<T: ChainTransport> RoundExecutor<T> {
                             request,
                         )
                     })?;
-                    self.chain_client
-                        .advance_vote_batch_with_recovery(
-                            AdvanceVoteBatch {
-                                vote_round_id: round_id,
-                                bundle_index: work.bundle_index,
-                                ordered_batch_digest: batch.batch_digest,
-                                ordered_proposal_ids: batch
-                                    .commitments
-                                    .iter()
-                                    .map(|commitment| commitment.proposal_id)
-                                    .collect(),
-                            },
-                            ChainRecoveryMode::ExactTree,
-                            control.chain(),
-                        )
-                        .await
+                    ChainAdvanceRequest::VoteBatch(AdvanceVoteBatch {
+                        vote_round_id: round_id,
+                        bundle_index: work.bundle_index,
+                        ordered_batch_digest: batch.batch_digest,
+                        ordered_proposal_ids: batch
+                            .commitments
+                            .iter()
+                            .map(|commitment| commitment.proposal_id)
+                            .collect(),
+                    })
                 }
                 VoteRecoveryWorkKind::SubmitShares => unreachable!("handled above"),
-            }
-            .map_err(|failure| self.chain_failure(failure, work.clone(), request))?;
+            };
+            // One exact-tree pass, bound to the epoch this pass began under so
+            // an epoch change during helper-plan persistence is observed by
+            // the chain episode instead of adopted by it.
+            let outcome = self
+                .chain_client
+                .advance_until_terminal_in_epoch(
+                    chain_request,
+                    &ChainAdvancePolicy {
+                        initial_recovery_mode: ChainRecoveryMode::ExactTree,
+                        max_passes: 1,
+                        ..ChainAdvancePolicy::default()
+                    },
+                    control.chain(),
+                    control.entry_epoch(),
+                )
+                .await
+                .map(ChainAdvanceOutcome::into_result)
+                .map_err(|failure| self.chain_failure(failure, work.clone(), request))?;
             progress.report(VoteRecoveryProgress::ChainOutcome(outcome.clone()));
             chain_outcome = Some(outcome.clone());
             match outcome {
