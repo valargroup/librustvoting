@@ -8,7 +8,7 @@ use zcash_voting::prelude::{
     RoundHostContext, RoundPlan, RoundRecoverySnapshot, RoundStepDisposition, RoundStepOutcome,
     SignedVoteBatch, VotingDb,
 };
-use zcash_voting::{HyperTransport, RouteHttp};
+use zcash_voting::{HelperTransport, HyperTransport, RouteHttp};
 
 /// Drives one round to its next idle point with the SDK-owned executor.
 ///
@@ -44,20 +44,21 @@ pub async fn advance_round_until_idle<R: RouteHttp>(
     host: impl Fn() -> RoundHostContext,
     control: &ChainSubmissionControl,
 ) -> Result<RoundStepOutcome> {
-    let helper_client = HelperClient::new(
-        Arc::new(HyperTransport::with_shared_route(Arc::clone(&route))),
-        HelperHealth::default(),
-    );
+    // One transport, and so one blocking runtime, serves helpers, the chain,
+    // and the vote tree; each `HyperTransport` owns worker threads.
+    let transport = Arc::new(HyperTransport::with_shared_route(route));
+    let helper_transport: Arc<dyn HelperTransport> = transport.clone();
+    let helper_client = HelperClient::new(helper_transport, HelperHealth::default());
     let executor = RoundExecutor::with_transport(
         voting_db,
-        HyperTransport::with_shared_route(Arc::clone(&route)),
+        Arc::clone(&transport),
         ChainSubmissionClientConfig::for_network(network, chain_endpoints),
         helper_client,
     )
     .map_err(|failure| anyhow::anyhow!(failure.message().to_string()))?
     .with_binding(binding)
     .context("bind round executor")?
-    .with_tree_transport(Arc::new(HyperTransport::with_shared_route(route)));
+    .with_tree_transport(transport);
     loop {
         let outcome = executor
             .advance_next(&host(), control, &NoopRoundStepProgressReporter {})
