@@ -85,12 +85,19 @@ pub(crate) enum Obligation {
         prerequisite: Option<u32>,
     },
     /// A submitted helper share awaits confirmation. One no helper has
-    /// accepted yet cannot be confirmed by polling and blocks the foreground.
+    /// accepted yet blocks the foreground; one no helper has even reached
+    /// (no acceptance, no ambiguous attempt, nothing in flight) cannot be
+    /// confirmed by polling and is delivered again instead.
     Confirm {
         bundle_index: u32,
         proposal_id: u32,
         share_index: u32,
+        /// At least one helper definitely holds the share.
         accepted: bool,
+        /// Some attempt reached a helper with an unknown outcome, or is
+        /// durably reserved and still in flight. Only tracking can classify
+        /// it; redelivery would exclude that helper and make no progress.
+        outcome_unknown: bool,
         prerequisite: Option<u32>,
     },
 }
@@ -437,20 +444,22 @@ pub(crate) fn classify(
         }
         match phase {
             crate::phases::SharePhase::Submitted => {
-                let accepted = snapshot
-                    .shares
-                    .iter()
-                    .find(|share| {
-                        share.bundle_index == bundle_index
-                            && share.proposal_id == proposal_id
-                            && share.share_index == share_index
-                    })
-                    .is_none_or(|share| share.confirmed || !share.sent_to_urls.is_empty());
+                let row = snapshot.shares.iter().find(|share| {
+                    share.bundle_index == bundle_index
+                        && share.proposal_id == proposal_id
+                        && share.share_index == share_index
+                });
+                let accepted =
+                    row.is_none_or(|share| share.confirmed || !share.sent_to_urls.is_empty());
+                let outcome_unknown = row.is_some_and(|share| {
+                    !share.ambiguous_urls.is_empty() || !share.attempting_urls.is_empty()
+                });
                 obligations.push(Obligation::Confirm {
                     bundle_index,
                     proposal_id,
                     share_index,
                     accepted,
+                    outcome_unknown,
                     prerequisite: None,
                 });
             }

@@ -271,14 +271,17 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 proposal_id,
                 share_index,
                 accepted,
+                outcome_unknown,
                 ..
             } => {
-                // A share row no helper has accepted yet (every POST failed
+                // A share row no helper has reached (every POST failed
                 // definitely, or a reservation was cleared before dispatch)
                 // cannot be confirmed by polling: no helper holds it. Deliver
-                // it from its durable plan, unless its vote's own chain work
-                // is still pending, in which case delivery must wait for the
-                // confirmation.
+                // it from its durable plan. A share some helper may hold
+                // (an ambiguous attempt, or one still in flight) is polled:
+                // redelivery excludes those helpers, so only tracking can
+                // classify them and make progress. Delivery also waits while
+                // the vote's own chain work is pending.
                 let chain_pending =
                     classified
                         .obligations
@@ -295,7 +298,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
                             }
                             _ => false,
                         });
-                if !accepted && !chain_pending {
+                let never_reached = !accepted && !outcome_unknown;
+                if never_reached && !chain_pending {
                     return self
                         .run_deliver(&scope, bundle_index, proposal_id, progress)
                         .await;

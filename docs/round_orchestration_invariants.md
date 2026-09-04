@@ -113,7 +113,7 @@ canonical obligations are:
 | `Cast` | bundle | every draft `(proposal_id, choice)` the bundle must cast, the units to retire first, the delegation prerequisite if any |
 | `ReconcileChain` | vote unit | unit id, ordered member proposals, phase, tx hash, the delegation prerequisite if any |
 | `Deliver` | confirmed vote | vote key, tree position, the share indexes owed, whether a durable helper plan already exists |
-| `Confirm` | share | share key |
+| `Confirm` | share | share key; whether a helper accepted it; whether an attempt's outcome is unknown or still in flight |
 | `Blocked` | bundle cast | the reason the host must resolve: an open ballot, or unrostered intents to clear |
 
 An obligation carries everything its execution needs. The executor never
@@ -200,11 +200,17 @@ atomic batch (or one singleton when there is one draft).
 ### Share obligations
 
 - A confirmed vote's expected share indexes come from its recovery bundle.
-  Indexes with no share row, and rows no helper has accepted yet
-  (`sent_to_urls` empty), are `Deliver` work: delivery from the durable plan,
-  not polling, because no helper holds the share.
-- A `Submitted` share row at least one helper accepted is `Confirm` work:
-  polling only.
+  Indexes with no share row are `Deliver` work.
+- A `Submitted` share row is `Confirm` work. It blocks the foreground while
+  no helper has accepted it (`sent_to_urls` empty). Dispatch delivers such a
+  row again from its durable plan only when no helper has reached it at all
+  (no accepted, ambiguous, or in-flight helper): no helper holds it, so
+  polling cannot confirm it. A row with an ambiguous or in-flight attempt is
+  polled: redelivery excludes those helpers and only tracking can classify
+  them
+  (`a_confirm_share_step_for_an_accepted_share_polls_instead_of_delivering`,
+  `a_share_with_only_ambiguous_evidence_is_polled_not_redelivered`,
+  `a_blocking_confirm_share_step_delivers_before_polling`).
 - `Deliver` states whether the vote's durable helper plan exists. A fresh
   cast, and a `ReconcileChain` for a unit that was never dispatched (a cast
   whose plan preparation failed after persistence), make plans durable before
