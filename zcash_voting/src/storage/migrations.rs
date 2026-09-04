@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VotingError;
 
@@ -148,9 +148,7 @@ DROP TABLE IF EXISTS rounds;";
 pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to read database version: {}", e),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("failed to read database version", &e))?;
 
     if version > CURRENT_VERSION {
         return Err(VotingError::Internal {
@@ -165,19 +163,22 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
         return verify_current_chain_submission_schema(conn);
     }
 
-    let tx = conn.transaction().map_err(|e| VotingError::Internal {
-        message: format!("failed to start database migration transaction: {}", e),
-    })?;
+    // Immediate: a deferred transaction takes the write lock lazily on its
+    // first statement, and a read-to-write upgrade that loses the race fails
+    // without invoking the busy handler, so the connection busy timeout would
+    // not cover the schema statements below.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| {
+            VotingError::from_sqlite("failed to start database migration transaction", &e)
+        })?;
 
     if version < LAUNCH_VERSION {
-        tx.execute_batch(RESET_SQL)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to reset pre-launch database schema: {}", e),
-            })?;
+        tx.execute_batch(RESET_SQL).map_err(|e| {
+            VotingError::from_sqlite("failed to reset pre-launch database schema", &e)
+        })?;
         tx.execute_batch(include_str!("migrations/001_init.sql"))
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to create launch database schema: {}", e),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to create launch database schema", &e))?;
     } else {
         // Launched databases hold delegation state that cannot be rebuilt, so
         // they are upgraded in place rather than recreated.
@@ -186,13 +187,15 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
             if *from < upgraded {
                 continue;
             }
-            tx.execute_batch(sql).map_err(|e| VotingError::Internal {
-                message: format!(
-                    "failed to upgrade database schema from version {} to {}: {}",
-                    from,
-                    from + 1,
-                    e
-                ),
+            tx.execute_batch(sql).map_err(|e| {
+                VotingError::from_sqlite(
+                    &format!(
+                        "failed to upgrade database schema from version {} to {}",
+                        from,
+                        from + 1
+                    ),
+                    &e,
+                )
             })?;
             upgraded = from + 1;
         }
@@ -207,12 +210,9 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     }
 
     tx.pragma_update(None, "user_version", CURRENT_VERSION)
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to update database version: {}", e),
-        })?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit database migration: {}", e),
-    })?;
+        .map_err(|e| VotingError::from_sqlite("failed to update database version", &e))?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("failed to commit database migration", &e))?;
 
     Ok(())
 }
@@ -275,10 +275,12 @@ fn normalize_schema_sql(sql: &str) -> String {
     normalized
 }
 
+/// Classifies a SQLite failure raised while inspecting migration state.
+///
+/// Concurrent opens can see `SQLITE_BUSY` here too, so the error must stay
+/// retryable rather than collapsing into `Internal`.
 fn migration_error(error: rusqlite::Error) -> VotingError {
-    VotingError::Internal {
-        message: format!("failed to inspect chain-submission migration state: {error}"),
-    }
+    VotingError::from_sqlite("failed to inspect chain-submission migration state", &error)
 }
 
 #[cfg(test)]

@@ -384,7 +384,7 @@ pub(crate) fn remove_attempting_server_for_generation(
 ///
 /// This raw SQL helper is crate-internal because callers must provide a
 /// nullifier that matches the persisted vote recovery bundle. Wallet
-/// integrations should use `CommittedVote::submit_prepared_shares`, which
+/// integrations should use `ConfirmedVote::submit_prepared_shares`, which
 /// derives that nullifier and owns journal-before-dispatch ordering.
 ///
 /// All reported helper URLs must canonicalize. Existing evidence is merged
@@ -444,8 +444,8 @@ pub(crate) fn record_share_delegation_for_vote_generation(
 ) -> Result<u64, VotingError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to lock committed vote for helper delivery: {e}"),
+        .map_err(|e| {
+            VotingError::from_sqlite("failed to lock committed vote for helper delivery", &e)
         })?;
     let current_commitment_bundle_json: Option<String> = tx
         .query_row(
@@ -486,8 +486,8 @@ pub(crate) fn record_share_delegation_for_vote_generation(
         submit_at,
         &mut || {},
     )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit helper-share generation transaction: {e}"),
+    tx.commit().map_err(|e| {
+        VotingError::from_sqlite("failed to commit helper-share generation transaction", &e)
     })?;
     Ok(submit_at)
 }

@@ -159,6 +159,27 @@ fn test_migrate_idempotent() {
 /// its shape: a fully confirmed vote, a hash-only vote, a delegation-only
 /// bundle, or committed recovery material.
 #[test]
+fn a_busy_schema_transaction_stays_retryable() {
+    // The sidecar open path retries only `DbBusy`, so a `SQLITE_BUSY` raised
+    // while the migration takes the write lock must not be flattened into
+    // `Internal` — that made a concurrent open of an older sidecar fail
+    // outright instead of retrying.
+    let temp = v17_file(|_| {});
+    let holder = Connection::open(temp.path()).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let mut contender = Connection::open(temp.path()).unwrap();
+    // Without a busy timeout the contended write lock fails immediately, which
+    // is the classification this test is about, not the waiting behavior.
+    contender.busy_timeout(std::time::Duration::ZERO).unwrap();
+
+    let error = migrate(&mut contender).unwrap_err();
+
+    assert_eq!(error.kind(), crate::VotingErrorKind::DbBusy);
+    assert!(error.retryable(), "{error}");
+}
+
+#[test]
 fn v17_domain_evidence_is_preserved_and_creates_no_submission_rows() {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&v17_schema()).unwrap();
