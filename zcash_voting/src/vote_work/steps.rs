@@ -64,19 +64,25 @@ impl<T: ChainTransport> RoundExecutor<T> {
     }
 
     /// Runs the first planned step, if any.
+    ///
+    /// The operation epoch is captured before planning, so an epoch change
+    /// while the initial plan waits on the database interrupts the step that
+    /// follows instead of being adopted by it.
     pub async fn advance_next(
         &self,
         host: &RoundHostContext,
         control: &ChainSubmissionControl,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
+        let step_control = StepControl::capture(control);
         let plan = self
             .plan()
             .map_err(|error| self.step_voting_failure(error, None))?;
         let Some(step) = plan.next_steps.first().cloned() else {
             return Ok(self.no_work(None, plan));
         };
-        self.advance_step(step, host, control, progress).await
+        self.advance_step_under(step, host, &step_control, progress)
+            .await
     }
 
     /// Runs one planned step by one bounded pass.
@@ -97,7 +103,18 @@ impl<T: ChainTransport> RoundExecutor<T> {
         control: &ChainSubmissionControl,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        let step_control = StepControl::capture(control);
+        self.advance_step_under(step, host, &StepControl::capture(control), progress)
+            .await
+    }
+
+    /// Runs one step under a control captured by the public entry point.
+    async fn advance_step_under(
+        &self,
+        step: NextStep,
+        host: &RoundHostContext,
+        control: &StepControl<'_>,
+        progress: &dyn RoundStepProgressReporter,
+    ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let wallet_id = self
             .wallet_scope()
             .map(str::to_string)
@@ -112,7 +129,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             }
             _ => None,
         };
-        let Some(_guard) = round_lock::acquire(wallet_id, &round_id, scope, control)
+        let Some(_guard) = round_lock::acquire(wallet_id, &round_id, scope, control.chain())
             .await
             .map_err(|message| {
                 self.step_failure(
@@ -144,7 +161,6 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 ),
             ));
         }
-        let control = &step_control;
         if control.interrupted() {
             return self.step_cancelled(Some(step), None, Vec::new(), None);
         }
