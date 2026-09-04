@@ -677,6 +677,35 @@ fn a_committed_batch_with_a_dropped_member_is_retired_whole_and_recast() {
 }
 
 #[test]
+fn a_batch_whose_every_member_left_the_roster_is_retired_once_and_recast_from_nothing() {
+    let db = db_with_two_bundles();
+    db.set_ballot_intent(ROUND, 5, Decision::Choice(0), 3)
+        .unwrap();
+    db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+    db.store_van_position(ROUND, 0, 7).unwrap();
+    // An undispatched batch {1, 9} on bundle 0; both proposals then left the
+    // roster, which now lists only 5.
+    store_two_action_batch_recovery_fixture_for(&db, (1, 0), (9, 1));
+    assert_eq!(db.vote_phase(ROUND, 0, 1).unwrap(), VotePhase::Committed);
+    assert_eq!(db.vote_phase(ROUND, 0, 9).unwrap(), VotePhase::Committed);
+
+    // The second departed member finds its batch already cleared by the
+    // first; retirement must report both instead of failing the whole
+    // transaction and stranding every later cast on the bundle.
+    assert_eq!(
+        db.retire_undispatched_votes_outside_roster(ROUND, 0, &[5])
+            .unwrap(),
+        vec![1, 9]
+    );
+    assert_ne!(db.vote_phase(ROUND, 0, 1).unwrap(), VotePhase::Committed);
+    assert_ne!(db.vote_phase(ROUND, 0, 9).unwrap(), VotePhase::Committed);
+    assert!(db
+        .retire_undispatched_votes_outside_roster(ROUND, 0, &[5])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn retiring_undispatched_votes_outside_the_roster_leaves_siblings_alone() {
     let db = db_with_two_bundles();
     seed_dropped_proposal_with_mixed_siblings(&db);

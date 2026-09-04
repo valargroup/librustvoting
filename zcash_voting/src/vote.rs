@@ -2670,7 +2670,15 @@ pub(crate) fn retire_undispatched_votes_outside_roster_with_conn(
     drop(stmt);
 
     let mut retired = Vec::new();
+    let mut cleared: Vec<u32> = Vec::new();
     for (proposal_id, recovery) in candidates {
+        // A batch is cleared whole the first time one of its members is
+        // reached; a later departed member of the same batch has nothing
+        // left to load or clear.
+        if cleared.contains(&proposal_id) {
+            retired.push(proposal_id);
+            continue;
+        }
         let batch_digest = recovery.batch.as_ref().map(|batch| batch.digest);
         // Only an explicit lifecycle-owned answer skips the vote; a storage
         // failure propagates with its own classification.
@@ -2700,6 +2708,7 @@ pub(crate) fn retire_undispatched_votes_outside_roster_with_conn(
                         bundle_index,
                         member.proposal_id,
                     )?;
+                    cleared.push(member.proposal_id);
                 }
             }
             None => clear_unsubmitted_vote_recovery_with_conn(
