@@ -1294,4 +1294,40 @@ mod round_executor {
             .unwrap();
         assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
     }
+
+    #[test]
+    fn a_binding_for_a_network_other_than_the_stored_round_is_refused() {
+        // The fixture round is stored for Testnet; the host binds Mainnet with
+        // a Mainnet chain client, which the chain-network check alone accepts.
+        let database = host_database();
+        let helper_client =
+            HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
+        let executor = RoundExecutor::new(
+            database,
+            ChainSubmissionClientConfig::for_network(
+                Network::Mainnet,
+                vec!["https://chain.invalid".to_string()],
+            ),
+            helper_client,
+        )
+        .unwrap();
+
+        let error = executor
+            .with_binding(RoundBinding {
+                round_id: ROUND_ID.to_string(),
+                network: Network::Mainnet,
+                proposals: vec![ProposalRosterEntry {
+                    proposal_id: 1,
+                    num_options: 2,
+                }],
+                hotkey_secret: None,
+            })
+            .err()
+            .expect("the stored round is Testnet");
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("stored for network Testnet"),
+            "{error}"
+        );
+    }
 }

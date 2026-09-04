@@ -467,7 +467,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// # Errors
     ///
     /// Returns [`VotingError::InvalidInput`] for a non-canonical round id, a
-    /// network other than the chain client's, an empty roster, or a repeated
+    /// network other than the chain client's or than the network the wallet
+    /// already stores this round under, an empty roster, or a repeated
     /// proposal id. The network is checked here because chain identity
     /// derivation would otherwise reject it only after proving and helper
     /// plans had already been persisted.
@@ -480,6 +481,27 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     binding.network, self.chain_network
                 ),
             });
+        }
+        // A round this wallet already holds under another network would only
+        // be rejected by prepare_vote_work after CastVote had synced and
+        // cached a tree from the binding's node fleet; refuse it up front.
+        {
+            let conn = self.database.conn();
+            if crate::storage::queries::has_round(&conn, &binding.round_id, &self.wallet_id)? {
+                let stored = crate::storage::queries::load_round_network(
+                    &conn,
+                    &binding.round_id,
+                    &self.wallet_id,
+                )?;
+                if stored != binding.network {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "round {} is stored for network {stored:?} but the binding names {:?}",
+                            binding.round_id, binding.network
+                        ),
+                    });
+                }
+            }
         }
         if binding.proposals.is_empty() {
             return Err(VotingError::InvalidInput {
