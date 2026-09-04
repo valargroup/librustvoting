@@ -68,6 +68,20 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- **Breaking:** `DelegationDriver` gains `wallet_id` and
+  `shares_database_with`. `RoundExecutor` refuses a driver whose wallet or
+  sidecar connection differs from its own frozen scope before invoking any
+  delegation stage. `DelegationPipeline` captures its wallet at construction
+  the same way and exposes it through `wallet_id`.
+- `RoundExecutor::with_binding` rejects an empty or repeated proposal roster
+  with `InvalidInput`; an empty roster previously planned as vacuously
+  decided and skipped the round.
+- `VotingDb::open_wallet_sidecar` keys a bare relative file name through the
+  current directory, so `wallet.db`, `./wallet.db`, and the absolute path share
+  one connection.
+- A PIR URL the transport cannot build is classified as a non-retryable
+  `PirHttpFailurePhase::Build` failure instead of a retryable connect error.
+
 - `wire::VotingErrorKindView::Other` is a Serde catch-all: an error category
   added by a newer crate deserializes into it instead of failing an older
   host's `VotingErrorView` parse.

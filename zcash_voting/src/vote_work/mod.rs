@@ -447,8 +447,36 @@ impl<T: ChainTransport> RoundExecutor<T> {
     }
 
     /// Binds the round, roster, and hotkey the step API operates on.
+    ///
+    /// The roster must be the complete, nonempty, distinct proposal set from
+    /// the authenticated round configuration. An empty roster is rejected
+    /// here because the planner would otherwise treat it as vacuously
+    /// decided and never advertise `CastVote`, silently skipping the round.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] for a non-canonical round id, an
+    /// empty roster, or a repeated proposal id.
     pub fn with_binding(mut self, binding: RoundBinding) -> Result<Self, VotingError> {
         crate::types::validate_vote_round_id_hex(&binding.round_id)?;
+        if binding.proposals.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "round binding requires a nonempty proposal roster".to_string(),
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(repeated) = binding
+            .proposals
+            .iter()
+            .find(|entry| !seen.insert(entry.proposal_id))
+        {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "round binding roster lists proposal {} more than once",
+                    repeated.proposal_id
+                ),
+            });
+        }
         self.binding = Some(binding);
         Ok(self)
     }

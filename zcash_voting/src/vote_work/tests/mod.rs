@@ -135,6 +135,23 @@ mod round_executor {
         bound_executor(database, None)
     }
 
+    fn bound_executor_unbound(
+        database: Arc<crate::round::VotingDb>,
+    ) -> (RoundExecutor<HyperTransport>, Arc<crate::round::VotingDb>) {
+        let helper_client =
+            HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
+        let executor = RoundExecutor::new(
+            Arc::clone(&database),
+            ChainSubmissionClientConfig::for_network(
+                Network::Testnet,
+                vec!["http://chain.invalid".to_string()],
+            ),
+            helper_client,
+        )
+        .unwrap();
+        (executor, database)
+    }
+
     fn bound_executor(
         database: Arc<crate::round::VotingDb>,
         hotkey_secret: Option<zeroize::Zeroizing<Vec<u8>>>,
@@ -789,5 +806,48 @@ mod round_executor {
         )
         .await;
         assert_eq!(requests, 2, "both nodes are tried in order");
+    }
+    #[test]
+    fn a_binding_requires_a_nonempty_distinct_roster() {
+        let binding = |proposals: Vec<ProposalRosterEntry>| RoundBinding {
+            round_id: ROUND_ID.to_string(),
+            network: Network::Testnet,
+            proposals,
+            hotkey_secret: None,
+        };
+        let unbound = || {
+            let (executor, _) = bound_executor_unbound(host_database());
+            executor
+        };
+
+        let error = unbound()
+            .with_binding(binding(Vec::new()))
+            .err()
+            .expect("an empty roster must be rejected");
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("nonempty"), "{error}");
+
+        let error = unbound()
+            .with_binding(binding(vec![
+                ProposalRosterEntry {
+                    proposal_id: 4,
+                    num_options: 2,
+                },
+                ProposalRosterEntry {
+                    proposal_id: 4,
+                    num_options: 3,
+                },
+            ]))
+            .err()
+            .expect("a repeated proposal must be rejected");
+        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("proposal 4"), "{error}");
+
+        assert!(unbound()
+            .with_binding(binding(vec![ProposalRosterEntry {
+                proposal_id: 4,
+                num_options: 2,
+            }]))
+            .is_ok());
     }
 }
