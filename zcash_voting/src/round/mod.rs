@@ -340,10 +340,19 @@ impl VotingDb {
     /// Concurrent opens of one path serialize on that path alone: a slow open
     /// of one sidecar (busy timeout, migrations, retries) never delays an
     /// open of a different sidecar.
+    ///
+    /// An empty `wallet_id` is refused with [`VotingError::InvalidInput`]
+    /// before anything is opened: every wallet-scoped row is keyed by the id,
+    /// so an empty scope would silently read and write no wallet's state.
     pub fn open_wallet_sidecar(
         wallet_db_path: &Path,
         wallet_id: &str,
     ) -> Result<Arc<Self>, VotingError> {
+        if wallet_id.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "wallet id must not be empty".to_string(),
+            });
+        }
         let sidecar_path = Self::wallet_sidecar_path(wallet_db_path);
         let key = sidecar_registry_key(&sidecar_path);
         let (opener, shared) = registered_sidecar(&key);

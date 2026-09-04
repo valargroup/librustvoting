@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::round::{sidecar_registry_key, VotingDb};
+use crate::VotingError;
 
 fn fresh_wallet_path(label: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -113,4 +114,23 @@ fn a_bare_file_name_keys_the_same_connection_as_its_other_spellings() {
     assert!(bare.is_absolute(), "{}", bare.display());
     assert_eq!(bare, dotted);
     assert_eq!(bare, absolute);
+}
+
+#[test]
+fn an_empty_wallet_id_is_refused_before_the_sidecar_is_opened() {
+    let wallet_path = fresh_wallet_path("empty-wallet-id");
+
+    let refused = match VotingDb::open_wallet_sidecar(&wallet_path, "") {
+        Ok(_) => panic!("an empty wallet id must be refused"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(refused, VotingError::InvalidInput { ref message } if message.contains("wallet id")),
+        "expected InvalidInput naming the wallet id, got {refused:?}"
+    );
+    assert!(
+        !VotingDb::wallet_sidecar_path(&wallet_path).exists(),
+        "a refused open must not create the sidecar file"
+    );
 }
