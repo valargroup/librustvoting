@@ -68,6 +68,14 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- `RoundExecutor` steps capture the host's operation epoch on entry and treat
+  an epoch change like cancellation at every boundary where a step decides to
+  continue, including before helper preflight; a session or account switch
+  can no longer dispatch a vote or helper share from a stale invocation.
+- Every `DelegationPipeline` stage verifies that the pipeline's own database
+  handle still selects the wallet captured at construction and fails with
+  `InvalidInput` otherwise.
+
 - **Breaking:** `DelegationDriver` gains `wallet_id` and
   `shares_database_with`. `RoundExecutor` refuses a driver whose wallet or
   sidecar connection differs from its own frozen scope before invoking any

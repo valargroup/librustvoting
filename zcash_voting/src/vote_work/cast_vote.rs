@@ -11,13 +11,13 @@ use crate::{
         SignedVoteBatch, VoteCommitStage, VoteCommitmentRecovery, VoteSigner, VoteWorkRequest,
     },
     wire::DraftVote,
-    ChainSubmissionControl, ChainTransport, VotingError, VotingHotkey,
+    ChainTransport, VotingError, VotingHotkey,
 };
 
 use super::{
-    execution::bounded_message, steps::PROVING_STACK_BYTES, RoundExecutor, RoundHostContext,
-    RoundStepFailure, RoundStepFailureKind, RoundStepOutcome, RoundStepProgress,
-    RoundStepProgressReporter,
+    execution::bounded_message, step_control::StepControl, steps::PROVING_STACK_BYTES,
+    RoundExecutor, RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome,
+    RoundStepProgress, RoundStepProgressReporter,
 };
 
 impl<T: ChainTransport> RoundExecutor<T> {
@@ -27,7 +27,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         bundle_index: u32,
         plan: &RoundPlan,
         host: &RoundHostContext,
-        control: &ChainSubmissionControl,
+        control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let binding = self
@@ -127,7 +127,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                             failure.message, reset_failure.message
                         ));
                     }
-                    if control.is_cancelled() {
+                    if control.interrupted() {
                         return Err(failure);
                     }
                     last_failure = Some(failure);
@@ -146,7 +146,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             })
             .await?
         };
-        if control.is_cancelled() {
+        if control.interrupted() {
             return self.step_cancelled(Some(step), None, Vec::new(), None);
         }
 

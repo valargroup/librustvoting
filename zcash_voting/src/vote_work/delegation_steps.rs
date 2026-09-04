@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use crate::{
     session::NextStep, types::DelegationProgressBridge, AdvanceDelegation, ChainAdvanceRequest,
-    ChainSubmissionControl, ChainTransport,
+    ChainTransport,
 };
 
 use super::{
+    step_control::StepControl,
     steps::{persisted_policy, PROVING_STACK_BYTES},
     RoundExecutor, RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome,
     RoundStepProgress, RoundStepProgressReporter,
@@ -20,7 +21,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         step: NextStep,
         bundle_index: u32,
         host: &RoundHostContext,
-        control: &ChainSubmissionControl,
+        control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let inputs = self.delegation_inputs(&step, host)?;
@@ -76,7 +77,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // The driver emits `PayloadReady` itself and the drain above forwards
         // it, so reporting one here would deliver the terminal event twice.
         let signed = signed.map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        if control.is_cancelled() {
+        if control.interrupted() {
             // Proof, setup, and a provided Keystone signature are durable by
             // now, so the next pass re-dispatches through AdvanceDelegation
             // without proving or asking the device again. The signed bundle
@@ -93,7 +94,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .advance_until_terminal(
                 ChainAdvanceRequest::Delegation(request),
                 &host.chain_policy,
-                control,
+                control.chain(),
             )
             .await
             .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;
@@ -105,7 +106,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         step: NextStep,
         bundle_index: u32,
         host: &RoundHostContext,
-        control: &ChainSubmissionControl,
+        control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let inputs = self.delegation_inputs(&step, host)?;
@@ -134,7 +135,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .advance_until_terminal(
                 ChainAdvanceRequest::Delegation(request),
                 &persisted_policy(host),
-                control,
+                control.chain(),
             )
             .await
             .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;

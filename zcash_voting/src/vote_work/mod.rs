@@ -9,6 +9,7 @@ mod cast_vote;
 mod delegation_steps;
 mod execution;
 mod round_lock;
+mod step_control;
 mod step_outcomes;
 mod steps;
 mod vote_completion;

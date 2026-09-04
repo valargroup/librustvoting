@@ -446,11 +446,19 @@ mod round_executor {
         let _ = RoundStepFailureKind::Busy;
     }
 
-    /// A driver that signs instantly and cancels the host control from inside
-    /// the signing thread, so the executor observes cancellation after the
-    /// payload is signed and before chain dispatch.
+    /// How the mock driver interrupts the host control from inside signing.
+    #[derive(Clone, Copy)]
+    enum Interrupt {
+        Cancel,
+        NewOperationEpoch,
+    }
+
+    /// A driver that signs instantly and interrupts the host control from
+    /// inside the signing thread, so the executor observes the interruption
+    /// after the payload is signed and before chain dispatch.
     struct CancelAfterSigningDriver {
         control: ChainSubmissionControl,
+        interrupt: Interrupt,
         wallet_id: String,
         database: Arc<crate::round::VotingDb>,
     }
@@ -476,7 +484,12 @@ mod round_executor {
             progress: &dyn DelegationProgressReporter,
         ) -> Result<SignedDelegationBundle, VotingError> {
             progress.on_progress(DelegationProgress::PayloadReady);
-            self.control.cancel();
+            match self.interrupt {
+                Interrupt::Cancel => self.control.cancel(),
+                Interrupt::NewOperationEpoch => self
+                    .control
+                    .set_operation_epoch(self.control.operation_epoch() + 1),
+            }
             Ok(SignedDelegationBundle {
                 submission: DelegationSubmission {
                     proof: vec![0x61; 96],
@@ -513,10 +526,20 @@ mod round_executor {
         driver_wallet_id: &str,
         database: &Arc<crate::round::VotingDb>,
     ) -> RoundHostContext {
+        host_with_interrupting_delegation(control, Interrupt::Cancel, driver_wallet_id, database)
+    }
+
+    fn host_with_interrupting_delegation(
+        control: &ChainSubmissionControl,
+        interrupt: Interrupt,
+        driver_wallet_id: &str,
+        database: &Arc<crate::round::VotingDb>,
+    ) -> RoundHostContext {
         RoundHostContext {
             delegation: Some(DelegationStepInputs {
                 driver: Arc::new(CancelAfterSigningDriver {
                     control: control.clone(),
+                    interrupt,
                     wallet_id: driver_wallet_id.to_string(),
                     database: Arc::clone(database),
                 }),
@@ -936,5 +959,35 @@ mod round_executor {
                 num_options: 2,
             }]))
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_delegate_step_stops_when_the_host_moves_to_a_new_operation_epoch() {
+        let executor = executor();
+        decided_ballot(&executor);
+        let control = ChainSubmissionControl::new(7);
+        let step = NextStep::Delegate { bundle_index: 0 };
+
+        let outcome = executor
+            .advance_step(
+                step.clone(),
+                &host_with_interrupting_delegation(
+                    &control,
+                    Interrupt::NewOperationEpoch,
+                    "wallet",
+                    executor.database(),
+                ),
+                &control,
+                &NoopRoundStepProgressReporter {},
+            )
+            .await
+            .unwrap();
+
+        // Not cancelled, but the epoch the step started under is gone: the
+        // step must not dispatch to the chain on behalf of epoch 7.
+        assert!(!control.is_cancelled());
+        assert_eq!(control.operation_epoch(), 8);
+        assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
+        assert!(outcome.delegation.is_some());
     }
 }

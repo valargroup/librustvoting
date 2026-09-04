@@ -19,8 +19,8 @@ use crate::{
 };
 
 use super::{
-    execution::parse_round_id, round_lock, BallotIntent, RoundExecutor, RoundHostContext,
-    RoundStepFailure, RoundStepFailureKind, RoundStepOutcome, RoundStepProgress,
+    execution::parse_round_id, round_lock, step_control::StepControl, BallotIntent, RoundExecutor,
+    RoundHostContext, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome, RoundStepProgress,
     RoundStepProgressReporter,
 };
 
@@ -87,7 +87,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// `InvalidInput` naming that prerequisite, before any lock-scoped work
     /// or network I/O; run the prerequisite first or use `advance_next`.
     /// `Delegate` and `AdvanceDelegation` lock their bundle; every other step
-    /// locks the round.
+    /// locks the round. The operation epoch is captured on entry: cancellation
+    /// or an epoch change is observed at every boundary where the step decides
+    /// to continue, and either ends the step as `Cancelled`.
     pub async fn advance_step(
         &self,
         step: NextStep,
@@ -95,6 +97,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         control: &ChainSubmissionControl,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
+        let step_control = StepControl::capture(control);
         let wallet_id = self
             .wallet_scope()
             .map(str::to_string)
@@ -141,7 +144,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 ),
             ));
         }
-        if control.is_cancelled() {
+        let control = &step_control;
+        if control.interrupted() {
             return self.step_cancelled(Some(step), None, Vec::new(), None);
         }
         progress.report(RoundStepProgress::Selected(step.clone()));
@@ -165,7 +169,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     .advance_until_terminal(
                         ChainAdvanceRequest::ImportedDelegation(request),
                         &persisted_policy(host),
-                        control,
+                        control.chain(),
                     )
                     .await
                     .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;

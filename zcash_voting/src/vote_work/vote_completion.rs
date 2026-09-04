@@ -9,13 +9,14 @@ use crate::{
     },
     vote::{CommittedVote, SignedVoteBatch},
     AdvanceVote, AdvanceVoteBatch, ChainAdvanceOutcome, ChainAdvancePolicy, ChainAdvanceRequest,
-    ChainSubmissionControl, ChainTransport,
+    ChainTransport,
 };
 
 use super::{
-    execution::vote_key, steps::persisted_policy, RoundExecutor, RoundHostContext,
-    RoundStepDisposition, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome,
-    RoundStepProgress, RoundStepProgressReporter, VoteRecoveryRequest, VoteShareDeliveryReport,
+    execution::vote_key, step_control::StepControl, steps::persisted_policy, RoundExecutor,
+    RoundHostContext, RoundStepDisposition, RoundStepFailure, RoundStepFailureKind,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter, VoteRecoveryRequest,
+    VoteShareDeliveryReport,
 };
 
 impl<T: ChainTransport> RoundExecutor<T> {
@@ -27,7 +28,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         bundle_index: u32,
         proposal_id: u32,
         host: &RoundHostContext,
-        control: &ChainSubmissionControl,
+        control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let binding = self
@@ -79,7 +80,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         advance_chain: bool,
         policy: &ChainAdvancePolicy,
         host: &RoundHostContext,
-        control: &ChainSubmissionControl,
+        control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let binding = self
@@ -99,12 +100,17 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let bundle_index = first.bundle_index();
         let first_proposal = first.proposal_id();
 
+        // Proving may have taken minutes; do not start contacting helpers for
+        // a step the host has since cancelled or moved past.
+        if control.interrupted() {
+            return self.step_cancelled(Some(step), None, Vec::new(), None);
+        }
         let preflight = self
             .helper_client
             .preflight_fleet(&host.configured_helper_urls)
             .await
             .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        if control.is_cancelled() {
+        if control.interrupted() {
             return self.step_cancelled(Some(step), None, Vec::new(), None);
         }
         for vote in &votes {
@@ -146,7 +152,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             };
             let outcome = self
                 .chain_client
-                .advance_until_terminal(request, policy, control)
+                .advance_until_terminal(request, policy, control.chain())
                 .await
                 .map_err(|failure| self.step_chain_failure(failure, Some(step.clone())))?;
             let result = outcome.clone().into_result();
@@ -180,7 +186,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
 
         let mut deliveries = Vec::with_capacity(votes.len());
         for vote in votes {
-            if control.is_cancelled() {
+            if control.interrupted() {
                 return self.step_cancelled(Some(step), chain_outcome, deliveries, None);
             }
             // Confirmation updates the durable recovery generation, so recover
@@ -202,7 +208,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     "vote was reported confirmed but its recovery material has no tree position",
                 )
             })?;
-            let cancel = || control.is_cancelled();
+            let cancel = || control.interrupted();
             let delivery = vote
                 .submit_prepared_shares(
                     &self.database,
@@ -254,14 +260,14 @@ impl<T: ChainTransport> RoundExecutor<T> {
         step: NextStep,
         share: ShareKey,
         host: &RoundHostContext,
-        control: &ChainSubmissionControl,
+        control: &StepControl<'_>,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let round_id = self
             .binding()
             .map(|binding| binding.round_id.clone())
             .map_err(|error| self.step_voting_failure(error, Some(step.clone())))?;
-        let cancel = || control.is_cancelled();
+        let cancel = || control.interrupted();
         let report = confirm_pending_share(
             &self.database,
             &ShareConfirmationParams {
@@ -281,7 +287,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         });
         let disposition = if report.confirmed {
             RoundStepDisposition::Advanced
-        } else if control.is_cancelled() {
+        } else if control.interrupted() {
             RoundStepDisposition::Cancelled
         } else {
             RoundStepDisposition::Pending
