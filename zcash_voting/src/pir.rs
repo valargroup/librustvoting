@@ -932,7 +932,7 @@ mod tests {
             },
             "supported_versions": {
                 "pir": ["v0"],
-                "vote_protocol": "v1",
+                "vote_protocol": "v0",
                 "tally": "v0",
                 "vote_server": "v1"
             },
