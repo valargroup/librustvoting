@@ -700,13 +700,17 @@ fn join_chain_url(base_url: &str, segments: &[&str]) -> String {
     url
 }
 
-/// Length above which one unbroken run of encoded characters is treated as
+/// Length from which one unbroken run of encoded characters is treated as
 /// request material rather than as an explanation.
 ///
-/// Set above a 64-character transaction hash, which is public, often the whole
-/// diagnosis, and worth keeping legible, and far below the shortest proof,
-/// signature or address a node could echo back.
-const MAX_SERVER_TEXT_RUN_LENGTH: usize = 96;
+/// One character above a 64-character transaction hash, which is public, often
+/// the whole diagnosis, and worth keeping legible. Everything longer is
+/// request material: the shortest thing a rejecting node can echo out of a
+/// submission is an authorization signature, 64 bytes that
+/// [`crate::wire_codec`] base64-encodes to 88 characters, and a proof or an
+/// address is far longer still. Nothing written for a person to read runs 65
+/// characters without a space or a punctuation mark.
+const MAX_SERVER_TEXT_RUN_LENGTH: usize = 65;
 
 /// Replaces encoded blobs in server-controlled text with a marker, so the
 /// text can be handed to [`ChainSubmissionDiagnostic::from_redacted_message`].
@@ -723,8 +727,7 @@ const MAX_SERVER_TEXT_RUN_LENGTH: usize = 96;
 /// of at least `MAX_SERVER_TEXT_RUN_LENGTH` characters from the hex/base64
 /// alphabet is replaced wherever it appears, and everything around it —
 /// including the punctuation and the prose the diagnostic is kept for —
-/// survives untouched. No natural-language word reaches that length and no
-/// encoded blob stays under it.
+/// survives untouched.
 fn redact_encoded_material(text: &str) -> String {
     let mut redacted = String::with_capacity(text.len());
     let mut run = String::new();

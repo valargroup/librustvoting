@@ -264,3 +264,34 @@ async fn an_encoded_blob_wrapped_in_punctuation_is_redacted() {
         diagnostic.message()
     );
 }
+
+#[tokio::test]
+async fn an_echoed_authorization_signature_is_redacted() {
+    let transport = Arc::new(ScriptedTransport::default());
+    // Exactly what `wire_codec` puts on the wire: a 64-byte authorization
+    // signature, base64-encoded to 88 characters. It is the shortest thing a
+    // node can quote back out of a submission, so it sets the cutoff.
+    let signature = base64_signature();
+    assert_eq!(signature.len(), 88);
+    transport.queue(Ok(json(
+        422,
+        format!(r#"{{"code":7,"log":"bad signature: {signature}"}}"#),
+    )));
+    let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+
+    let PostAttemptOutcome::Rejected { diagnostic, .. } =
+        client.submit_delegation(0, &delegation()).await
+    else {
+        panic!("expected deterministic rejection");
+    };
+    assert_eq!(
+        diagnostic.message(),
+        "vote chain rejected transaction with code 7: bad signature: [redacted]"
+    );
+}
+
+/// A 64-byte signature encoded the way the wire encodes one.
+fn base64_signature() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode([0x5a_u8; 64])
+}
