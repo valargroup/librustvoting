@@ -225,3 +225,39 @@ fn the_mismatch_kind_says_nothing_about_whether_the_bundle_was_broadcast() {
         "{refusal:?}"
     );
 }
+
+/// The rebuild clears the binding before it spends time building a
+/// replacement, so an absent binding is exactly the window in which another
+/// process may have dispatched the old payload. The write refuses there too,
+/// rather than reading `NULL` as proof that this is a first write.
+#[test]
+fn a_write_over_a_cleared_binding_is_refused_once_the_bundle_is_broadcast() {
+    let db = db_with_delegation_setup(1);
+    db.discard_unbroadcast_delegation(ROUND_ID, Some(0))
+        .unwrap();
+    assert_eq!(van_comm_rand_of(&db, 0), None, "the discard clears it");
+    // What a lifecycle call in another process does while the replacement is
+    // being built.
+    insert_chain_submission(&db, 0);
+
+    let error = store_binding(&db, &[0x99; 32]).unwrap_err();
+
+    assert!(
+        matches!(error, VotingError::DelegationAlreadyBroadcast { .. }),
+        "{error:?}"
+    );
+    assert_eq!(van_comm_rand_of(&db, 0), None);
+}
+
+/// The same window with nothing dispatched into it: the rebuild completes,
+/// because the guard is on the evidence and not on the absent binding.
+#[test]
+fn a_write_over_a_cleared_binding_succeeds_when_nothing_was_broadcast() {
+    let db = db_with_delegation_setup(1);
+    db.discard_unbroadcast_delegation(ROUND_ID, Some(0))
+        .unwrap();
+
+    store_binding(&db, &[0x99; 32]).expect("an unbroadcast bundle rebuilds");
+
+    assert_eq!(van_comm_rand_of(&db, 0), Some(vec![0x99; 32]));
+}

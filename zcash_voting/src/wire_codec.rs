@@ -1336,6 +1336,10 @@ impl From<&VotingError> for VotingErrorView {
                 view.http_status = *http_status;
                 view.endpoint = endpoint.clone();
             }
+            VotingError::DelegationTargetMismatch { bundle_index, .. }
+            | VotingError::DelegationAlreadyBroadcast { bundle_index, .. } => {
+                view.bundle_index = Some(*bundle_index);
+            }
             _ => {}
         }
         view

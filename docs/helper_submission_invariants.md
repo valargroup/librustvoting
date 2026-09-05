@@ -1396,18 +1396,18 @@ the owning rows, and foreign-key cascades remove the round's helper plans and
 delivery history as part of that deletion. The records are not selectively
 cleared while their round remains live.
 
-`RoundApi::delete_round` refuses a round that shows broadcast evidence — a
+`VotingDb::delete_round` refuses a round that shows broadcast evidence — a
 delegation transaction hash, a VAN position, a chain submission, a vote, or a
 delivered helper share — so ordinary deletion cannot destroy what recovers a
-round. `RoundApi::delete_round_discarding_recovery` remains the explicit
+round. `VotingDb::delete_round_discarding_recovery` remains the explicit
 per-round escape hatch for a deliberate abandonment and is not refused. Both
 take the round's chain-submission gate before reading the evidence they act on,
 and the checked path re-reads that evidence inside the transaction that
 deletes, so a submission starting concurrently cannot lose its rows.
 
 Enforcement:
-[`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),
-[`RoundApi::delete_round_discarding_recovery`](../zcash_voting/src/round/mod.rs),
+[`VotingDb::delete_round`](../zcash_voting/src/round/mod.rs),
+[`VotingDb::delete_round_discarding_recovery`](../zcash_voting/src/round/mod.rs),
 [`VotingDb::clear_wallet_state`](../zcash_voting/src/storage/operations.rs),
 and the `rounds` foreign-key cascades.
 

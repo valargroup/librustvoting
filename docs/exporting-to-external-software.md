@@ -181,11 +181,11 @@ treated as terminal. If the controller establishes that an exact signed
 transaction cannot confirm and must be replaced, it prepares and retains a
 corrected complete package. Before any vote commitment exists, the voter may
 retain its session metadata and draft choices, call
-`RoundApi::delete_round_discarding_recovery`, import the corrected package, and
+`VotingDb::delete_round_discarding_recovery`, import the corrected package, and
 restore that local state. The all-bundle confirmation barrier keeps this reset
 ahead of irreversible vote state.
 
-The plain `RoundApi::delete_round` refuses a round whose delegation reached the
+The plain `VotingDb::delete_round` refuses a round whose delegation reached the
 network, because its stored setup is the only thing that can reproduce that
 round's voting weight. This reset is the case where that weight is being given
 up deliberately, in exchange for the corrected package, so it takes the

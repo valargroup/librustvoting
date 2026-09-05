@@ -175,10 +175,16 @@ pub enum VotingError {
     /// The stored delegation setup of `bundle_index` does not reproduce from
     /// the voting hotkey the caller supplied.
     ///
-    /// Distinct from `InvalidInput` because it has one correct answer that a
-    /// host can act on: the bundle was never broadcast, so discarding its setup
-    /// and rebuilding it is safe and is the only way forward. Retrying with the
-    /// same key never succeeds.
+    /// A comparison over the stored binding, and nothing more. It is distinct
+    /// from `InvalidInput` because retrying with the same key never succeeds:
+    /// either the caller holds the wrong hotkey for this round, or the bundle
+    /// is rebuilt against the key it does hold. It is not authorization to
+    /// discard anything — a bundle whose delegation is already on chain fails
+    /// this comparison exactly as one that never left the device does, and its
+    /// setup is then the only thing that can reproduce the round's voting
+    /// weight. The message says "if the bundle was never broadcast" for that
+    /// reason, and the discard settles the question itself, refusing with
+    /// [`VotingError::DelegationAlreadyBroadcast`].
     ///
     /// Preparation is the only path that rebuilds, so the message names it. A
     /// host normally never sees this, because proof reuse absorbs it and

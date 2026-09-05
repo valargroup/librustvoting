@@ -1201,12 +1201,17 @@ fn store_delegation_data_inner(
         }
     }
 
-    // Replacing a binding that already exists is the hotkey rebuild, and it
-    // must not run over a bundle whose delegation reached the network: that
-    // bundle's stored setup is the only thing that reproduces its voting
-    // weight. A first write, and an idempotent rewrite of the same binding,
-    // are untouched.
-    if existing_van_comm_rand.is_some_and(|existing| existing != van_comm_rand) {
+    // Any write that is not a rewrite of the binding already stored must not
+    // run over a bundle whose delegation reached the network: that bundle's
+    // stored setup is the only thing that reproduces its voting weight.
+    //
+    // An absent binding is not evidence that this is a first write. The hotkey
+    // rebuild clears the column and only then spends the time to construct a
+    // replacement, so `None` here is exactly the window in which another
+    // process may have dispatched the old payload. Only an identical binding
+    // proves the write changes nothing, and that is the one case skipped.
+    let is_rewrite_of_stored_binding = existing_van_comm_rand.as_deref() == Some(van_comm_rand);
+    if !is_rewrite_of_stored_binding {
         if let Some((index, evidence)) =
             delegation_broadcast_evidence(&tx, round_id, wallet_id, Some(bundle_index))?
         {
@@ -2970,35 +2975,20 @@ pub fn delete_bundles_from(
     // existed carries only a transaction hash or a VAN position, and pruning it
     // would destroy the `van_comm_rand` its spent governance nullifiers make
     // irreplaceable.
-    let protected: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM chain_submissions
-              WHERE round_id = :round_id AND wallet_id = :wallet_id
-                AND bundle_index >= :from_index)
-                OR EXISTS(SELECT 1 FROM bundles
-              WHERE round_id = :round_id AND wallet_id = :wallet_id
-                AND bundle_index >= :from_index
-                AND (delegation_tx_hash IS NOT NULL OR van_leaf_position IS NOT NULL))
-                OR EXISTS(SELECT 1 FROM votes
-              WHERE round_id = :round_id AND wallet_id = :wallet_id
-                AND bundle_index >= :from_index)
-                OR EXISTS(SELECT 1 FROM share_delegations
-              WHERE round_id = :round_id AND wallet_id = :wallet_id
-                AND bundle_index >= :from_index)",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":from_index": from_index as i64,
-            },
-            |row| row.get(0),
-        )
-        .map_err(|error| VotingError::Internal {
-            message: format!("failed to check chain-submission prune guard: {error}"),
-        })?;
-    if protected {
-        return Err(VotingError::Busy {
-            message: "cannot prune bundles protected by chain-submission evidence".to_string(),
-        });
+    //
+    // The refusal is `DelegationAlreadyBroadcast`, not `Busy`: every fact it
+    // reads is durable, so nothing a caller waits for will clear it, and a
+    // host retry loop driven by `retryable()` would spin forever on a
+    // condition that is permanent by construction.
+    if let Some((index, evidence)) =
+        first_broadcast_evidence_from(&tx, round_id, wallet_id, from_index)?
+    {
+        return Err(already_broadcast(
+            round_id,
+            index,
+            evidence,
+            "prune bundles",
+        ));
     }
 
     let rows = tx
@@ -3607,6 +3597,23 @@ impl DelegationBroadcastEvidence {
     }
 }
 
+/// Names of the tables this database actually has, so a guard can tell a table
+/// that is empty from one that does not exist yet.
+fn present_tables(conn: &Connection) -> Result<Vec<String>, VotingError> {
+    let mut statement = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to prepare table listing: {error}"),
+        })?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to list tables: {error}"),
+        })?;
+    Ok(names)
+}
+
 /// The one wording every path uses to refuse a destructive or replacing call
 /// on a round that has already reached the network.
 pub(crate) fn already_broadcast(
@@ -3624,6 +3631,34 @@ pub(crate) fn already_broadcast(
     }
 }
 
+/// Which bundles of a round a broadcast-evidence check covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleScope {
+    /// Every bundle of the round.
+    Round,
+    /// One bundle.
+    One(u32),
+    /// Every bundle from this index upward, the shape a suffix prune deletes.
+    From(u32),
+}
+
+impl BundleScope {
+    fn filter(self) -> &'static str {
+        match self {
+            Self::Round => "",
+            Self::One(_) => "AND bundle_index = :bundle_index",
+            Self::From(_) => "AND bundle_index >= :bundle_index",
+        }
+    }
+
+    fn bound_index(self) -> Option<u32> {
+        match self {
+            Self::Round => None,
+            Self::One(index) | Self::From(index) => Some(index),
+        }
+    }
+}
+
 /// The first broadcast evidence found for a round, or one bundle of it.
 ///
 /// Ordered checks, cheapest and most direct first; the caller only needs to
@@ -3634,46 +3669,81 @@ pub fn delegation_broadcast_evidence(
     wallet_id: &str,
     bundle_index: Option<u32>,
 ) -> Result<Option<(u32, DelegationBroadcastEvidence)>, VotingError> {
-    let bundle_filter = match bundle_index {
-        Some(_) => "AND bundle_index = :bundle_index",
-        None => "",
+    let scope = match bundle_index {
+        Some(index) => BundleScope::One(index),
+        None => BundleScope::Round,
     };
-    let checks: [(&str, DelegationBroadcastEvidence); 5] = [
+    first_broadcast_evidence(conn, round_id, wallet_id, scope)
+}
+
+/// The first broadcast evidence found at or above `from_index`, which is the
+/// scope a suffix prune is about to delete.
+pub(crate) fn first_broadcast_evidence_from(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    from_index: u32,
+) -> Result<Option<(u32, DelegationBroadcastEvidence)>, VotingError> {
+    first_broadcast_evidence(conn, round_id, wallet_id, BundleScope::From(from_index))
+}
+
+fn first_broadcast_evidence(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    scope: BundleScope,
+) -> Result<Option<(u32, DelegationBroadcastEvidence)>, VotingError> {
+    let bundle_filter = scope.filter();
+    let checks: [(&str, &str, DelegationBroadcastEvidence); 5] = [
         (
+            "bundles",
             "SELECT bundle_index FROM bundles
               WHERE round_id = :round_id AND wallet_id = :wallet_id
                 AND delegation_tx_hash IS NOT NULL",
             DelegationBroadcastEvidence::DelegationTxHash,
         ),
         (
+            "bundles",
             "SELECT bundle_index FROM bundles
               WHERE round_id = :round_id AND wallet_id = :wallet_id
                 AND van_leaf_position IS NOT NULL",
             DelegationBroadcastEvidence::VanLeafPosition,
         ),
         (
+            "chain_submissions",
             "SELECT bundle_index FROM chain_submissions
               WHERE round_id = :round_id AND wallet_id = :wallet_id",
             DelegationBroadcastEvidence::ChainSubmission,
         ),
         (
+            "votes",
             "SELECT bundle_index FROM votes
               WHERE round_id = :round_id AND wallet_id = :wallet_id",
             DelegationBroadcastEvidence::Vote,
         ),
         (
+            "share_delegations",
             "SELECT bundle_index FROM share_delegations
               WHERE round_id = :round_id AND wallet_id = :wallet_id",
             DelegationBroadcastEvidence::ShareDelegation,
         ),
     ];
 
-    for (sql, evidence) in checks {
+    // Setup writes run on sidecars that predate some of these tables, so the
+    // guard has to answer for them too. A table this build expects but that
+    // the database has not gained yet holds no evidence of anything, and
+    // saying so is the truthful answer rather than a read error.
+    let present = present_tables(conn)?;
+
+    for (table, sql, evidence) in checks {
+        if !present.iter().any(|name| name == table) {
+            continue;
+        }
         let sql = format!("{sql} {bundle_filter} LIMIT 1");
         let mut statement = conn.prepare(&sql).map_err(|e| VotingError::Internal {
             message: format!("failed to prepare broadcast evidence query: {e}"),
         })?;
-        let found: Option<i64> = match bundle_index {
+        let found: Option<i64> = match scope.bound_index() {
             Some(index) => statement
                 .query_row(
                     named_params! {

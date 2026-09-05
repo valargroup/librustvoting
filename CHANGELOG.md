@@ -467,6 +467,12 @@ This release is `zcash_voting` 4.0.0.
   setup in between and have the replacement written over it. A first write, and
   an idempotent rewrite of the same binding, are unaffected.
 
+- **Breaking:** pruning a bundle suffix that shows broadcast evidence fails
+  with `DelegationAlreadyBroadcast` instead of `Busy`. The evidence is durable,
+  so the old classification told a host retry loop to repeat a call that can
+  never succeed. `VotingErrorView` now carries `bundle_index` for both
+  `DelegationTargetMismatch` and `DelegationAlreadyBroadcast`.
+
 - A chain rejection's diagnostic carries the node's own explanation instead of
   a bare numeric code. The text is server-controlled, so any proof, signature
   or address the node echoed out of the submitted request is replaced with

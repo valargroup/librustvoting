@@ -259,10 +259,13 @@ fn pruning_refuses_every_bundle_that_may_be_on_chain() {
         seed(&db);
 
         let error = db.delete_skipped_bundles(ROUND_ID, 1).unwrap_err();
+        // The evidence is durable, so the refusal must not be the retryable
+        // kind: nothing a caller waits for will ever clear it.
         assert!(
-            matches!(error, VotingError::Busy { .. }),
+            matches!(error, VotingError::DelegationAlreadyBroadcast { .. }),
             "{label}: {error:?}"
         );
+        assert!(!error.retryable(), "{label}");
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 2, "{label}");
         assert_eq!(
             van_comm_rand_of(&db, 1),
