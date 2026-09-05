@@ -133,6 +133,9 @@ pub(crate) struct RoundObligations {
     /// Votes whose stored choice the ballot no longer agrees with. They are
     /// superseded by a cast and reserve nothing.
     pub(crate) stale_vote_keys: BTreeSet<(u32, u32)>,
+    /// The round holds a ballot choice but no bundle rows, so the host must
+    /// persist the bundle plan before any vote work can be planned.
+    pub(crate) needs_bundle_setup: bool,
 }
 
 /// Classifies `units` against `ballot` (the roster and intents already
@@ -525,6 +528,7 @@ pub(crate) fn classify(
         open_proposals,
         unrostered_intents,
         stale_vote_keys,
+        needs_bundle_setup: false,
     })
 }
 

@@ -469,6 +469,9 @@ pub struct RoundPlanView {
     pub completed_for_display: bool,
     pub completed_vote_display: Option<CompletedVoteDisplayView>,
     pub needs_draft_setup: bool,
+    /// True when the round holds a ballot choice but no bundle rows yet, so
+    /// the host must persist the bundle plan before any vote work is planned.
+    pub needs_bundle_setup: bool,
     /// True when delegation work needs fresh or restored wallet signing material.
     ///
     /// Read these derived flags instead of matching `NextStepView::kind`

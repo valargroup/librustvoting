@@ -86,12 +86,21 @@ pub(crate) fn classify_round(
     proposal_ids: &[u32],
 ) -> Result<RoundObligations, VotingError> {
     let ballot = classify_ballot_intents(proposal_ids, &snapshot.intents)?;
+    // A choice is recorded but the round has no bundle rows yet. Eligibility
+    // deliberately does not persist bundles, so a host that records a ballot
+    // before running bundle setup lands here on a fresh round. That is a
+    // resolvable ordering condition, not malformed input: report it as work
+    // the host still owes so the round stays plannable and the remedy is
+    // named, rather than failing every later `plan` call with an opaque
+    // error.
     if !ballot.choice_proposals.is_empty() && snapshot.delegations.is_empty() {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "round {} has ballot choice intent but no eligible bundle rows",
-                snapshot.round_id
-            ),
+        return Ok(RoundObligations {
+            obligations: Vec::new(),
+            choice_proposals: ballot.choice_proposals,
+            open_proposals: ballot.open_proposals,
+            unrostered_intents: ballot.unrostered_intents,
+            stale_vote_keys: Default::default(),
+            needs_bundle_setup: true,
         });
     }
     let units = group_vote_units(snapshot, &snapshot.intents)?;

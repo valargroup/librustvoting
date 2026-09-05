@@ -2726,7 +2726,7 @@ fn skipped_proposal_is_terminal_not_recovery() {
 }
 
 #[test]
-fn choice_intent_without_bundles_is_invalid() {
+fn choice_intent_without_bundles_reports_bundle_setup() {
     let db = VotingDb::open_in_memory().unwrap();
     db.set_wallet_id(W);
     db.create_round(crate::Network::Testnet, &round_params(), None)
@@ -2734,11 +2734,25 @@ fn choice_intent_without_bundles_is_invalid() {
     db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
         .unwrap();
 
-    let err = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap_err();
-    assert!(
-        err.to_string().contains("no eligible bundle rows"),
-        "unexpected error: {err}"
-    );
+    // Eligibility does not persist bundles, so a ballot recorded before
+    // bundle setup must leave the round plannable and name the remedy
+    // instead of failing every later plan call.
+    let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+    assert!(plan.needs_bundle_setup);
+    assert_eq!(plan.primary_action, RoundPlanAction::Delegate);
+    assert!(plan.next_steps.is_empty());
+    assert!(!plan.pending_recovery);
+    // The recorded choice is still reported, so the host does not re-collect it.
+    assert_eq!(plan.open_proposals, vec![1, 3]);
+}
+
+#[test]
+fn choice_intent_with_bundles_does_not_report_bundle_setup() {
+    let db = db_with_bundle();
+    db.set_ballot_intent(ROUND, 1, Decision::Choice(1), 3)
+        .unwrap();
+    let plan = resume_plan(&db, ROUND, &[1]).unwrap();
+    assert!(!plan.needs_bundle_setup);
 }
 
 #[test]

@@ -10,6 +10,14 @@ This release is `zcash_voting` 4.0.0.
 
 ### Added
 
+- `RoundPlan::needs_bundle_setup` reports a round that holds a ballot choice
+  but has no bundle rows yet. Eligibility checks do not persist a bundle
+  plan, so a host that records a ballot before running setup previously made
+  every later `resume_plan` call fail with `InvalidInput`, leaving the round
+  unvotable and naming no remedy. Planning now reports the condition with a
+  `Delegate` primary action and no steps; persist the bundle plan and plan
+  again.
+
 - `RoundExecutor` executes any planner `NextStep` for a bound round: it
   proves and signs delegations through a `DelegationDriver`, re-signs and
   advances in-flight delegations, casts every draft of a bundle (tree sync,
