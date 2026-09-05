@@ -47,7 +47,14 @@ Orchestration owns:
 - executing one obligation per executor call under the right lock, with the
   step's scope captured once and its partial results carried through every
   outcome and failure;
+- composing those calls into a run that ends at a state only the host can
+  resolve, under a stated pacing and failure policy;
 - the round-wide immediate-share designation as durable state.
+
+The last two are separate layers on purpose. `vote_work` executes exactly one
+obligation per call and returns. `round_drive` decides which obligations to run
+and when to stop, and owns no classification of its own. A host supplies
+transports, timing, signing material and cancellation to both.
 
 Orchestration does not own chain submission state, helper delivery mechanics,
 delegation proving, transport, or sidecar identity. It reads their phase
@@ -336,6 +343,89 @@ returned on an outcome is a host-facing projection, not a control input.
 - **Prerequisites are refused at dispatch.** A step whose obligation carries
   a delegation prerequisite fails with `InvalidInput` naming it, before any
   I/O.
+- **A listed step always resolves.** A step the locked plan no longer lists is
+  `NoWork`: another pass finished it. A step that plan *still* lists but that
+  resolves to no obligation is an `InvariantViolation`, because both facts come
+  from the same read and can only disagree if projection and classification
+  have. Answering `NoWork` there would let any caller that re-selects from a
+  refreshed plan loop on it forever, so the refusal lives here rather than in
+  each host's loop.
+
+## Round driving
+
+`round_drive` composes executor calls. It adds no facts about a round; every
+decision about what a step *means* stays in the planner and the executor.
+
+- **Selection is always from a plan the driver read itself.** The plan on a
+  `RoundStepOutcome` is a host-facing projection, not a control input, so it is
+  reported to the host and never used to choose the next step.
+- **The host context is read once per dispatch, not once per run.** A run can
+  take minutes, and a long proof can cross the last-moment or vote-end
+  boundary, so the step that follows plans against the clock it actually runs
+  under. This does not weaken "scope is captured once": each step still
+  captures one context at entry and reads it for its whole duration.
+- **Round-locked obligations never run concurrently; bundle-locked ones may.**
+  The split is the same one the executor uses to choose a lock scope. Two
+  round-locked steps in flight would queue on one lock and gain nothing but a
+  held proving thread. One fresh plan admits an ordered wave of distinct
+  bundle-locked steps up to `max_bundle_concurrency` and the remaining dispatch
+  budget; the wave stops before the first round-locked step. Every admitted
+  step captures its own host context. Results are folded in dispatch order
+  after the complete wave drains, so every durable effect is retained.
+- **Stop-round failure isolation is strictly serial.** When
+  `FailureIsolation::StopRound` is selected, the driver admits one step at a
+  time so no later obligation can already be running when the first failure
+  ends the run. `SkipBundle` uses bounded bundle concurrency.
+- **Failure isolation is per bundle.** Under `SkipBundle` a failed obligation's
+  bundle is skipped for the rest of the run and every other bundle keeps going;
+  every failure is reported together at the end, each with the durable effects
+  its step had already made.
+- **A `Pending` step is re-polled only while its chain work is `Tracking`, or
+  after chain confirmation while helper delivery awaits ambiguous attempts.**
+  An episode that ended in recovery has already escalated to the exact tree
+  once; re-polling it for the rest of the round would hide a stuck submission
+  the host can retry later, so the run stops and names it. A confirmed outcome
+  is not stalled chain recovery: the wait leads to a fresh plan whose share
+  obligations continue helper tracking. The step a re-poll named is dispatched
+  next whenever the refreshed plan still lists it, so a pending submission is
+  not starved by a step that sorts earlier, and the run cannot poll forever:
+  every dispatch, re-polls included, counts against `max_dispatches`.
+- **A recorded failure outranks a healthy-looking handoff.** A run that failed
+  and then finds only background share work left reports the failure, not
+  `BackgroundShareWorkOnly`; the latter reads as "the timer finishes it" and
+  would hide the failure. For the same reason a terminal chain disposition that
+  carries no outcome is reported as a failure rather than as a finished round:
+  the outcome is the only place the rejection survives.
+- **An empty step list is not necessarily success.** Persisted terminal
+  submissions, missing bundle setup, and ballot blockers all project no
+  executable step. The driver reports them in that precedence after recorded
+  failures; only an empty plan with none of those conditions is `NoWorkLeft`.
+- **The dispatch budget is evaluated against a fresh plan.** After the final
+  admitted dispatch or wave, the driver re-plans, refreshes the tally, and
+  prefers natural quiescence when the work completed. If work remains,
+  `PassBudgetExhausted::remaining`, `RoundRunReport::plan`, and the tally all
+  describe that same read. A zero budget still performs and reports one plan.
+- **Missing stored Keystone signatures are a host handoff.** Before admitting
+  signer-requiring bundle work, the driver verifies that **every bundle the
+  round still owes a delegation for** has a durable signature row — not only
+  the ones the current wave would run. A wave is bounded by the concurrency
+  limit, so checking its members alone would prove and broadcast the signed
+  bundles and report the unsigned ones a wave later: the voter would sign in
+  several device rounds, and delegations would already be on the wire before
+  the first of them. Absence yields `NeedsDelegationSignatures` before anything
+  is dispatched; malformed stored material remains an executor failure.
+- **Progress is run-relative and exact.** A proposal is complete when no `Cast`
+  and no `ReconcileChain` obligation covers it, measured against the vote work
+  the run's first plan owed. Obligation membership names every member of an
+  atomic batch, which a host counting `NextStep`s cannot see: a batch projects
+  to one `AdvanceVoteBatch` carrying only its first member's id.
+- **Every event names the step it came from.** `RoundStepProgress::ChainOutcome`
+  and `TreeSynced` carry no subject of their own, so a run that interleaves
+  bundles must attribute them or a host will misread per-bundle progress.
+
+The host-facing projections of a run live in `wire` beside the plan and step
+views, in the same flat serde-stable shape, and are built only from a report
+the driver produced. They are a projection, never a second source of truth.
 
 ## Required conformance coverage
 
@@ -398,6 +488,83 @@ Conformance is demonstrated by behavior. Tests cover:
 - a version 19 sidecar with a marked plan backfills exactly one immutable
   designation row (`v19_immediate_markers_backfill_to_v20`).
 
+### Round driving
+
+- an undecided round stops for the ballot rather than reporting the round
+  finished, and a fully skipped ballot stops with nothing left to do
+  (`a_round_the_voter_has_not_decided_stops_for_the_ballot`,
+  `a_fully_skipped_ballot_stops_with_no_work_left`);
+- a partly decided ballot still runs the bundle's delegation prerequisite,
+  because the planner lists it while the voter decides the rest of the roster
+  (`a_partly_decided_ballot_still_runs_the_delegation_prerequisite`);
+- a delegation obligation with no signing material stops the run naming its
+  bundles, before anything is dispatched
+  (`a_delegation_step_without_signing_material_stops_naming_its_bundles`,
+  `a_missing_stored_keystone_signature_stops_for_the_host`,
+  `stored_keystone_handoff_names_only_unsigned_bundles`), and the handoff names
+  every unsigned bundle before anything is dispatched, including one outside
+  the first wave
+  (`every_unsigned_bundle_is_named_before_anything_is_dispatched`,
+  `the_handoff_names_every_unsigned_bundle_not_only_one_wave`);
+- a choice recorded before bundle persistence stops for bundle setup, and a
+  persisted rejected or hashless submission stops for manual handling rather
+  than reporting success
+  (`a_choice_without_bundles_stops_for_bundle_setup`,
+  `a_rejected_submission_stops_the_run_carrying_its_diagnostic`,
+  `a_persisted_hashless_submission_requires_manual_handling`);
+- cancellation observed before the first plan stops the run without reading one
+  (`a_cancelled_control_stops_before_the_first_plan`), and the dispatch budget
+  reports a fresh plan that still has work while natural quiescence wins after
+  a successful final dispatch
+  (`the_dispatch_budget_stops_a_plan_that_never_shrinks`,
+  `a_final_allowed_dispatch_refreshes_before_deciding_quiescence`);
+- the tally counts every chosen proposal the run starts owing, and a skipped
+  proposal is not a question to complete
+  (`the_tally_counts_every_chosen_proposal_the_run_starts_owing`,
+  `a_skipped_proposal_is_not_a_question_to_complete`);
+- a failed bundle is skipped and the rest of the round still runs, every
+  failure names the bundle it isolated, and the skip is reported as it happens
+  (`a_failed_bundle_is_skipped_and_the_rest_of_the_round_runs`,
+  `a_skipped_bundle_is_reported_as_it_happens`); `StopRound` instead ends at
+  the first failure and isolates nothing
+  (`stop_round_ends_at_the_first_failure`);
+- the re-poll wait is polled rather than slept through, so cancellation or a
+  new operation epoch ends it immediately
+  (`a_cancelled_host_does_not_pay_the_rest_of_the_repoll_wait`,
+  `a_new_operation_epoch_ends_the_repoll_wait`,
+  `the_repoll_wait_runs_to_completion_when_nothing_interrupts`);
+- a tracking submission is polled again after that wait, and a rejected one
+  stops the run carrying its diagnostic
+  (`a_tracking_submission_is_polled_again_after_the_repoll_wait`,
+  `a_rejected_submission_stops_the_run_carrying_its_diagnostic`); one stuck in
+  recovery stops rather than being polled for the rest of the round
+  (`a_submission_stuck_in_recovery_stops_instead_of_being_polled_forever`), and
+  one that never confirms stops at the dispatch budget naming the work it left
+  (`a_submission_that_never_confirms_stops_at_the_dispatch_budget`); confirmed
+  chain work awaiting ambiguous helper attempts is replanned rather than
+  reported as stalled recovery
+  (`confirmed_chain_work_pending_on_helpers_is_replanned_not_stalled`);
+- selection takes plan order, passes over an isolated bundle entirely, and
+  prefers the step a re-poll named while the plan still lists it
+  (`round_drive::tests::selection`);
+- independent bundle-locked steps overlap only up to the configured limit and
+  never overshoot the remaining dispatch budget
+  (`bundle_steps_run_up_to_the_configured_limit`,
+  `one_bundle_slot_keeps_bundle_steps_serial`,
+  `dispatch_budget_is_not_overshot_by_concurrent_launches`);
+- every step observation names its step, including the subjectless chain
+  outcome, and a plan is reported before anything is dispatched
+  (`every_step_observation_names_its_step`,
+  `a_run_reports_its_plan_before_it_dispatches_anything`);
+- an atomic batch counts every ordered member rather than its anchor, and
+  progress is measured against what the run started owing
+  (`a_batch_counts_every_ordered_member_not_just_its_anchor`,
+  `progress_is_measured_against_what_the_run_started_owing`);
+- a share a helper already holds is left to the host's background tracking
+  (`a_share_a_helper_already_holds_is_left_to_background_tracking`), and the
+  default policy is pinned
+  (`the_default_policy_is_the_cadence_hosts_were_driving_by_hand`).
+
 ### Executor
 
 - a failure after chain confirmation carries the chain outcome and the
@@ -405,11 +572,20 @@ Conformance is demonstrated by behavior. Tests cover:
 - the epoch and binding captured at entry are the ones a step uses after a
   long proof even if the host rebinds meanwhile;
 - a step with an unresolved delegation prerequisite is refused before I/O;
+- every step the projection emits resolves back to an obligation
+  (`every_projected_step_resolves_to_the_obligation_it_came_from`), which is
+  what makes an unresolvable listed step an invariant violation rather than a
+  reachable state; a step the plan no longer lists is `NoWork` without network
+  I/O (`empty_plan_and_stale_steps_return_no_work_without_network_io`);
 - a resumed on-wire vote is reconciled with the chain before its helper plan
   is required, even while the ballot is not terminal.
 
 ## Reviewer checklist
 
+- Does the change let anything select a step from a plan it did not read
+  itself? An outcome's plan is a projection, not a control input.
+- Does a new driver decision belong to classification instead? The driver
+  schedules; it does not decide what work a round owes.
 - Does the change add a second place that decides whether a unit is still
   the wallet's to plan? It must use the lifecycle position instead.
 - Does any code path treat a batch member on its own?

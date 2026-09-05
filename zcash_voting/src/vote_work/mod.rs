@@ -11,7 +11,7 @@ mod round_lock;
 mod share_confirmation;
 mod step_control;
 mod step_ledger;
-mod step_outcomes;
+pub(crate) mod step_outcomes;
 mod step_scope;
 mod steps;
 mod vote_completion;

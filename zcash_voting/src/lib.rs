@@ -47,6 +47,7 @@ pub mod prelude;
 pub mod recovery;
 pub mod round;
 pub mod round_auth;
+pub mod round_drive;
 mod round_planning;
 pub mod selection;
 pub mod session;
@@ -117,6 +118,11 @@ pub use pir::{
     PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
 pub use pir::{PirFleet, PirProofSource, PirSession};
+pub use round_drive::{
+    FailureIsolation, NoopRoundDriveReporter, RoundDriveEvent, RoundDrivePolicy,
+    RoundDriveReporter, RoundDriveReporterBridge, RoundDriver, RoundHostSource,
+    RoundHostSourceBridge, RoundQuiescence, RoundRunReport, RoundStepFailureRecord, RoundWorkTally,
+};
 pub use transport::{
     DirectRoute, PirHttpFailure, PirHttpFailurePhase, RouteError, RouteFuture, RouteHttp,
     RoutePhase, RouteRequest, RouteResponse,

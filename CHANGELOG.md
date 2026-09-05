@@ -10,6 +10,34 @@ This release is `zcash_voting` 4.0.0.
 
 ### Added
 
+- `round_drive` composes `RoundExecutor` calls into one run: `RoundDriver::run`
+  re-plans from durable state, dispatches the obligations the plan lists, paces
+  a still-tracking submission by `RoundDrivePolicy::pending_repoll`, isolates
+  failures per bundle, and returns a `RoundRunReport` whose `RoundQuiescence`
+  names the state only the host can resolve — an open ballot, delegation
+  signatures it does not hold, a terminal or stalled chain submission,
+  background share work, cancellation, or nothing left to do. `RoundHostSource`
+  supplies the host context once per dispatch rather than once per run, so a
+  long proof cannot leave the following step planning against a stale clock,
+  and `RoundDriveEvent` names the step every observation came from, which a
+  bare `RoundStepProgress` does not. `RoundWorkTally` reports run-relative
+  ballot progress from obligation membership, so an atomic batch counts as
+  every proposal in it rather than as its anchor alone. Independent
+  bundle-locked delegation work runs up to
+  `RoundDrivePolicy::max_bundle_concurrency`, while round-locked work and
+  `StopRound` failure isolation remain serial. Dispatch-budget reports are
+  taken from a fresh plan after the last allowed wave, and absent per-bundle
+  stored Keystone signatures stop before dispatch as a signature handoff.
+  Empty plans distinguish missing bundle setup and persisted terminal
+  submissions from completed work. A signature handoff names every bundle the
+  round still owes a delegation for, not only the ones the current wave would
+  run, so a voter signs once rather than a wave at a time and nothing is
+  dispatched before the first of them. Hosts previously wrote this loop
+  themselves; `docs/round_orchestration_invariants.md` specifies it. `wire`
+  carries the host-facing projections — `RoundRunReportView`,
+  `RoundQuiescenceView`, `RoundWorkTallyView`, `RoundDriveEventView` and
+  `RoundStepFailureRecordView` — in the same flat, serde-stable shape the other
+  views use, and the prelude exports the driver types.
 - `RoundPlan::needs_bundle_setup` reports a round that holds a ballot choice
   but has no bundle rows yet. Eligibility checks do not persist a bundle
   plan, so a host that records a ballot before running setup previously made
@@ -85,6 +113,13 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- **Breaking:** `RoundExecutor::advance_step` refuses a step that the plan it
+  reads under the lock still lists but that resolves to no obligation, failing
+  with `RoundStepFailureKind::InvariantViolation` instead of returning
+  `NoWork`. A step the plan no longer lists is still `NoWork`. The two facts
+  come from one read and can only disagree if projection and classification
+  have; answering `NoWork` let any host that re-selects from a refreshed plan
+  loop on that step forever, so each host had to guard it itself.
 - **Breaking:** `RoundStepFailureKind` (and its wire view) gains
   `InsufficientEligibility` and `NoSpendableNotes` so hosts can tell an
   eligibility problem from malformed input without parsing messages.
@@ -119,6 +154,12 @@ This release is `zcash_voting` 4.0.0.
   delegation target before the first tree request.
 - The wallet example builds one `HyperTransport` for helpers, the chain, and
   the vote tree.
+- **Breaking:** the wallet example's `advance_round_until_idle` runs over
+  `RoundDriver` instead of its own `advance_next` loop. It takes a
+  `RoundDrivePolicy` and returns a `RoundRunReport`, so a caller reads why the
+  run stopped rather than inferring it from the last outcome's disposition, and
+  `RoundAdvanceError` no longer carries a step failure: the driver isolates
+  failures and keeps them, with their durable effects, in the report.
 
 - `advance_until_terminal` escalates to the exact tree immediately after a
   `Recovering` result; `pending_repoll` paces only `Tracking` polls.

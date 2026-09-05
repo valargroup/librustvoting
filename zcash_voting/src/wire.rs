@@ -816,3 +816,129 @@ pub struct RoundStepProgressView {
     pub share: Option<ShareKeyView>,
     pub share_confirmed: Option<bool>,
 }
+
+/// Discriminator of a [`RoundQuiescenceView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundQuiescenceKind {
+    NoWorkLeft,
+    NeedsBundleSetup,
+    PersistedChainTerminal,
+    NeedsBallot,
+    NeedsDelegationSignatures,
+    BackgroundShareWorkOnly,
+    Cancelled,
+    ChainTerminal,
+    ChainRecoveryStalled,
+    Failures,
+    PassBudgetExhausted,
+}
+
+/// Why one round run stopped, flattened for host bindings.
+///
+/// Each field is populated only for the kinds that carry it; a host switches
+/// on `kind` and reads what that variant names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundQuiescenceView {
+    pub kind: RoundQuiescenceKind,
+    /// `NeedsBallot`: proposals with no terminal decision yet.
+    #[serde(default)]
+    pub open_proposals: Vec<u32>,
+    /// `NeedsBallot`: durable intents outside the roster the host must clear.
+    #[serde(default)]
+    pub unrostered_intents: Vec<u32>,
+    /// `NeedsDelegationSignatures`: every bundle still awaiting a signature.
+    #[serde(default)]
+    pub bundles: Vec<u32>,
+    /// `BackgroundShareWorkOnly`: the shares the host's timer finishes.
+    #[serde(default)]
+    pub shares: Vec<ShareKeyView>,
+    /// `ChainTerminal` and `ChainRecoveryStalled`: the step and its outcome.
+    pub step: Option<NextStepView>,
+    pub chain_outcome: Option<ChainSubmissionOutcomeView>,
+    /// `PassBudgetExhausted`: the work the run left behind.
+    #[serde(default)]
+    pub remaining: Vec<NextStepView>,
+}
+
+/// Ballot progress of one run, measured against what it started owing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundWorkTallyView {
+    pub completed_proposals: u32,
+    pub total_proposals: u32,
+    pub remaining_obligations: u32,
+}
+
+/// One failure a run isolated, with the bundle it skipped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundStepFailureRecordView {
+    pub step: Option<NextStepView>,
+    /// The bundle skipped for the rest of the run, when the failure named one.
+    pub bundle_index: Option<u32>,
+    pub failure: RoundStepFailureView,
+}
+
+/// Everything one round run did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundRunReportView {
+    pub quiescence: RoundQuiescenceView,
+    /// The last plan the run read, absent only when it stopped before one.
+    pub plan: Option<RoundPlanView>,
+    pub tally: RoundWorkTallyView,
+    /// Failures in dispatch order. A non-empty list does not imply a
+    /// `Failures` quiescence: a run can isolate one bundle and finish the rest.
+    #[serde(default)]
+    pub failures: Vec<RoundStepFailureRecordView>,
+    #[serde(default)]
+    pub skipped_bundles: Vec<u32>,
+    #[serde(default)]
+    pub chain_outcomes: Vec<RoundChainOutcomeView>,
+    #[serde(default)]
+    pub share_deliveries: Vec<ShareBatchDeliveryReportView>,
+}
+
+/// A terminal chain outcome bound to the step that produced it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundChainOutcomeView {
+    pub step: NextStepView,
+    pub outcome: ChainSubmissionOutcomeView,
+}
+
+/// Discriminator of a [`RoundDriveEventView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundDriveEventKind {
+    PlanRefreshed,
+    StepSelected,
+    StepProgress,
+    StepFinished,
+    StepFailed,
+    AwaitingRepoll,
+    BundleSkipped,
+}
+
+/// One observation from a run, flattened for host bindings.
+///
+/// Every variant that describes work names its step: a run overlaps bundles,
+/// and a bare progress record carries no subject of its own, so a host reading
+/// one stream would otherwise misattribute it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoundDriveEventView {
+    pub kind: RoundDriveEventKind,
+    /// The step every work-describing variant belongs to.
+    pub step: Option<NextStepView>,
+    /// `PlanRefreshed`: the plan the driver selects from, and its tally.
+    pub plan: Option<RoundPlanView>,
+    pub tally: Option<RoundWorkTallyView>,
+    /// `StepProgress`: progress from inside the running step.
+    pub progress: Option<RoundStepProgressView>,
+    /// `StepFinished`: the executor's own answer for the step.
+    pub disposition: Option<RoundStepDispositionView>,
+    /// `StepFailed`: why it failed.
+    pub failure_kind: Option<RoundStepFailureKindView>,
+    pub message: Option<String>,
+    /// `AwaitingRepoll`: how long the driver waits before polling again.
+    pub delay_seconds: Option<f64>,
+    /// `BundleSkipped`: the bundle isolated for the rest of the run.
+    pub bundle_index: Option<u32>,
+}

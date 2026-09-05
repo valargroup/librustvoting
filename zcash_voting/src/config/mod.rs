@@ -99,10 +99,7 @@ impl Default for WalletCapabilities {
             // Both protocol generations are accepted so one wallet build
             // spans the server rollout: every deployed config advertises v0
             // today, and a config that moves to v1 must not strand it.
-            vote_protocol: vec![
-                VERSION_V0.to_string(),
-                VOTE_PROTOCOL_VERSION_V1.to_string(),
-            ],
+            vote_protocol: vec![VERSION_V0.to_string(), VOTE_PROTOCOL_VERSION_V1.to_string()],
             tally: vec![VERSION_V0.to_string()],
             pir: vec![VERSION_V0.to_string()],
         }
@@ -2077,8 +2074,7 @@ mod tests {
             let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
             let mut dynamic: serde_json::Value =
                 serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
-            dynamic["supported_versions"]["vote_protocol"] =
-                serde_json::json!(advertised);
+            dynamic["supported_versions"]["vote_protocol"] = serde_json::json!(advertised);
             let resolved_static =
                 resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
 

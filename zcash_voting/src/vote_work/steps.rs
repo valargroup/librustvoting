@@ -47,6 +47,19 @@ impl<T: ChainTransport> RoundExecutor<T> {
         resume_plan(&self.database, &binding.round_id, &binding.proposal_ids())
     }
 
+    /// Plans the bound round, keeping the obligations beside the plan.
+    ///
+    /// The obligations name every member of an atomic batch, which the
+    /// projected steps do not: a batch projects to one `AdvanceVoteBatch`
+    /// carrying only its first member's id. The round driver reads them to
+    /// report exact ballot progress.
+    pub(crate) fn plan_classified(&self) -> Result<ClassifiedPlan, VotingError> {
+        self.wallet_scope()?;
+        let binding = self.binding()?;
+        self.ensure_stored_round_network(&binding.round_id, "the binding")?;
+        plan_round_classified(&self.database, &binding.round_id, &binding.proposal_ids())
+    }
+
     /// Records ballot decisions and returns the refreshed plan.
     ///
     /// Option counts come from the bound roster, so a decision for an unknown
@@ -104,7 +117,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
     ///
     /// The step is resolved against a fresh plan under the lock to the
     /// obligation it executes; a step another pass already completed returns
-    /// `NoWork`. A step whose bundle still has a delegation step ahead of it
+    /// `NoWork`. A step that plan still lists but that resolves to no
+    /// obligation is an `InvariantViolation` rather than `NoWork`, so a caller
+    /// re-selecting from a refreshed plan cannot loop on it forever. A step whose bundle still has a delegation step ahead of it
     /// in the plan fails with `InvalidInput` naming that prerequisite, before
     /// any lock-scoped work or network I/O; run the prerequisite first or use
     /// `advance_next`. `Delegate` and `AdvanceDelegation` lock their bundle;
@@ -173,6 +188,30 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let classified = self.classified_plan(&scope)?;
         let Some(obligation) = resolve_step(&classified.obligations.obligations, &scope.step)
         else {
+            // A step this plan no longer lists is benign: another pass, or a
+            // background tracking pass, finished it. A step the plan still
+            // lists but that resolves to no obligation is not: both facts come
+            // from this one read, so they cannot disagree unless projection and
+            // classification have. Answering `NoWork` there invites a caller
+            // that re-selects from a refreshed plan to loop forever, which is
+            // why the loop in `wallet-example` and every host driver would
+            // otherwise need a guard of its own.
+            //
+            // `Obligation::Retire` and `Obligation::Blocked` cannot reach this
+            // branch: they are never projected as steps, so no `NextStep` in
+            // the plan resolves to them.
+            if classified.plan.next_steps.contains(&scope.step) {
+                return Err(self.step_failure(
+                    RoundStepFailureKind::InvariantViolation,
+                    Some(&scope.step),
+                    None,
+                    &ledger,
+                    format!(
+                        "{:?} resolved to no obligation in the plan that still lists it",
+                        scope.step
+                    ),
+                ));
+            }
             return Ok(self.no_work(Some(scope.step), classified.plan));
         };
         if let Some(prerequisite) = blocking_prerequisite(&classified.plan.next_steps, &scope.step)
