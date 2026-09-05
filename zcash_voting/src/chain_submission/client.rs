@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use super::{ChainSubmissionConfirmation, ChainSubmissionDiagnostic, ChainSubmissionPending};
 use crate::{storage::VotingDb, HyperTransport, Network};
 
 use super::{
@@ -63,6 +64,124 @@ pub struct ChainSubmissionClientConfig {
     /// This must contain exactly `maximum_post_attempts - 1` entries. Every
     /// delay must be nonzero and no greater than ten minutes.
     pub retry_backoffs: Vec<Duration>,
+}
+
+/// Default time to track a candidate hash before entering recovery.
+pub const DEFAULT_CHAIN_TRACKING_WINDOW: Duration = Duration::from_secs(90);
+/// Default POST attempts per advancement call.
+pub const DEFAULT_CHAIN_MAXIMUM_POST_ATTEMPTS: usize = 3;
+/// Default delays between the default POST attempts.
+pub const DEFAULT_CHAIN_RETRY_BACKOFFS: [Duration; 2] =
+    [Duration::from_secs(2), Duration::from_secs(4)];
+
+impl ChainSubmissionClientConfig {
+    /// Configuration for `network` with the conventional chain id and the
+    /// SDK's default tracking and retry policy.
+    ///
+    /// `endpoints` are validated when the client is constructed.
+    pub fn for_network(network: Network, endpoints: Vec<String>) -> Self {
+        Self {
+            network,
+            vote_chain_id: network.default_vote_chain_id().to_string(),
+            endpoints,
+            tracking_window: DEFAULT_CHAIN_TRACKING_WINDOW,
+            maximum_post_attempts: DEFAULT_CHAIN_MAXIMUM_POST_ATTEMPTS,
+            retry_backoffs: DEFAULT_CHAIN_RETRY_BACKOFFS.to_vec(),
+        }
+    }
+
+    /// Overrides the chain id, for deployments that publish it in configuration.
+    pub fn with_vote_chain_id(mut self, vote_chain_id: impl Into<String>) -> Self {
+        self.vote_chain_id = vote_chain_id.into();
+        self
+    }
+
+    /// Overrides the tracking window.
+    pub fn with_tracking_window(mut self, tracking_window: Duration) -> Self {
+        self.tracking_window = tracking_window;
+        self
+    }
+
+    /// Overrides the POST budget; `retry_backoffs` must hold `attempts - 1` delays.
+    pub fn with_post_attempts(mut self, attempts: usize, retry_backoffs: Vec<Duration>) -> Self {
+        self.maximum_post_attempts = attempts;
+        self.retry_backoffs = retry_backoffs;
+        self
+    }
+}
+
+/// One chain advancement request in any of its shapes.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum ChainAdvanceRequest {
+    Delegation(AdvanceDelegation),
+    ImportedDelegation(AdvanceImportedDelegation),
+    Vote(AdvanceVote),
+    VoteBatch(AdvanceVoteBatch),
+}
+
+/// Policy for one advancement episode, a finite composition of bounded passes.
+#[derive(Clone, Debug)]
+pub struct ChainAdvancePolicy {
+    /// Recovery mode of the first pass. Fresh submissions can start with
+    /// `StatusOnly`; resumed durable work should start with `ExactTree`.
+    pub initial_recovery_mode: ChainRecoveryMode,
+    /// Delay between passes while the row is `Tracking`.
+    pub pending_repoll: Duration,
+    /// Whether a `Recovering` result escalates to `ExactTree` once.
+    pub escalate_to_exact_tree: bool,
+    /// Passes per episode; `0` means until the row leaves `Tracking`.
+    pub max_passes: usize,
+}
+
+impl Default for ChainAdvancePolicy {
+    fn default() -> Self {
+        Self {
+            initial_recovery_mode: ChainRecoveryMode::StatusOnly,
+            pending_repoll: Duration::from_secs(2),
+            escalate_to_exact_tree: true,
+            max_passes: 45,
+        }
+    }
+}
+
+impl ChainAdvancePolicy {
+    /// Policy for work that is already durable: exact-tree reconciliation
+    /// from the first pass, as the resume planner requires.
+    pub fn for_persisted_work() -> Self {
+        Self {
+            initial_recovery_mode: ChainRecoveryMode::ExactTree,
+            ..Self::default()
+        }
+    }
+}
+
+/// Where an advancement episode ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChainAdvanceOutcome {
+    Confirmed(ChainSubmissionConfirmation),
+    SubmittedWithoutHash(ChainSubmissionDiagnostic),
+    Rejected(ChainSubmissionDiagnostic),
+    /// The episode's pass budget ended, or recovery is exhausted for now;
+    /// schedule another episode.
+    StillPending(ChainSubmissionPending),
+    Cancelled,
+}
+
+impl ChainAdvanceOutcome {
+    /// The last pass result the episode observed.
+    pub fn into_result(self) -> ChainSubmissionResult {
+        match self {
+            Self::Confirmed(confirmation) => ChainSubmissionResult::Confirmed(confirmation),
+            Self::SubmittedWithoutHash(diagnostic) => {
+                ChainSubmissionResult::SubmittedWithoutHash(diagnostic)
+            }
+            Self::Rejected(diagnostic) => ChainSubmissionResult::Rejected(diagnostic),
+            Self::StillPending(pending) => ChainSubmissionResult::Pending(pending),
+            Self::Cancelled => ChainSubmissionResult::Cancelled,
+        }
+    }
 }
 
 /// Host-owned cancellation and session-epoch authority for bounded calls.
@@ -216,7 +335,9 @@ pub struct AdvanceVoteBatch {
 /// bounded pass from [`ChainSubmissionResult`] rather than mutating submission
 /// state directly.
 pub struct ChainSubmissionClient<T> {
-    db: Arc<VotingDb>,
+    /// Wallet captured at construction; every submission identity uses it.
+    /// The store holds the private scoped database handle.
+    wallet_id: String,
     network: Network,
     coordinator:
         ChainSubmissionCoordinator<T, SqliteChainSubmissionStore, SystemChainSubmissionClock>,
@@ -277,14 +398,30 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
                     diagnostic.message(),
                 )
             })?;
-        let store = Arc::new(SqliteChainSubmissionStore::new(Arc::clone(&db)));
+        // Work on a private handle scoped to the wallet selected now. The
+        // caller keeps its own handle, and re-scoping that one must not move
+        // a later pass of an in-flight episode to another wallet's state.
+        let wallet_id = db.wallet_id();
+        let db = Arc::new(db.scoped(&wallet_id).map_err(|error| {
+            ChainSubmissionFailure::without_state(
+                ChainSubmissionFailureKind::InvalidInput,
+                error.to_string(),
+            )
+        })?);
+        let store = Arc::new(SqliteChainSubmissionStore::new(db));
         let coordinator =
             ChainSubmissionCoordinator::new(protocol, store, SystemChainSubmissionClock, policy)?;
         Ok(Self {
-            db,
+            wallet_id,
             network: config.network,
             coordinator,
         })
+    }
+
+    /// The wallet every submission identity is bound to, captured when the
+    /// client was constructed.
+    pub fn wallet_id(&self) -> &str {
+        &self.wallet_id
     }
 
     /// Advances one prepared delegation through one bounded status-only pass.
@@ -537,6 +674,54 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .await
     }
 
+    /// One bounded pass of `request` for work begun earlier under
+    /// `entry_epoch`; see [`Self::advance_until_terminal_in_epoch`].
+    async fn advance_pass_in_epoch(
+        &self,
+        request: &ChainAdvanceRequest,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+        entry_epoch: u64,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let advancement = match request {
+            ChainAdvanceRequest::Delegation(inner) => StoreAdvancementRequest::delegation(
+                self.identity(
+                    inner.vote_round_id,
+                    inner.bundle_index,
+                    ChainSubmissionTarget::Delegation,
+                )?,
+                inner.spend_auth_signature,
+            ),
+            ChainAdvanceRequest::ImportedDelegation(inner) => {
+                StoreAdvancementRequest::imported_delegation(self.identity(
+                    inner.vote_round_id,
+                    inner.bundle_index,
+                    ChainSubmissionTarget::Delegation,
+                )?)
+            }
+            ChainAdvanceRequest::Vote(inner) => StoreAdvancementRequest::vote(self.identity(
+                inner.vote_round_id,
+                inner.bundle_index,
+                ChainSubmissionTarget::Vote {
+                    proposal_id: inner.proposal_id,
+                },
+            )?),
+            ChainAdvanceRequest::VoteBatch(inner) => StoreAdvancementRequest::vote_batch(
+                self.identity(
+                    inner.vote_round_id,
+                    inner.bundle_index,
+                    ChainSubmissionTarget::VoteBatch {
+                        ordered_batch_digest: inner.ordered_batch_digest,
+                    },
+                )?,
+                inner.ordered_proposal_ids.clone(),
+            )?,
+        };
+        self.coordinator
+            .advance_in_epoch(advancement, recovery, control, entry_epoch)
+            .await
+    }
+
     fn identity(
         &self,
         vote_round_id: [u8; 32],
@@ -544,7 +729,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         target: ChainSubmissionTarget,
     ) -> Result<ChainSubmissionIdentity, ChainSubmissionFailure> {
         ChainSubmissionIdentity::new(
-            self.db.wallet_id(),
+            self.wallet_id.clone(),
             self.network,
             vote_round_id,
             bundle_index,
@@ -558,3 +743,180 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         })
     }
 }
+
+impl<T: ChainTransport> ChainSubmissionClient<T> {
+    /// Runs bounded passes until the request reaches a terminal outcome or
+    /// the policy's pass budget ends.
+    ///
+    /// Each iteration is one bounded `advance_*_with_recovery` pass. A
+    /// `Tracking` result waits `pending_repoll` and passes again; a
+    /// `Recovering` result escalates to `ExactTree` at most once per episode
+    /// and otherwise ends the episode as `StillPending`; terminal results are
+    /// never retried. Cancellation, or an operation-epoch change since the
+    /// episode began, is observed between passes and during the repoll wait
+    /// and ends the episode as `Cancelled`.
+    pub async fn advance_until_terminal(
+        &self,
+        request: ChainAdvanceRequest,
+        policy: &ChainAdvancePolicy,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure> {
+        self.advance_until_terminal_in_epoch(request, policy, control, control.operation_epoch())
+            .await
+    }
+
+    /// [`Self::advance_until_terminal`] for an episode that belongs to work
+    /// begun earlier under `entry_epoch`.
+    ///
+    /// A caller that proved or signed before reaching the chain passes the
+    /// epoch it captured at its own entry, so a host epoch change during that
+    /// work is observed here instead of being recaptured as the episode's
+    /// own. The episode ends as `Cancelled` if the control's epoch differs
+    /// from `entry_epoch` at any pass boundary or during the repoll wait, and
+    /// every bounded pass captures its operation under `entry_epoch`, so a
+    /// change between the boundary check and the pass is caught by the
+    /// coordinator rather than adopted.
+    pub async fn advance_until_terminal_in_epoch(
+        &self,
+        request: ChainAdvanceRequest,
+        policy: &ChainAdvancePolicy,
+        control: &ChainSubmissionControl,
+        entry_epoch: u64,
+    ) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure> {
+        // Imported delegations carry no recovery mode.
+        let imported = matches!(request, ChainAdvanceRequest::ImportedDelegation(_));
+        run_episode(policy, control, entry_epoch, |recovery| {
+            let recovery = if imported {
+                ChainRecoveryMode::StatusOnly
+            } else {
+                recovery
+            };
+            self.advance_pass_in_epoch(&request, recovery, control, entry_epoch)
+        })
+        .await
+    }
+}
+
+/// The episode loop over `pass`, one bounded advancement per call.
+///
+/// A `Tracking` result waits `policy.pending_repoll` and passes again; a
+/// `Recovering` result escalates to `ExactTree` at most once per episode and
+/// otherwise ends the episode as `StillPending`; terminal results end the
+/// episode on the pass that produced them; `policy.max_passes` bounds the
+/// passes. Cancellation, or an operation epoch other than `entry_epoch`, is
+/// observed before every pass and during the repoll wait and ends the
+/// episode as `Cancelled`; so is a pass that fails after the host moved on,
+/// since the coordinator refuses a stale epoch inside the pass.
+async fn run_episode<F, Fut>(
+    policy: &ChainAdvancePolicy,
+    control: &ChainSubmissionControl,
+    entry_epoch: u64,
+    mut pass: F,
+) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure>
+where
+    F: FnMut(ChainRecoveryMode) -> Fut,
+    Fut: std::future::Future<Output = Result<ChainSubmissionResult, ChainSubmissionFailure>>,
+{
+    let mut recovery = policy.initial_recovery_mode;
+    let mut escalated = recovery == ChainRecoveryMode::ExactTree;
+    let mut passes = 0usize;
+    loop {
+        if interrupted(control, entry_epoch) {
+            return Ok(ChainAdvanceOutcome::Cancelled);
+        }
+        passes += 1;
+        let result = match pass(recovery).await {
+            Ok(result) => result,
+            // An epoch change between the boundary check and the pass is
+            // refused inside the pass; a host that moved on ends the episode
+            // as cancelled whatever the timing, never as a failed step.
+            Err(_) if interrupted(control, entry_epoch) => {
+                return Ok(ChainAdvanceOutcome::Cancelled)
+            }
+            Err(failure) => return Err(failure),
+        };
+        let pending = match result {
+            ChainSubmissionResult::Confirmed(confirmation) => {
+                return Ok(ChainAdvanceOutcome::Confirmed(confirmation))
+            }
+            ChainSubmissionResult::SubmittedWithoutHash(diagnostic) => {
+                return Ok(ChainAdvanceOutcome::SubmittedWithoutHash(diagnostic))
+            }
+            ChainSubmissionResult::Rejected(diagnostic) => {
+                return Ok(ChainAdvanceOutcome::Rejected(diagnostic))
+            }
+            ChainSubmissionResult::Cancelled => return Ok(ChainAdvanceOutcome::Cancelled),
+            ChainSubmissionResult::Pending(pending) => pending,
+        };
+        let escalating_now = match &pending {
+            ChainSubmissionPending::Recovering { .. } => {
+                if policy.escalate_to_exact_tree && !escalated {
+                    escalated = true;
+                    recovery = ChainRecoveryMode::ExactTree;
+                    true
+                } else {
+                    return Ok(ChainAdvanceOutcome::StillPending(pending));
+                }
+            }
+            ChainSubmissionPending::Tracking { .. } => false,
+        };
+        if policy.max_passes != 0 && passes >= policy.max_passes {
+            return Ok(ChainAdvanceOutcome::StillPending(pending));
+        }
+        // `pending_repoll` paces Tracking polls. Escalating to the exact
+        // tree is a different pass, not a repoll; run it at once.
+        if escalating_now {
+            continue;
+        }
+        if interrupted_during(policy.pending_repoll, control, entry_epoch).await {
+            return Ok(ChainAdvanceOutcome::Cancelled);
+        }
+    }
+}
+
+/// How often a repoll wait re-checks host cancellation. Matches the control
+/// check cadence used by the submission coordinator.
+const REPOLL_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Whether an episode that began under `entry_epoch` must stop: the host
+/// cancelled, or it has moved to another operation epoch since.
+fn interrupted(control: &ChainSubmissionControl, entry_epoch: u64) -> bool {
+    control.is_cancelled() || control.operation_epoch() != entry_epoch
+}
+
+/// Waits `delay` between polling passes, returning early with `true` as soon
+/// as the episode is interrupted (see [`interrupted`]).
+///
+/// `ChainAdvancePolicy::pending_repoll` is host-configured and unbounded, so
+/// an unconditional sleep would defer shutdown or account-switch cancellation
+/// by the whole interval. Interruption is observed within
+/// [`REPOLL_CANCELLATION_CHECK_INTERVAL`] instead.
+async fn interrupted_during(
+    delay: Duration,
+    control: &ChainSubmissionControl,
+    entry_epoch: u64,
+) -> bool {
+    // A host may configure an effectively infinite repoll. An absolute
+    // deadline that far out cannot be represented, so `None` means "wait
+    // until cancelled" rather than overflowing.
+    let deadline = tokio::time::Instant::now().checked_add(delay);
+    loop {
+        if interrupted(control, entry_epoch) {
+            return true;
+        }
+        let remaining = match deadline {
+            Some(deadline) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                deadline - now
+            }
+            None => REPOLL_CANCELLATION_CHECK_INTERVAL,
+        };
+        tokio::time::sleep(remaining.min(REPOLL_CANCELLATION_CHECK_INTERVAL)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests;

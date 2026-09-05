@@ -145,8 +145,26 @@ where
         recovery: ChainRecoveryMode,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let operation_epoch = control.operation_epoch();
+        self.advance_in_epoch(request, recovery, control, operation_epoch)
+            .await
+    }
+
+    /// One bounded pass for work that began earlier under `operation_epoch`.
+    ///
+    /// The captured operation carries that epoch rather than the control's
+    /// current one, so a host epoch change between the caller's own check and
+    /// this pass is observed by the coordinator's interruption checks instead
+    /// of being adopted as the pass's own epoch.
+    pub(super) async fn advance_in_epoch(
+        &self,
+        request: StoreAdvancementRequest,
+        recovery: ChainRecoveryMode,
+        control: &dyn SubmissionControl,
+        operation_epoch: u64,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         let operation =
-            CapturedSubmissionOperation::new(request.identity().clone(), control.operation_epoch());
+            CapturedSubmissionOperation::new(request.identity().clone(), operation_epoch);
         let applicable_identities = request.applicable_identities();
         let lease = self
             .store

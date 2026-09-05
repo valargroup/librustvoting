@@ -1,8 +1,8 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 19;
+const CURRENT_VERSION: u32 = 20;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -129,11 +129,18 @@ END;",
         18,
         include_str!("migrations/003_hashless_submission.sql"),
     ),
+    // v20 makes the round's immediate helper-share designation a row of its
+    // own, adopted from the version-19 plan markers.
+    (
+        19,
+        include_str!("migrations/004_round_immediate_share.sql"),
+    ),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
 DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
+DROP TABLE IF EXISTS round_immediate_share;
 DROP TABLE IF EXISTS helper_share_plans;
 DROP TABLE IF EXISTS chain_submissions;
 DROP TABLE IF EXISTS share_delegations;
@@ -148,9 +155,7 @@ DROP TABLE IF EXISTS rounds;";
 pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to read database version: {}", e),
-        })?;
+        .map_err(|e| VotingError::from_sqlite("failed to read database version", &e))?;
 
     if version > CURRENT_VERSION {
         return Err(VotingError::Internal {
@@ -165,19 +170,22 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
         return verify_current_chain_submission_schema(conn);
     }
 
-    let tx = conn.transaction().map_err(|e| VotingError::Internal {
-        message: format!("failed to start database migration transaction: {}", e),
-    })?;
+    // Immediate: a deferred transaction takes the write lock lazily on its
+    // first statement, and a read-to-write upgrade that loses the race fails
+    // without invoking the busy handler, so the connection busy timeout would
+    // not cover the schema statements below.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| {
+            VotingError::from_sqlite("failed to start database migration transaction", &e)
+        })?;
 
     if version < LAUNCH_VERSION {
-        tx.execute_batch(RESET_SQL)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to reset pre-launch database schema: {}", e),
-            })?;
+        tx.execute_batch(RESET_SQL).map_err(|e| {
+            VotingError::from_sqlite("failed to reset pre-launch database schema", &e)
+        })?;
         tx.execute_batch(include_str!("migrations/001_init.sql"))
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to create launch database schema: {}", e),
-            })?;
+            .map_err(|e| VotingError::from_sqlite("failed to create launch database schema", &e))?;
     } else {
         // Launched databases hold delegation state that cannot be rebuilt, so
         // they are upgraded in place rather than recreated.
@@ -186,13 +194,15 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
             if *from < upgraded {
                 continue;
             }
-            tx.execute_batch(sql).map_err(|e| VotingError::Internal {
-                message: format!(
-                    "failed to upgrade database schema from version {} to {}: {}",
-                    from,
-                    from + 1,
-                    e
-                ),
+            tx.execute_batch(sql).map_err(|e| {
+                VotingError::from_sqlite(
+                    &format!(
+                        "failed to upgrade database schema from version {} to {}",
+                        from,
+                        from + 1
+                    ),
+                    &e,
+                )
             })?;
             upgraded = from + 1;
         }
@@ -207,12 +217,9 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     }
 
     tx.pragma_update(None, "user_version", CURRENT_VERSION)
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to update database version: {}", e),
-        })?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit database migration: {}", e),
-    })?;
+        .map_err(|e| VotingError::from_sqlite("failed to update database version", &e))?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("failed to commit database migration", &e))?;
 
     Ok(())
 }
@@ -225,8 +232,9 @@ fn verify_current_chain_submission_schema(conn: &Connection) -> Result<(), Votin
     if chain_submission_schema_fingerprint(conn)? != chain_submission_schema_fingerprint(&expected)?
     {
         return Err(VotingError::Internal {
-            message: "database uses an unsupported chain-submission schema for version 19"
-                .to_string(),
+            message: format!(
+                "database uses an unsupported chain-submission schema for version {CURRENT_VERSION}"
+            ),
         });
     }
     Ok(())
@@ -275,10 +283,12 @@ fn normalize_schema_sql(sql: &str) -> String {
     normalized
 }
 
+/// Classifies a SQLite failure raised while inspecting migration state.
+///
+/// Concurrent opens can see `SQLITE_BUSY` here too, so the error must stay
+/// retryable rather than collapsing into `Internal`.
 fn migration_error(error: rusqlite::Error) -> VotingError {
-    VotingError::Internal {
-        message: format!("failed to inspect chain-submission migration state: {error}"),
-    }
+    VotingError::from_sqlite("failed to inspect chain-submission migration state", &error)
 }
 
 #[cfg(test)]

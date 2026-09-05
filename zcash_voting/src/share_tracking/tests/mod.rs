@@ -352,7 +352,10 @@ fn recovery_bundle_fixture() -> VoteRecoveryBundle {
 }
 
 /// Builds a round holding one recoverable vote and one recorded share.
-fn db_with_share(sent_to_urls: &[String]) -> VotingDb {
+/// A wallet with one recoverable vote (round `0101..`, bundle 0, proposal 1,
+/// choice 2 of 3) whose share 0 is durably recorded as sent to `sent_to_urls`;
+/// an empty list is a share no helper has accepted yet.
+pub(crate) fn db_with_share(sent_to_urls: &[String]) -> VotingDb {
     db_with_delivery(sent_to_urls, &[], sent_to_urls.len())
 }
 
@@ -577,6 +580,7 @@ async fn submit_initial_share_to_candidates(
     .unwrap()
 }
 
+mod batch_report;
 mod confirmation;
 mod delivery_plan;
 mod initial_delivery;

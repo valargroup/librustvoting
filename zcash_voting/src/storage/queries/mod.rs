@@ -1123,31 +1123,28 @@ fn store_delegation_data_inner(
     };
     if let Some(existing_secrets) = existing_secrets {
         if existing_secrets != secrets_blob {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "refusing to overwrite padded_note_secrets for round={}, bundle={}",
-                    round_id, bundle_index
-                ),
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::PaddedNoteSecrets,
             });
         }
     }
     if let Some(existing_sighash) = existing_sighash {
         if existing_sighash != pczt_sighash {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "refusing to overwrite pczt_sighash for round={}, bundle={}",
-                    round_id, bundle_index
-                ),
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::PcztSighash,
             });
         }
     }
     if let (Some(existing_tx1_effects), Some(tx1_effects)) = (existing_tx1_effects, tx1_effects) {
         if existing_tx1_effects != tx1_effects {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "refusing to overwrite tx1_effects for round={}, bundle={}",
-                    round_id, bundle_index
-                ),
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::Tx1Effects,
             });
         }
     }
@@ -2935,9 +2932,8 @@ pub fn delete_bundles_from(
             message: format!("failed to clear bundle policy after deleting all bundles: {e}"),
         })?;
     }
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("failed to commit bundle deletion: {e}"),
-    })?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("failed to commit bundle deletion", &e))?;
     Ok(rows as u64)
 }
 
@@ -3168,6 +3164,93 @@ pub fn get_vote_tx_hash(
     .map_err(|e| VotingError::Internal {
         message: format!("failed to get vote tx hash: {}", e),
     })
+}
+
+/// One vote row as round planning reads it: the stored choice, the
+/// version-17 projection columns, and the raw recovery JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VoteRecoveryRow {
+    pub(crate) bundle_index: u32,
+    pub(crate) proposal_id: u32,
+    pub(crate) choice: u32,
+    pub(crate) tx_hash: Option<String>,
+    pub(crate) vc_tree_position: Option<i64>,
+    pub(crate) commitment_bundle_json: Option<String>,
+}
+
+/// Every vote row of one wallet's round, ordered by bundle then proposal.
+pub(crate) fn vote_recovery_rows(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<VoteRecoveryRow>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, proposal_id, choice, tx_hash, vc_tree_position,
+                    commitment_bundle_json
+             FROM votes
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+             ORDER BY bundle_index, proposal_id",
+        )
+        .map_err(|e| VotingError::from_sqlite("prepare vote recovery rows", &e))?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok(VoteRecoveryRow {
+                    bundle_index: row.get::<_, i64>(0)? as u32,
+                    proposal_id: row.get::<_, i64>(1)? as u32,
+                    choice: row.get::<_, i64>(2)? as u32,
+                    tx_hash: row.get(3)?,
+                    vc_tree_position: row.get(4)?,
+                    commitment_bundle_json: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("query vote recovery rows", &e))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::from_sqlite("read vote recovery row", &e))
+}
+
+/// One bundle row as round planning reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BundlePlanningRow {
+    pub(crate) bundle_index: u32,
+    /// The bundle came from a delegation capability import: it omits local
+    /// note selection, which locally prepared bundles always persist.
+    pub(crate) capability_imported: bool,
+    /// The version-17 projection of the delegation transaction hash.
+    pub(crate) delegation_tx_hash: Option<String>,
+}
+
+/// Every bundle row of one wallet's round, ordered by bundle index.
+pub(crate) fn bundle_planning_rows(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<BundlePlanningRow>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, note_positions_blob IS NULL, delegation_tx_hash
+             FROM bundles
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+             ORDER BY bundle_index",
+        )
+        .map_err(|e| VotingError::from_sqlite("prepare bundle planning rows", &e))?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok(BundlePlanningRow {
+                    bundle_index: row.get::<_, i64>(0)? as u32,
+                    capability_imported: row.get::<_, i64>(1)? != 0,
+                    delegation_tx_hash: row.get(2)?,
+                })
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("query bundle planning rows", &e))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::from_sqlite("read bundle planning row", &e))
 }
 
 pub fn get_commitment_bundle(

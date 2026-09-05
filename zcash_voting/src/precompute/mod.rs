@@ -14,10 +14,7 @@
 pub(crate) use crate::backend::{pasta_curves, zcash_client_sqlite};
 use std::borrow::Borrow;
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::sync::Arc;
 
 use zcash_client_sqlite::WalletDb;
 
@@ -33,8 +30,9 @@ use crate::{delegate::PreparedDelegationReport, round::BundleLayout, types::Netw
 
 pub use crate::vote::VanWitness;
 
-static VOTE_TREE_SYNCS: OnceLock<Mutex<HashMap<String, Arc<crate::tree_sync::VoteTreeSync>>>> =
-    OnceLock::new();
+mod vote_tree_registry;
+
+pub(crate) use vote_tree_registry::vote_tree_for;
 
 /// Result of PIR precomputation for one delegation bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,23 +118,71 @@ pub fn verify_witness(witness: &WitnessData) -> Result<(), VotingError> {
 ///
 /// For each confirmed bundle that has not yet submitted a vote, this also
 /// verifies that the confirmed event position contains its delegation VAN.
+///
+/// This asks for no particular route. It continues on whichever of the
+/// wallet's tree clients already holds the round, so incremental state is
+/// kept, and otherwise on the client most recently used: a wallet a host
+/// routed over its own transport is never downgraded to the direct HTTP
+/// transport. Use [`sync_vote_tree_with`] to require a specific route.
 pub fn sync_vote_tree(db: &VotingDb, round_id: &str, node_url: &str) -> Result<u32, VotingError> {
-    vote_tree_sync_for(db)?.sync(db, round_id, node_url)
+    vote_tree_registry::vote_tree_for_round(db, round_id)?.sync(db, round_id, node_url)
+}
+
+/// Same as [`sync_vote_tree`], but the wallet's tree client routes over
+/// `transport`.
+///
+/// The process keeps one tree client per wallet and transport. A sync over a
+/// transport the wallet has not used before gets its own client and resyncs
+/// from scratch; the clients of other transports, and their synced state,
+/// are untouched. Pass the same transport on every call for a wallet to keep
+/// the incremental state; hosts that clone one `Arc` per wallet already do.
+///
+/// A routed client is retained after every caller-owned clone of its
+/// transport is gone for as long as it holds any round's tree state, so a
+/// sync followed by [`van_witness`] works even when the transport was moved
+/// into the call. Until that state is dropped, an unrouted [`sync_vote_tree`]
+/// for one of its rounds continues on it. To release the route, reset its
+/// rounds with [`reset_vote_tree`] (a round id, or `""` for the wallet); the
+/// client is also dropped when the last connection to the sidecar closes.
+pub fn sync_vote_tree_with(
+    db: &VotingDb,
+    round_id: &str,
+    node_url: &str,
+    transport: Arc<dyn vote_commitment_tree_client::transport::Transport>,
+) -> Result<u32, VotingError> {
+    vote_tree_for(db, Some(transport))?.sync(db, round_id, node_url)
 }
 
 /// Generates the VAN witness needed by `vote::commit`.
+///
+/// Served by the wallet's tree client that holds the round, synced furthest,
+/// so a witness after [`sync_vote_tree`] uses that sync's state even when
+/// another executor for the wallet synced over a different transport in
+/// between.
 pub fn van_witness(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
     anchor_height: u32,
 ) -> Result<VanWitness, VotingError> {
-    vote_tree_sync_for(db)?.generate_van_witness(db, round_id, bundle_index, anchor_height)
+    vote_tree_registry::vote_tree_for_round(db, round_id)?.generate_van_witness(
+        db,
+        round_id,
+        bundle_index,
+        anchor_height,
+    )
 }
 
 /// Drops cached vote tree state for one round, or all rounds when `round_id` is empty.
+///
+/// A round-scoped reset drops the round on every tree client the wallet has,
+/// whatever transport each is bound to. An account-wide reset also forgets
+/// the clients and their transports, so the next sync binds afresh.
 pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError> {
-    vote_tree_sync_for(db)?.reset(round_id)
+    if round_id.is_empty() {
+        return vote_tree_registry::forget_wallet(db);
+    }
+    vote_tree_registry::reset_round(db, round_id)
 }
 
 /// Drops cached vote tree state and, for round-scoped resets, clears locally
@@ -163,18 +209,14 @@ pub fn reset_voting_session_state(db: &VotingDb, round_id: &str) -> Result<(), V
     Ok(())
 }
 
-fn vote_tree_sync_for(db: &VotingDb) -> Result<Arc<crate::tree_sync::VoteTreeSync>, VotingError> {
-    let wallet_id = db.wallet_id();
-    let mut guard = VOTE_TREE_SYNCS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|e| VotingError::Internal {
-            message: format!("vote tree sync registry lock poisoned: {e}"),
-        })?;
-    Ok(guard
-        .entry(wallet_id)
-        .or_insert_with(|| Arc::new(crate::tree_sync::VoteTreeSync::new()))
-        .clone())
+/// Rounds whose vote tree the wallet currently holds in memory, on any of
+/// its tree clients.
+///
+/// Observes only; it never creates a client. A round appears from its first
+/// sync attempt until [`reset_vote_tree`] drops it, so a host can see what a
+/// reset would discard.
+pub fn cached_vote_tree_rounds(db: &VotingDb) -> Vec<String> {
+    vote_tree_registry::cached_rounds(db)
 }
 
 /// Fetches and persists PIR-backed IMT non-membership proofs for one bundle.
@@ -185,7 +227,7 @@ pub fn delegation_pir(
     round_id: &str,
     bundle_index: u32,
     notes: &[NoteInfo],
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<PirPrecomputeReport, VotingError> {
     let result =
@@ -220,7 +262,7 @@ pub fn precompute_pir_proofs(
     notes: &[NoteInfo],
     bundle_policy: crate::note_bundling::BundlePolicy,
     network: Network,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
 ) -> Result<PirCachePrecomputeResult, VotingError> {
     db.precompute_pir_proof_cache(notes, bundle_policy, network, pir_client)
 }
@@ -272,7 +314,7 @@ pub fn precompute_snapshot_bundles(
     round_id: &str,
     notes: &[NoteInfo],
     bundle_policy: BundlePolicy,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<SnapshotBundlePrecomputeReport, VotingError> {
     db.require_round_network(round_id, network, "snapshot bundle precompute")?;
@@ -330,7 +372,7 @@ pub(crate) fn warm_delegation_pir(
     bundle_index: u32,
     notes: &[NoteInfo],
     layout: BundleLayout,
-    pir_client: &pir_client::PirClientBlocking,
+    pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<PreparedDelegationReport, VotingError> {
     db.ensure_padded_secrets(round_id, bundle_index, notes)?;
@@ -1385,3 +1427,6 @@ mod session_reset_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -581,6 +581,19 @@ a later invocation with a fresh bounded budget and a newly committed
 reservation, after a tree pass under exact-tree advancement. Retries are
 allowed only for the same semantic generation.
 
+### Host request executors
+
+`HyperTransport<R: RouteHttp>` applies this classification for every host
+executor. The executor calls the dispatch hook immediately before request
+bytes can reach a network stack; the SDK treats any failure or deadline it
+observes after that call as `possibly_dispatched` and before it as
+`definitely_unsent`. An executor's post-dispatch phase is honored even without
+the hook; a `BeforeDispatch` phase reported after the hook is honored only
+from an executor that declares `hook_precedes_connection_setup` (the SDK's
+`DirectRoute`, whose Hyper client fuses connection setup with the first write
+and reports connect failures distinctly). An executor must fail closed when
+its route is unavailable and must never fall back to a direct connection.
+
 ## Reconciliation and retry
 
 One lifecycle facade provides typed local delegation, imported-delegation,
@@ -901,6 +914,18 @@ unnecessary. Storage failure is reported alongside the strongest truthful
 state already durable or known to the current call without inventing a durable
 transition.
 
+### Episodes
+
+`ChainSubmissionClient::advance_until_terminal` composes bounded passes into
+one finite episode under a `ChainAdvancePolicy`. Every iteration is one
+`advance_*_with_recovery` pass, so every public result above still describes
+exactly one pass. An episode re-polls after `Tracking`, escalates to
+`ExactTree` at most once after `Recovering` and otherwise ends as
+`StillPending`, never repeats a pass after `SubmittedWithoutHash`,
+`Rejected`, or `Confirmed`, and checks cancellation between passes. Persisted
+work starts with `ExactTree` (`ChainAdvancePolicy::for_persisted_work`), as
+the resume planner requires.
+
 ## Concurrency, generation locking, and cancellation
 
 The lock order is:
@@ -960,6 +985,18 @@ effects:
   write.
 
 The captured host operation epoch is checked at the same pre-commit boundaries.
+
+### Round executor lock scopes
+
+`RoundExecutor` serializes `Delegate` and `AdvanceDelegation` per
+`(wallet, round, bundle)` and every other step per `(wallet, round)`. The
+planner never emits vote work for a bundle whose delegation is still
+in flight, so the two scopes do not overlap on one bundle's lifecycle rows.
+
+Which facts the executor re-verifies inside each act's own transaction or
+lock, after planning from a read snapshot, is tabulated under "Check-then-act"
+in [`round_orchestration_invariants.md`](round_orchestration_invariants.md);
+for chain work the act is this lifecycle's generation compare-and-swap.
 
 ## Cleanup, pruning, and deletion
 
@@ -1069,6 +1106,32 @@ round id, or a vote claimed by two batches is an invariant error rather than a
 silently different phase. Session plans emit no submit, poll, or reconstruction
 step for a lifecycle-owned or terminal row.
 
+## Version 19 to version 20
+
+Version 20 adds `round_immediate_share`: one row per wallet and round naming
+the helper share submitted immediately. Version 19 carried that designation
+only as an `immediate` marker inside the designated vote's persisted helper
+plan, and every reader re-derived or rescanned it; a designated proposal that
+later left the roster had to be special-cased so a plan for the remaining
+roster would not name a second share. The row is written once, in the same
+transaction as the designated vote's own plan, and is immutable
+(`round_immediate_share_immutable`). It is voided with the undispatched
+generation it was made for, on the same condition that clears the vote's
+helper plan (`clear_round_immediate_share_on_vote_generation_change`), and
+cascades with the vote row. Confirmation does not void it.
+
+The `19 -> 20` step creates the table and its triggers and adopts the first
+marked plan of each round as its designation, always at domain share index 0
+(`v19_immediate_markers_backfill_to_v20`). Every other row is preserved
+byte for byte. Fresh and incrementally migrated version-20 schemas must match
+(`migrate_from_launch_version_matches_a_fresh_schema`). The planner reads the
+row through its round snapshot and derives a designation from the ballot only
+while no row exists; helper-plan preparation reads the row and never
+re-derives once it exists
+(`the_designated_votes_own_plan_writes_the_designation_and_every_plan_reads_it`,
+`the_designation_is_voided_with_its_undispatched_generation_but_not_by_confirmation`,
+`a_persisted_immediate_designation_survives_its_proposal_leaving_the_roster`).
+
 ## Removed legacy APIs
 
 The public API does not expose:
@@ -1174,6 +1237,26 @@ Tests cover:
   attempts may exceed endpoint count, and endpoint selection cycles by ordinal;
   and
 - retries cannot change semantic generation.
+
+- `episode_escalates_to_exact_tree_once`: one `Recovering` pass escalates
+  the episode to `ExactTree`; a second ends it as `StillPending`.
+- `episode_never_retries_terminal_outcomes`: `SubmittedWithoutHash`,
+  `Rejected`, `Confirmed`, and `Cancelled` end the episode on the pass that
+  produced them.
+- `episode_ends_after_its_pass_budget_and_paces_tracking_polls`: the pass
+  budget bounds an episode, a zero budget runs until the row leaves
+  `Tracking`, and every `Tracking` pass but the last waits `pending_repoll`.
+- `an_epoch_change_or_cancellation_between_passes_ends_the_episode`: an
+  epoch change during the repoll wait, a stale entry epoch, or cancellation
+  ends the episode as `Cancelled` without another pass.
+- `a_pass_refused_for_a_stale_epoch_ends_the_episode_as_cancelled`: an epoch
+  change admitted past the boundary check and refused inside the pass ends
+  the episode as `Cancelled`, not as a failed step; a pass that fails while
+  the host is still on the episode's epoch is reported as its failure.
+- `chain_failures_classify_by_dispatch_and_mark_the_dispatch_handle` and
+  `helper_failures_classify_by_dispatch_and_phase`: a `RouteHttp` failure
+  before the dispatch hook is `definitely_unsent`; after it is
+  `possibly_dispatched`.
 
 ### Recovery
 

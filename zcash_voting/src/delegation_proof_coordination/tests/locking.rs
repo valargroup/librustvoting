@@ -11,7 +11,7 @@ use crate::VotingError;
 use super::super::{coordinate, DelegationProofIdentity};
 
 fn identity(wallet_id: &str, bundle_index: u32) -> DelegationProofIdentity {
-    DelegationProofIdentity::new(wallet_id.to_string(), "round", bundle_index)
+    DelegationProofIdentity::new(0, wallet_id.to_string(), "round", bundle_index)
 }
 
 #[test]
@@ -221,4 +221,38 @@ fn wait_callback_reentry_returns_busy() {
     leader.join().unwrap().unwrap();
     follower.join().unwrap().unwrap();
     assert!(nested_call_was_busy.load(Ordering::SeqCst));
+}
+
+#[test]
+fn different_sidecars_with_one_wallet_id_enter_proof_work_concurrently() {
+    let both_entered = Arc::new(Barrier::new(3));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+
+    for sidecar_id in [21, 22] {
+        let both_entered = both_entered.clone();
+        let active = active.clone();
+        let max_active = max_active.clone();
+        workers.push(thread::spawn(move || {
+            coordinate(
+                DelegationProofIdentity::new(sidecar_id, "shared".to_string(), "round", 0),
+                || {},
+                |_| {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    both_entered.wait();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }));
+    }
+
+    both_entered.wait();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(max_active.load(Ordering::SeqCst), 2);
 }

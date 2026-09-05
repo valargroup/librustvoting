@@ -258,7 +258,15 @@ pub async fn submit_committed_vote_shares(
     request: WalletHelperShareSubmissionRequest<'_>,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareBatchDeliveryReport> {
-    committed
+    // Only a confirmed vote can submit shares: the SDK reads the durable
+    // confirmation and hands back the typed handle, or `None` while the
+    // chain submission is still pending.
+    let confirmed = committed
+        .clone()
+        .confirmed(voting_db)
+        .context("read vote confirmation")?
+        .ok_or_else(|| anyhow::anyhow!("vote must be confirmed before submitting helper shares"))?;
+    confirmed
         .submit_prepared_shares(
             voting_db,
             client,

@@ -10,6 +10,7 @@ lrz = ["zcash_voting/lrz", "voting-crypto-deps/lrz"]
 zakura = ["zcash_voting/zakura", "voting-crypto-deps/default"]
 
 [dependencies]
+zeroize = "1"
 anyhow = "1"
 base64 = "0.22"
 bytes = "1"
