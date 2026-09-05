@@ -700,6 +700,52 @@ impl VotingDb {
             })
     }
 
+    /// Holds shared account and round access plus exclusive access to one
+    /// bundle's delegation lifecycle for the life of the returned lease.
+    ///
+    /// Distinct bundles remain independent, while round or wallet deletion and
+    /// chain submission for this bundle cannot overlap setup.
+    fn acquire_delegation_setup_lease(
+        &self,
+        round_id: &str,
+        wallet_id: &str,
+        bundle_index: u32,
+    ) -> Result<Option<crate::chain_submission::coordination::DelegationSetupLease>, VotingError>
+    {
+        let Some(round_identity) = self.chain_submission_round_identity(round_id, wallet_id)?
+        else {
+            return Ok(None);
+        };
+        let identity = crate::ChainSubmissionIdentity::new(
+            wallet_id,
+            round_identity.network(),
+            *round_identity.vote_round_id(),
+            bundle_index,
+            crate::ChainSubmissionTarget::Delegation,
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to identify delegation setup: {error}"),
+        })?;
+        self.chain_submission_coordination()
+            .try_acquire_delegation_setup(&identity)
+            .map(Some)
+            .map_err(|error| match error {
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
+                    VotingError::Busy {
+                        message: format!(
+                            "delegation setup or chain submission is active for round \
+                             {round_id}, bundle {bundle_index}"
+                        ),
+                    }
+                }
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(
+                    error,
+                ) => VotingError::Internal {
+                    message: error.to_string(),
+                },
+            })
+    }
+
     /// Clears the local delegation setup of bundles that were never broadcast,
     /// so setup can rebuild them, and reports how many were cleared.
     ///
@@ -1111,11 +1157,11 @@ impl VotingDb {
         consensus_branch_id: u32,
     ) -> Result<GovernancePczt, VotingError> {
         let wallet_id = self.wallet_id();
-        // Every setup writer takes the gate before inspecting the binding and
-        // keeps it through persistence. A mismatch-only gate is insufficient:
-        // a second writer can otherwise observe the cleared rebuild window and
-        // write a competing setup while the first writer still holds the gate.
-        let _setup_lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
+        // Every setup writer takes its bundle's lifecycle gate before
+        // inspecting the binding and keeps it through persistence. The shared
+        // round gate excludes deletion without serializing unrelated bundles.
+        let _setup_lease =
+            self.acquire_delegation_setup_lease(round_id, &wallet_id, bundle_index)?;
         let (params, stored_network) = {
             let conn = self.conn();
             let (params, stored_network) =

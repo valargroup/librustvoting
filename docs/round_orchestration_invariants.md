@@ -295,6 +295,13 @@ own write transaction or lock:
 | `Confirm` | per-share operation lock | the helper specification's quorum rules |
 | `Delegate`, `AdvanceDelegation` | bundle lock | the delegation pipeline and coordinator |
 
+Delegation setup uses the chain coordinator's matching hierarchy: shared
+account access, shared round access, and exclusive access to its bundle.
+Distinct bundles can therefore build setup concurrently, while wallet or
+round deletion and chain lifecycle work for the same bundle remain excluded
+(`another_bundle_builds_while_delegation_setup_is_active`,
+`delegation_setup_excludes_only_its_bundle_lifecycle`).
+
 The executor takes exactly two authoritative plans per step: one un-locked to
 choose the step, one under the lock to resolve it to an obligation. The plan
 returned on an outcome is a host-facing projection, not a control input.

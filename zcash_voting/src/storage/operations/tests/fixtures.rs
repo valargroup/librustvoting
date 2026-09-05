@@ -83,6 +83,14 @@ pub(super) fn insert_vote_row(db: &VotingDb, bundle_index: u32) {
 /// One Ironwood note plus a round seeded for it, the shape every real
 /// delegation setup needs.
 pub(super) fn ironwood_setup_fixture() -> (VotingDb, NoteInfo, Vec<u8>) {
+    let (db, mut notes, fvk_bytes) = ironwood_setup_fixture_with_note_count(1);
+    (db, notes.remove(0), fvk_bytes)
+}
+
+/// An Ironwood round whose descending notes form the requested bundle layout.
+pub(super) fn ironwood_setup_fixture_with_note_count(
+    note_count: usize,
+) -> (VotingDb, Vec<NoteInfo>, Vec<u8>) {
     use orchard::{
         note::{NoteVersion, Rho},
         value::NoteValue,
@@ -99,22 +107,32 @@ pub(super) fn ironwood_setup_fixture() -> (VotingDb, NoteInfo, Vec<u8>) {
     let address = fvk.address_at(0u32, Scope::External);
 
     let mut rng = OsRng;
-    let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, NoteVersion::V3);
-    let note = orchard::Note::new(
-        address,
-        NoteValue::from_raw(13_000_000),
-        Rho::from_nf_old(parent_note.nullifier(&fvk)),
-        NoteVersion::V3,
-        &mut rng,
-    );
-    let note_info =
-        NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &Network::Regtest).unwrap();
+    let notes = (0..note_count)
+        .map(|note_index| {
+            let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, NoteVersion::V3);
+            let note = orchard::Note::new(
+                address,
+                NoteValue::from_raw(13_000_000 - note_index as u64),
+                Rho::from_nf_old(parent_note.nullifier(&fvk)),
+                NoteVersion::V3,
+                &mut rng,
+            );
+            NoteInfo::from_orchard_note(
+                &note,
+                7 + note_index as u64,
+                Scope::External,
+                &ufvk,
+                &Network::Regtest,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
 
     let db = test_db();
     db.init_round(Network::Regtest, &test_params_nu6_3(), None)
         .unwrap();
-    db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
-    (db, note_info, fvk.to_bytes().to_vec())
+    db.ensure_bundles(ROUND_ID, &notes).unwrap();
+    (db, notes, fvk.to_bytes().to_vec())
 }
 
 pub(super) fn keys_for_hotkey_byte(fvk_bytes: &[u8], hotkey_byte: u8) -> DelegationKeys {

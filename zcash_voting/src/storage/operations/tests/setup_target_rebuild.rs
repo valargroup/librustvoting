@@ -111,6 +111,27 @@ fn existing_setup_reuse_refuses_an_active_rebuild() {
     );
 }
 
+/// Setup exclusion follows the bundle scope used by delegation work. A
+/// five-note bundle being prepared must not make a concurrent one-note tail
+/// fail merely because both belong to the same round.
+#[test]
+fn another_bundle_builds_while_delegation_setup_is_active() {
+    let (db, notes, fvk_bytes) = ironwood_setup_fixture_with_note_count(6);
+    let keys = keys_for_hotkey_byte(&fvk_bytes, 0x43);
+    let _first_bundle_setup = db
+        .acquire_delegation_setup_lease(ROUND_ID, W, 0)
+        .unwrap()
+        .expect("a current round has a submission identity");
+
+    db.build_governance_pczt(ROUND_ID, 1, &notes[5..], &keys, nu6_3_branch_id())
+        .expect("an unrelated bundle must remain independent");
+
+    assert!(
+        van_comm_rand_of(&db, 1).is_some(),
+        "the tail bundle setup must be persisted"
+    );
+}
+
 /// The Keystone shape validates too: a bundle set up against a round-bound
 /// target reproduces from the hotkey behind that target.
 ///
