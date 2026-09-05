@@ -405,11 +405,26 @@ pub(crate) fn classify(
     }
 
     for (bundle_index, drafts) in drafts {
-        obligations.push(Obligation::Cast {
-            bundle_index,
-            drafts,
-            prerequisite: None,
-        });
+        if crate::ATOMIC_VOTE_BATCHES_ENABLED {
+            obligations.push(Obligation::Cast {
+                bundle_index,
+                drafts,
+                prerequisite: None,
+            });
+        } else {
+            // One cast per proposal, so each becomes a singleton commitment on
+            // the `cast-vote` endpoint. They stay separate obligations rather
+            // than one grouped cast, which is what lets the host run them
+            // concurrently and lets each proposal's shares start streaming as
+            // soon as that proposal is cast.
+            for draft in drafts {
+                obligations.push(Obligation::Cast {
+                    bundle_index,
+                    drafts: vec![draft],
+                    prerequisite: None,
+                });
+            }
+        }
     }
     for bundle_index in blocked {
         let reason = if !open_proposals.is_empty() {

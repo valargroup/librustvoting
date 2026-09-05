@@ -119,9 +119,18 @@ pub fn derive_hotkey_x_coords_from_raw_address(
 ///
 /// Unlike the VAN, this commitment binds the complete encoded transmission key,
 /// including its y-coordinate sign bit.
+///
+/// `output_rho` is the spend's **nullifier** — the bundle's `nf_signed` — and
+/// not the spend's own rho. An Orchard output note takes its rho from the
+/// nullifier of the spend beside it, so passing `rho_signed` here reconstructs
+/// a different note. The commitment then disagrees with every bundle the PCZT
+/// builder has ever written, which surfaces as "the voting hotkey does not
+/// match" however right the hotkey is. Both values are 32 bytes and neither
+/// type nor arity catches the swap, so read the note beside `rho_signed` in
+/// `build_governance_pczt` before changing this call.
 pub(crate) fn derive_governance_output_cmx(
     hotkey_raw_address: &[u8; 43],
-    rho_signed: &[u8; 32],
+    output_rho: &[u8; 32],
     rseed_output: &[u8; 32],
     network: VotingNetwork,
     snapshot_height: u64,
@@ -131,15 +140,15 @@ pub(crate) fn derive_governance_output_cmx(
         .ok_or_else(|| VotingError::InvalidInput {
             message: "hotkey_raw_address is not a valid Orchard address".to_string(),
         })?;
-    let rho = Rho::from_bytes(rho_signed)
+    let rho = Rho::from_bytes(output_rho)
         .into_option()
         .ok_or_else(|| VotingError::Internal {
-            message: "stored rho_signed is not a valid Orchard Rho".to_string(),
+            message: "stored nf_signed is not a valid Orchard Rho".to_string(),
         })?;
     let rseed = RandomSeed::from_bytes(*rseed_output, &rho)
         .into_option()
         .ok_or_else(|| VotingError::Internal {
-            message: "stored rseed_output is not valid for rho_signed".to_string(),
+            message: "stored rseed_output is not valid for nf_signed".to_string(),
         })?;
     let consensus_branch_id = crate::lwd::branch_id_for_height(network, snapshot_height)?;
     let branch_id =
@@ -508,7 +517,25 @@ pub(crate) fn build_governance_pczt(
         });
     }
 
-    // Compute constrained rho
+    // `rho_signed` and `nf_signed` are the two halves of one action, and the
+    // difference between them decides which note a later reader can rebuild.
+    //
+    //   rho_signed  the *input* rho of the spend note below, constrained to
+    //               Poseidon(cmx_1..cmx_5, van_comm, vote_round_id) so the
+    //               spend cannot be lifted into another bundle or round.
+    //   nf_signed   the *nullifier* the builder derives from that spend note
+    //               and the account's nullifier key, captured further down
+    //               from the finished action. It is public, it is what the
+    //               chain checks for a double spend, and — because Orchard
+    //               gives an output note the rho of the spend beside it — it
+    //               is also the governance output note's rho.
+    //
+    // So reconstructing the spend note needs `rho_signed`; reconstructing the
+    // governance output note needs `nf_signed`. Neither derives from the other
+    // without `nk`, which is why both are persisted. Reaching for the wrong one
+    // rebuilds a different note, and its commitment then disagrees with every
+    // bundle ever written — which surfaces as "the voting hotkey does not
+    // match" no matter how right the hotkey is.
     let rho_signed = governance::compute_rho_binding(
         &all_cmx[0],
         &all_cmx[1],
@@ -603,6 +630,8 @@ pub(crate) fn build_governance_pczt(
 
         let action_index = spend_idx;
         let governance_action = &pczt_bundle.actions()[action_index];
+        // The spend's nullifier. This is the governance output note's rho —
+        // see the note beside `rho_signed` above before using either.
         let nf_signed_bytes: [u8; 32] = governance_action.spend().nullifier().to_bytes();
         let rk_bytes: [u8; 32] = governance_action.spend().rk().into();
         let alpha = governance_action

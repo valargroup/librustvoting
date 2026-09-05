@@ -1100,6 +1100,7 @@ impl From<crate::RoundStepFailureKind> for RoundStepFailureKindView {
             K::Signing => Self::Signing,
             K::HelperDeliveryIncomplete => Self::HelperDeliveryIncomplete,
             K::VoteEnded => Self::VoteEnded,
+            K::DelegationTargetMismatch => Self::DelegationTargetMismatch,
         }
     }
 }
@@ -1372,6 +1373,8 @@ impl From<VotingErrorKind> for VotingErrorKindView {
             VotingErrorKind::SetupAlreadyPersisted => Self::SetupAlreadyPersisted,
             VotingErrorKind::DbBusy => Self::DbBusy,
             VotingErrorKind::PirUnavailable => Self::PirUnavailable,
+            VotingErrorKind::DelegationTargetMismatch => Self::DelegationTargetMismatch,
+            VotingErrorKind::DelegationAlreadyBroadcast => Self::DelegationAlreadyBroadcast,
         }
     }
 }

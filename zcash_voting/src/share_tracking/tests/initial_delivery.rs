@@ -1932,7 +1932,10 @@ async fn initial_delivery_does_not_recreate_share_after_round_deletion() {
                 .first()
                 .is_some_and(|record| !record.sent_to_urls.is_empty())
         {
-            db.clear_round(ROUND_ID).unwrap();
+            // The host deliberately forgets a round mid-delivery; the share
+            // rows it already delivered are exactly what the checked path
+            // refuses to destroy.
+            db.clear_round_discarding_recovery(ROUND_ID).unwrap();
             cleared.store(true, Ordering::Relaxed);
         }
         false

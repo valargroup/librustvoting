@@ -441,6 +441,16 @@ This release is `zcash_voting` 4.0.0.
 - Eligibility, no-spendable-note, write-once setup, and PIR failures carry
   structured fields. Their display text keeps the earlier wording.
 
+### Fixed
+
+- Schema version 21 rebuilds `chain_submissions` onto the 50-proposal bound.
+  A sidecar migrated by a build that carried the 15-proposal bound kept that
+  CHECK at version 20; nothing rewrote it, and the version-20 fingerprint
+  check then refused to open the sidecar at all, so every voting call on that
+  wallet failed with an unsupported-chain-submission-schema error. Rows are
+  preserved, and the rebuild is a no-op for a database that already holds the
+  widened bound.
+
 ### Removed
 
 - **Breaking:** removed the persisted-vote recovery driver

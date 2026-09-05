@@ -116,6 +116,13 @@ impl<T: ChainTransport> RoundExecutor<T> {
             VotingErrorKind::ProofFailed => RoundStepFailureKind::ProofFailed,
             VotingErrorKind::KeystoneSignatureConflict => RoundStepFailureKind::Signing,
             VotingErrorKind::Internal => RoundStepFailureKind::InvariantViolation,
+            VotingErrorKind::DelegationTargetMismatch => {
+                RoundStepFailureKind::DelegationTargetMismatch
+            }
+            // A refusal to clear recovery state is a host asking for something
+            // the round no longer permits, not a step that failed on its own
+            // terms.
+            VotingErrorKind::DelegationAlreadyBroadcast => RoundStepFailureKind::InvalidInput,
         };
         self.step_failure(kind, step, None, ledger, error.to_string())
     }

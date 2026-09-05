@@ -248,6 +248,13 @@ pub enum RoundStepFailureKind {
     /// cast. Steps that advance or recover work already on the wire still
     /// run; only `CastVote` is refused.
     VoteEnded,
+    /// A bundle's stored delegation setup does not reproduce from the voting
+    /// hotkey the host supplied.
+    ///
+    /// Its own kind because it has one correct answer and retrying is never
+    /// it: nothing was broadcast, so the host discards the unbroadcast setup
+    /// and lets setup rebuild against the key it holds.
+    DelegationTargetMismatch,
 }
 
 /// Failure that retains the strongest truthful durable state and a

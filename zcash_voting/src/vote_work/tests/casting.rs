@@ -119,7 +119,7 @@ async fn a_bound_hotkey_that_is_not_the_delegation_target_is_refused_before_tree
     assert!(
         failure
             .message
-            .contains("does not match the confirmed delegation target"),
+            .contains("does not reproduce from the bound voting hotkey"),
         "{}",
         failure.message
     );

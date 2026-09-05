@@ -941,7 +941,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
         for index in 0..2 {
             let data =
                 queries::load_zkp2_inputs(&conn, &params.vote_round_id, WALLET, index).unwrap();
@@ -1260,7 +1260,11 @@ mod tests {
         queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0, 42)
             .unwrap();
 
-        customer.clear_round(&params.vote_round_id).unwrap();
+        // A deliberate abandonment: the round holds a VAN position, so the
+        // checked path refuses it and the operator is choosing to lose it.
+        customer
+            .clear_round_discarding_recovery(&params.vote_round_id)
+            .unwrap();
         let mut corrected = capability.clone();
         corrected.bundles[1].delegation_tx_hash = "11".repeat(32);
         import_capability(&customer, &corrected, import_context(&hotkey, &params)).unwrap();

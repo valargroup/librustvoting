@@ -423,11 +423,13 @@ impl PirFleet {
                 normalized.push(url);
             }
         }
-        if normalized.is_empty() {
-            return Err(VotingError::InvalidInput {
-                message: "at least one PIR server URL is required".to_string(),
-            });
-        }
+        // An empty fleet is constructible on purpose. Steps that advance a
+        // delegation the chain already holds never touch PIR, and a host has
+        // no endpoint to offer them; refusing here made the fleet a
+        // precondition of opening a session at all, which left a submitted
+        // delegation unable to resume without PIR. Any actual use still fails
+        // with this exact message from `with_failover`, so the requirement is
+        // enforced where it is real rather than where it is merely convenient.
         negotiated_pir_layout(layout)?;
         Ok(Self {
             endpoints: normalized,

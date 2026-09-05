@@ -437,12 +437,24 @@ fn parse_post_response(
                 } else {
                     ChainRejectionKind::Other
                 },
-                // The response log is server-controlled and may echo proofs,
-                // signatures, or the complete request. Keep durable-safe
-                // diagnostics limited to the stable numeric result.
+                // The response log is the only thing that says *why* the chain
+                // refused, and a bare numeric code leaves an operator with
+                // nothing to act on. It is server-controlled text, so it is
+                // carried as data and never as instruction:
+                // `from_redacted_message` escapes it and bounds it to
+                // `MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES` before it reaches the
+                // durable row, which means a log that echoes the submitted
+                // request lands here escaped and truncated rather than dropped.
                 diagnostic: ChainSubmissionDiagnostic::from_redacted_message(
                     ChainSubmissionDiagnosticKind::ChainRejected,
-                    format!("vote chain rejected transaction with code {code}"),
+                    if parsed.log.trim().is_empty() {
+                        format!("vote chain rejected transaction with code {code}")
+                    } else {
+                        format!(
+                            "vote chain rejected transaction with code {code}: {}",
+                            parsed.log.trim()
+                        )
+                    },
                 ),
                 candidate_transaction_hash,
             }
@@ -514,9 +526,27 @@ fn validate_json_response(response: &ChainHttpResponse) -> Result<(), ChainSubmi
             .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
     });
     if !is_json {
-        return Err(invalid_protocol(
-            "vote-chain response Content-Type must be application/json",
-        ));
+        // Report what actually arrived. The gateway sets `application/json` on
+        // every response it writes, including its errors, so a different type
+        // means the answer came from somewhere else — a proxy error page, a
+        // router 404, a panic — and the body is the only thing that says
+        // which. The text is server-controlled, so it rides along as data:
+        // `invalid_protocol` escapes it and bounds it like any other
+        // diagnostic.
+        let observed = response.content_type().unwrap_or("(absent)");
+        let body = String::from_utf8_lossy(response.body());
+        let excerpt = body.trim();
+        return Err(invalid_protocol(if excerpt.is_empty() {
+            format!(
+                "vote-chain response Content-Type must be application/json, got {observed} \
+                 with an empty body"
+            )
+        } else {
+            format!(
+                "vote-chain response Content-Type must be application/json, got {observed}: \
+                 {excerpt}"
+            )
+        }));
     }
     Ok(())
 }
@@ -535,8 +565,7 @@ struct TransactionResultJson {
     tx_hash: Option<String>,
     code: u32,
     #[serde(default)]
-    #[serde(rename = "log")]
-    _log: String,
+    log: String,
     #[serde(default)]
     batch_digest: BatchDigestJson,
 }
@@ -1021,18 +1050,21 @@ mod tests {
             candidate_transaction_hash,
             Some(CandidateTransactionHash::from_str(HASH).unwrap())
         );
+        // The chain's own words are what make a rejection actionable.
         assert_eq!(
             diagnostic.message(),
-            "vote chain rejected transaction with code 7"
+            "vote chain rejected transaction with code 7: round closed"
         );
-        assert!(!diagnostic.message().contains("round closed"));
     }
 
     #[tokio::test]
-    async fn rejection_diagnostic_does_not_retain_server_log_material() {
+    async fn rejection_diagnostic_carries_the_server_log_escaped_and_bounded() {
         let transport = Arc::new(ScriptedTransport::default());
-        let secret = "proof-and-signature-from-submitted-request";
-        transport.queue(Ok(json(422, format!(r#"{{"code":7,"log":"{secret}"}}"#))));
+        // Server-controlled text, including anything it echoes back from the
+        // request, is surfaced rather than dropped: an operator cannot act on
+        // a bare code. It stays data — escaped, bounded, never interpreted.
+        let reason = "delegation proof verification failed";
+        transport.queue(Ok(json(422, format!(r#"{{"code":7,"log":"{reason}"}}"#))));
         let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
 
         let PostAttemptOutcome::Rejected { diagnostic, .. } =
@@ -1040,15 +1072,71 @@ mod tests {
         else {
             panic!("expected deterministic rejection");
         };
-        assert!(!diagnostic.message().contains(secret));
         assert_eq!(
             diagnostic.message(),
-            "vote chain rejected transaction with code 7"
+            format!("vote chain rejected transaction with code 7: {reason}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hostile_server_log_cannot_exceed_or_escape_the_durable_diagnostic() {
+        let transport = Arc::new(ScriptedTransport::default());
+        let hostile = "line\\nbreak\\tand ".repeat(200);
+        transport.queue(Ok(json(422, format!(r#"{{"code":7,"log":"{hostile}"}}"#))));
+        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+
+        let PostAttemptOutcome::Rejected { diagnostic, .. } =
+            client.submit_delegation(0, &delegation()).await
+        else {
+            panic!("expected deterministic rejection");
+        };
+        assert!(
+            diagnostic.message().len()
+                <= crate::chain_submission::MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
+            "{}",
+            diagnostic.message().len()
+        );
+        assert!(!diagnostic.message().contains('\n'));
+        assert!(!diagnostic.message().contains('\t'));
+    }
+
+    #[tokio::test]
+    async fn a_non_json_response_reports_its_type_and_body() {
+        let transport = Arc::new(ScriptedTransport::default());
+        // What a router 404 or proxy error page looks like: the gateway itself
+        // always answers in JSON, so this is the case where knowing the body
+        // is the whole diagnosis.
+        transport.queue(Ok(ChainHttpResponse::new(
+            404,
+            b"404 page not found".to_vec(),
+            Some("text/plain; charset=utf-8".to_string()),
+            Vec::new(),
+        )));
+        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+
+        let PostAttemptOutcome::PossiblyDispatched(diagnostic) =
+            client.submit_delegation(0, &delegation()).await
+        else {
+            panic!("a non-JSON answer leaves the dispatch unknown");
+        };
+        assert!(
+            diagnostic.message().contains("text/plain"),
+            "{}",
+            diagnostic.message()
+        );
+        assert!(
+            diagnostic.message().contains("404 page not found"),
+            "{}",
+            diagnostic.message()
         );
     }
 
     #[tokio::test]
     async fn nullifier_spent_is_classified_only_by_numeric_code() {
+        // The log is reported verbatim but never classifies: a code-2 rejection
+        // stays `NullifierAlreadySpent` while its log talks about something
+        // else, and a code-7 rejection stays `Other` while its log claims a
+        // spent nullifier.
         let transport = Arc::new(ScriptedTransport::default());
         transport.queue(Ok(json(
             422,
@@ -1063,7 +1151,7 @@ mod tests {
                 kind: ChainRejectionKind::NullifierAlreadySpent,
                 ref diagnostic,
                 ..
-            } if !diagnostic.message().contains("unrelated")
+            } if diagnostic.message().contains("an unrelated and untrusted message")
         ));
 
         let transport = Arc::new(ScriptedTransport::default());

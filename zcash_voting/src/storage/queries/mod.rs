@@ -603,7 +603,15 @@ pub fn list_rounds(conn: &Connection, wallet_id: &str) -> Result<Vec<RoundSummar
 
 /// Delete a round and all associated data. Child tables (bundles, cached_tree_state,
 /// proofs, witnesses, votes) are removed automatically via ON DELETE CASCADE.
-pub fn clear_round(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<(), VotingError> {
+///
+/// Crate-internal: this is the raw delete, with no boundary check of its own.
+/// Callers outside the crate go through [`crate::VotingDb::clear_round`], which
+/// refuses a round whose delegation may already be on chain.
+pub(crate) fn clear_round(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<(), VotingError> {
     conn.execute(
         "DELETE FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -1441,7 +1449,12 @@ pub(crate) struct DelegationTargetBindingInputs {
     pub(crate) van_comm_rand: Vec<u8>,
     pub(crate) gov_comm: Vec<u8>,
     pub(crate) total_note_value: u64,
+    /// The spend note's constrained rho. Reconstructs the *spend*, not the
+    /// output; `crate::action` documents the split where both are produced.
     pub(crate) rho_signed: Vec<u8>,
+    /// The spend's nullifier, which Orchard makes the governance *output*
+    /// note's rho. This is the one that reproduces `cmx_new`.
+    pub(crate) nf_signed: Vec<u8>,
     pub(crate) rseed_output: Vec<u8>,
     pub(crate) cmx_new: Vec<u8>,
 }
@@ -1455,8 +1468,8 @@ pub(crate) fn load_delegation_target_binding_inputs(
     bundle_index: u32,
 ) -> Result<DelegationTargetBindingInputs, VotingError> {
     conn.query_row(
-        "SELECT van_comm_rand, gov_comm, total_note_value, rho_signed, rseed_output, cmx_new \
-         FROM bundles \
+        "SELECT van_comm_rand, gov_comm, total_note_value, rho_signed, nf_signed, rseed_output, \
+         cmx_new FROM bundles \
          WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! {
             ":round_id": round_id,
@@ -1469,8 +1482,9 @@ pub(crate) fn load_delegation_target_binding_inputs(
                 gov_comm: row.get(1)?,
                 total_note_value: row.get::<_, i64>(2)? as u64,
                 rho_signed: row.get(3)?,
-                rseed_output: row.get(4)?,
-                cmx_new: row.get(5)?,
+                nf_signed: row.get(4)?,
+                rseed_output: row.get(5)?,
+                cmx_new: row.get(6)?,
             })
         },
     )
@@ -2885,11 +2899,25 @@ pub fn delete_bundles_from(
         });
     }
 
+    // Every fact that says a delegation may already be on chain, not just a
+    // chain-submission row. A round delegated before the submission lifecycle
+    // existed carries only a transaction hash or a VAN position, and pruning it
+    // would destroy the `van_comm_rand` its spent governance nullifiers make
+    // irreplaceable.
     let protected: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM chain_submissions
-              WHERE round_id = :round_id
-                AND wallet_id = :wallet_id
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index >= :from_index)
+                OR EXISTS(SELECT 1 FROM bundles
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index >= :from_index
+                AND (delegation_tx_hash IS NOT NULL OR van_leaf_position IS NOT NULL))
+                OR EXISTS(SELECT 1 FROM votes
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index >= :from_index)
+                OR EXISTS(SELECT 1 FROM share_delegations
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
                 AND bundle_index >= :from_index)",
             named_params! {
                 ":round_id": round_id,
@@ -3449,6 +3477,274 @@ pub fn clear_unsigned_delegation_setup_fields(
         message: format!("failed to clear unsigned delegation setup fields: {e}"),
     })?;
     Ok(())
+}
+
+/// Whether a bundle already holds the delegation setup that binds it to a
+/// hotkey target.
+pub fn bundle_has_delegation_setup(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<bool, VotingError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bundles
+          WHERE round_id = :round_id AND wallet_id = :wallet_id
+            AND bundle_index = :bundle_index
+            AND gov_comm IS NOT NULL AND cmx_new IS NOT NULL
+            AND rho_signed IS NOT NULL AND rseed_output IS NOT NULL)",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| row.get(0),
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to check delegation setup: {e}"),
+    })
+}
+
+/// Evidence that a bundle's delegation may already exist outside this wallet.
+///
+/// Each variant is a fact that only becomes true once the delegation has been
+/// handed to the network, or once work has been built on top of one that was.
+/// The delegation's governance nullifiers are deterministic and spent on chain,
+/// so once any of these holds, the bundle's setup — `van_comm_rand` above all,
+/// and the hotkey target it commits to — is the only thing that can ever
+/// reproduce that round's voting weight. It must never be cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationBroadcastEvidence {
+    /// A delegation transaction hash is recorded for the bundle.
+    DelegationTxHash,
+    /// The bundle holds a VAN leaf position, which only the chain assigns.
+    VanLeafPosition,
+    /// A chain submission row exists. The lifecycle owns dispatch from
+    /// `submitting` onward, so a row means a dispatch may already have gone out
+    /// even when no hash came back.
+    ChainSubmission,
+    /// A vote was built against this bundle's delegation.
+    Vote,
+    /// A helper share was delivered for this bundle.
+    ShareDelegation,
+}
+
+impl DelegationBroadcastEvidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DelegationTxHash => "a delegation transaction hash",
+            Self::VanLeafPosition => "a VAN leaf position",
+            Self::ChainSubmission => "a chain submission",
+            Self::Vote => "a vote",
+            Self::ShareDelegation => "a delivered helper share",
+        }
+    }
+}
+
+/// The first broadcast evidence found for a round, or one bundle of it.
+///
+/// Ordered checks, cheapest and most direct first; the caller only needs to
+/// know that the boundary was crossed and what to say about it.
+pub fn delegation_broadcast_evidence(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: Option<u32>,
+) -> Result<Option<(u32, DelegationBroadcastEvidence)>, VotingError> {
+    let bundle_filter = match bundle_index {
+        Some(_) => "AND bundle_index = :bundle_index",
+        None => "",
+    };
+    let checks: [(&str, DelegationBroadcastEvidence); 5] = [
+        (
+            "SELECT bundle_index FROM bundles
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND delegation_tx_hash IS NOT NULL",
+            DelegationBroadcastEvidence::DelegationTxHash,
+        ),
+        (
+            "SELECT bundle_index FROM bundles
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND van_leaf_position IS NOT NULL",
+            DelegationBroadcastEvidence::VanLeafPosition,
+        ),
+        (
+            "SELECT bundle_index FROM chain_submissions
+              WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            DelegationBroadcastEvidence::ChainSubmission,
+        ),
+        (
+            "SELECT bundle_index FROM votes
+              WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            DelegationBroadcastEvidence::Vote,
+        ),
+        (
+            "SELECT bundle_index FROM share_delegations
+              WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            DelegationBroadcastEvidence::ShareDelegation,
+        ),
+    ];
+
+    for (sql, evidence) in checks {
+        let sql = format!("{sql} {bundle_filter} LIMIT 1");
+        let mut statement = conn.prepare(&sql).map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare broadcast evidence query: {e}"),
+        })?;
+        let found: Option<i64> = match bundle_index {
+            Some(index) => statement
+                .query_row(
+                    named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": wallet_id,
+                        ":bundle_index": index,
+                    },
+                    |row| row.get(0),
+                )
+                .optional(),
+            None => statement
+                .query_row(
+                    named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+                    |row| row.get(0),
+                )
+                .optional(),
+        }
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read broadcast evidence: {e}"),
+        })?;
+        if let Some(index) = found {
+            return Ok(Some((index as u32, evidence)));
+        }
+    }
+    Ok(None)
+}
+
+/// Clears the local delegation setup of bundles that were never broadcast, so
+/// setup can rebuild them.
+///
+/// This is the recovery path for a bundle whose setup can no longer be used —
+/// the wallet's voting hotkey no longer reproduces the stored target, say — and
+/// it is deliberately allowed to discard a successful proof, which
+/// [`clear_unsigned_delegation_setup_fields`] preserves. A proof over a target
+/// the wallet cannot sign for is not work worth keeping, and re-proving costs
+/// only time.
+///
+/// Every broadcast guard is repeated in the statement itself, not just checked
+/// beforehand, so a submission that starts between the check and the write
+/// cannot lose its setup. Returns the number of bundles cleared.
+pub(crate) fn discard_unbroadcast_delegation_setup(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: Option<u32>,
+) -> Result<u32, VotingError> {
+    // The outer filter runs against four different tables, so it stays
+    // unqualified; the subquery below is the one that reads `bundles`.
+    let bundle_filter = match bundle_index {
+        Some(_) => "AND bundle_index = :bundle_index",
+        None => "",
+    };
+    let scoped_bundle_filter = match bundle_index {
+        Some(_) => "AND bundles.bundle_index = :bundle_index",
+        None => "",
+    };
+    // The guard is one expression, reused by every statement below, so no
+    // deletion can be written with a weaker condition than the others.
+    let unbroadcast_guard = format!(
+        "round_id = :round_id
+           AND wallet_id = :wallet_id
+           {bundle_filter}
+           AND bundle_index IN (
+               SELECT bundles.bundle_index FROM bundles
+                WHERE bundles.round_id = :round_id
+                  AND bundles.wallet_id = :wallet_id
+                  AND bundles.delegation_tx_hash IS NULL
+                  AND bundles.van_leaf_position IS NULL
+                  {scoped_bundle_filter}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chain_submissions submission
+                       WHERE submission.round_id = bundles.round_id
+                         AND submission.wallet_id = bundles.wallet_id
+                         AND submission.bundle_index = bundles.bundle_index
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM votes vote
+                       WHERE vote.round_id = bundles.round_id
+                         AND vote.wallet_id = bundles.wallet_id
+                         AND vote.bundle_index = bundles.bundle_index
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM share_delegations share
+                       WHERE share.round_id = bundles.round_id
+                         AND share.wallet_id = bundles.wallet_id
+                         AND share.bundle_index = bundles.bundle_index
+                  )
+           )"
+    );
+
+    let params = |statement: &mut rusqlite::Statement<'_>| -> Result<usize, rusqlite::Error> {
+        match bundle_index {
+            Some(index) => statement.execute(named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": index,
+            }),
+            None => {
+                statement.execute(named_params! { ":round_id": round_id, ":wallet_id": wallet_id })
+            }
+        }
+    };
+
+    let mut cleared = 0usize;
+    for (label, sql) in [
+        (
+            "clear delegation setup",
+            format!(
+                "UPDATE bundles
+                    SET van_comm_rand = NULL,
+                        dummy_nullifiers = NULL,
+                        rho_signed = NULL,
+                        padded_note_data = NULL,
+                        nf_signed = NULL,
+                        cmx_new = NULL,
+                        alpha = NULL,
+                        rseed_signed = NULL,
+                        rseed_output = NULL,
+                        gov_comm = NULL,
+                        total_note_value = NULL,
+                        address_index = NULL,
+                        rk = NULL,
+                        gov_nullifiers_blob = NULL,
+                        padded_note_secrets = NULL,
+                        pczt_sighash = NULL,
+                        tx1_effects = NULL
+                  WHERE {unbroadcast_guard}"
+            ),
+        ),
+        (
+            "discard delegation proofs",
+            format!("DELETE FROM proofs WHERE {unbroadcast_guard}"),
+        ),
+        (
+            "discard delegation keystone signatures",
+            format!("DELETE FROM keystone_signatures WHERE {unbroadcast_guard}"),
+        ),
+        (
+            "discard delegation witnesses",
+            format!("DELETE FROM witnesses WHERE {unbroadcast_guard}"),
+        ),
+    ] {
+        let mut statement = conn.prepare(&sql).map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare {label}: {e}"),
+        })?;
+        let affected = params(&mut statement).map_err(|e| VotingError::Internal {
+            message: format!("failed to {label}: {e}"),
+        })?;
+        if label == "clear delegation setup" {
+            cleared = affected;
+        }
+    }
+
+    Ok(cleared as u32)
 }
 
 fn ensure_vote_submission_matches_ballot_intent(
