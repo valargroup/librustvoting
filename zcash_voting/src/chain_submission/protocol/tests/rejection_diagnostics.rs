@@ -295,3 +295,41 @@ fn base64_signature() -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode([0x5a_u8; 64])
 }
+
+#[tokio::test]
+async fn a_content_type_parameter_cannot_carry_request_material_into_the_diagnostic() {
+    let transport = Arc::new(ScriptedTransport::default());
+    // A proxy is free to hang anything off the header, including what it was
+    // sent. Only the media type is diagnostic, so only the media type is kept.
+    let signature = base64_signature();
+    transport.queue(Ok(ChainHttpResponse::new(
+        502,
+        b"upstream refused".to_vec(),
+        Some(format!("text/plain; detail={signature}")),
+        Vec::new(),
+    )));
+    let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+
+    let PostAttemptOutcome::PossiblyDispatched(diagnostic) =
+        client.submit_delegation(0, &delegation()).await
+    else {
+        panic!("a non-JSON answer leaves the dispatch unknown");
+    };
+    assert!(
+        !diagnostic.message().contains(&signature),
+        "{}",
+        diagnostic.message()
+    );
+    assert!(
+        !diagnostic.message().contains("detail="),
+        "{}",
+        diagnostic.message()
+    );
+    assert!(
+        diagnostic
+            .message()
+            .contains("got text/plain: upstream refused"),
+        "{}",
+        diagnostic.message()
+    );
+}

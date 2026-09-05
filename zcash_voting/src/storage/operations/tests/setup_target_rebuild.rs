@@ -170,6 +170,25 @@ fn rewriting_the_same_binding_is_allowed_after_broadcast() {
 /// Writes bundle 0's delegation setup with `van_comm_rand`, leaving every
 /// other field as `db_with_delegation_setup` left it.
 fn store_binding(db: &VotingDb, van_comm_rand: &[u8; 32]) -> Result<(), VotingError> {
+    store_setup(db, van_comm_rand, &[0xAA; 32])
+}
+
+/// The same write with the governance commitment moved too, which is the shape
+/// of a caller that keeps the stored blinding factor and changes what it
+/// commits to.
+fn store_binding_with_gov_comm(
+    db: &VotingDb,
+    van_comm_rand: &[u8; 32],
+    gov_comm: &[u8; 32],
+) -> Result<(), VotingError> {
+    store_setup(db, van_comm_rand, gov_comm)
+}
+
+fn store_setup(
+    db: &VotingDb,
+    van_comm_rand: &[u8; 32],
+    gov_comm: &[u8; 32],
+) -> Result<(), VotingError> {
     queries::store_delegation_data(
         &db.conn(),
         ROUND_ID,
@@ -184,7 +203,7 @@ fn store_binding(db: &VotingDb, van_comm_rand: &[u8; 32]) -> Result<(), VotingEr
         &[0x77; 32],
         &[0x88; 32],
         &[0x99; 32],
-        &[0xAA; 32],
+        gov_comm,
         1_000,
         0,
         &[(vec![0xBB; 32], vec![0xCC; 32])],
@@ -260,4 +279,34 @@ fn a_write_over_a_cleared_binding_succeeds_when_nothing_was_broadcast() {
     store_binding(&db, &[0x99; 32]).expect("an unbroadcast bundle rebuilds");
 
     assert_eq!(van_comm_rand_of(&db, 0), Some(vec![0x99; 32]));
+}
+
+/// The stored blinding factor is not a licence to rewrite what it commits to.
+/// Every column the write can change is compared, so a caller that keeps
+/// `van_comm_rand` and moves the governance commitment is still refused.
+#[test]
+fn keeping_the_binding_while_changing_derived_setup_is_still_a_replacement() {
+    let db = db_with_delegation_setup(1);
+    insert_chain_submission(&db, 0);
+
+    let error = store_binding_with_gov_comm(&db, &[0x11; 32], &[0xEE; 32]).unwrap_err();
+
+    assert!(
+        matches!(error, VotingError::DelegationAlreadyBroadcast { .. }),
+        "{error:?}"
+    );
+    let gov_comm: Option<Vec<u8>> = db
+        .conn()
+        .query_row(
+            "SELECT gov_comm FROM bundles
+              WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+            rusqlite::params![ROUND_ID, W],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        gov_comm,
+        Some(vec![0xAA; 32]),
+        "nothing may have been written"
+    );
 }

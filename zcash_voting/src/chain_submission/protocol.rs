@@ -535,7 +535,25 @@ fn validate_json_response(response: &ChainHttpResponse) -> Result<(), ChainSubmi
         // which. The text is server-controlled, so it rides along as data:
         // it is redacted below, and `invalid_protocol` then escapes and bounds
         // it like any other diagnostic.
-        let observed = response.content_type().unwrap_or("(absent)");
+        //
+        // Only the media type is kept out of the header. Its parameters are as
+        // free-form as the body — a proxy is at liberty to answer
+        // `text/plain; detail=<signature>` — and they say nothing about who
+        // answered, which is the whole question here. The media type is
+        // redacted too, since nothing stops a hostile one from being a blob
+        // itself.
+        let observed = response
+            .content_type()
+            .map(|content_type| {
+                redact_encoded_material(
+                    content_type
+                        .split(';')
+                        .next()
+                        .unwrap_or(content_type)
+                        .trim(),
+                )
+            })
+            .unwrap_or_else(|| "(absent)".to_string());
         let body = String::from_utf8_lossy(response.body());
         // Same trust boundary as a rejection log: whoever answered instead of
         // the gateway may be quoting the request back.

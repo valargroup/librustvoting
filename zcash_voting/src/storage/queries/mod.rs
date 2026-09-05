@@ -1143,29 +1143,22 @@ fn store_delegation_data_inner(
         VotingError::from_sqlite("failed to begin delegation setup write", &error)
     })?;
 
-    let existing: Option<(
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-    )> = tx
+    let existing: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = tx
         .query_row(
-            "SELECT padded_note_secrets, pczt_sighash, tx1_effects, van_comm_rand FROM bundles \
+            "SELECT padded_note_secrets, pczt_sighash, tx1_effects FROM bundles \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|e| VotingError::Internal {
             message: format!("failed to load existing delegation data: {}", e),
         })?;
-    let Some((existing_secrets, existing_sighash, existing_tx1_effects, existing_van_comm_rand)) =
-        existing
-    else {
+    let Some((existing_secrets, existing_sighash, existing_tx1_effects)) = existing else {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "bundle not found: round={}, bundle={}",
@@ -1201,17 +1194,62 @@ fn store_delegation_data_inner(
         }
     }
 
-    // Any write that is not a rewrite of the binding already stored must not
-    // run over a bundle whose delegation reached the network: that bundle's
-    // stored setup is the only thing that reproduces its voting weight.
+    // Any write that would change the stored setup must not run over a bundle
+    // whose delegation reached the network: that bundle's stored setup is the
+    // only thing that reproduces its voting weight.
     //
-    // An absent binding is not evidence that this is a first write. The hotkey
-    // rebuild clears the column and only then spends the time to construct a
-    // replacement, so `None` here is exactly the window in which another
-    // process may have dispatched the old payload. Only an identical binding
-    // proves the write changes nothing, and that is the one case skipped.
-    let is_rewrite_of_stored_binding = existing_van_comm_rand.as_deref() == Some(van_comm_rand);
-    if !is_rewrite_of_stored_binding {
+    // The one case skipped is a write that leaves every column exactly as it
+    // found it, which is how an interrupted setup resumes. It is decided by
+    // comparing every column the update below can write, because the binding
+    // alone does not determine the rest: a caller supplying the stored
+    // `van_comm_rand` with any other derived field changed would otherwise
+    // walk straight past this guard. `IS` rather than `=` so a stored NULL
+    // compares as a value.
+    //
+    // An absent binding, in particular, is not evidence of a first write. The
+    // hotkey rebuild clears the setup and only then spends the time to
+    // construct its replacement, so that gap is exactly the window in which
+    // another process may have dispatched the old payload.
+    let write_changes_nothing: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM bundles \
+             WHERE round_id = :round_id AND wallet_id = :wallet_id \
+               AND bundle_index = :bundle_index \
+               AND van_comm_rand IS :rand AND dummy_nullifiers IS :dummies \
+               AND rho_signed IS :rho AND padded_note_data IS :padded \
+               AND nf_signed IS :nf_signed AND cmx_new IS :cmx_new \
+               AND alpha IS :alpha AND rseed_signed IS :rseed_signed \
+               AND rseed_output IS :rseed_output AND gov_comm IS :gov_comm \
+               AND total_note_value IS :total_note_value \
+               AND address_index IS :address_index \
+               AND (:rk IS NULL OR rk IS :rk) \
+               AND (:gov_nullifiers_blob IS NULL \
+                    OR gov_nullifiers_blob IS :gov_nullifiers_blob))",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":rand": van_comm_rand,
+                ":dummies": dummy_blob,
+                ":rho": rho_signed,
+                ":padded": padded_blob,
+                ":nf_signed": nf_signed,
+                ":cmx_new": cmx_new,
+                ":alpha": alpha,
+                ":rseed_signed": rseed_signed,
+                ":rseed_output": rseed_output,
+                ":gov_comm": gov_comm,
+                ":total_note_value": total_note_value as i64,
+                ":address_index": address_index as i64,
+                ":rk": rk,
+                ":gov_nullifiers_blob": gov_nullifiers_blob,
+            },
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to compare stored delegation setup: {error}"),
+        })?;
+    if !write_changes_nothing {
         if let Some((index, evidence)) =
             delegation_broadcast_evidence(&tx, round_id, wallet_id, Some(bundle_index))?
         {

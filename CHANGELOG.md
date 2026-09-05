@@ -451,9 +451,9 @@ This release is `zcash_voting` 4.0.0.
   preserved, and the rebuild is a no-op for a database that already holds the
   widened bound.
 
-- `RoundApi::delete_round` refuses a round whose delegation has reached the
+- `VotingDb::delete_round` refuses a round whose delegation has reached the
   network, since its stored setup is the only thing that can reproduce that
-  round's voting weight. `RoundApi::delete_round_discarding_recovery` is the
+  round's voting weight. `VotingDb::delete_round_discarding_recovery` is the
   explicitly named escape hatch for abandoning such a round on purpose, and is
   what the corrected-capability-package reset uses. Both take the round's
   chain-submission gate before reading the evidence they act on, and the
