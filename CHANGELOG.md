@@ -140,6 +140,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Schema version 20 rebuilds `chain_submissions` onto the 50-proposal bound.
+  A sidecar migrated by a build that carried the 15-proposal bound kept that
+  CHECK at version 19; nothing rewrote it, and the version-19 fingerprint
+  check then refused to open the sidecar at all, so every voting call on that
+  wallet failed with an unsupported-chain-submission-schema error. Rows are
+  preserved, and the rebuild is a no-op for a database that already holds the
+  widened bound.
 - Exhausting an invocation's POST budget on a possibly-dispatched attempt, a
   colliding hash, or cancellation during the final dispatch no longer ends a
   generation as `SubmittedWithoutHash`. The row stays hashless `Recovering`

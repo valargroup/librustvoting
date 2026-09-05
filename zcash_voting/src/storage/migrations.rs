@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 19;
+const CURRENT_VERSION: u32 = 20;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -128,6 +128,14 @@ END;",
     (
         18,
         include_str!("migrations/003_hashless_submission.sql"),
+    ),
+    // v20 rebuilds `chain_submissions` onto the 50-proposal bound. Sidecars
+    // migrated by a build that carried the 15-proposal bound keep it at
+    // version 19, and the version-19 fingerprint check then refuses to open
+    // them at all, so the widened bound needs a version of its own.
+    (
+        19,
+        include_str!("migrations/004_chain_submissions_proposal_range.sql"),
     ),
 ];
 

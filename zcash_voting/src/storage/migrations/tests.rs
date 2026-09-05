@@ -47,6 +47,16 @@ fn without_chain_submissions(schema: &str) -> String {
     schema[..start].to_string()
 }
 
+/// The complete version-19 schema as a build carrying the 15-proposal bound
+/// left it: everything `001_init.sql` creates, with `chain_submissions` still
+/// refusing proposal ids above 15.
+fn v19_legacy_proposal_bound_schema() -> String {
+    include_str!("001_init.sql").replace(
+        "proposal_id BETWEEN 1 AND 50",
+        "proposal_id BETWEEN 1 AND 15",
+    )
+}
+
 fn v16_schema() -> String {
     without_helper_share_plans(&without_chain_submissions(include_str!("001_init.sql")))
 }
@@ -402,6 +412,57 @@ fn fresh_and_migrated_v18_schemas_accept_supported_singleton_proposals() {
         let error = insert(0x51, crate::types::MAX_PROPOSAL_ID + 1).unwrap_err();
         assert!(is_constraint_violation(&error), "{schema_kind}: {error}");
     }
+}
+
+#[test]
+fn v19_legacy_proposal_bound_migrates_and_keeps_its_rows() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&v19_legacy_proposal_bound_schema())
+        .unwrap();
+    conn.pragma_update(None, "user_version", 19).unwrap();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    let insert = |conn: &Connection, identity_byte: u8, proposal_id: u32| {
+        conn.execute(
+            "INSERT INTO chain_submissions
+             (identity_key, round_id, wallet_id, network, bundle_index, kind,
+              proposal_id, generation_digest, state, committed_post_reservations,
+              created_at, updated_at)
+             VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', ?3, ?4,
+                     'submitting', 1, 9, 9)",
+            rusqlite::params![
+                vec![identity_byte; 32],
+                ROUND,
+                i64::from(proposal_id),
+                vec![0x42_u8; 32],
+            ],
+        )
+    };
+    insert(&conn, 0x60, 3).unwrap();
+    let before = dump_table(&conn, "chain_submissions");
+    // The stale bound is what makes this database unopenable today.
+    assert!(is_constraint_violation(
+        &insert(&conn, 0x61, 20).unwrap_err()
+    ));
+
+    migrate(&mut conn).unwrap();
+
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_VERSION);
+    assert_eq!(dump_table(&conn, "chain_submissions"), before);
+    insert(&conn, 0x61, 20).expect("migrated schema must accept a widened proposal id");
+    let error = insert(&conn, 0x62, crate::types::MAX_PROPOSAL_ID + 1).unwrap_err();
+    assert!(is_constraint_violation(&error), "{error}");
+    // A second open must still pass the fingerprint check.
+    migrate(&mut conn).unwrap();
 }
 
 #[test]
