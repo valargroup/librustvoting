@@ -59,6 +59,58 @@ fn setup_rebuilds_a_bundle_the_current_hotkey_cannot_use() {
     );
 }
 
+/// Every setup call joins the same exclusion as a rebuild, including the
+/// first write. Otherwise a caller can observe the binding after the rebuild
+/// cleared it and write a competing setup while the rebuilder still holds the
+/// round gate.
+#[test]
+fn first_setup_write_refuses_the_cleared_binding_window() {
+    let (db, note, fvk_bytes) = ironwood_setup_fixture();
+    let keys = keys_for_hotkey_byte(&fvk_bytes, 0x43);
+    let _rebuild_lease = db
+        .acquire_round_exclusive_lease(ROUND_ID, W)
+        .unwrap()
+        .expect("a current round has a submission identity");
+
+    let error = db
+        .build_governance_pczt(ROUND_ID, 0, &[note], &keys, nu6_3_branch_id())
+        .unwrap_err();
+
+    assert!(matches!(error, VotingError::Busy { .. }), "{error:?}");
+    assert_eq!(
+        van_comm_rand_of(&db, 0),
+        None,
+        "a setup writer must not enter while the rebuild gate is held"
+    );
+}
+
+/// Reusing an existing setup is serialized too. If only mismatch-triggered
+/// rebuilds took the gate, a same-hotkey caller could begin from a generation
+/// that another caller was about to discard.
+#[test]
+fn existing_setup_reuse_refuses_an_active_rebuild() {
+    let (db, note, fvk_bytes) = ironwood_setup_fixture();
+    let keys = keys_for_hotkey_byte(&fvk_bytes, 0x43);
+    db.build_governance_pczt(ROUND_ID, 0, &[note.clone()], &keys, nu6_3_branch_id())
+        .unwrap();
+    let stored_setup = van_comm_rand_of(&db, 0);
+    let _rebuild_lease = db
+        .acquire_round_exclusive_lease(ROUND_ID, W)
+        .unwrap()
+        .expect("a current round has a submission identity");
+
+    let error = db
+        .build_governance_pczt(ROUND_ID, 0, &[note], &keys, nu6_3_branch_id())
+        .unwrap_err();
+
+    assert!(matches!(error, VotingError::Busy { .. }), "{error:?}");
+    assert_eq!(
+        van_comm_rand_of(&db, 0),
+        stored_setup,
+        "a refused reuse must leave the durable setup unchanged"
+    );
+}
+
 /// The Keystone shape validates too: a bundle set up against a round-bound
 /// target reproduces from the hotkey behind that target.
 ///

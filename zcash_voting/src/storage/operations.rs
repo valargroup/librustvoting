@@ -703,11 +703,11 @@ impl VotingDb {
     /// Clears the local delegation setup of bundles that were never broadcast,
     /// so setup can rebuild them, and reports how many were cleared.
     ///
-    /// Crate-internal on purpose. Hosts do not choose when to discard: setup
-    /// calls this itself through [`VotingDb::rebuild_setup_unusable_by_hotkey`]
-    /// once it knows the stored target cannot be reproduced, because the choice
-    /// turns on whether the delegation may already be on chain and a host that
-    /// judges that wrongly destroys a round's voting weight for good.
+    /// Crate-internal on purpose. Hosts do not choose when to discard:
+    /// [`VotingDb::build_governance_pczt`] calls this itself once it knows the
+    /// stored target cannot be reproduced, because the choice turns on whether
+    /// the delegation may already be on chain and a host that judges that
+    /// wrongly destroys a round's voting weight for good.
     ///
     /// The recovery path for a delegation the wallet can no longer use but has
     /// not committed to anything: most importantly a bundle whose stored target
@@ -1012,26 +1012,23 @@ impl VotingDb {
     /// evidence exists the discard below refuses and this call fails, keeping
     /// the setup that is the round's only path back to its voting weight.
     ///
-    /// Returns the round's exclusive gate when it discarded, and the caller
-    /// must hold it until the replacement setup is written. A discard whose
-    /// exclusion ended at this return would leave the bundle with no setup
-    /// while a lifecycle call already holding a payload for the old one could
-    /// dispatch and persist it, and the replacement would then be written over
-    /// broadcast work. Returns `None` when the stored setup is usable and
-    /// nothing was discarded, since there is then nothing to exclude.
-    fn rebuild_setup_unusable_by_hotkey(
+    /// The caller must hold the round's exclusive submission gate from before
+    /// this check until the resulting setup is persisted. Taking the gate only
+    /// after observing a mismatch would leave two races: the observed binding
+    /// could be replaced before the discard, and another setup call could see
+    /// the temporarily cleared binding and build without taking the gate.
+    fn discard_setup_unusable_by_hotkey_locked(
         &self,
         round_id: &str,
         bundle_index: u32,
         params: &VotingRoundParams,
         stored_network: Network,
         keys: &DelegationKeys,
-    ) -> Result<Option<crate::chain_submission::coordination::ExclusiveRoundLease>, VotingError>
-    {
+    ) -> Result<(), VotingError> {
         let wallet_id = self.wallet_id();
         let conn = self.conn();
         if !queries::bundle_has_delegation_setup(&conn, round_id, &wallet_id, bundle_index)? {
-            return Ok(None);
+            return Ok(());
         }
         let identity = DelegationProofIdentity::new(
             self.sidecar_id(),
@@ -1048,18 +1045,14 @@ impl VotingDb {
         );
         drop(conn);
         match validation {
-            Ok(()) => Ok(None),
+            Ok(()) => Ok(()),
             Err(VotingError::DelegationTargetMismatch { .. }) => {
-                // Taken before the discard reads its evidence and held past
-                // this return, so the discard and the write that replaces what
-                // it removed happen under one uninterrupted exclusion.
-                let lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
                 self.discard_unbroadcast_delegation_locked(
                     round_id,
                     &wallet_id,
                     Some(bundle_index),
                 )?;
-                Ok(lease)
+                Ok(())
             }
             Err(other) => Err(other),
         }
@@ -1119,6 +1112,11 @@ impl VotingDb {
         consensus_branch_id: u32,
     ) -> Result<GovernancePczt, VotingError> {
         let wallet_id = self.wallet_id();
+        // Every setup writer takes the gate before inspecting the binding and
+        // keeps it through persistence. A mismatch-only gate is insufficient:
+        // a second writer can otherwise observe the cleared rebuild window and
+        // write a competing setup while the first writer still holds the gate.
+        let _setup_lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
         let (params, stored_network) = {
             let conn = self.conn();
             let (params, stored_network) =
@@ -1135,9 +1133,7 @@ impl VotingDb {
         // Before any stored setup is reused, make sure it belongs to the hotkey
         // this call carries. Setup runs ahead of `ensure_padded_secrets`, which
         // would otherwise hand back the previous hotkey's secrets.
-        // Held, when a rebuild happened, until the replacement setup below is
-        // persisted: the discard and its replacement are one exclusion.
-        let _rebuild_lease = self.rebuild_setup_unusable_by_hotkey(
+        self.discard_setup_unusable_by_hotkey_locked(
             round_id,
             bundle_index,
             &params,
