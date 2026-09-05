@@ -192,3 +192,36 @@ fn store_binding(db: &VotingDb, van_comm_rand: &[u8; 32]) -> Result<(), VotingEr
         &crate::tx1::placeholder_tx1_effects(),
     )
 }
+
+/// The mismatch kind reports the disagreement and nothing else. A bundle
+/// already on chain fails the comparison identically to one that never left
+/// the device, so a host must not read the kind as permission to discard —
+/// the discard decides that itself, and refuses.
+#[test]
+fn the_mismatch_kind_says_nothing_about_whether_the_bundle_was_broadcast() {
+    let (db, note, fvk_bytes) = ironwood_setup_fixture();
+    let first = keys_for_hotkey_byte(&fvk_bytes, 0x43);
+    db.build_governance_pczt(ROUND_ID, 0, &[note], &first, nu6_3_branch_id())
+        .unwrap();
+    insert_chain_submission(&db, 0);
+
+    let identity = DelegationProofIdentity::new(db.sidecar_id(), W.to_string(), ROUND_ID, 0);
+    let second = keys_for_hotkey_byte(&fvk_bytes, 0x44);
+    let error = db
+        .validate_delegation_proof_target(&identity, &second)
+        .unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        crate::VotingErrorKind::DelegationTargetMismatch
+    );
+    // And the recovery that kind might suggest is refused, which is where the
+    // unbroadcast guarantee actually lives.
+    let refusal = db
+        .discard_unbroadcast_delegation(ROUND_ID, Some(0))
+        .unwrap_err();
+    assert!(
+        matches!(refusal, VotingError::DelegationAlreadyBroadcast { .. }),
+        "{refusal:?}"
+    );
+}

@@ -1008,7 +1008,11 @@ impl PreparedDelegationBundle {
     /// and the same target-bound hotkey. A pipeline constructed with another
     /// same-network hotkey would otherwise be handed the stored delegation
     /// for the original target. Fails with [`VotingError::InvalidInput`] on a
-    /// note, network, round, or target mismatch.
+    /// note, network or round mismatch, and with
+    /// [`VotingError::DelegationTargetMismatch`] when the stored target does
+    /// not reproduce from this pipeline's hotkey. That last one reports the
+    /// disagreement only; it does not establish that the bundle is
+    /// unbroadcast, and so does not license discarding it.
     pub fn validate_persisted_proof(&self, voting_db: &VotingDb) -> Result<(), VotingError> {
         validate_persisted_proof_reuse(
             voting_db,

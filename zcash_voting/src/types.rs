@@ -79,9 +79,17 @@ pub enum VotingErrorKind {
     SetupAlreadyPersisted,
     DbBusy,
     PirUnavailable,
-    /// A bundle's stored delegation setup cannot be used with the voting
-    /// hotkey the host holds. Nothing was broadcast, so the bundle can be
-    /// discarded and rebuilt.
+    /// A bundle's stored delegation setup does not reproduce from the voting
+    /// hotkey the host holds.
+    ///
+    /// It says what disagrees, not what may be done about it: the comparison
+    /// is over the stored binding alone, and a bundle whose delegation is
+    /// already on chain fails it the same way one that never left the device
+    /// does. Rebuilding is safe only when nothing was broadcast, which is a
+    /// separate question — ask it with `delegation_broadcast_evidence`, or let
+    /// the discard answer it, since it refuses with
+    /// [`VotingErrorKind::DelegationAlreadyBroadcast`] rather than destroying
+    /// the setup that recovers a round's voting weight.
     DelegationTargetMismatch,
     /// A delegation may already be on chain, so the state the host asked to
     /// clear is the only thing that can recover the round's voting weight.
