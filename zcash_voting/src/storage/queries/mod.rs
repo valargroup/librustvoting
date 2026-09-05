@@ -1135,22 +1135,37 @@ fn store_delegation_data_inner(
     // Serialize padded_note_secrets as flat blob: N * 64 bytes (rho[32] || rseed[32] per entry).
     let secrets_blob = encode_padded_note_secrets(padded_note_secrets);
 
-    let existing: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+    // One transaction, because the guards below read the state they guard.
+    // The evidence check in particular decides whether an existing binding may
+    // be replaced, and a submission that commits between that read and the
+    // UPDATE would otherwise have its setup rewritten underneath it.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
+        VotingError::from_sqlite("failed to begin delegation setup write", &error)
+    })?;
+
+    let existing: Option<(
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    )> = tx
         .query_row(
-            "SELECT padded_note_secrets, pczt_sighash, tx1_effects FROM bundles \
+            "SELECT padded_note_secrets, pczt_sighash, tx1_effects, van_comm_rand FROM bundles \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| VotingError::Internal {
             message: format!("failed to load existing delegation data: {}", e),
         })?;
-    let Some((existing_secrets, existing_sighash, existing_tx1_effects)) = existing else {
+    let Some((existing_secrets, existing_sighash, existing_tx1_effects, existing_van_comm_rand)) =
+        existing
+    else {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "bundle not found: round={}, bundle={}",
@@ -1186,7 +1201,25 @@ fn store_delegation_data_inner(
         }
     }
 
-    let rows = conn
+    // Replacing a binding that already exists is the hotkey rebuild, and it
+    // must not run over a bundle whose delegation reached the network: that
+    // bundle's stored setup is the only thing that reproduces its voting
+    // weight. A first write, and an idempotent rewrite of the same binding,
+    // are untouched.
+    if existing_van_comm_rand.is_some_and(|existing| existing != van_comm_rand) {
+        if let Some((index, evidence)) =
+            delegation_broadcast_evidence(&tx, round_id, wallet_id, Some(bundle_index))?
+        {
+            return Err(already_broadcast(
+                round_id,
+                index,
+                evidence,
+                "replace delegation setup",
+            ));
+        }
+    }
+
+    let rows = tx
         .execute(
             "UPDATE bundles SET van_comm_rand = :rand, dummy_nullifiers = :dummies, \
              rho_signed = :rho, padded_note_data = :padded, nf_signed = :nf_signed, \
@@ -1235,6 +1268,10 @@ fn store_delegation_data_inner(
             ),
         });
     }
+
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite("failed to commit delegation setup write", &error)
+    })?;
 
     Ok(())
 }
@@ -3567,6 +3604,23 @@ impl DelegationBroadcastEvidence {
             Self::Vote => "a vote",
             Self::ShareDelegation => "a delivered helper share",
         }
+    }
+}
+
+/// The one wording every path uses to refuse a destructive or replacing call
+/// on a round that has already reached the network.
+pub(crate) fn already_broadcast(
+    round_id: &str,
+    bundle_index: u32,
+    evidence: DelegationBroadcastEvidence,
+    action: &str,
+) -> VotingError {
+    VotingError::DelegationAlreadyBroadcast {
+        bundle_index,
+        evidence: format!(
+            "{} for round {round_id}, refusing to {action}",
+            evidence.as_str()
+        ),
     }
 }
 

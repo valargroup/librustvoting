@@ -402,10 +402,19 @@ pub struct PirFleet {
 impl PirFleet {
     /// Builds a fleet from ordered endpoint URLs, dropping duplicates.
     ///
+    /// An empty fleet is constructible on purpose, so successful construction
+    /// is not evidence that a usable endpoint exists: the requirement is
+    /// enforced where a query actually needs one. Steps that advance a
+    /// delegation the chain already holds never touch PIR, and refusing here
+    /// made the fleet a precondition of opening a session at all, which left a
+    /// submitted delegation unable to resume without PIR.
+    ///
     /// # Errors
     ///
-    /// Returns [`VotingError::InvalidInput`] for an empty list, an empty URL,
-    /// or an unusable layout.
+    /// Returns [`VotingError::InvalidInput`] for an empty URL or an unusable
+    /// layout. An empty endpoint list constructs successfully and fails at
+    /// [`PirFleet::with_failover`], and so at [`PirFleet::connect`], with
+    /// `InvalidInput`.
     pub fn new(
         endpoints: &[String],
         layout: PirLayout,

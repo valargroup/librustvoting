@@ -224,3 +224,43 @@ async fn a_transaction_hash_in_a_log_stays_legible() {
         format!("vote chain rejected transaction with code 7: conflicts with {HASH}")
     );
 }
+
+#[tokio::test]
+async fn an_encoded_blob_wrapped_in_punctuation_is_redacted() {
+    let transport = Arc::new(ScriptedTransport::default());
+    // A minified echo of the request: the blob touches no whitespace, so a
+    // word-at-a-time reading would keep every byte of it.
+    let proof = "ab".repeat(600);
+    transport.queue(Ok(json(
+        422,
+        format!(r#"{{"code":7,"log":"rejected request={{\"proof\":\"{proof}\"}}"}}"#),
+    )));
+    let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+
+    let PostAttemptOutcome::Rejected { diagnostic, .. } =
+        client.submit_delegation(0, &delegation()).await
+    else {
+        panic!("expected deterministic rejection");
+    };
+    assert!(
+        !diagnostic.message().contains("abababab"),
+        "{}",
+        diagnostic.message()
+    );
+    assert!(
+        diagnostic.message().contains("[redacted]"),
+        "{}",
+        diagnostic.message()
+    );
+    // The punctuation around it, and the words, are not encoded material.
+    assert!(
+        diagnostic.message().contains("rejected request="),
+        "{}",
+        diagnostic.message()
+    );
+    assert!(
+        diagnostic.message().contains("proof"),
+        "{}",
+        diagnostic.message()
+    );
+}

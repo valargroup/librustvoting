@@ -460,6 +460,13 @@ This release is `zcash_voting` 4.0.0.
   checked path re-reads that evidence inside the transaction that deletes, so a
   submission starting concurrently cannot lose the rows that recover it.
 
+- Delegation setup that replaces an existing binding is refused once its
+  bundle shows broadcast evidence, and the check runs in the transaction that
+  writes. The hotkey rebuild holds the round's submission gate from the discard
+  through the replacement write, so a lifecycle call cannot dispatch the old
+  setup in between and have the replacement written over it. A first write, and
+  an idempotent rewrite of the same binding, are unaffected.
+
 - A chain rejection's diagnostic carries the node's own explanation instead of
   a bare numeric code. The text is server-controlled, so any proof, signature
   or address the node echoed out of the submitted request is replaced with

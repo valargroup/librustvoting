@@ -700,13 +700,13 @@ fn join_chain_url(base_url: &str, segments: &[&str]) -> String {
     url
 }
 
-/// Length above which one unbroken run of encoded text is treated as request
-/// material rather than as an explanation.
+/// Length above which one unbroken run of encoded characters is treated as
+/// request material rather than as an explanation.
 ///
 /// Set above a 64-character transaction hash, which is public, often the whole
 /// diagnosis, and worth keeping legible, and far below the shortest proof,
 /// signature or address a node could echo back.
-const MAX_SERVER_TEXT_TOKEN_LENGTH: usize = 96;
+const MAX_SERVER_TEXT_RUN_LENGTH: usize = 96;
 
 /// Replaces encoded blobs in server-controlled text with a marker, so the
 /// text can be handed to [`ChainSubmissionDiagnostic::from_redacted_message`].
@@ -715,23 +715,40 @@ const MAX_SERVER_TEXT_TOKEN_LENGTH: usize = 96;
 /// its non-JSON error bodies can carry a proof, a signature, or the voting
 /// address out of the submitted transaction. Escaping and truncation bound
 /// what a durable diagnostic costs but do not decide what belongs in one, and
-/// that row is written to disk and shown again after restart. The prose the
-/// diagnostic is kept for survives untouched: only a run of at least
-/// `MAX_SERVER_TEXT_TOKEN_LENGTH` characters drawn entirely from the
-/// hex/base64 alphabet is replaced, which no natural-language word reaches and
-/// no encoded blob stays under.
+/// that row is written to disk and shown again after restart.
+///
+/// The scan is over runs, not words: a node that answers
+/// `request={"proof":"<hex>"}` wraps its blob in punctuation, and a
+/// whitespace-delimited reading would keep the whole thing. Every maximal run
+/// of at least `MAX_SERVER_TEXT_RUN_LENGTH` characters from the hex/base64
+/// alphabet is replaced wherever it appears, and everything around it —
+/// including the punctuation and the prose the diagnostic is kept for —
+/// survives untouched. No natural-language word reaches that length and no
+/// encoded blob stays under it.
 fn redact_encoded_material(text: &str) -> String {
     let mut redacted = String::with_capacity(text.len());
-    for token in text.split_inclusive(char::is_whitespace) {
-        let body = token.trim_end();
-        if body.len() >= MAX_SERVER_TEXT_TOKEN_LENGTH && body.chars().all(is_encoded_character) {
-            redacted.push_str("[redacted]");
+    let mut run = String::new();
+    for character in text.chars() {
+        if is_encoded_character(character) {
+            run.push(character);
         } else {
-            redacted.push_str(body);
+            push_run(&mut redacted, &mut run);
+            redacted.push(character);
         }
-        redacted.push_str(&token[body.len()..]);
     }
+    push_run(&mut redacted, &mut run);
     redacted
+}
+
+/// Appends `run` to `redacted`, as a marker once it is long enough to be
+/// encoded material, and empties it either way.
+fn push_run(redacted: &mut String, run: &mut String) {
+    if run.len() >= MAX_SERVER_TEXT_RUN_LENGTH {
+        redacted.push_str("[redacted]");
+    } else {
+        redacted.push_str(run);
+    }
+    run.clear();
 }
 
 /// Whether `character` can appear in hex, base64 or base64url output.
