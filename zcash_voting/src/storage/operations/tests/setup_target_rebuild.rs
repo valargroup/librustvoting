@@ -307,8 +307,8 @@ fn a_write_over_a_cleared_binding_is_refused_once_the_bundle_is_broadcast() {
     db.discard_unbroadcast_delegation(ROUND_ID, Some(0))
         .unwrap();
     assert_eq!(van_comm_rand_of(&db, 0), None, "the discard clears it");
-    // What a lifecycle call in another process does while the replacement is
-    // being built.
+    // A bundle can sit with no binding after an explicit host-driven discard,
+    // and a later direct write must still not walk over broadcast evidence.
     insert_chain_submission(&db, 0);
 
     let error = store_binding(&db, &[0x99; 32]).unwrap_err();
@@ -318,6 +318,95 @@ fn a_write_over_a_cleared_binding_is_refused_once_the_bundle_is_broadcast() {
         "{error:?}"
     );
     assert_eq!(van_comm_rand_of(&db, 0), None);
+}
+
+/// The rebuild's exchange is one transaction, so evidence that arrives while
+/// the replacement is being built refuses the whole thing and the setup it
+/// would have discarded is still there. When the discard committed on its own,
+/// a refusal at the write left the bundle with neither.
+///
+/// Exercised at the query, because the race it closes is between processes:
+/// the round gate is process-local and cannot exclude the other party.
+#[test]
+fn a_rebuild_refused_at_the_write_keeps_the_old_setup_and_its_proof() {
+    let db = db_with_delegation_setup(1);
+    queries::store_proof(&db.conn(), ROUND_ID, W, 0, &[0x01; 8]).unwrap();
+    // What another process dispatches while the replacement is being built.
+    insert_chain_submission(&db, 0);
+
+    let error = replace_setup(&db, &[0x99; 32]).unwrap_err();
+
+    assert!(
+        matches!(error, VotingError::DelegationAlreadyBroadcast { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        van_comm_rand_of(&db, 0),
+        Some(vec![0x11; 32]),
+        "the setup that recovers the round must survive a refused rebuild"
+    );
+    let proofs: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM proofs
+              WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+            rusqlite::params![ROUND_ID, W],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(proofs, 1, "nor may its proof be discarded");
+}
+
+/// The same exchange with nothing dispatched into it: the replacement lands
+/// and takes the old setup's derived rows with it.
+#[test]
+fn a_rebuild_that_is_not_refused_replaces_the_setup_and_its_proof() {
+    let db = db_with_delegation_setup(1);
+    queries::store_proof(&db.conn(), ROUND_ID, W, 0, &[0x01; 8]).unwrap();
+
+    replace_setup(&db, &[0x99; 32]).expect("an unbroadcast bundle rebuilds");
+
+    assert_eq!(van_comm_rand_of(&db, 0), Some(vec![0x99; 32]));
+    let proofs: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM proofs
+              WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+            rusqlite::params![ROUND_ID, W],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        proofs, 0,
+        "the stale proof goes with the setup it was made for"
+    );
+}
+
+/// Exchanges bundle 0's setup for one bound to `van_comm_rand`.
+fn replace_setup(db: &VotingDb, van_comm_rand: &[u8; 32]) -> Result<(), VotingError> {
+    queries::replace_unbroadcast_delegation_setup(
+        &db.conn(),
+        ROUND_ID,
+        W,
+        0,
+        van_comm_rand,
+        &[vec![0x22; 32]],
+        &[0x33; 32],
+        &[vec![0x44; 32]],
+        &[0x55; 32],
+        &[0x66; 32],
+        &[0x77; 32],
+        &[0x88; 32],
+        &[0x99; 32],
+        &[0xAA; 32],
+        1_000,
+        0,
+        &[(vec![0xBB; 32], vec![0xCC; 32])],
+        &[0xDD; 32],
+        &crate::tx1::placeholder_tx1_effects(),
+        &[0xEE; 32],
+        &[vec![0xFF; 32]],
+    )
 }
 
 /// The same window with nothing dispatched into it: the rebuild completes,

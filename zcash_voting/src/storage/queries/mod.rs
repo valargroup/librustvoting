@@ -1095,6 +1095,100 @@ pub(crate) fn store_delegation_data_with_pczt_fields(
     )
 }
 
+/// Replaces one bundle's delegation setup, discarding what it had, as a single
+/// transaction.
+///
+/// The rebuild path for a bundle whose stored target the wallet's voting
+/// hotkey no longer reproduces. The evidence check, the discard of the old
+/// setup and its derived rows, and the write of the replacement all commit
+/// together, so the bundle never sits with its recovery state deleted and no
+/// replacement in its place.
+///
+/// That matters because the round's submission gate is process-local: it
+/// cannot exclude a second process holding a payload for the old setup. If one
+/// dispatches while the replacement is being built, the evidence is here
+/// before this transaction takes it, and the whole rebuild is refused with the
+/// old setup still stored — which is the state that recovers the round's
+/// voting weight.
+///
+/// Refuses with `DelegationAlreadyBroadcast` and writes nothing when the
+/// bundle shows any broadcast evidence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replace_unbroadcast_delegation_setup(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    van_comm_rand: &[u8],
+    dummy_nullifiers: &[Vec<u8>],
+    rho_signed: &[u8],
+    padded_cmx: &[Vec<u8>],
+    nf_signed: &[u8],
+    cmx_new: &[u8],
+    alpha: &[u8],
+    rseed_signed: &[u8],
+    rseed_output: &[u8],
+    gov_comm: &[u8],
+    total_note_value: u64,
+    address_index: u32,
+    padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
+    pczt_sighash: &[u8],
+    tx1_effects: &[u8],
+    rk: &[u8],
+    gov_nullifiers: &[Vec<u8>],
+) -> Result<(), VotingError> {
+    crate::tx1::validate_tx1_effects(tx1_effects)?;
+    let dummy_blob: Vec<u8> = dummy_nullifiers.iter().flatten().copied().collect();
+    let padded_blob: Vec<u8> = padded_cmx.iter().flatten().copied().collect();
+    let secrets_blob = encode_padded_note_secrets(padded_note_secrets);
+    let gov_nullifiers_blob = encode_gov_nullifiers_blob(gov_nullifiers);
+
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
+        VotingError::from_sqlite("failed to begin delegation setup replacement", &error)
+    })?;
+
+    if let Some((index, evidence)) =
+        first_broadcast_evidence(&tx, round_id, wallet_id, BundleScope::One(bundle_index))?
+    {
+        return Err(already_broadcast(
+            round_id,
+            index,
+            evidence,
+            "replace delegation setup",
+        ));
+    }
+
+    discard_unbroadcast_delegation_setup_within(&tx, round_id, wallet_id, Some(bundle_index))?;
+    store_delegation_setup_within(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        van_comm_rand,
+        &dummy_blob,
+        rho_signed,
+        &padded_blob,
+        nf_signed,
+        cmx_new,
+        alpha,
+        rseed_signed,
+        rseed_output,
+        gov_comm,
+        total_note_value,
+        address_index,
+        &secrets_blob,
+        pczt_sighash,
+        Some(tx1_effects),
+        Some(rk),
+        Some(gov_nullifiers_blob.as_slice()),
+    )?;
+
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite("failed to commit delegation setup replacement", &error)
+    })?;
+    Ok(())
+}
+
 fn store_delegation_data_inner(
     conn: &Connection,
     round_id: &str,
@@ -1142,7 +1236,65 @@ fn store_delegation_data_inner(
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
         VotingError::from_sqlite("failed to begin delegation setup write", &error)
     })?;
+    store_delegation_setup_within(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        van_comm_rand,
+        &dummy_blob,
+        rho_signed,
+        &padded_blob,
+        nf_signed,
+        cmx_new,
+        alpha,
+        rseed_signed,
+        rseed_output,
+        gov_comm,
+        total_note_value,
+        address_index,
+        &secrets_blob,
+        pczt_sighash,
+        tx1_effects,
+        rk,
+        gov_nullifiers_blob,
+    )?;
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite("failed to commit delegation setup write", &error)
+    })?;
 
+    Ok(())
+}
+
+/// The setup write's guards and update, for a caller that owns the
+/// transaction.
+///
+/// Blobs arrive already encoded, because a rebuild encodes them once and runs
+/// this beside the discard that made room for them.
+#[allow(clippy::too_many_arguments)]
+fn store_delegation_setup_within(
+    tx: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    van_comm_rand: &[u8],
+    dummy_blob: &[u8],
+    rho_signed: &[u8],
+    padded_blob: &[u8],
+    nf_signed: &[u8],
+    cmx_new: &[u8],
+    alpha: &[u8],
+    rseed_signed: &[u8],
+    rseed_output: &[u8],
+    gov_comm: &[u8],
+    total_note_value: u64,
+    address_index: u32,
+    secrets_blob: &[u8],
+    pczt_sighash: &[u8],
+    tx1_effects: Option<&[u8]>,
+    rk: Option<&[u8]>,
+    gov_nullifiers_blob: Option<&[u8]>,
+) -> Result<(), VotingError> {
     let existing: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = tx
         .query_row(
             "SELECT padded_note_secrets, pczt_sighash, tx1_effects FROM bundles \
@@ -1311,10 +1463,6 @@ fn store_delegation_data_inner(
             ),
         });
     }
-
-    tx.commit().map_err(|error| {
-        VotingError::from_sqlite("failed to commit delegation setup write", &error)
-    })?;
 
     Ok(())
 }
@@ -3834,7 +3982,28 @@ pub(crate) fn discard_unbroadcast_delegation_setup(
             &error,
         )
     })?;
+    let cleared =
+        discard_unbroadcast_delegation_setup_within(&tx, round_id, wallet_id, bundle_index)?;
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite(
+            "failed to commit delegation setup discard transaction",
+            &error,
+        )
+    })?;
+    Ok(cleared)
+}
 
+/// The discard's statements, for a caller that owns the transaction.
+///
+/// Separate from the entry point above because a rebuild must not commit the
+/// discard on its own: the replacement has to land in the same transaction, or
+/// a failure between them leaves the bundle with neither.
+fn discard_unbroadcast_delegation_setup_within(
+    tx: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: Option<u32>,
+) -> Result<u32, VotingError> {
     // The outer filter runs against four different tables, so it stays
     // unqualified; the subquery below is the one that reads `bundles`.
     let bundle_filter = match bundle_index {
@@ -3942,12 +4111,6 @@ pub(crate) fn discard_unbroadcast_delegation_setup(
         }
     }
 
-    tx.commit().map_err(|error| {
-        VotingError::from_sqlite(
-            "failed to commit delegation setup discard transaction",
-            &error,
-        )
-    })?;
     Ok(cleared as u32)
 }
 

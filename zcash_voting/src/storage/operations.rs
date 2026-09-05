@@ -997,38 +997,44 @@ impl VotingDb {
     }
     // --- Phase 1: Delegation setup ---
 
-    /// Discards delegation setup the supplied hotkey cannot use, so this setup
-    /// call rebuilds it.
+    /// Whether the stored delegation setup must be rebuilt because the
+    /// supplied hotkey cannot reproduce its target.
     ///
     /// A wallet whose voting hotkey for a round changed — it was never durably
-    /// stored, or storage handed back nothing and a fresh one was bound — holds
-    /// bundles whose stored target it can no longer reproduce. Every later step
-    /// refuses them, and the write-once setup guard refuses to replace them, so
-    /// without this the round is stuck for good with no host-visible way out.
+    /// stored, or storage handed back nothing and a fresh one was bound —
+    /// holds bundles whose stored target it can no longer reproduce. Every
+    /// later step refuses them, and the write-once setup guard refuses to
+    /// replace them, so without a rebuild the round is stuck for good with no
+    /// host-visible way out.
     ///
     /// The SDK decides this, not the host: the choice turns on whether the
     /// delegation may already be on chain, which is exactly the judgement a
-    /// host has no way to make and must never make wrongly. When any broadcast
-    /// evidence exists the discard below refuses and this call fails, keeping
-    /// the setup that is the round's only path back to its voting weight.
+    /// host has no way to make and must never make wrongly.
     ///
-    /// The caller must hold the round's exclusive submission gate from before
-    /// this check until the resulting setup is persisted. Taking the gate only
-    /// after observing a mismatch would leave two races: the observed binding
-    /// could be replaced before the discard, and another setup call could see
-    /// the temporarily cleared binding and build without taking the gate.
-    fn discard_setup_unusable_by_hotkey_locked(
+    /// This only reports; nothing is discarded here. The replacement takes real
+    /// time to build, and a discard committed ahead of it would leave the
+    /// bundle with neither its old setup nor a new one. The caller's gate
+    /// cannot prevent that, being process-local, so
+    /// [`queries::replace_unbroadcast_delegation_setup`] performs the whole
+    /// exchange in one transaction and refuses it outright when broadcast
+    /// evidence arrived while the replacement was being built.
+    ///
+    /// The caller must hold the round's exclusive submission gate across this
+    /// check and the write that follows, which is what keeps a second caller
+    /// in this process from starting from a binding this one is about to
+    /// replace.
+    fn setup_target_needs_rebuild(
         &self,
         round_id: &str,
         bundle_index: u32,
         params: &VotingRoundParams,
         stored_network: Network,
         keys: &DelegationKeys,
-    ) -> Result<(), VotingError> {
+    ) -> Result<bool, VotingError> {
         let wallet_id = self.wallet_id();
         let conn = self.conn();
         if !queries::bundle_has_delegation_setup(&conn, round_id, &wallet_id, bundle_index)? {
-            return Ok(());
+            return Ok(false);
         }
         let identity = DelegationProofIdentity::new(
             self.sidecar_id(),
@@ -1045,15 +1051,8 @@ impl VotingDb {
         );
         drop(conn);
         match validation {
-            Ok(()) => Ok(()),
-            Err(VotingError::DelegationTargetMismatch { .. }) => {
-                self.discard_unbroadcast_delegation_locked(
-                    round_id,
-                    &wallet_id,
-                    Some(bundle_index),
-                )?;
-                Ok(())
-            }
+            Ok(()) => Ok(false),
+            Err(VotingError::DelegationTargetMismatch { .. }) => Ok(true),
             Err(other) => Err(other),
         }
     }
@@ -1131,16 +1130,20 @@ impl VotingDb {
             (params, stored_network)
         };
         // Before any stored setup is reused, make sure it belongs to the hotkey
-        // this call carries. Setup runs ahead of `ensure_padded_secrets`, which
-        // would otherwise hand back the previous hotkey's secrets.
-        self.discard_setup_unusable_by_hotkey_locked(
-            round_id,
-            bundle_index,
-            &params,
-            stored_network,
-            keys,
-        )?;
-        let padded_note_secrets = self.ensure_padded_secrets(round_id, bundle_index, notes)?;
+        // this call carries. Nothing is discarded yet: the replacement takes
+        // real time to build, and a discard committed ahead of it would leave
+        // the bundle with neither its old setup nor a new one.
+        let rebuild =
+            self.setup_target_needs_rebuild(round_id, bundle_index, &params, stored_network, keys)?;
+        // A rebuild cannot reuse the stored padded secrets: they belong to the
+        // target the wallet can no longer reproduce. They are sampled in memory
+        // here and reach the database only with the replacement, so a failure
+        // anywhere below leaves the stored setup exactly as it was.
+        let padded_note_secrets = if rebuild {
+            crate::action::sample_padded_note_secrets(notes.len())?
+        } else {
+            self.ensure_padded_secrets(round_id, bundle_index, notes)?
+        };
         let van_blinding = keys.van_blinding_for_bundle(&params, bundle_index, notes)?;
         let result = crate::action::build_governance_pczt(
             notes,
@@ -1163,31 +1166,59 @@ impl VotingDb {
             .ok_or_else(|| VotingError::InvalidInput {
                 message: "total note weight overflows u64".to_string(),
             })?;
-        // Persist delegation data plus the PCZT-derived signing fields.
+        // Persist delegation data plus the PCZT-derived signing fields. A
+        // rebuild exchanges the old setup for this one in a single
+        // transaction; a first setup has nothing to exchange.
         let conn = self.conn();
-        queries::store_delegation_data_with_pczt_fields(
-            &conn,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            &result.van_comm_rand,
-            &result.dummy_nullifiers,
-            &result.rho_signed,
-            &result.padded_cmx,
-            &result.nf_signed,
-            &result.cmx_new,
-            &result.alpha,
-            &result.rseed_signed,
-            &result.rseed_output,
-            &result.van,
-            total_note_value,
-            keys.address_index,
-            &result.padded_note_secrets,
-            &result.pczt_sighash,
-            &result.tx1_effects,
-            &result.rk,
-            &result.gov_nullifiers,
-        )?;
+        if rebuild {
+            queries::replace_unbroadcast_delegation_setup(
+                &conn,
+                round_id,
+                &wallet_id,
+                bundle_index,
+                &result.van_comm_rand,
+                &result.dummy_nullifiers,
+                &result.rho_signed,
+                &result.padded_cmx,
+                &result.nf_signed,
+                &result.cmx_new,
+                &result.alpha,
+                &result.rseed_signed,
+                &result.rseed_output,
+                &result.van,
+                total_note_value,
+                keys.address_index,
+                &result.padded_note_secrets,
+                &result.pczt_sighash,
+                &result.tx1_effects,
+                &result.rk,
+                &result.gov_nullifiers,
+            )?;
+        } else {
+            queries::store_delegation_data_with_pczt_fields(
+                &conn,
+                round_id,
+                &wallet_id,
+                bundle_index,
+                &result.van_comm_rand,
+                &result.dummy_nullifiers,
+                &result.rho_signed,
+                &result.padded_cmx,
+                &result.nf_signed,
+                &result.cmx_new,
+                &result.alpha,
+                &result.rseed_signed,
+                &result.rseed_output,
+                &result.van,
+                total_note_value,
+                keys.address_index,
+                &result.padded_note_secrets,
+                &result.pczt_sighash,
+                &result.tx1_effects,
+                &result.rk,
+                &result.gov_nullifiers,
+            )?;
+        }
         Ok(result)
     }
 

@@ -440,22 +440,22 @@ fn parse_post_response(
                 // The response log is the only thing that says *why* the chain
                 // refused, and a bare numeric code leaves an operator with
                 // nothing to act on. It is server-controlled text, so it is
-                // carried as data and never as instruction, and it is redacted
-                // here rather than downstream: `redact_encoded_material` drops
-                // any proof, signature or address the node echoed out of the
-                // submitted request, which is what
-                // `from_redacted_message` requires of its callers, and that
-                // constructor then escapes what is left and bounds it to
-                // `MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES`.
+                // carried as data and never as instruction:
+                // `from_redacted_message` escapes it and bounds it to
+                // `MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES` before it reaches the
+                // durable row. The wallet's own submission is not a secret from
+                // the wallet, and the row never leaves this device, so a log
+                // that echoes the request lands here escaped and truncated
+                // rather than dropped or picked over.
                 diagnostic: ChainSubmissionDiagnostic::from_redacted_message(
                     ChainSubmissionDiagnosticKind::ChainRejected,
-                    match redact_encoded_material(parsed.log.trim()) {
-                        reason if reason.is_empty() => {
-                            format!("vote chain rejected transaction with code {code}")
-                        }
-                        reason => {
-                            format!("vote chain rejected transaction with code {code}: {reason}")
-                        }
+                    if parsed.log.trim().is_empty() {
+                        format!("vote chain rejected transaction with code {code}")
+                    } else {
+                        format!(
+                            "vote chain rejected transaction with code {code}: {}",
+                            parsed.log.trim()
+                        )
                     },
                 ),
                 candidate_transaction_hash,
@@ -533,31 +533,11 @@ fn validate_json_response(response: &ChainHttpResponse) -> Result<(), ChainSubmi
         // means the answer came from somewhere else — a proxy error page, a
         // router 404, a panic — and the body is the only thing that says
         // which. The text is server-controlled, so it rides along as data:
-        // it is redacted below, and `invalid_protocol` then escapes and bounds
-        // it like any other diagnostic.
-        //
-        // Only the media type is kept out of the header. Its parameters are as
-        // free-form as the body — a proxy is at liberty to answer
-        // `text/plain; detail=<signature>` — and they say nothing about who
-        // answered, which is the whole question here. The media type is
-        // redacted too, since nothing stops a hostile one from being a blob
-        // itself.
-        let observed = response
-            .content_type()
-            .map(|content_type| {
-                redact_encoded_material(
-                    content_type
-                        .split(';')
-                        .next()
-                        .unwrap_or(content_type)
-                        .trim(),
-                )
-            })
-            .unwrap_or_else(|| "(absent)".to_string());
+        // `invalid_protocol` escapes it and bounds it like any other
+        // diagnostic.
+        let observed = response.content_type().unwrap_or("(absent)");
         let body = String::from_utf8_lossy(response.body());
-        // Same trust boundary as a rejection log: whoever answered instead of
-        // the gateway may be quoting the request back.
-        let excerpt = redact_encoded_material(body.trim());
+        let excerpt = body.trim();
         return Err(invalid_protocol(if excerpt.is_empty() {
             format!(
                 "vote-chain response Content-Type must be application/json, got {observed} \
@@ -716,65 +696,6 @@ fn join_chain_url(base_url: &str, segments: &[&str]) -> String {
         url.push_str(segment);
     }
     url
-}
-
-/// Length from which one unbroken run of encoded characters is treated as
-/// request material rather than as an explanation.
-///
-/// One character above a 64-character transaction hash, which is public, often
-/// the whole diagnosis, and worth keeping legible. Everything longer is
-/// request material: the shortest thing a rejecting node can echo out of a
-/// submission is an authorization signature, 64 bytes that
-/// [`crate::wire_codec`] base64-encodes to 88 characters, and a proof or an
-/// address is far longer still. Nothing written for a person to read runs 65
-/// characters without a space or a punctuation mark.
-const MAX_SERVER_TEXT_RUN_LENGTH: usize = 65;
-
-/// Replaces encoded blobs in server-controlled text with a marker, so the
-/// text can be handed to [`ChainSubmissionDiagnostic::from_redacted_message`].
-///
-/// A vote-chain node is free to echo the request it refused, so its `log` and
-/// its non-JSON error bodies can carry a proof, a signature, or the voting
-/// address out of the submitted transaction. Escaping and truncation bound
-/// what a durable diagnostic costs but do not decide what belongs in one, and
-/// that row is written to disk and shown again after restart.
-///
-/// The scan is over runs, not words: a node that answers
-/// `request={"proof":"<hex>"}` wraps its blob in punctuation, and a
-/// whitespace-delimited reading would keep the whole thing. Every maximal run
-/// of at least `MAX_SERVER_TEXT_RUN_LENGTH` characters from the hex/base64
-/// alphabet is replaced wherever it appears, and everything around it —
-/// including the punctuation and the prose the diagnostic is kept for —
-/// survives untouched.
-fn redact_encoded_material(text: &str) -> String {
-    let mut redacted = String::with_capacity(text.len());
-    let mut run = String::new();
-    for character in text.chars() {
-        if is_encoded_character(character) {
-            run.push(character);
-        } else {
-            push_run(&mut redacted, &mut run);
-            redacted.push(character);
-        }
-    }
-    push_run(&mut redacted, &mut run);
-    redacted
-}
-
-/// Appends `run` to `redacted`, as a marker once it is long enough to be
-/// encoded material, and empties it either way.
-fn push_run(redacted: &mut String, run: &mut String) {
-    if run.len() >= MAX_SERVER_TEXT_RUN_LENGTH {
-        redacted.push_str("[redacted]");
-    } else {
-        redacted.push_str(run);
-    }
-    run.clear();
-}
-
-/// Whether `character` can appear in hex, base64 or base64url output.
-fn is_encoded_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=' | '_' | '-')
 }
 
 fn invalid_protocol(message: impl AsRef<str>) -> ChainSubmissionDiagnostic {

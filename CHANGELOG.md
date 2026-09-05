@@ -474,11 +474,8 @@ This release is `zcash_voting` 4.0.0.
   `DelegationTargetMismatch` and `DelegationAlreadyBroadcast`.
 
 - A chain rejection's diagnostic carries the node's own explanation instead of
-  a bare numeric code. The text is server-controlled, so any proof, signature
-  or address the node echoed out of the submitted request is replaced with
-  `[redacted]` before the diagnostic is stored, and what remains is escaped and
-  bounded as before. Non-JSON responses report their content type and body
-  under the same redaction.
+  a bare numeric code, escaped and bounded as before. Non-JSON responses report
+  their content type and body the same way.
 
 ### Removed
 
