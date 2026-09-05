@@ -160,12 +160,19 @@ pub(crate) fn project(
     let pending_recovery = submission_managed || !steps.is_empty();
     let needs_draft_setup =
         !blocking_recovery && !all_decided && !obligations.open_proposals.is_empty();
-    let primary_action = select_primary_action(
-        &steps,
-        blocking_recovery,
-        blocking_share_work,
-        completed_for_display,
-    );
+    // Bundle setup is the only thing that can unblock the round, and it is
+    // delegation preparation, so point the host at the delegation area
+    // rather than reporting Idle for a round that plainly owes work.
+    let primary_action = if obligations.needs_bundle_setup {
+        RoundPlanAction::Delegate
+    } else {
+        select_primary_action(
+            &steps,
+            blocking_recovery,
+            blocking_share_work,
+            completed_for_display,
+        )
+    };
     let recovered_delegation_work = recovered_delegation_work_from_steps(
         snapshot,
         &delegation,
@@ -216,6 +223,7 @@ pub(crate) fn project(
         completed_for_display,
         completed_vote_display,
         needs_draft_setup,
+        needs_bundle_setup: obligations.needs_bundle_setup,
         primary_action,
         needs_delegation_signing: work_summary.needs_delegation_signing,
         has_in_flight_delegation: work_summary.has_in_flight_delegation,

@@ -738,6 +738,14 @@ pub struct RoundPlan {
     pub completed_vote_display: Option<CompletedVoteDisplay>,
     /// True when a wallet should collect or restore draft choices for open proposals.
     pub needs_draft_setup: bool,
+    /// True when the round holds a ballot choice but no bundle rows yet.
+    ///
+    /// Eligibility checks do not persist bundles, so a host that records a
+    /// ballot before running bundle setup sees this instead of an error. The
+    /// remedy is to persist the bundle plan for the round (`ensure_bundles`,
+    /// or the pipeline's setup/precompute entry points) and plan again; no
+    /// vote work can be planned until then.
+    pub needs_bundle_setup: bool,
     /// Primary work area derived from the crate-owned recovery state.
     pub primary_action: RoundPlanAction,
     /// True when delegation work needs fresh or restored wallet signing material.

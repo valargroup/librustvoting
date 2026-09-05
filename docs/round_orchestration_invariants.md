@@ -259,6 +259,15 @@ source of truth:
   `immediate_share_confirmed`, `recovered_*_work`, `primary_action`) are
   computed from the obligations and the snapshot only.
 
+A round holding a ballot choice with no bundle rows owes bundle setup, not
+vote work. Eligibility does not persist a bundle plan, so a host that records
+a ballot before running setup reaches this state on a fresh round. It is a
+resolvable ordering condition, not malformed input: the plan reports
+`needs_bundle_setup` with a `Delegate` primary action and no steps, so the
+round stays plannable and the recorded choices are still reported. Planning
+never treats it as "nothing to do", which would silently skip the round
+(`choice_intent_without_bundles_reports_bundle_setup`).
+
 A host-selected `NextStep` is resolved back to exactly one obligation in a
 fresh plan taken under the lock, or to no work.
 
