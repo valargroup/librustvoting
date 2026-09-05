@@ -622,53 +622,99 @@ impl VotingDb {
     /// touching the round's other rows.
     pub fn clear_round(&self, round_id: &str) -> Result<(), VotingError> {
         let wallet_id = self.wallet_id();
-        self.refuse_if_broadcast(round_id, &wallet_id, None, "clear round")?;
-        self.clear_round_unchecked(round_id)
+        // The gate comes before the check, and the check runs again inside the
+        // transaction that deletes: a submission that starts after an
+        // unsynchronised check would otherwise have the rows that recover it
+        // deleted out from under it, which is the concurrent case this refusal
+        // exists for.
+        let _lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
+        let conn = self.conn();
+        match queries::clear_round_if_unbroadcast(&conn, round_id, &wallet_id)? {
+            None => Ok(()),
+            Some((bundle_index, evidence)) => Err(Self::already_broadcast(
+                round_id,
+                bundle_index,
+                evidence,
+                "clear round",
+            )),
+        }
     }
 
     /// Deletes a round even though its delegation reached the network,
     /// discarding the only state that could recover its voting weight.
     ///
-    /// Crate-internal, and staying that way: nothing a host can call may take
-    /// this path. The two in-crate callers are deliberate destructions of a
-    /// round the operator has already decided to abandon.
-    ///
     /// Separate from [`VotingDb::clear_round`], and named for what it costs,
-    /// because the two callers that need it are deliberate destructions — the
-    /// wallet or account is going away, or a capability package is being
-    /// re-imported over a round the operator has decided to abandon — while
-    /// every recovery path must take the checked one. Reaching for this to get
-    /// past a refusal strands the round's weight: its governance nullifiers are
-    /// spent on chain and `van_comm_rand` cannot be recomputed.
-    pub(crate) fn clear_round_discarding_recovery(
-        &self,
-        round_id: &str,
-    ) -> Result<(), VotingError> {
+    /// because it exists only for a deliberate abandonment — the wallet or
+    /// account is going away, or a corrected capability package is being
+    /// re-imported over a round the operator has decided to give up — while
+    /// every recovery and cleanup path must take the checked one. Reaching for
+    /// this to get past a refusal strands the round's weight: its governance
+    /// nullifiers are spent on chain and `van_comm_rand` cannot be recomputed.
+    ///
+    /// Public because a host needs one per-round escape hatch that a refusal
+    /// cannot close — the corrected-package reset in
+    /// `docs/exporting-to-external-software.md` is exactly that case, and
+    /// clearing the whole wallet is not an equivalent substitute. It still
+    /// takes the round's submission gate, so it cannot run underneath an
+    /// active submission.
+    pub fn clear_round_discarding_recovery(&self, round_id: &str) -> Result<(), VotingError> {
         self.clear_round_unchecked(round_id)
     }
 
     fn clear_round_unchecked(&self, round_id: &str) -> Result<(), VotingError> {
         let wallet_id = self.wallet_id();
-        let deletion_identity = self.chain_submission_round_identity(round_id, &wallet_id)?;
-        let _lease = deletion_identity
-            .as_ref()
-            .map(|identity| {
-                self.chain_submission_coordination()
-                    .try_acquire_round_exclusive(identity)
-                    .map_err(|error| match error {
-                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
-                            VotingError::Busy {
-                                message: format!("chain submission is active for round {round_id}"),
-                            }
-                        }
-                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(error) => {
-                            VotingError::Internal { message: error.to_string() }
-                        }
-                    })
-            })
-            .transpose()?;
+        let _lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
         let conn = self.conn();
         queries::clear_round(&conn, round_id, &wallet_id)
+    }
+
+    /// Holds a round's chain-submission gate for the life of the returned
+    /// lease, or `Ok(None)` when the round has no submission identity to gate.
+    ///
+    /// Every destructive path takes this before it reads the evidence it is
+    /// about to act on, so no submission can start in the window between the
+    /// two.
+    fn acquire_round_exclusive_lease(
+        &self,
+        round_id: &str,
+        wallet_id: &str,
+    ) -> Result<Option<crate::chain_submission::coordination::ExclusiveRoundLease>, VotingError>
+    {
+        let Some(identity) = self.chain_submission_round_identity(round_id, wallet_id)? else {
+            return Ok(None);
+        };
+        self.chain_submission_coordination()
+            .try_acquire_round_exclusive(&identity)
+            .map(Some)
+            .map_err(|error| match error {
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
+                    VotingError::Busy {
+                        message: format!("chain submission is active for round {round_id}"),
+                    }
+                }
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(
+                    error,
+                ) => VotingError::Internal {
+                    message: error.to_string(),
+                },
+            })
+    }
+
+    /// The one wording every path uses to refuse a destructive call on a round
+    /// that has already reached the network.
+    fn already_broadcast(
+        round_id: &str,
+        bundle_index: u32,
+        evidence: queries::DelegationBroadcastEvidence,
+        action: &str,
+    ) -> VotingError {
+        VotingError::DelegationAlreadyBroadcast {
+            bundle_index,
+            evidence: format!(
+                "{} for round {round_id}, refusing to {action}",
+                evidence.as_str()
+            ),
+        }
     }
 
     /// Clears the local delegation setup of bundles that were never broadcast,
@@ -702,30 +748,13 @@ impl VotingDb {
         bundle_index: Option<u32>,
     ) -> Result<u32, VotingError> {
         let wallet_id = self.wallet_id();
+        let _lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
         self.refuse_if_broadcast(
             round_id,
             &wallet_id,
             bundle_index,
             "discard delegation setup",
         )?;
-        let deletion_identity = self.chain_submission_round_identity(round_id, &wallet_id)?;
-        let _lease = deletion_identity
-            .as_ref()
-            .map(|identity| {
-                self.chain_submission_coordination()
-                    .try_acquire_round_exclusive(identity)
-                    .map_err(|error| match error {
-                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
-                            VotingError::Busy {
-                                message: format!("chain submission is active for round {round_id}"),
-                            }
-                        }
-                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(error) => {
-                            VotingError::Internal { message: error.to_string() }
-                        }
-                    })
-            })
-            .transpose()?;
         let conn = self.conn();
         queries::discard_unbroadcast_delegation_setup(&conn, round_id, &wallet_id, bundle_index)
     }
@@ -756,13 +785,9 @@ impl VotingDb {
             queries::delegation_broadcast_evidence(&conn, round_id, wallet_id, bundle_index)?;
         drop(conn);
         match evidence {
-            Some((index, evidence)) => Err(VotingError::DelegationAlreadyBroadcast {
-                bundle_index: index,
-                evidence: format!(
-                    "{} for round {round_id}, refusing to {action}",
-                    evidence.as_str()
-                ),
-            }),
+            Some((index, evidence)) => {
+                Err(Self::already_broadcast(round_id, index, evidence, action))
+            }
             None => Ok(()),
         }
     }
@@ -4060,6 +4085,48 @@ mod tests {
         assert!(db.clear_round(ROUND_ID).is_err());
         db.clear_round_discarding_recovery(ROUND_ID).unwrap();
         assert!(!db.has_round(ROUND_ID).unwrap());
+    }
+
+    /// The gate is taken before anything is read or deleted, so a submission
+    /// already running keeps the round it depends on.
+    #[test]
+    fn clear_round_takes_the_submission_gate_before_it_deletes_anything() {
+        let db = db_with_delegation_setup(1);
+        let identity = db
+            .chain_submission_round_identity(ROUND_ID, W)
+            .unwrap()
+            .expect("a round with a network has a submission identity");
+        let _held = db
+            .chain_submission_coordination()
+            .try_acquire_round_exclusive(&identity)
+            .map_err(|_| "the gate is free")
+            .unwrap();
+
+        let error = db.clear_round(ROUND_ID).unwrap_err();
+
+        assert!(matches!(error, VotingError::Busy { .. }), "{error:?}");
+        assert!(db.has_round(ROUND_ID).unwrap());
+    }
+
+    /// The evidence check lives in the transaction that deletes, not only in
+    /// the advisory check above it, so evidence written after that check still
+    /// refuses the delete.
+    #[test]
+    fn clear_round_rechecks_evidence_in_the_transaction_that_deletes() {
+        let db = db_with_delegation_setup(1);
+        queries::store_van_position(&db.conn(), ROUND_ID, W, 0, 7).unwrap();
+
+        let refused = queries::clear_round_if_unbroadcast(&db.conn(), ROUND_ID, W)
+            .unwrap()
+            .expect("broadcast evidence refuses the delete");
+
+        assert_eq!(refused.0, 0);
+        assert_eq!(
+            refused.1,
+            queries::DelegationBroadcastEvidence::VanLeafPosition
+        );
+        assert!(db.has_round(ROUND_ID).unwrap());
+        assert_eq!(van_comm_rand_of(&db, 0), Some(vec![0x11; 32]));
     }
 
     #[test]

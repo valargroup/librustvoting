@@ -451,6 +451,22 @@ This release is `zcash_voting` 4.0.0.
   preserved, and the rebuild is a no-op for a database that already holds the
   widened bound.
 
+- `RoundApi::delete_round` refuses a round whose delegation has reached the
+  network, since its stored setup is the only thing that can reproduce that
+  round's voting weight. `RoundApi::delete_round_discarding_recovery` is the
+  explicitly named escape hatch for abandoning such a round on purpose, and is
+  what the corrected-capability-package reset uses. Both take the round's
+  chain-submission gate before reading the evidence they act on, and the
+  checked path re-reads that evidence inside the transaction that deletes, so a
+  submission starting concurrently cannot lose the rows that recover it.
+
+- A chain rejection's diagnostic carries the node's own explanation instead of
+  a bare numeric code. The text is server-controlled, so any proof, signature
+  or address the node echoed out of the submitted request is replaced with
+  `[redacted]` before the diagnostic is stored, and what remains is escaped and
+  bounded as before. Non-JSON responses report their content type and body
+  under the same redaction.
+
 ### Removed
 
 - **Breaking:** removed the persisted-vote recovery driver

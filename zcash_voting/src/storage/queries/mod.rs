@@ -622,6 +622,35 @@ pub(crate) fn clear_round(
     Ok(())
 }
 
+/// Deletes a round, but only when nothing in it has reached the network.
+///
+/// The evidence check and the delete share one immediate transaction, so a
+/// submission that starts after an advisory check cannot lose the rows that
+/// recover it: whatever that submission wrote is either already visible here,
+/// and refuses the delete, or it lands after this transaction commits and
+/// finds no round to attach to.
+///
+/// Returns the evidence that refused the delete, or `None` once the round is
+/// gone. The caller owns the wording of the refusal, so one definition of
+/// "already broadcast" reaches the host from every path.
+pub(crate) fn clear_round_if_unbroadcast(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Option<(u32, DelegationBroadcastEvidence)>, VotingError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
+        VotingError::from_sqlite("failed to begin round deletion transaction", &error)
+    })?;
+    if let Some(evidence) = delegation_broadcast_evidence(&tx, round_id, wallet_id, None)? {
+        return Ok(Some(evidence));
+    }
+    clear_round(&tx, round_id, wallet_id)?;
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite("failed to commit round deletion transaction", &error)
+    })?;
+    Ok(None)
+}
+
 // --- Bundles ---
 
 /// Insert a bundle row from positions only.

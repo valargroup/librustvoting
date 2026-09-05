@@ -502,6 +502,37 @@ fn v20_legacy_proposal_bound_migrates_and_keeps_its_rows() {
     migrate(&mut conn).unwrap();
 }
 
+/// A version-20 sidecar that is also missing an index or a trigger upgrades
+/// through the ladder and comes out repaired.
+///
+/// The rebuild in migration 005 drops both before it recreates them, so an
+/// unconditional drop would abort the upgrade on the way to the repair that
+/// would have fixed it.
+#[test]
+fn v20_missing_indexes_and_triggers_upgrade_and_are_repaired() {
+    for tamper in [
+        "DROP INDEX chain_submissions_candidate_owner",
+        "DROP INDEX chain_submissions_identity",
+        "DROP TRIGGER chain_submissions_immutable_identity",
+        "DROP TRIGGER chain_submissions_monotonic_reservations",
+    ] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v20_legacy_proposal_bound_schema())
+            .unwrap();
+        conn.execute_batch(tamper).unwrap();
+        conn.pragma_update(None, "user_version", 20).unwrap();
+
+        migrate(&mut conn).unwrap_or_else(|error| panic!("{tamper}: {error}"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION, "{tamper}");
+        // The fingerprint agrees again, so a second open is a no-op.
+        migrate(&mut conn).unwrap_or_else(|error| panic!("{tamper}: {error}"));
+    }
+}
+
 #[test]
 fn v18_submission_rows_migrate_incrementally_to_v19() {
     let mut conn = Connection::open_in_memory().unwrap();

@@ -10,12 +10,18 @@
 --
 -- Rows are copied verbatim: every stored proposal id satisfies the old bound
 -- and therefore the wider one.
-DROP TRIGGER chain_submissions_immutable_identity;
-DROP TRIGGER chain_submissions_monotonic_reservations;
-DROP TRIGGER chain_submissions_immutable_tracking_start;
-DROP INDEX chain_submissions_identity;
-DROP INDEX chain_submissions_candidate_owner;
-DROP INDEX chain_submissions_confirmation_hash_owner;
+--
+-- The drops are conditional because a version-20 sidecar may also be missing
+-- one of these indexes or triggers. That drift is repairable, and the repair
+-- runs after this ladder step; an unconditional DROP would abort the upgrade
+-- before it could, leaving exactly the database this migration exists to
+-- rescue unopenable.
+DROP TRIGGER IF EXISTS chain_submissions_immutable_identity;
+DROP TRIGGER IF EXISTS chain_submissions_monotonic_reservations;
+DROP TRIGGER IF EXISTS chain_submissions_immutable_tracking_start;
+DROP INDEX IF EXISTS chain_submissions_identity;
+DROP INDEX IF EXISTS chain_submissions_candidate_owner;
+DROP INDEX IF EXISTS chain_submissions_confirmation_hash_owner;
 ALTER TABLE chain_submissions RENAME TO chain_submissions_v20;
 
 CREATE TABLE chain_submissions (

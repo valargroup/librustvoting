@@ -511,9 +511,31 @@ impl VotingDb {
             .collect()
     }
 
-    /// Deletes all persisted state for one round in the current wallet scope.
+    /// Deletes all persisted state for one round in the current wallet scope,
+    /// unless part of that round has already reached the network.
+    ///
+    /// Refuses with `DelegationAlreadyBroadcast` once a delegation transaction
+    /// hash, a VAN position, a chain submission, a vote or a delivered helper
+    /// share exists, because the round's stored setup is then the only thing
+    /// that can reproduce its voting weight. Use
+    /// [`RoundApi::delete_round_discarding_recovery`] to abandon such a round
+    /// on purpose.
     pub fn delete_round(&self, round_id: &str) -> Result<(), VotingError> {
         self.clear_round(round_id)
+    }
+
+    /// Deletes one round even though part of it has reached the network,
+    /// giving up the state that could recover its voting weight.
+    ///
+    /// The escape hatch behind [`RoundApi::delete_round`]'s refusal, for the
+    /// case where the voter has decided to abandon the round: a delegation
+    /// that cannot confirm and is being replaced by a corrected capability
+    /// package, ahead of any vote commitment. The round's governance
+    /// nullifiers are already spent on chain and its `van_comm_rand` cannot be
+    /// recomputed, so its weight does not come back. Every recovery path, and
+    /// every automatic cleanup, must use the checked deletion instead.
+    pub fn delete_round_discarding_recovery(&self, round_id: &str) -> Result<(), VotingError> {
+        self.clear_round_discarding_recovery(round_id)
     }
 
     /// Returns the policy a round's bundle plan must be derived with.
