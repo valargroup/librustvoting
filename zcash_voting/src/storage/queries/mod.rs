@@ -3637,6 +3637,13 @@ pub(crate) fn discard_unbroadcast_delegation_setup(
     wallet_id: &str,
     bundle_index: Option<u32>,
 ) -> Result<u32, VotingError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|error| {
+        VotingError::from_sqlite(
+            "failed to begin delegation setup discard transaction",
+            &error,
+        )
+    })?;
+
     // The outer filter runs against four different tables, so it stays
     // unqualified; the subquery below is the one that reads `bundles`.
     let bundle_filter = match bundle_index {
@@ -3733,7 +3740,7 @@ pub(crate) fn discard_unbroadcast_delegation_setup(
             format!("DELETE FROM witnesses WHERE {unbroadcast_guard}"),
         ),
     ] {
-        let mut statement = conn.prepare(&sql).map_err(|e| VotingError::Internal {
+        let mut statement = tx.prepare(&sql).map_err(|e| VotingError::Internal {
             message: format!("failed to prepare {label}: {e}"),
         })?;
         let affected = params(&mut statement).map_err(|e| VotingError::Internal {
@@ -3744,6 +3751,12 @@ pub(crate) fn discard_unbroadcast_delegation_setup(
         }
     }
 
+    tx.commit().map_err(|error| {
+        VotingError::from_sqlite(
+            "failed to commit delegation setup discard transaction",
+            &error,
+        )
+    })?;
     Ok(cleared as u32)
 }
 

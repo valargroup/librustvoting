@@ -167,16 +167,6 @@ pub(crate) fn validate_hotkey_address_for_bundle(
         // from a bundle whose value or round binding moved: the VAN covers the
         // hotkey, the bundle's total note value and the round id, while the
         // commitment covers the hotkey and the note's own randomness.
-        // TEMPORARY diagnostic.
-        eprintln!(
-            "[target-diag] bundle={} addr={} stored_network={:?} snapshot={} van_match={} cmx_match={}",
-            identity.bundle_index(),
-            hex::encode(hotkey_raw_address),
-            stored_network,
-            params.snapshot_height,
-            expected_van == binding.gov_comm,
-            expected_cmx == stored_cmx,
-        );
         return Err(VotingError::DelegationTargetMismatch {
             bundle_index: identity.bundle_index(),
             van_matches: expected_van == binding.gov_comm,
@@ -3816,6 +3806,45 @@ mod tests {
         // The round and its note positions survive, so setup can rebuild.
         assert!(db.has_round(ROUND_ID).unwrap());
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 1);
+    }
+
+    /// A failure in any discard statement rolls the entire transition back, so
+    /// setup and its derived artifacts cannot persist in different generations.
+    #[test]
+    fn delegation_setup_discard_is_atomic() {
+        let db = db_with_delegation_setup(1);
+        queries::store_proof(&db.conn(), ROUND_ID, W, 0, &[0x01; 8]).unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_delegation_proof_delete
+                 BEFORE DELETE ON proofs
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected proof deletion failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = db
+            .discard_unbroadcast_delegation(ROUND_ID, None)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected proof deletion failure"),
+            "{error:?}"
+        );
+        assert_eq!(van_comm_rand_of(&db, 0), Some(vec![0x11; 32]));
+        let proof_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM proofs
+                  WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                rusqlite::params![ROUND_ID, W],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(proof_count, 1);
     }
 
     /// The discard is safe to repeat: a host retrying recovery must not need to
