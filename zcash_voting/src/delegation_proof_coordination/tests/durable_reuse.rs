@@ -53,18 +53,24 @@ fn reused_proof_rejects_mismatched_keys() {
     let db = db_with_persisted_proofs();
     let selected_note = note();
 
-    for (mismatched_keys, expected_message) in [
+    // A hotkey the stored target does not reproduce is its own kind, because a
+    // host recovers from it by rebuilding the bundle; the network and round
+    // mismatches beside it stay plain invalid input.
+    for (mismatched_keys, expected_kind, expected_message) in [
         (
             keys(Network::Mainnet, 1),
+            crate::VotingErrorKind::InvalidInput,
             "delegation keys network Mainnet does not match stored round network Testnet",
         ),
         (
             keys(Network::Testnet, 2),
+            crate::VotingErrorKind::InvalidInput,
             "voting target round does not match delegation round",
         ),
         (
             keys_for_hotkey(Network::Testnet, 1, 0x22),
-            "delegation keys hotkey target does not match stored bundle target",
+            crate::VotingErrorKind::DelegationTargetMismatch,
+            "stored delegation target does not reproduce from this voting hotkey",
         ),
     ] {
         let error = ensure_proof(
@@ -78,7 +84,7 @@ fn reused_proof_rejects_mismatched_keys() {
         )
         .expect_err("a persisted proof must not bypass delegation-key validation");
 
-        assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+        assert_eq!(error.kind(), expected_kind, "{error}");
         assert!(error.to_string().contains(expected_message), "{error}");
     }
 }
@@ -116,11 +122,14 @@ fn reused_proof_rejects_receiver_sign_flip() {
     )
     .expect_err("a persisted proof must remain bound to the exact Orchard receiver");
 
-    assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
     assert!(
-        error
-            .to_string()
-            .contains("hotkey target does not match stored bundle target"),
+        matches!(
+            error,
+            VotingError::DelegationTargetMismatch {
+                bundle_index: 0,
+                ..
+            }
+        ),
         "{error}"
     );
 }
@@ -359,11 +368,14 @@ fn persisted_proof_reuse_validation_rejects_another_hotkey_without_pir() {
         &keys_for_hotkey(Network::Testnet, 1, 0x22),
     )
     .expect_err("a different same-network hotkey must not reuse the proof");
-    assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
     assert!(
-        error
-            .to_string()
-            .contains("hotkey target does not match stored bundle target"),
+        matches!(
+            error,
+            VotingError::DelegationTargetMismatch {
+                bundle_index: 0,
+                ..
+            }
+        ),
         "{error}"
     );
 

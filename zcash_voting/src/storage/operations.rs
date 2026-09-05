@@ -92,7 +92,7 @@ fn validate_delegation_target_for_bundle(
 
 /// Checks that `hotkey_raw_address` reproduces the bundle's persisted
 /// governance output and target-bound VAN commitment.
-fn validate_hotkey_address_for_bundle(
+pub(crate) fn validate_hotkey_address_for_bundle(
     conn: &rusqlite::Connection,
     params: &VotingRoundParams,
     stored_network: Network,
@@ -105,17 +105,6 @@ fn validate_hotkey_address_for_bundle(
         identity.wallet_id(),
         identity.bundle_index(),
     )?;
-    let rho_signed: [u8; 32] =
-        binding
-            .rho_signed
-            .as_slice()
-            .try_into()
-            .map_err(|_| VotingError::Internal {
-                message: format!(
-                    "stored rho_signed must be 32 bytes, got {}",
-                    binding.rho_signed.len()
-                ),
-            })?;
     let rseed_output: [u8; 32] =
         binding
             .rseed_output
@@ -138,9 +127,21 @@ fn validate_hotkey_address_for_bundle(
                     binding.cmx_new.len()
                 ),
             })?;
+    let nf_signed: [u8; 32] =
+        binding
+            .nf_signed
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!(
+                    "stored nf_signed must be 32 bytes, got {}",
+                    binding.nf_signed.len()
+                ),
+            })?;
+    // The output note's rho is the spend's nullifier, not the spend's rho.
     let expected_cmx = crate::action::derive_governance_output_cmx(
         hotkey_raw_address,
-        &rho_signed,
+        &nf_signed,
         &rseed_output,
         stored_network,
         params.snapshot_height,
@@ -162,9 +163,14 @@ fn validate_hotkey_address_for_bundle(
         &binding.van_comm_rand,
     )?;
     if expected_van != binding.gov_comm || expected_cmx != stored_cmx {
-        return Err(VotingError::InvalidInput {
-            message: "delegation keys hotkey target does not match stored bundle target"
-                .to_string(),
+        // Which half disagrees separates a hotkey that is merely different
+        // from a bundle whose value or round binding moved: the VAN covers the
+        // hotkey, the bundle's total note value and the round id, while the
+        // commitment covers the hotkey and the note's own randomness.
+        return Err(VotingError::DelegationTargetMismatch {
+            bundle_index: identity.bundle_index(),
+            van_matches: expected_van == binding.gov_comm,
+            commitment_matches: expected_cmx == stored_cmx,
         });
     }
 
@@ -604,29 +610,230 @@ impl VotingDb {
         )
     }
 
-    /// Delete all data for a round.
+    /// Delete all data for a round that was never broadcast.
+    ///
+    /// Refuses a round any part of which reached the network. A delegation's
+    /// governance nullifiers are deterministic and already spent by then, so
+    /// the round's stored setup — `van_comm_rand` and the hotkey target it
+    /// commits to — is the only thing that can reproduce its voting weight, and
+    /// deleting it would strand that weight with no way back. Callers that want
+    /// to rebuild an unusable but unbroadcast delegation should use
+    /// [`VotingDb::discard_unbroadcast_delegation`], which clears setup without
+    /// touching the round's other rows.
     pub fn clear_round(&self, round_id: &str) -> Result<(), VotingError> {
         let wallet_id = self.wallet_id();
-        let deletion_identity = self.chain_submission_round_identity(round_id, &wallet_id)?;
-        let _lease = deletion_identity
-            .as_ref()
-            .map(|identity| {
-                self.chain_submission_coordination()
-                    .try_acquire_round_exclusive(identity)
-                    .map_err(|error| match error {
-                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
-                            VotingError::Busy {
-                                message: format!("chain submission is active for round {round_id}"),
-                            }
-                        }
-                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(error) => {
-                            VotingError::Internal { message: error.to_string() }
-                        }
-                    })
-            })
-            .transpose()?;
+        // The gate comes before the check, and the check runs again inside the
+        // transaction that deletes: a submission that starts after an
+        // unsynchronised check would otherwise have the rows that recover it
+        // deleted out from under it, which is the concurrent case this refusal
+        // exists for.
+        let _lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
+        let conn = self.conn();
+        match queries::clear_round_if_unbroadcast(&conn, round_id, &wallet_id)? {
+            None => Ok(()),
+            Some((bundle_index, evidence)) => Err(queries::already_broadcast(
+                round_id,
+                bundle_index,
+                evidence,
+                "clear round",
+            )),
+        }
+    }
+
+    /// Deletes a round even though its delegation reached the network,
+    /// discarding the only state that could recover its voting weight.
+    ///
+    /// Separate from [`VotingDb::clear_round`], and named for what it costs,
+    /// because it exists only for a deliberate abandonment — the wallet or
+    /// account is going away, or a corrected capability package is being
+    /// re-imported over a round the operator has decided to give up — while
+    /// every recovery and cleanup path must take the checked one. Reaching for
+    /// this to get past a refusal strands the round's weight: its governance
+    /// nullifiers are spent on chain and `van_comm_rand` cannot be recomputed.
+    ///
+    /// Public because a host needs one per-round escape hatch that a refusal
+    /// cannot close — the corrected-package reset in
+    /// `docs/exporting-to-external-software.md` is exactly that case, and
+    /// clearing the whole wallet is not an equivalent substitute. It still
+    /// takes the round's submission gate, so it cannot run underneath an
+    /// active submission.
+    pub fn clear_round_discarding_recovery(&self, round_id: &str) -> Result<(), VotingError> {
+        self.clear_round_unchecked(round_id)
+    }
+
+    fn clear_round_unchecked(&self, round_id: &str) -> Result<(), VotingError> {
+        let wallet_id = self.wallet_id();
+        let _lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
         let conn = self.conn();
         queries::clear_round(&conn, round_id, &wallet_id)
+    }
+
+    /// Holds a round's chain-submission gate for the life of the returned
+    /// lease, or `Ok(None)` when the round has no submission identity to gate.
+    ///
+    /// Every destructive path takes this before it reads the evidence it is
+    /// about to act on, so no submission can start in the window between the
+    /// two.
+    fn acquire_round_exclusive_lease(
+        &self,
+        round_id: &str,
+        wallet_id: &str,
+    ) -> Result<Option<crate::chain_submission::coordination::ExclusiveRoundLease>, VotingError>
+    {
+        let Some(identity) = self.chain_submission_round_identity(round_id, wallet_id)? else {
+            return Ok(None);
+        };
+        self.chain_submission_coordination()
+            .try_acquire_round_exclusive(&identity)
+            .map(Some)
+            .map_err(|error| match error {
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
+                    VotingError::Busy {
+                        message: format!("chain submission is active for round {round_id}"),
+                    }
+                }
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(
+                    error,
+                ) => VotingError::Internal {
+                    message: error.to_string(),
+                },
+            })
+    }
+
+    /// Holds shared account and round access plus exclusive access to one
+    /// bundle's delegation lifecycle for the life of the returned lease.
+    ///
+    /// Distinct bundles remain independent, while round or wallet deletion and
+    /// chain submission for this bundle cannot overlap setup.
+    fn acquire_delegation_setup_lease(
+        &self,
+        round_id: &str,
+        wallet_id: &str,
+        bundle_index: u32,
+    ) -> Result<Option<crate::chain_submission::coordination::DelegationSetupLease>, VotingError>
+    {
+        let Some(round_identity) = self.chain_submission_round_identity(round_id, wallet_id)?
+        else {
+            return Ok(None);
+        };
+        let identity = crate::ChainSubmissionIdentity::new(
+            wallet_id,
+            round_identity.network(),
+            *round_identity.vote_round_id(),
+            bundle_index,
+            crate::ChainSubmissionTarget::Delegation,
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to identify delegation setup: {error}"),
+        })?;
+        self.chain_submission_coordination()
+            .try_acquire_delegation_setup(&identity)
+            .map(Some)
+            .map_err(|error| match error {
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
+                    VotingError::Busy {
+                        message: format!(
+                            "delegation setup or chain submission is active for round \
+                             {round_id}, bundle {bundle_index}"
+                        ),
+                    }
+                }
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(
+                    error,
+                ) => VotingError::Internal {
+                    message: error.to_string(),
+                },
+            })
+    }
+
+    /// Clears the local delegation setup of bundles that were never broadcast,
+    /// so setup can rebuild them, and reports how many were cleared.
+    ///
+    /// Crate-internal on purpose. Hosts do not choose when to discard:
+    /// [`VotingDb::build_governance_pczt`] calls this itself once it knows the
+    /// stored target cannot be reproduced, because the choice turns on whether
+    /// the delegation may already be on chain and a host that judges that
+    /// wrongly destroys a round's voting weight for good.
+    ///
+    /// The recovery path for a delegation the wallet can no longer use but has
+    /// not committed to anything: most importantly a bundle whose stored target
+    /// its voting hotkey no longer reproduces, which
+    /// `validate_delegation_keys_match_bundle` rejects and
+    /// [`VotingDb::clear_unsigned_delegation_setup_fields`] preserves because
+    /// the bundle carries a successful proof. Nothing here has left the device,
+    /// so re-proving is the whole cost.
+    ///
+    /// Pass `bundle_index` to scope the discard to one bundle; `None` covers
+    /// every unbroadcast bundle of the round and leaves broadcast siblings
+    /// untouched, so a round that is half committed still recovers the half
+    /// that is not.
+    ///
+    /// Refuses the whole call when the requested scope shows any broadcast
+    /// evidence, and the write itself repeats every guard, so a submission
+    /// racing this call cannot lose its setup.
+    pub(crate) fn discard_unbroadcast_delegation(
+        &self,
+        round_id: &str,
+        bundle_index: Option<u32>,
+    ) -> Result<u32, VotingError> {
+        let wallet_id = self.wallet_id();
+        let _lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
+        self.discard_unbroadcast_delegation_locked(round_id, &wallet_id, bundle_index)
+    }
+
+    /// The discard itself, for a caller that already holds the round's
+    /// exclusive gate and will keep holding it.
+    ///
+    /// Split out because a discard whose lease ends at the return is only half
+    /// of a rebuild: the replacement setup is built and written afterwards,
+    /// and that write must be covered by the same exclusion as the discard.
+    fn discard_unbroadcast_delegation_locked(
+        &self,
+        round_id: &str,
+        wallet_id: &str,
+        bundle_index: Option<u32>,
+    ) -> Result<u32, VotingError> {
+        self.refuse_if_broadcast(
+            round_id,
+            wallet_id,
+            bundle_index,
+            "discard delegation setup",
+        )?;
+        let conn = self.conn();
+        queries::discard_unbroadcast_delegation_setup(&conn, round_id, wallet_id, bundle_index)
+    }
+
+    /// Whether any part of the scope has reached the network, and what said so.
+    ///
+    /// Exposed so a host can ask before offering a destructive recovery, and
+    /// so the refusal below and the UI it drives agree on one definition.
+    pub(crate) fn delegation_broadcast_evidence(
+        &self,
+        round_id: &str,
+        bundle_index: Option<u32>,
+    ) -> Result<Option<(u32, queries::DelegationBroadcastEvidence)>, VotingError> {
+        let wallet_id = self.wallet_id();
+        let conn = self.conn();
+        queries::delegation_broadcast_evidence(&conn, round_id, &wallet_id, bundle_index)
+    }
+
+    fn refuse_if_broadcast(
+        &self,
+        round_id: &str,
+        wallet_id: &str,
+        bundle_index: Option<u32>,
+        action: &str,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let evidence =
+            queries::delegation_broadcast_evidence(&conn, round_id, wallet_id, bundle_index)?;
+        drop(conn);
+        match evidence {
+            Some((index, evidence)) => Err(queries::already_broadcast(
+                round_id, index, evidence, action,
+            )),
+            None => Ok(()),
+        }
     }
 
     fn chain_submission_round_identity(
@@ -836,6 +1043,66 @@ impl VotingDb {
     }
     // --- Phase 1: Delegation setup ---
 
+    /// Whether the stored delegation setup must be rebuilt because the
+    /// supplied hotkey cannot reproduce its target.
+    ///
+    /// A wallet whose voting hotkey for a round changed — it was never durably
+    /// stored, or storage handed back nothing and a fresh one was bound —
+    /// holds bundles whose stored target it can no longer reproduce. Every
+    /// later step refuses them, and the write-once setup guard refuses to
+    /// replace them, so without a rebuild the round is stuck for good with no
+    /// host-visible way out.
+    ///
+    /// The SDK decides this, not the host: the choice turns on whether the
+    /// delegation may already be on chain, which is exactly the judgement a
+    /// host has no way to make and must never make wrongly.
+    ///
+    /// This only reports; nothing is discarded here. The replacement takes real
+    /// time to build, and a discard committed ahead of it would leave the
+    /// bundle with neither its old setup nor a new one. The caller's gate
+    /// cannot prevent that, being process-local, so
+    /// [`queries::replace_unbroadcast_delegation_setup`] performs the whole
+    /// exchange in one transaction and refuses it outright when broadcast
+    /// evidence arrived while the replacement was being built.
+    ///
+    /// The caller must hold the round's exclusive submission gate across this
+    /// check and the write that follows, which is what keeps a second caller
+    /// in this process from starting from a binding this one is about to
+    /// replace.
+    fn setup_target_needs_rebuild(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        params: &VotingRoundParams,
+        stored_network: Network,
+        keys: &DelegationKeys,
+    ) -> Result<bool, VotingError> {
+        let wallet_id = self.wallet_id();
+        let conn = self.conn();
+        if !queries::bundle_has_delegation_setup(&conn, round_id, &wallet_id, bundle_index)? {
+            return Ok(false);
+        }
+        let identity = DelegationProofIdentity::new(
+            self.sidecar_id(),
+            wallet_id.clone(),
+            round_id,
+            bundle_index,
+        );
+        let validation = validate_hotkey_address_for_bundle(
+            &conn,
+            params,
+            stored_network,
+            &identity,
+            &keys.hotkey_raw_address,
+        );
+        drop(conn);
+        match validation {
+            Ok(()) => Ok(false),
+            Err(VotingError::DelegationTargetMismatch { .. }) => Ok(true),
+            Err(other) => Err(other),
+        }
+    }
+
     /// Load the account-scoped data needed to sign a persisted delegation PCZT.
     ///
     /// `keys` must be the same [`DelegationKeys`] used for PCZT setup. The
@@ -890,6 +1157,11 @@ impl VotingDb {
         consensus_branch_id: u32,
     ) -> Result<GovernancePczt, VotingError> {
         let wallet_id = self.wallet_id();
+        // Every setup writer takes its bundle's lifecycle gate before
+        // inspecting the binding and keeps it through persistence. The shared
+        // round gate excludes deletion without serializing unrelated bundles.
+        let _setup_lease =
+            self.acquire_delegation_setup_lease(round_id, &wallet_id, bundle_index)?;
         let (params, stored_network) = {
             let conn = self.conn();
             let (params, stored_network) =
@@ -903,7 +1175,21 @@ impl VotingDb {
             queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
             (params, stored_network)
         };
-        let padded_note_secrets = self.ensure_padded_secrets(round_id, bundle_index, notes)?;
+        // Before any stored setup is reused, make sure it belongs to the hotkey
+        // this call carries. Nothing is discarded yet: the replacement takes
+        // real time to build, and a discard committed ahead of it would leave
+        // the bundle with neither its old setup nor a new one.
+        let rebuild =
+            self.setup_target_needs_rebuild(round_id, bundle_index, &params, stored_network, keys)?;
+        // A rebuild cannot reuse the stored padded secrets: they belong to the
+        // target the wallet can no longer reproduce. They are sampled in memory
+        // here and reach the database only with the replacement, so a failure
+        // anywhere below leaves the stored setup exactly as it was.
+        let padded_note_secrets = if rebuild {
+            crate::action::sample_padded_note_secrets(notes.len())?
+        } else {
+            self.ensure_padded_secrets(round_id, bundle_index, notes)?
+        };
         let van_blinding = keys.van_blinding_for_bundle(&params, bundle_index, notes)?;
         let result = crate::action::build_governance_pczt(
             notes,
@@ -926,31 +1212,59 @@ impl VotingDb {
             .ok_or_else(|| VotingError::InvalidInput {
                 message: "total note weight overflows u64".to_string(),
             })?;
-        // Persist delegation data plus the PCZT-derived signing fields.
+        // Persist delegation data plus the PCZT-derived signing fields. A
+        // rebuild exchanges the old setup for this one in a single
+        // transaction; a first setup has nothing to exchange.
         let conn = self.conn();
-        queries::store_delegation_data_with_pczt_fields(
-            &conn,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            &result.van_comm_rand,
-            &result.dummy_nullifiers,
-            &result.rho_signed,
-            &result.padded_cmx,
-            &result.nf_signed,
-            &result.cmx_new,
-            &result.alpha,
-            &result.rseed_signed,
-            &result.rseed_output,
-            &result.van,
-            total_note_value,
-            keys.address_index,
-            &result.padded_note_secrets,
-            &result.pczt_sighash,
-            &result.tx1_effects,
-            &result.rk,
-            &result.gov_nullifiers,
-        )?;
+        if rebuild {
+            queries::replace_unbroadcast_delegation_setup(
+                &conn,
+                round_id,
+                &wallet_id,
+                bundle_index,
+                &result.van_comm_rand,
+                &result.dummy_nullifiers,
+                &result.rho_signed,
+                &result.padded_cmx,
+                &result.nf_signed,
+                &result.cmx_new,
+                &result.alpha,
+                &result.rseed_signed,
+                &result.rseed_output,
+                &result.van,
+                total_note_value,
+                keys.address_index,
+                &result.padded_note_secrets,
+                &result.pczt_sighash,
+                &result.tx1_effects,
+                &result.rk,
+                &result.gov_nullifiers,
+            )?;
+        } else {
+            queries::store_delegation_data_with_pczt_fields(
+                &conn,
+                round_id,
+                &wallet_id,
+                bundle_index,
+                &result.van_comm_rand,
+                &result.dummy_nullifiers,
+                &result.rho_signed,
+                &result.padded_cmx,
+                &result.nf_signed,
+                &result.cmx_new,
+                &result.alpha,
+                &result.rseed_signed,
+                &result.rseed_output,
+                &result.van,
+                total_note_value,
+                keys.address_index,
+                &result.padded_note_secrets,
+                &result.pczt_sighash,
+                &result.tx1_effects,
+                &result.rk,
+                &result.gov_nullifiers,
+            )?;
+        }
         Ok(result)
     }
 
@@ -1418,9 +1732,21 @@ impl VotingDb {
             target.raw_orchard_address(),
         )
         .map_err(|error| match error {
-            VotingError::InvalidInput { .. } => VotingError::InvalidInput {
+            // Deliberately not `DelegationTargetMismatch`: that kind tells a
+            // host the bundle is discardable, and this delegation is confirmed
+            // on chain. Its setup is the only thing that can ever vote that
+            // weight, so nothing here may be rebuilt.
+            VotingError::DelegationTargetMismatch {
+                van_matches,
+                commitment_matches,
+                ..
+            } => VotingError::InvalidInput {
                 message: format!(
-                    "round {round_id} bundle {bundle_index}: the bound voting hotkey does not match the confirmed delegation target"
+                    "round {round_id} bundle {bundle_index}: the confirmed delegation's target \
+                     does not reproduce from the bound voting hotkey (van_matches={van_matches}, \
+                     commitment_matches={commitment_matches}). The delegation is on chain, so \
+                     this bundle cannot be rebuilt; its vote needs the hotkey the delegation was \
+                     made with."
                 ),
             },
             other => other,
@@ -2891,6 +3217,10 @@ mod pir_wallet_scope_tests;
 
 #[cfg(test)]
 mod tests {
+    mod broadcast_protection;
+    mod fixtures;
+    mod setup_target_rebuild;
+
     use super::*;
     use crate::types::{RoundBoundVotingHotkeyTarget, VotingHotkey};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -6870,8 +7200,9 @@ mod tests {
         );
         drop(conn);
 
-        // Verify cascade: clearing the round removes everything
-        db.clear_round(ROUND_ID).unwrap();
+        // Verify cascade: clearing the round removes everything. This round
+        // has votes, so only the destructive path applies.
+        db.clear_round_discarding_recovery(ROUND_ID).unwrap();
         assert!(db.list_rounds().unwrap().is_empty());
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 0);
     }

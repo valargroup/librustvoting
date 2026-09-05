@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 20;
+const CURRENT_VERSION: u32 = 21;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -135,6 +135,14 @@ END;",
         19,
         include_str!("migrations/004_round_immediate_share.sql"),
     ),
+    // v21 rebuilds `chain_submissions` onto the 50-proposal bound. Sidecars
+    // migrated by a build that carried the 15-proposal bound keep it at
+    // version 20, and the version-20 fingerprint check then refuses to open
+    // them at all, so the widened bound needs a version of its own.
+    (
+        20,
+        include_str!("migrations/005_chain_submissions_proposal_range.sql"),
+    ),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
@@ -167,7 +175,7 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     }
 
     if version == CURRENT_VERSION {
-        return verify_current_chain_submission_schema(conn);
+        return ensure_current_chain_submission_schema(conn);
     }
 
     // Immediate: a deferred transaction takes the write lock lazily on its
@@ -221,16 +229,94 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     tx.commit()
         .map_err(|e| VotingError::from_sqlite("failed to commit database migration", &e))?;
 
-    Ok(())
+    // A ladder that ends on a different shape than this build describes is the
+    // same drift, reached the long way round.
+    ensure_current_chain_submission_schema(conn)
 }
 
-fn verify_current_chain_submission_schema(conn: &Connection) -> Result<(), VotingError> {
+/// Brings `chain_submissions` to the shape `002_chain_submissions.sql`
+/// describes, rebuilding it in place if it has drifted, and keeping every row.
+///
+/// The table's DDL has been edited without a version bump more than once — the
+/// proposal bound has moved in both directions — and each time every database
+/// already at the current version became unopenable, because the fingerprint
+/// check below is exact and the migration ladder has nothing left to run. A
+/// rebuild is the honest answer: rows are copied verbatim, so nothing durable
+/// is at stake, and the schema converges on what this build expects instead of
+/// stranding the wallet. A row the new shape genuinely rejects still fails the
+/// copy, which is the one case worth stopping for.
+fn ensure_current_chain_submission_schema(conn: &mut Connection) -> Result<(), VotingError> {
+    if chain_submission_schema_matches_current(conn)? {
+        return Ok(());
+    }
+    // Only constraint, index and trigger drift is repairable. The rebuild
+    // carries rows across by name, so a table whose columns differ is drift
+    // this cannot honestly resolve — there is no answer for a column that is
+    // missing or unknown — and it stays the hard failure it has always been.
+    let columns = chain_submission_columns(conn)?;
+    if columns != expected_chain_submission_columns()? {
+        return verify_current_chain_submission_schema(conn);
+    }
+    let column_list = columns.join(", ");
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::from_sqlite("failed to start schema repair", &e))?;
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS chain_submissions_immutable_identity;
+         DROP TRIGGER IF EXISTS chain_submissions_monotonic_reservations;
+         DROP TRIGGER IF EXISTS chain_submissions_immutable_tracking_start;
+         DROP INDEX IF EXISTS chain_submissions_identity;
+         DROP INDEX IF EXISTS chain_submissions_candidate_owner;
+         DROP INDEX IF EXISTS chain_submissions_confirmation_hash_owner;
+         ALTER TABLE chain_submissions RENAME TO chain_submissions_drifted;",
+    )
+    .map_err(|e| VotingError::from_sqlite("failed to set aside the drifted schema", &e))?;
+    tx.execute_batch(include_str!("migrations/002_chain_submissions.sql"))
+        .map_err(|e| VotingError::from_sqlite("failed to recreate chain submissions", &e))?;
+    tx.execute_batch(&format!(
+        "INSERT INTO chain_submissions ({column_list})
+             SELECT {column_list} FROM chain_submissions_drifted;
+         DROP TABLE chain_submissions_drifted;"
+    ))
+    .map_err(|e| VotingError::from_sqlite("failed to carry chain submissions across", &e))?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("failed to commit schema repair", &e))?;
+
+    verify_current_chain_submission_schema(conn)
+}
+
+fn chain_submission_columns(conn: &Connection) -> Result<Vec<String>, VotingError> {
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info('chain_submissions') ORDER BY cid")
+        .map_err(migration_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(migration_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(migration_error)?;
+    Ok(columns)
+}
+
+fn expected_chain_submission_columns() -> Result<Vec<String>, VotingError> {
     let expected = Connection::open_in_memory().map_err(migration_error)?;
     expected
         .execute_batch(include_str!("migrations/002_chain_submissions.sql"))
         .map_err(migration_error)?;
-    if chain_submission_schema_fingerprint(conn)? != chain_submission_schema_fingerprint(&expected)?
-    {
+    chain_submission_columns(&expected)
+}
+
+fn chain_submission_schema_matches_current(conn: &Connection) -> Result<bool, VotingError> {
+    let expected = Connection::open_in_memory().map_err(migration_error)?;
+    expected
+        .execute_batch(include_str!("migrations/002_chain_submissions.sql"))
+        .map_err(migration_error)?;
+    Ok(chain_submission_schema_fingerprint(conn)?
+        == chain_submission_schema_fingerprint(&expected)?)
+}
+
+fn verify_current_chain_submission_schema(conn: &Connection) -> Result<(), VotingError> {
+    if !chain_submission_schema_matches_current(conn)? {
         return Err(VotingError::Internal {
             message: format!(
                 "database uses an unsupported chain-submission schema for version {CURRENT_VERSION}"

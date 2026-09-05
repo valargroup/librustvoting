@@ -441,6 +441,42 @@ This release is `zcash_voting` 4.0.0.
 - Eligibility, no-spendable-note, write-once setup, and PIR failures carry
   structured fields. Their display text keeps the earlier wording.
 
+### Fixed
+
+- Schema version 21 rebuilds `chain_submissions` onto the 50-proposal bound.
+  A sidecar migrated by a build that carried the 15-proposal bound kept that
+  CHECK at version 20; nothing rewrote it, and the version-20 fingerprint
+  check then refused to open the sidecar at all, so every voting call on that
+  wallet failed with an unsupported-chain-submission-schema error. Rows are
+  preserved, and the rebuild is a no-op for a database that already holds the
+  widened bound.
+
+- `VotingDb::delete_round` refuses a round whose delegation has reached the
+  network, since its stored setup is the only thing that can reproduce that
+  round's voting weight. `VotingDb::delete_round_discarding_recovery` is the
+  explicitly named escape hatch for abandoning such a round on purpose, and is
+  what the corrected-capability-package reset uses. Both take the round's
+  chain-submission gate before reading the evidence they act on, and the
+  checked path re-reads that evidence inside the transaction that deletes, so a
+  submission starting concurrently cannot lose the rows that recover it.
+
+- Delegation setup that replaces an existing binding is refused once its
+  bundle shows broadcast evidence, and the check runs in the transaction that
+  writes. The hotkey rebuild holds the round's submission gate from the discard
+  through the replacement write, so a lifecycle call cannot dispatch the old
+  setup in between and have the replacement written over it. A first write, and
+  an idempotent rewrite of the same binding, are unaffected.
+
+- **Breaking:** pruning a bundle suffix that shows broadcast evidence fails
+  with `DelegationAlreadyBroadcast` instead of `Busy`. The evidence is durable,
+  so the old classification told a host retry loop to repeat a call that can
+  never succeed. `VotingErrorView` now carries `bundle_index` for both
+  `DelegationTargetMismatch` and `DelegationAlreadyBroadcast`.
+
+- A chain rejection's diagnostic carries the node's own explanation instead of
+  a bare numeric code, escaped and bounded as before. Non-JSON responses report
+  their content type and body the same way.
+
 ### Removed
 
 - **Breaking:** removed the persisted-vote recovery driver

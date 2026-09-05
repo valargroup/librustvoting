@@ -63,6 +63,20 @@ mod van_blinding;
 pub mod vote;
 pub mod vote_commitment;
 pub mod vote_work;
+/// Whether a bundle's due proposals are cast as one atomic batch.
+///
+/// Off while the vote chain has no `cast-vote-batch` route: batching posts to
+/// that endpoint, and a chain without it answers 404, which the submission
+/// lifecycle can only read as a possibly-dispatched ambiguity. With this off
+/// the planner emits one cast per proposal, each a singleton commitment on
+/// `cast-vote`, which every deployed chain accepts.
+///
+/// Turn back on once the batch route ships. Nothing else has to change: the
+/// batch paths, their storage, and their recovery are all still here and
+/// tested, and a round mid-flight under one setting keeps planning under the
+/// shape its durable rows already have.
+pub const ATOMIC_VOTE_BATCHES_ENABLED: bool = false;
+
 pub mod wire;
 mod wire_codec;
 pub mod witness;

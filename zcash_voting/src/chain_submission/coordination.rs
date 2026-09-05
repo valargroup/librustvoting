@@ -182,6 +182,54 @@ impl SubmissionCoordination {
             .map_err(|_| ExclusiveRoundAcquireError::Busy)
     }
 
+    /// Attempts to admit delegation setup alongside unrelated bundles while
+    /// excluding account cleanup, round deletion, and lifecycle work for the
+    /// same bundle.
+    ///
+    /// The acquisition order matches [`SubmissionCoordination::acquire`].
+    /// Setup is synchronous, so contention is reported to its retrying caller
+    /// instead of waiting on Tokio locks.
+    pub(crate) fn try_acquire_delegation_setup(
+        &self,
+        identity: &ChainSubmissionIdentity,
+    ) -> Result<DelegationSetupLease, ExclusiveRoundAcquireError> {
+        let account_gate = shared_lock(
+            &self.account_gates,
+            identity.wallet_id().to_string(),
+            || tokio::sync::RwLock::new(()),
+        )
+        .map_err(ExclusiveRoundAcquireError::Failure)?;
+        let account_guard = account_gate
+            .try_read_owned()
+            .map_err(|_| ExclusiveRoundAcquireError::Busy)?;
+
+        let round_key = round_key(identity);
+        let round_gate = shared_lock(
+            &self.round_gates,
+            round_key,
+            || tokio::sync::RwLock::new(()),
+        )
+        .map_err(ExclusiveRoundAcquireError::Failure)?;
+        let round_guard = round_gate
+            .try_read_owned()
+            .map_err(|_| ExclusiveRoundAcquireError::Busy)?;
+
+        let bundle_key = BundleOperationKey::from_identity(identity);
+        let bundle_lock = shared_lock(&self.bundle_locks, bundle_key, || {
+            tokio::sync::Mutex::new(())
+        })
+        .map_err(ExclusiveRoundAcquireError::Failure)?;
+        let bundle_guard = bundle_lock
+            .try_lock_owned()
+            .map_err(|_| ExclusiveRoundAcquireError::Busy)?;
+
+        Ok(DelegationSetupLease {
+            _account_guard: account_guard,
+            _round_guard: round_guard,
+            _bundle_guard: bundle_guard,
+        })
+    }
+
     pub(super) fn register_in_flight(
         &self,
         identity: &ChainSubmissionIdentity,
@@ -263,6 +311,13 @@ pub(crate) struct ExclusiveAccountLease {
     _guard: OwnedRwLockWriteGuard<()>,
 }
 
+/// Continuously-held exclusion for one bundle's delegation setup.
+pub(crate) struct DelegationSetupLease {
+    _account_guard: OwnedRwLockReadGuard<()>,
+    _round_guard: OwnedRwLockReadGuard<()>,
+    _bundle_guard: OwnedMutexGuard<()>,
+}
+
 fn shared_lock<K, L>(
     registry: &Mutex<HashMap<K, Weak<L>>>,
     key: K,
@@ -324,6 +379,8 @@ impl Drop for InFlightSubmission {
 mod tests {
     use super::*;
     use crate::chain_submission::ChainSubmissionTarget;
+
+    mod delegation_setup;
 
     fn identity(target: ChainSubmissionTarget, bundle_index: u32) -> ChainSubmissionIdentity {
         ChainSubmissionIdentity::new("wallet", Network::Testnet, [1; 32], bundle_index, target)

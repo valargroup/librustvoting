@@ -181,8 +181,27 @@ otherwise `Blocked` with the reason.
 `Blocked` is never projected as a `NextStep`; the plan reports it through
 `open_proposals`, `unrostered_intents` and the absence of a cast step.
 
-All drafts for one bundle form one `Cast` obligation and are cast as one
-atomic batch (or one singleton when there is one draft).
+How a bundle's drafts are grouped into cast obligations follows the build's
+`ATOMIC_VOTE_BATCHES_ENABLED` constant, and nothing else:
+
+- with batching **on**, all drafts for one bundle form one `Cast` obligation
+  and are cast as one atomic batch (or one singleton when there is one draft)
+  (`every_draft_of_a_bundle_is_one_cast_obligation_with_its_delegation_prerequisite`,
+  `a_cast_step_for_one_proposal_resolves_to_the_bundles_whole_draft_set`);
+- with batching **off**, which is how it currently ships because no deployed
+  chain serves the `cast-vote-batch` route, each draft becomes its own `Cast`
+  obligation over a single proposal, and each is dispatched as a singleton on
+  `cast-vote`. The same two tests state this shape.
+
+The grouping decision is made once, in `classify`, and the rest of the
+specification is written in terms of the units it produces. A singleton
+obligation is terminal on its own: it is planned, cast, confirmed and has its
+shares delivered without reference to the bundle's other drafts. The
+atomic-batch rule — one unit, never partially retired, advanced, or recast —
+governs the batches that exist, and with batching off none are formed for new
+work. A round whose durable rows already hold a batch keeps planning as a
+batch under either setting, because units are formed from the votes'
+persisted recovery bundles rather than from the constant.
 
 ### Delegation obligations
 
@@ -275,6 +294,13 @@ own write transaction or lock:
 | `Deliver` | round lock | plan creation under `BEGIN IMMEDIATE` with the `commitment_bundle_json` compare-and-swap; designation compare-and-swap; `CommittedVote::confirmed` re-reads the generation |
 | `Confirm` | per-share operation lock | the helper specification's quorum rules |
 | `Delegate`, `AdvanceDelegation` | bundle lock | the delegation pipeline and coordinator |
+
+Delegation setup uses the chain coordinator's matching hierarchy: shared
+account access, shared round access, and exclusive access to its bundle.
+Distinct bundles can therefore build setup concurrently, while wallet or
+round deletion and chain lifecycle work for the same bundle remain excluded
+(`another_bundle_builds_while_delegation_setup_is_active`,
+`delegation_setup_excludes_only_its_bundle_lifecycle`).
 
 The executor takes exactly two authoritative plans per step: one un-locked to
 choose the step, one under the lock to resolve it to an obligation. The plan

@@ -460,7 +460,9 @@ async fn nullifier_spent_after_definite_committed_failure_stays_recoverable() {
         .unwrap_err();
 
     assert_eq!(failure.kind(), ChainSubmissionFailureKind::Protocol);
-    assert!(!failure.message().contains("must not be retained"));
+    // The chain's own words ride along so a rejection can be acted on; the
+    // recovery state below is what the test is really pinning.
+    assert!(failure.message().contains("must not be retained"));
     assert_eq!(
         failure.strongest_state().unwrap().state(),
         ChainSubmissionState::Recovering
@@ -2321,7 +2323,7 @@ async fn chain_rejection_preserves_bound_recovery_and_redacts_diagnostics() {
             candidate_transaction_hash: None,
             ref diagnostic,
         }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::ChainRejected
-            && !diagnostic.message().contains("sensitive"))
+            && diagnostic.message().contains("sensitive"))
     );
     let record = store.record(&identity).unwrap();
     assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);

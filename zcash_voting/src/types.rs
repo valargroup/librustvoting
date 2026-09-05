@@ -79,6 +79,21 @@ pub enum VotingErrorKind {
     SetupAlreadyPersisted,
     DbBusy,
     PirUnavailable,
+    /// A bundle's stored delegation setup does not reproduce from the voting
+    /// hotkey the host holds.
+    ///
+    /// It says what disagrees, not what may be done about it: the comparison
+    /// is over the stored binding alone, and a bundle whose delegation is
+    /// already on chain fails it the same way one that never left the device
+    /// does. Rebuilding is safe only when nothing was broadcast, which is a
+    /// separate question — ask it with `delegation_broadcast_evidence`, or let
+    /// the discard answer it, since it refuses with
+    /// [`VotingErrorKind::DelegationAlreadyBroadcast`] rather than destroying
+    /// the setup that recovers a round's voting weight.
+    DelegationTargetMismatch,
+    /// A delegation may already be on chain, so the state the host asked to
+    /// clear is the only thing that can recover the round's voting weight.
+    DelegationAlreadyBroadcast,
 }
 
 fn insufficient_eligibility_message(
@@ -157,6 +172,49 @@ pub enum VotingError {
         retryable: bool,
         message: String,
     },
+    /// The stored delegation setup of `bundle_index` does not reproduce from
+    /// the voting hotkey the caller supplied.
+    ///
+    /// A comparison over the stored binding, and nothing more. It is distinct
+    /// from `InvalidInput` because retrying with the same key never succeeds:
+    /// either the caller holds the wrong hotkey for this round, or the bundle
+    /// is rebuilt against the key it does hold. It is not authorization to
+    /// discard anything — a bundle whose delegation is already on chain fails
+    /// this comparison exactly as one that never left the device does, and its
+    /// setup is then the only thing that can reproduce the round's voting
+    /// weight. The message says "if the bundle was never broadcast" for that
+    /// reason, and the discard settles the question itself, refusing with
+    /// [`VotingError::DelegationAlreadyBroadcast`].
+    ///
+    /// Preparation is the only path that rebuilds, so the message names it. A
+    /// host normally never sees this, because proof reuse absorbs it and
+    /// rebuilds; Keystone signing keeps the strict check, since the device
+    /// signed the exact PCZT the stored setup describes and this call may be
+    /// about to apply that signature. Naming the recovery is what turns that
+    /// refusal into an instruction instead of a dead end.
+    #[error(
+        "bundle {bundle_index}'s stored delegation target does not reproduce from this voting \
+         hotkey (van_matches={van_matches}, commitment_matches={commitment_matches}); if the \
+         bundle was never broadcast, re-run delegation preparation to rebuild it"
+    )]
+    DelegationTargetMismatch {
+        bundle_index: u32,
+        /// Whether the VAN commitment reproduced. It binds the hotkey, the
+        /// bundle's total note value and the round, so a false here with a
+        /// matching commitment means something other than the hotkey moved.
+        van_matches: bool,
+        /// Whether the governance output commitment reproduced. It binds the
+        /// hotkey and the note's own randomness.
+        commitment_matches: bool,
+    },
+    /// The caller asked to clear state for `bundle_index`, whose delegation may
+    /// already be on chain.
+    ///
+    /// The round's governance nullifiers are deterministic and spent by then,
+    /// so its stored setup is the only thing that can reproduce its voting
+    /// weight. Nothing was cleared.
+    #[error("delegation for bundle {bundle_index} may already be on chain ({evidence}), so its recovery state was kept")]
+    DelegationAlreadyBroadcast { bundle_index: u32, evidence: String },
 }
 
 impl VotingError {
@@ -174,6 +232,8 @@ impl VotingError {
             Self::SetupAlreadyPersisted { .. } => VotingErrorKind::SetupAlreadyPersisted,
             Self::DbBusy { .. } => VotingErrorKind::DbBusy,
             Self::PirUnavailable { .. } => VotingErrorKind::PirUnavailable,
+            Self::DelegationTargetMismatch { .. } => VotingErrorKind::DelegationTargetMismatch,
+            Self::DelegationAlreadyBroadcast { .. } => VotingErrorKind::DelegationAlreadyBroadcast,
         }
     }
 

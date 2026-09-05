@@ -520,6 +520,8 @@ pub enum VotingErrorKindView {
     SetupAlreadyPersisted,
     DbBusy,
     PirUnavailable,
+    DelegationTargetMismatch,
+    DelegationAlreadyBroadcast,
     /// Any category this host does not know. Serde deserializes unknown
     /// category strings into it, so a newer crate can add kinds without
     /// breaking an older host's view.
@@ -718,6 +720,7 @@ pub enum RoundStepFailureKindView {
     Signing,
     HelperDeliveryIncomplete,
     VoteEnded,
+    DelegationTargetMismatch,
 }
 
 /// Outcome of one round step.

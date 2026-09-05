@@ -437,12 +437,26 @@ fn parse_post_response(
                 } else {
                     ChainRejectionKind::Other
                 },
-                // The response log is server-controlled and may echo proofs,
-                // signatures, or the complete request. Keep durable-safe
-                // diagnostics limited to the stable numeric result.
+                // The response log is the only thing that says *why* the chain
+                // refused, and a bare numeric code leaves an operator with
+                // nothing to act on. It is server-controlled text, so it is
+                // carried as data and never as instruction:
+                // `from_redacted_message` escapes it and bounds it to
+                // `MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES` before it reaches the
+                // durable row. The wallet's own submission is not a secret from
+                // the wallet, and the row never leaves this device, so a log
+                // that echoes the request lands here escaped and truncated
+                // rather than dropped or picked over.
                 diagnostic: ChainSubmissionDiagnostic::from_redacted_message(
                     ChainSubmissionDiagnosticKind::ChainRejected,
-                    format!("vote chain rejected transaction with code {code}"),
+                    if parsed.log.trim().is_empty() {
+                        format!("vote chain rejected transaction with code {code}")
+                    } else {
+                        format!(
+                            "vote chain rejected transaction with code {code}: {}",
+                            parsed.log.trim()
+                        )
+                    },
                 ),
                 candidate_transaction_hash,
             }
@@ -514,9 +528,27 @@ fn validate_json_response(response: &ChainHttpResponse) -> Result<(), ChainSubmi
             .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
     });
     if !is_json {
-        return Err(invalid_protocol(
-            "vote-chain response Content-Type must be application/json",
-        ));
+        // Report what actually arrived. The gateway sets `application/json` on
+        // every response it writes, including its errors, so a different type
+        // means the answer came from somewhere else — a proxy error page, a
+        // router 404, a panic — and the body is the only thing that says
+        // which. The text is server-controlled, so it rides along as data:
+        // `invalid_protocol` escapes it and bounds it like any other
+        // diagnostic.
+        let observed = response.content_type().unwrap_or("(absent)");
+        let body = String::from_utf8_lossy(response.body());
+        let excerpt = body.trim();
+        return Err(invalid_protocol(if excerpt.is_empty() {
+            format!(
+                "vote-chain response Content-Type must be application/json, got {observed} \
+                 with an empty body"
+            )
+        } else {
+            format!(
+                "vote-chain response Content-Type must be application/json, got {observed}: \
+                 {excerpt}"
+            )
+        }));
     }
     Ok(())
 }
@@ -535,8 +567,7 @@ struct TransactionResultJson {
     tx_hash: Option<String>,
     code: u32,
     #[serde(default)]
-    #[serde(rename = "log")]
-    _log: String,
+    log: String,
     #[serde(default)]
     batch_digest: BatchDigestJson,
 }
@@ -677,6 +708,7 @@ fn invalid_protocol(message: impl AsRef<str>) -> ChainSubmissionDiagnostic {
 #[cfg(test)]
 mod tests {
     mod batch_request;
+    mod rejection_diagnostics;
 
     use std::{
         collections::VecDeque,
@@ -990,96 +1022,6 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .is_err());
-    }
-
-    #[tokio::test]
-    async fn valid_422_is_a_deterministic_rejection_with_optional_hash() {
-        let transport = Arc::new(ScriptedTransport::default());
-        transport.queue(Ok(json(
-            422,
-            format!(r#"{{"tx_hash":"{HASH}","code":7,"log":"round closed"}}"#),
-        )));
-        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
-
-        let outcome = client.submit_delegation(0, &delegation()).await;
-        let PostAttemptOutcome::Rejected {
-            code,
-            kind,
-            diagnostic,
-            candidate_transaction_hash,
-        } = outcome
-        else {
-            panic!("expected deterministic rejection");
-        };
-        assert_eq!(code, 7);
-        assert_eq!(kind, ChainRejectionKind::Other);
-        assert_eq!(
-            diagnostic.kind(),
-            ChainSubmissionDiagnosticKind::ChainRejected
-        );
-        assert_eq!(
-            candidate_transaction_hash,
-            Some(CandidateTransactionHash::from_str(HASH).unwrap())
-        );
-        assert_eq!(
-            diagnostic.message(),
-            "vote chain rejected transaction with code 7"
-        );
-        assert!(!diagnostic.message().contains("round closed"));
-    }
-
-    #[tokio::test]
-    async fn rejection_diagnostic_does_not_retain_server_log_material() {
-        let transport = Arc::new(ScriptedTransport::default());
-        let secret = "proof-and-signature-from-submitted-request";
-        transport.queue(Ok(json(422, format!(r#"{{"code":7,"log":"{secret}"}}"#))));
-        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
-
-        let PostAttemptOutcome::Rejected { diagnostic, .. } =
-            client.submit_delegation(0, &delegation()).await
-        else {
-            panic!("expected deterministic rejection");
-        };
-        assert!(!diagnostic.message().contains(secret));
-        assert_eq!(
-            diagnostic.message(),
-            "vote chain rejected transaction with code 7"
-        );
-    }
-
-    #[tokio::test]
-    async fn nullifier_spent_is_classified_only_by_numeric_code() {
-        let transport = Arc::new(ScriptedTransport::default());
-        transport.queue(Ok(json(
-            422,
-            r#"{"code":2,"log":"an unrelated and untrusted message"}"#,
-        )));
-        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
-
-        assert!(matches!(
-            client.submit_delegation(0, &delegation()).await,
-            PostAttemptOutcome::Rejected {
-                code: 2,
-                kind: ChainRejectionKind::NullifierAlreadySpent,
-                ref diagnostic,
-                ..
-            } if !diagnostic.message().contains("unrelated")
-        ));
-
-        let transport = Arc::new(ScriptedTransport::default());
-        transport.queue(Ok(json(
-            422,
-            r#"{"code":7,"log":"nullifier already spent"}"#,
-        )));
-        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
-        assert!(matches!(
-            client.submit_delegation(0, &delegation()).await,
-            PostAttemptOutcome::Rejected {
-                code: 7,
-                kind: ChainRejectionKind::Other,
-                ..
-            }
-        ));
     }
 
     #[tokio::test]

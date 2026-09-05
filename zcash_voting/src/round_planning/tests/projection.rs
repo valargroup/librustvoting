@@ -72,5 +72,14 @@ fn a_cast_step_for_one_proposal_resolves_to_the_bundles_whole_draft_set() {
     else {
         panic!("a cast step resolves to its cast");
     };
-    assert_eq!(drafts.len(), 2);
+    // Batching on, the step resolves to the bundle's whole draft set and casts
+    // them atomically. Batching off, it resolves to just its own proposal —
+    // which is the point of the split, since each cast then confirms and
+    // starts delivering its shares on its own.
+    if crate::ATOMIC_VOTE_BATCHES_ENABLED {
+        assert_eq!(drafts.len(), 2);
+    } else {
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].proposal_id, 2);
+    }
 }

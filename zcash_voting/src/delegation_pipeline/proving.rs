@@ -75,6 +75,31 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         }
     }
 
+    /// Whether the bundle's persisted proof can still be used by this
+    /// pipeline's hotkey.
+    ///
+    /// A proof made for a target the current hotkey cannot reproduce is not
+    /// reusable, and saying so here is what lets setup rebuild the bundle. The
+    /// alternative is the round dying on a proof nothing can ever sign: every
+    /// path that reuses a proof validates it first, so without this the
+    /// mismatch is raised before setup — the one place that can fix it — is
+    /// ever reached.
+    ///
+    /// Only the target mismatch is absorbed. Every other validation failure is
+    /// still a failure, and setup refuses to rebuild anything that may already
+    /// be on chain, so a bundle whose delegation left the device still stops
+    /// here rather than losing the state that recovers it.
+    fn persisted_proof_is_reusable(
+        &self,
+        prepared: &PreparedDelegationBundle,
+    ) -> Result<bool, VotingError> {
+        match prepared.validate_persisted_proof(self.scoped_voting_db()?) {
+            Ok(()) => Ok(true),
+            Err(VotingError::DelegationTargetMismatch { .. }) => Ok(false),
+            Err(other) => Err(other),
+        }
+    }
+
     /// Persists witnesses and padded secrets and warms the bundle's PIR rows.
     pub fn precompute_pir(
         &self,
@@ -99,10 +124,12 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         progress: &dyn DelegationProgressReporter,
     ) -> Result<DelegationProofStatus, VotingError> {
         let prepared = self.prepare(bundle_index)?;
-        if self.has_persisted_proof(bundle_index)? {
-            prepared.validate_persisted_proof(self.scoped_voting_db()?)?;
+        if self.has_persisted_proof(bundle_index)? && self.persisted_proof_is_reusable(&prepared)? {
             return Ok(DelegationProofStatus::Reused);
         }
+        // Reached with a persisted proof only when that proof belongs to a
+        // target this hotkey cannot reproduce. Setup discards the unusable
+        // bundle and rebuilds it, or refuses if it may be on chain.
         self.ensure_setup(&prepared, &NoopProgressReporter)?;
         self.prove_with_fleet(&prepared, pir, progress)
     }
@@ -152,18 +179,29 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     ) -> Result<SignedDelegationBundle, VotingError> {
         progress.on_progress(DelegationProgress::SelectingNotes);
         let prepared = self.prepare(bundle_index)?;
+        // Software signing may rebuild a bundle whose proof this hotkey cannot
+        // use; Keystone signing may not, because the device signed the exact
+        // PCZT the stored setup describes and rebuilding under it would
+        // invalidate the signature this call is about to apply.
         let proof_persisted = self.has_persisted_proof(bundle_index)?;
+        let proof_reusable = match (proof_persisted, signer) {
+            (false, _) => false,
+            (true, DelegationSigner::Software(_)) => self.persisted_proof_is_reusable(&prepared)?,
+            (true, _) => {
+                // Reuse is only valid for the notes and target the proof was
+                // generated for; a different same-network hotkey must not be
+                // handed the original target's delegation.
+                prepared.validate_persisted_proof(self.scoped_voting_db()?)?;
+                true
+            }
+        };
         let pczt_bytes = match signer {
-            DelegationSigner::Software(_) if !proof_persisted => {
+            DelegationSigner::Software(_) if !proof_reusable => {
                 self.ensure_setup(&prepared, progress)?
             }
             _ => Vec::new(),
         };
-        if proof_persisted {
-            // Reuse is only valid for the notes and target the proof was
-            // generated for; a different same-network hotkey must not be
-            // handed the original target's delegation.
-            prepared.validate_persisted_proof(self.scoped_voting_db()?)?;
+        if proof_reusable {
             progress.on_progress(DelegationProgress::ProofComplete);
         } else {
             self.prove_with_fleet(&prepared, pir, progress)?;

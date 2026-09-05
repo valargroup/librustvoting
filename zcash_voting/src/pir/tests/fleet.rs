@@ -191,3 +191,30 @@ fn dot_segments_resolve_to_one_endpoint_identity() {
         "https://pir.example/api"
     );
 }
+
+/// An empty fleet builds, and fails only if something actually asks it for a
+/// PIR answer.
+///
+/// A step that advances a delegation the chain already holds needs no PIR, and
+/// a host running one has no endpoint to give. Enforcing the requirement at
+/// construction made the fleet a precondition of opening a session at all,
+/// which is what stopped a submitted delegation from resuming without PIR.
+#[test]
+fn an_empty_fleet_defers_its_requirement_to_the_first_use() {
+    let endpoints: Vec<String> = Vec::new();
+    let result = failover_over(
+        &endpoints,
+        |endpoint: &str| -> Result<String, VotingError> {
+            panic!("no endpoint to connect: {endpoint}")
+        },
+        |_session: &String| -> Result<u8, VotingError> { panic!("no session to use") },
+    );
+
+    let error = result.expect_err("an empty fleet cannot answer a PIR request");
+    assert!(
+        error
+            .to_string()
+            .contains("at least one PIR server URL is required"),
+        "{error}"
+    );
+}

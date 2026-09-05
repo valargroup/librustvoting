@@ -127,5 +127,15 @@ fn every_draft_of_a_bundle_is_one_cast_obligation_with_its_delegation_prerequisi
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(casts, vec![(0, 2, Some(0)), (1, 2, None)]);
+    // Each bundle's two choices are one cast while batching is on, and one
+    // cast apiece while it is off; the delegation prerequisite rides on every
+    // cast either way.
+    if crate::ATOMIC_VOTE_BATCHES_ENABLED {
+        assert_eq!(casts, vec![(0, 2, Some(0)), (1, 2, None)]);
+    } else {
+        assert_eq!(
+            casts,
+            vec![(0, 1, Some(0)), (0, 1, Some(0)), (1, 1, None), (1, 1, None)]
+        );
+    }
 }

@@ -401,9 +401,15 @@ pub(super) fn executor_ready_to_cast_with_hotkey_and_control(
         )
     };
     let rseed_output = [0x47u8; 32];
+    // The output note's rho is the spend's nullifier, so the commitment is
+    // derived from the value stored as `nf_signed` below.
+    let nf_signed = {
+        use crate::backend::pasta_curves::{group::ff::PrimeField, pallas};
+        pallas::Base::from(11u64).to_repr()
+    };
     let cmx_new = crate::action::derive_governance_output_cmx(
         target.raw_orchard_address(),
-        &rho_signed,
+        &nf_signed,
         &rseed_output,
         network,
         round_params.snapshot_height,
@@ -431,7 +437,7 @@ pub(super) fn executor_ready_to_cast_with_hotkey_and_control(
         &[],
         &rho_signed,
         &[],
-        &[0x43; 32],
+        &nf_signed,
         &cmx_new,
         &[0x45; 32],
         &[0x46; 32],

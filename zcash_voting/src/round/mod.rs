@@ -511,9 +511,31 @@ impl VotingDb {
             .collect()
     }
 
-    /// Deletes all persisted state for one round in the current wallet scope.
+    /// Deletes all persisted state for one round in the current wallet scope,
+    /// unless part of that round has already reached the network.
+    ///
+    /// Refuses with `DelegationAlreadyBroadcast` once a delegation transaction
+    /// hash, a VAN position, a chain submission, a vote or a delivered helper
+    /// share exists, because the round's stored setup is then the only thing
+    /// that can reproduce its voting weight. Use
+    /// [`VotingDb::delete_round_discarding_recovery`] to abandon such a round
+    /// on purpose.
     pub fn delete_round(&self, round_id: &str) -> Result<(), VotingError> {
         self.clear_round(round_id)
+    }
+
+    /// Deletes one round even though part of it has reached the network,
+    /// giving up the state that could recover its voting weight.
+    ///
+    /// The escape hatch behind [`VotingDb::delete_round`]'s refusal, for the
+    /// case where the voter has decided to abandon the round: a delegation
+    /// that cannot confirm and is being replaced by a corrected capability
+    /// package, ahead of any vote commitment. The round's governance
+    /// nullifiers are already spent on chain and its `van_comm_rand` cannot be
+    /// recomputed, so its weight does not come back. Every recovery path, and
+    /// every automatic cleanup, must use the checked deletion instead.
+    pub fn delete_round_discarding_recovery(&self, round_id: &str) -> Result<(), VotingError> {
+        self.clear_round_discarding_recovery(round_id)
     }
 
     /// Returns the policy a round's bundle plan must be derived with.
@@ -1502,7 +1524,13 @@ mod tests {
 
         let bundles_before = db.get_bundle_count(ROUND_ID).unwrap();
         let error = db.delete_skipped_bundles(ROUND_ID, 0).unwrap_err();
-        assert!(matches!(error, crate::VotingError::Busy { .. }));
+        // Not `Busy`: the evidence is durable, so no wait clears it and a host
+        // retry loop must not be told the call is worth repeating.
+        assert!(
+            matches!(error, crate::VotingError::DelegationAlreadyBroadcast { .. }),
+            "{error:?}"
+        );
+        assert!(!error.retryable());
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), bundles_before);
         let submissions: i64 = db
             .conn()

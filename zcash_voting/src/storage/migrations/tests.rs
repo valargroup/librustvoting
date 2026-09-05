@@ -60,6 +60,16 @@ fn v19_schema() -> String {
     without_round_immediate_share(include_str!("001_init.sql"))
 }
 
+/// The complete version-20 schema as a build carrying the 15-proposal bound
+/// left it: everything `001_init.sql` creates, with `chain_submissions` still
+/// refusing proposal ids above 15.
+fn v20_legacy_proposal_bound_schema() -> String {
+    include_str!("001_init.sql").replace(
+        "proposal_id BETWEEN 1 AND 50",
+        "proposal_id BETWEEN 1 AND 15",
+    )
+}
+
 fn v16_schema() -> String {
     without_helper_share_plans(&without_chain_submissions(include_str!("001_init.sql")))
 }
@@ -439,6 +449,91 @@ fn fresh_and_migrated_v18_schemas_accept_supported_singleton_proposals() {
 }
 
 #[test]
+fn v20_legacy_proposal_bound_migrates_and_keeps_its_rows() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&v20_legacy_proposal_bound_schema())
+        .unwrap();
+    conn.pragma_update(None, "user_version", 20).unwrap();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    let insert = |conn: &Connection, identity_byte: u8, proposal_id: u32| {
+        conn.execute(
+            "INSERT INTO chain_submissions
+             (identity_key, round_id, wallet_id, network, bundle_index, kind,
+              proposal_id, generation_digest, state, committed_post_reservations,
+              created_at, updated_at)
+             VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', ?3, ?4,
+                     'submitting', 1, 9, 9)",
+            rusqlite::params![
+                vec![identity_byte; 32],
+                ROUND,
+                i64::from(proposal_id),
+                vec![0x42_u8; 32],
+            ],
+        )
+    };
+    insert(&conn, 0x60, 3).unwrap();
+    let before = dump_table(&conn, "chain_submissions");
+    // The stale bound is what makes this database unopenable today.
+    assert!(is_constraint_violation(
+        &insert(&conn, 0x61, 20).unwrap_err()
+    ));
+
+    migrate(&mut conn).unwrap();
+
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_VERSION);
+    assert_eq!(dump_table(&conn, "chain_submissions"), before);
+    // The bound is whatever this build declares; the migration's job is to make
+    // the table agree with it, not to hold a fixed number.
+    insert(&conn, 0x61, crate::types::MAX_PROPOSAL_ID)
+        .expect("migrated schema must accept the declared maximum proposal");
+    let error = insert(&conn, 0x62, crate::types::MAX_PROPOSAL_ID + 1).unwrap_err();
+    assert!(is_constraint_violation(&error), "{error}");
+    // A second open must still pass the fingerprint check.
+    migrate(&mut conn).unwrap();
+}
+
+/// A version-20 sidecar that is also missing an index or a trigger upgrades
+/// through the ladder and comes out repaired.
+///
+/// The rebuild in migration 005 drops both before it recreates them, so an
+/// unconditional drop would abort the upgrade on the way to the repair that
+/// would have fixed it.
+#[test]
+fn v20_missing_indexes_and_triggers_upgrade_and_are_repaired() {
+    for tamper in [
+        "DROP INDEX chain_submissions_candidate_owner",
+        "DROP INDEX chain_submissions_identity",
+        "DROP TRIGGER chain_submissions_immutable_identity",
+        "DROP TRIGGER chain_submissions_monotonic_reservations",
+    ] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v20_legacy_proposal_bound_schema())
+            .unwrap();
+        conn.execute_batch(tamper).unwrap();
+        conn.pragma_update(None, "user_version", 20).unwrap();
+
+        migrate(&mut conn).unwrap_or_else(|error| panic!("{tamper}: {error}"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION, "{tamper}");
+        // The fingerprint agrees again, so a second open is a no-op.
+        migrate(&mut conn).unwrap_or_else(|error| panic!("{tamper}: {error}"));
+    }
+}
+
+#[test]
 fn v18_submission_rows_migrate_incrementally_to_v19() {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&v17_schema()).unwrap();
@@ -513,9 +608,17 @@ fn v18_submission_rows_migrate_incrementally_to_v19() {
          (identity_key, round_id, wallet_id, network, bundle_index, kind,
           proposal_id, generation_digest, state, committed_post_reservations,
           created_at, updated_at)
-         VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 50, ?3,
+         VALUES (?1, ?2, 'wallet', 'testnet', 1, 'vote', ?4, ?3,
                  'submitting', 1, 9, 9)",
-        rusqlite::params![vec![0x45_u8; 32], ROUND, vec![0x42_u8; 32]],
+        rusqlite::params![
+            vec![0x45_u8; 32],
+            ROUND,
+            vec![0x42_u8; 32],
+            // The declared maximum, so the row stays valid whichever bound
+            // this build carries. Its own bundle, because the row above
+            // already claims that proposal on bundle 0.
+            crate::types::MAX_PROPOSAL_ID
+        ],
     )
     .unwrap();
     assert_eq!(
@@ -800,15 +903,32 @@ fn current_fingerprint_rejects_missing_columns_indexes_and_triggers() {
             "",
             1,
         );
+    // A missing column is drift the repair cannot resolve honestly: it has no
+    // value to carry across, so this stays fatal.
     assert_rejected(&without_diagnostic_kind, None);
-    assert_rejected(
-        include_str!("002_chain_submissions.sql"),
-        Some("DROP INDEX chain_submissions_candidate_owner"),
-    );
-    assert_rejected(
-        include_str!("002_chain_submissions.sql"),
-        Some("DROP TRIGGER chain_submissions_immutable_identity"),
-    );
+
+    // A missing index or trigger is not. The columns are intact, so the table
+    // is rebuilt from the current DDL with every row carried across, which
+    // restores the enforcement that went missing instead of stranding the
+    // wallet on a database it can no longer open.
+    fn assert_repaired(tamper: &str) {
+        // The full schema, because the rebuild carries rows across a table
+        // whose foreign key must still resolve.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("001_init.sql")).unwrap();
+        conn.execute_batch(tamper).unwrap();
+        conn.pragma_update(None, "user_version", CURRENT_VERSION)
+            .unwrap();
+
+        migrate(&mut conn).expect("intact columns must be repaired, not refused");
+
+        // Repaired means the fingerprint matches again, so a second open is a
+        // no-op rather than another rebuild.
+        migrate(&mut conn).expect("a repaired schema stays repaired");
+    }
+
+    assert_repaired("DROP INDEX chain_submissions_candidate_owner");
+    assert_repaired("DROP TRIGGER chain_submissions_immutable_identity");
 }
 
 #[test]
@@ -1492,4 +1612,34 @@ fn stored_plan_snapshot_for_round(conn: &Connection, round_id: &str) -> Option<S
     )
     .optional()
     .unwrap()
+}
+
+/// Opt-in probe: repairs a real sidecar named by `REPAIR_PROBE_DB`.
+///
+/// Ignored by default because it needs a file from a real wallet, and a no-op
+/// when that file is not named: CI runs the ignored tests too, so a probe that
+/// demanded its input would fail every run that has nothing to probe.
+#[test]
+#[ignore]
+fn repairs_a_real_sidecar_named_by_the_environment() {
+    let Ok(path) = std::env::var("REPAIR_PROBE_DB") else {
+        return;
+    };
+    let mut conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chain_submissions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    migrate(&mut conn).expect("a drifted sidecar must repair");
+
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chain_submissions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(before, after, "every submission must survive the repair");
+    migrate(&mut conn).expect("a repaired sidecar stays repaired");
 }

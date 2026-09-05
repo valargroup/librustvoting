@@ -1100,6 +1100,7 @@ impl From<crate::RoundStepFailureKind> for RoundStepFailureKindView {
             K::Signing => Self::Signing,
             K::HelperDeliveryIncomplete => Self::HelperDeliveryIncomplete,
             K::VoteEnded => Self::VoteEnded,
+            K::DelegationTargetMismatch => Self::DelegationTargetMismatch,
         }
     }
 }
@@ -1335,6 +1336,10 @@ impl From<&VotingError> for VotingErrorView {
                 view.http_status = *http_status;
                 view.endpoint = endpoint.clone();
             }
+            VotingError::DelegationTargetMismatch { bundle_index, .. }
+            | VotingError::DelegationAlreadyBroadcast { bundle_index, .. } => {
+                view.bundle_index = Some(*bundle_index);
+            }
             _ => {}
         }
         view
@@ -1372,6 +1377,8 @@ impl From<VotingErrorKind> for VotingErrorKindView {
             VotingErrorKind::SetupAlreadyPersisted => Self::SetupAlreadyPersisted,
             VotingErrorKind::DbBusy => Self::DbBusy,
             VotingErrorKind::PirUnavailable => Self::PirUnavailable,
+            VotingErrorKind::DelegationTargetMismatch => Self::DelegationTargetMismatch,
+            VotingErrorKind::DelegationAlreadyBroadcast => Self::DelegationAlreadyBroadcast,
         }
     }
 }
