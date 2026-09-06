@@ -2159,14 +2159,60 @@ pub(crate) fn load_van_tree_entries(
 ) -> Result<Vec<VanTreeEntry>, VotingError> {
     let mut stmt = conn
         .prepare(
+            // A bundle whose vote may already be on chain no longer holds its
+            // delegation VAN at that leaf: casting spends it. `tx_hash` alone
+            // is too weak a signal for that — a vote whose POST was dispatched
+            // but never classified has none, yet may have spent the VAN. The
+            // reservation is the authoritative fact: a committed
+            // `chain_submissions` row means a POST was released, which the
+            // submission lifecycle treats as possibly dispatched.
+            //
+            // Reading only `tx_hash` deadlocked recovery. The stale expectation
+            // failed tree sync, tree sync failing aborted the cast that would
+            // have classified the vote, and so `tx_hash` stayed null and the
+            // next pass failed identically.
+            //
+            // A terminally `rejected` row is the one exception, and it is
+            // excluded for the same reason the rest are counted: what retires
+            // the expectation is a POST that may have spent the VAN, and a
+            // definite rejection spent nothing. `Rejected` is safe to read
+            // that way because it is terminal — no observation transitions out
+            // of it, and `reserve_recovery_retry` accepts only `Recovering` —
+            // so the row can never acquire an outstanding POST after the fact.
+            // Its own row is never deleted, so without this it would retire
+            // the expectation for the rest of the round and silently skip both
+            // the leaf-content and the leaf-presence check.
+            //
+            // A `recovering` row carrying `chain_rejected` is deliberately NOT
+            // excluded, even though its last classified outcome also spent
+            // nothing. Exact-tree recovery reaches any `Recovering` row
+            // regardless of diagnostic, and on a no-match it reserves a retry
+            // and releases a POST while leaving both `state` and
+            // `diagnostic_kind` untouched. Between that reservation and the
+            // response being classified, the row is indistinguishable from a
+            // quiescent rejection, so excluding it would restore a delegation
+            // VAN the retry may already have spent — failing tree sync against
+            // the successor leaf, which aborts the cast that would classify
+            // the retry, which is the self-sustaining deadlock this predicate
+            // exists to break. Distinguishing the two needs the retry dispatch
+            // journaled against the reservation counter, which the row does
+            // not record today.
             "SELECT b.bundle_index, b.van_leaf_position, b.gov_comm,
-                    EXISTS (
+                    (EXISTS (
                         SELECT 1 FROM votes v
                         WHERE v.round_id = b.round_id
                           AND v.wallet_id = b.wallet_id
                           AND v.bundle_index = b.bundle_index
                           AND v.tx_hash IS NOT NULL
                     )
+                    OR EXISTS (
+                        SELECT 1 FROM chain_submissions cs
+                        WHERE cs.round_id = b.round_id
+                          AND cs.wallet_id = b.wallet_id
+                          AND cs.bundle_index = b.bundle_index
+                          AND cs.kind IN ('vote', 'vote_batch')
+                          AND cs.state != 'rejected'
+                    ))
              FROM bundles b
              WHERE b.round_id = :round_id
                AND b.wallet_id = :wallet_id
