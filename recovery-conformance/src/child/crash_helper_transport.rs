@@ -49,11 +49,13 @@ impl<T: HelperTransport> HelperTransport for CrashHelperTransport<T> {
     }
 
     fn post_json<'a>(&'a self, url: &'a str, body: Vec<u8>, timeout: Duration) -> HelperFuture<'a> {
-        // Only a share submission. The helper client also POSTs during fleet
-        // preflight, which happens *before* any share is journaled, so firing
-        // there kills the process while `attempting_urls` is still legitimately
-        // empty — and makes a correctly ordered journal look like a missing
-        // one.
+        // Only a share submission arms the crash. Every other helper call this
+        // transport sees must pass through untouched, or the process dies at a
+        // point where no delivery attempt has been journaled yet and a
+        // correctly ordered journal looks like a missing one. Fleet preflight
+        // is `GET /status` and share status is `GET /share-status/...`, so
+        // neither reaches this method; the path check is what keeps that true
+        // if a future call POSTs somewhere else.
         let Some(armed) = self.armed.filter(|_| url.ends_with(SHARES_ENDPOINT)) else {
             return self.inner.post_json(url, body, timeout);
         };

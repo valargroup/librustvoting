@@ -14,6 +14,7 @@
 //! state a test is about to read; in a child it dies with the process.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -23,6 +24,8 @@ use zcash_voting::{
     round::VotingDb,
     round_drive::{FailureIsolation, RoundDrivePolicy, RoundDriver, RoundHostSource},
     session::Decision,
+    share_policy::ShareTimingPolicy,
+    share_tracking::{track_pending_shares, ShareTrackingParams},
     BallotIntent, ChainAdvancePolicy, ChainSubmissionClientConfig, ChainSubmissionControl,
     DelegationSigner, DelegationStepInputs, HelperClient, HelperHealth, HyperTransport, PirFleet,
     ProposalRosterEntry, RoundBinding, RoundExecutor, RoundHostContext,
@@ -164,6 +167,7 @@ async fn drive(
     // the wrappers become pass-throughs, which keeps the control run on the
     // same code path rather than a parallel one.
     let route = Arc::new(zcash_voting::transport::DirectRoute::default());
+    let route_for_helpers = Arc::clone(&route);
     let helper_client = HelperClient::new(
         Arc::new(CrashHelperTransport::new(
             HyperTransport::with_shared_route(Arc::clone(&route)),
@@ -229,11 +233,32 @@ async fn drive(
         },
         Arc::clone(&log),
     );
+    // Before the drive, not after. A crash around a share POST leaves one
+    // helper journaled with an unknown outcome, and only this pass re-sends it.
+    // Until it does, that share has no accepted helper, which keeps
+    // `blocking_recovery` true, which stops the driver from ever quiescing at
+    // `BackgroundShareWorkOnly` — so a recovery pass placed after the drive is
+    // unreachable on precisely the runs that need it. The driver polls the
+    // abandoned share until its budget runs out instead.
+    if armed.is_none() {
+        if let Err(error) = recover_pending_shares(&database, config, &route_for_helpers).await {
+            eprintln!("run: background share tracking stopped early: {error}");
+        }
+    }
+
     let control = ChainSubmissionControl::new(0);
     let report = RoundDriver::new(&executor)
         .with_policy(policy(armed.is_some(), config.max_dispatches))
         .run(&host, &control, &reporter)
         .await;
+
+    // Again afterwards: the drive itself can leave a share placed but
+    // unconfirmed, and the round is not settled until tracking says so.
+    if armed.is_none() {
+        if let Err(error) = recover_pending_shares(&database, config, &route_for_helpers).await {
+            eprintln!("run: background share tracking stopped early: {error}");
+        }
+    }
 
     let outcome = RunOutcome {
         quiescence: format!("{:?}", report.quiescence),
@@ -362,6 +387,125 @@ impl RoundHostSource for Host {
             max_proof_concurrency: 1,
         }
     }
+}
+
+/// How long an interrupted share attempt waits before it may be retried.
+///
+/// Both bounds of the policy are set to this, so the threshold is exactly this
+/// value rather than a quarter of a fourteen-day window clamped to an hour.
+/// Long enough that a retry is a considered recovery rather than an immediate
+/// double-send, short enough that a test can watch it happen.
+const SHARE_RETRY_AFTER_SECONDS: u64 = 45;
+
+/// Wall-clock ceiling on background tracking for one run.
+const SHARE_TRACKING_BUDGET: Duration = Duration::from_secs(8 * 60);
+
+/// Tracking passes before the run gives up, whatever the clock says.
+const MAX_TRACKING_PASSES: usize = 60;
+
+/// Runs the host's own background share tracking until nothing is pending.
+///
+/// The round driver deliberately stops at `BackgroundShareWorkOnly`: an
+/// unconfirmed share that some helper already accepted is the host's timer to
+/// finish, not the foreground run's. The `ConfirmShare` step it does dispatch
+/// only *polls* status — `confirm_pending_share` never re-POSTs. So the one
+/// component that recovers an interrupted attempt, `track_pending_shares`, was
+/// never running anywhere in this suite.
+///
+/// That is why the share crash stages could not converge. A crash around a
+/// share POST leaves exactly one helper journaled as attempted with its outcome
+/// unknown, and nothing was ever going to re-send it: the run delivered every
+/// other share and then sat polling the one it had abandoned. The D1..D5
+/// invariants describe recovery this suite was not performing.
+///
+/// # Timing
+///
+/// A share becomes retryable after a quarter of the remaining vote window,
+/// bounded by the policy. These rounds close fourteen days out, so the shipped
+/// bound clamps that to a full hour and no crash stage could observe its own
+/// recovery inside any sane test budget.
+///
+/// `max_overdue_threshold_seconds` is therefore lowered here. It changes *when*
+/// a retry becomes allowed, not whether the retry is duplicate-safe, which is
+/// the property these stages exist to test — the wallet still re-POSTs against
+/// a durable journal and still refuses to downgrade an acceptance. Supplying a
+/// timing policy is ordinary host configuration; `ShareTimingPolicy` is public
+/// for exactly this.
+async fn recover_pending_shares(
+    database: &Arc<VotingDb>,
+    config: &RoundRunConfig,
+    route: &Arc<zcash_voting::transport::DirectRoute>,
+) -> Result<()> {
+    let client = HelperClient::new(
+        Arc::new(HyperTransport::with_shared_route(Arc::clone(route))),
+        HelperHealth::default(),
+    );
+    let policy = ShareTimingPolicy {
+        max_overdue_threshold_seconds: SHARE_RETRY_AFTER_SECONDS,
+        min_overdue_threshold_seconds: SHARE_RETRY_AFTER_SECONDS,
+        ..ShareTimingPolicy::default()
+    };
+    let cancel = || false;
+    let deadline = tokio::time::Instant::now() + SHARE_TRACKING_BUDGET;
+
+    for pass in 1..=MAX_TRACKING_PASSES {
+        let report = track_pending_shares(
+            database,
+            &ShareTrackingParams {
+                round_id: &config.round_id,
+                configured_server_urls: &config.endpoints.helper_urls,
+                now_seconds: now_seconds(),
+                vote_end_time_seconds: Some(config.vote_end_time_seconds),
+                policy,
+            },
+            &client,
+            &cancel,
+        )
+        .await
+        .map_err(voting_error)?;
+
+        if !report.confirmed.is_empty()
+            || !report.resubmitted.is_empty()
+            || !report.ambiguous.is_empty()
+        {
+            eprintln!(
+                "run: tracking pass {pass}: {} confirmed, {} resubmitted, {} ambiguous",
+                report.confirmed.len(),
+                report.resubmitted.len(),
+                report.ambiguous.len()
+            );
+        }
+        // `None` is the report's way of saying nothing is pending, which is the
+        // only clean way out of this loop.
+        let Some(delay) = report.next_delay_seconds else {
+            eprintln!("run: background share tracking settled after {pass} passes");
+            return Ok(());
+        };
+        if !report.unrecoverable.is_empty() {
+            // Retrying cannot repair these, so spinning on them wastes the
+            // budget that a recoverable share still needs.
+            eprintln!(
+                "run: {} share(s) are unrecoverable and will not be retried",
+                report.unrecoverable.len()
+            );
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!("run: background share tracking hit its budget after {pass} passes");
+            return Ok(());
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_secs(delay.max(1))).min(deadline),
+        )
+        .await;
+    }
+    Ok(())
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 /// The roster the round was provisioned with.

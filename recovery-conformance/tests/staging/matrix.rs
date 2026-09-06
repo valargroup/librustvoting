@@ -30,8 +30,28 @@ const PIR_BASE: &str = "https://stage.pir.valargroup.org";
 /// fails the matrix rather than hanging it.
 const STAGE_BUDGET: Duration = Duration::from_secs(45 * 60);
 
+/// How long after provisioning the round's vote closes.
+///
+/// Share recovery treats a share as overdue after a quarter of the remaining
+/// vote window, so this also sets how long an interrupted attempt waits before
+/// it may be retried — bounded by the timing policy the suite passes to
+/// background tracking.
+const VOTE_WINDOW_SECONDS: i64 = 14 * 24 * 3600;
+
 /// Dispatch ceiling for one drive, so a plan that never shrinks ends the run.
-const MAX_DISPATCHES: usize = 512;
+///
+/// Sized from the work a resume can actually owe, because the ceiling is a
+/// livelock detector and a ceiling below the honest maximum turns every slow
+/// convergence into a false positive. The round carries 3 bundles x 3 proposals
+/// x 16 shares = 144 shares. A stage crashed at the first share POST resumes
+/// owing every one of them: one dispatch to deliver each, then one per
+/// confirmation poll, and a helper quorum routinely needs several polls before
+/// it answers. At 512 that stage exhausted the budget with all 144 shares still
+/// unconfirmed while the round was in fact converging.
+///
+/// Ten dispatches per share leaves room for delivery plus a long confirmation
+/// tail. A plan that genuinely never shrinks still ends the run, just later.
+const MAX_DISPATCHES: usize = 144 * 10;
 
 pub enum Run {
     Skipped(String),
@@ -228,17 +248,19 @@ enum Outcome {
 async fn exercise(
     fixture: &Fixture,
     stage: CrashStage,
-    round_id: &str,
+    round: &ProvisionedRound,
     control: &DurableSnapshot,
 ) -> Result<(), Outcome> {
     let started = Instant::now();
     let sidecar = fixture.workspace.join(format!("{}.db", stage.name()));
     let _ = std::fs::remove_file(&sidecar);
 
-    let armed = config_for(fixture, &sidecar, round_id, RunMode::Armed { stage });
+    let armed = config_for(fixture, &sidecar, round, RunMode::Armed { stage });
 
     // (c) spawn the armed child; (d) require SIGABRT and a matching observation
-    let crash = match run_until_crash(&fixture.worker, &armed) {
+    let crash = run_until_crash(&fixture.worker, &armed);
+    warm_from(fixture, &sidecar);
+    let crash = match crash {
         Ok(crash) => crash,
         Err(error) => {
             return Err(Outcome::Skipped(format!(
@@ -252,8 +274,13 @@ async fn exercise(
         .map_err(|error| Outcome::Failed(format!("unreadable sidecar: {error:#}")))?;
 
     // (f) plan twice in a fresh process-local database and require agreement
-    let plan = deterministic_plan(&sidecar, &fixture_account(), round_id, &proposal_ids())
-        .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+    let plan = deterministic_plan(
+        &sidecar,
+        &fixture_account(),
+        &round.round_id,
+        &proposal_ids(),
+    )
+    .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
 
     // (g) the stage's own durable expectations
     let bundle = default_target().bundle_index;
@@ -293,7 +320,7 @@ async fn exercise(
     }
 
     // (h) resume to quiescence in a new process
-    let resumed = config_for(fixture, &sidecar, round_id, RunMode::Unarmed);
+    let resumed = config_for(fixture, &sidecar, round, RunMode::Unarmed);
     if started.elapsed() > STAGE_BUDGET {
         return Err(Outcome::Skipped(
             "stage budget exhausted before resume".to_string(),
@@ -302,7 +329,9 @@ async fn exercise(
     // A resume that never completes is only a skip when the environment stopped
     // it. Retries that all end on the same non-transport error mean the round
     // does not converge, which is exactly what this matrix exists to catch.
-    let outcome = run_to_quiescence(&fixture.worker, &resumed).map_err(|error| {
+    let outcome = run_to_quiescence(&fixture.worker, &resumed);
+    warm_from(fixture, &sidecar);
+    let outcome = outcome.map_err(|error| {
         let detail = format!("{error:#}");
         if detail.contains("Transport") || detail.contains("PIR") {
             Outcome::Skipped(format!("resume did not complete: {detail}"))
@@ -386,8 +415,13 @@ async fn exercise(
     }
 
     // (k) a second resume must find nothing to do
-    let settled = deterministic_plan(&sidecar, &fixture_account(), round_id, &proposal_ids())
-        .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+    let settled = deterministic_plan(
+        &sidecar,
+        &fixture_account(),
+        &round.round_id,
+        &proposal_ids(),
+    )
+    .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     assert_idempotent(&settled).map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     Ok(())
 }
@@ -398,7 +432,12 @@ async fn build_control(fixture: &Fixture) -> anyhow::Result<DurableSnapshot> {
     let sidecar = fixture.workspace.join("control.db");
     let _ = std::fs::remove_file(&sidecar);
     let config = config_for(fixture, &sidecar, &round, RunMode::Unarmed);
-    let outcome = run_to_quiescence(&fixture.worker, &config)?;
+    let outcome = run_to_quiescence(&fixture.worker, &config);
+    // Before the outcome is judged: a run that failed still fetched whatever
+    // PIR proofs it got through, and those are exactly what the next run needs
+    // in order not to fail the same way.
+    warm_from(fixture, &sidecar);
+    let outcome = outcome?;
     anyhow::ensure!(
         outcome.is_terminal_success(),
         "the control run ended at {} rather than quiescence",
@@ -407,7 +446,66 @@ async fn build_control(fixture: &Fixture) -> anyhow::Result<DurableSnapshot> {
     DurableSnapshot::read(&sidecar)
 }
 
-async fn provision(fixture: &Fixture) -> anyhow::Result<String> {
+/// Folds whatever a finished sidecar learned back into the warm template.
+///
+/// Called for every worker run, successful or not, and deliberately so. The
+/// template began life holding proofs for the two full bundles only, and the
+/// third bundle's slots went to the PIR fleet on every run and timed out there
+/// — which is also the fetch that would have supplied them. Refreshing only
+/// after a clean run cannot break that cycle, because the cycle is what stops
+/// a run from being clean. A failed attempt still caches the proofs it did
+/// retrieve, so accumulating across attempts converges on a complete template.
+fn warm_from(fixture: &Fixture, sidecar: &Path) {
+    let Some(template) = &fixture.warm_pir else {
+        return;
+    };
+    match refresh_warm_pir(template, sidecar) {
+        Ok(added) if added > 0 => eprintln!("run: warmed {added} more PIR proofs"),
+        Ok(_) => {}
+        Err(error) => eprintln!("run: could not refresh the PIR template: {error}"),
+    }
+}
+
+/// Folds a completed round's PIR proofs back into the warm template.
+///
+/// Seeding is one-way without this, and an incomplete template stays
+/// incomplete: the proofs it lacks are fetched live every run, and the bundle
+/// they belong to is the one that times out — which is also the fetch that
+/// would have supplied them. The observed shape was a template holding proofs
+/// for the two full bundles only, so the third bundle's slots went to the PIR
+/// fleet on every single run and failed there repeatedly.
+///
+/// Safe to accumulate across rounds for the same reason seeding is: proofs are
+/// keyed by nullifier, the padded-slot secrets that generate the synthetic ones
+/// are copied *from* this template into each new round, and a real note's
+/// nullifier does not change. `INSERT OR IGNORE` never rewrites an existing
+/// row, so a stale proof cannot be introduced by refreshing.
+///
+/// Best-effort: a failure here costs speed on the next run, nothing else.
+fn refresh_warm_pir(
+    template: &std::path::Path,
+    sidecar: &std::path::Path,
+) -> anyhow::Result<usize> {
+    let connection = rusqlite::Connection::open(template)
+        .map_err(|error| anyhow::anyhow!("opening the template: {error}"))?;
+    connection
+        .execute(
+            "ATTACH DATABASE ?1 AS finished",
+            rusqlite::params![sidecar
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("sidecar path is not UTF-8"))?],
+        )
+        .map_err(|error| anyhow::anyhow!("attaching the finished round: {error}"))?;
+    let added = connection
+        .execute(
+            "INSERT OR IGNORE INTO pir_proof_cache SELECT * FROM finished.pir_proof_cache",
+            [],
+        )
+        .map_err(|error| anyhow::anyhow!("copying cached PIR proofs: {error}"))?;
+    Ok(added)
+}
+
+async fn provision(fixture: &Fixture) -> anyhow::Result<ProvisionedRound> {
     let target = ChainTarget {
         rpc_url: STAGING_CHAIN_RPC,
         chain_id: STAGING_CHAIN_ID,
@@ -415,8 +513,8 @@ async fn provision(fixture: &Fixture) -> anyhow::Result<String> {
     let vote_end = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64
-        + 14 * 24 * 3600;
-    provision_active_round(
+        + VOTE_WINDOW_SECONDS;
+    let round_id = provision_active_round(
         &fixture.keyring,
         PIR_BASE,
         LIGHTWALLETD_URLS[0],
@@ -424,15 +522,34 @@ async fn provision(fixture: &Fixture) -> anyhow::Result<String> {
         &target,
         vote_end,
     )
-    .await
+    .await?;
+    Ok(ProvisionedRound {
+        round_id,
+        vote_end_time_seconds: vote_end as u64,
+    })
 }
 
-fn config_for(fixture: &Fixture, sidecar: &Path, round_id: &str, mode: RunMode) -> RoundRunConfig {
+/// A freshly provisioned round and the vote end it was created with.
+///
+/// The vote end travels with the round because share recovery derives its
+/// retry window from the distance to it. Recomputing it later would silently
+/// disagree with what the chain was told.
+struct ProvisionedRound {
+    round_id: String,
+    vote_end_time_seconds: u64,
+}
+
+fn config_for(
+    fixture: &Fixture,
+    sidecar: &Path,
+    round: &ProvisionedRound,
+    mode: RunMode,
+) -> RoundRunConfig {
     RoundRunConfig {
         sidecar: sidecar.to_path_buf(),
         wallet_db: fixture.wallet_db.clone(),
         warm_pir_from: fixture.warm_pir.clone(),
-        round_id: round_id.to_string(),
+        round_id: round.round_id.clone(),
         account_uuid: fixture_account(),
         endpoints: endpoints_from(&fixture.deployment),
         target: default_target(),
@@ -440,6 +557,7 @@ fn config_for(fixture: &Fixture, sidecar: &Path, round_id: &str, mode: RunMode) 
         crash_log: sidecar.with_extension("crashlog.jsonl"),
         outcome: sidecar.with_extension("outcome.json"),
         max_dispatches: MAX_DISPATCHES,
+        vote_end_time_seconds: round.vote_end_time_seconds,
     }
 }
 

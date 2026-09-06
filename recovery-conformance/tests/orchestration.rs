@@ -41,6 +41,7 @@ fn config(mode: RunMode) -> RoundRunConfig {
         crash_log: PathBuf::from("/tmp/crash.jsonl"),
         outcome: PathBuf::from("/tmp/outcome.json"),
         max_dispatches: 512,
+        vote_end_time_seconds: 2_000_000_000,
     }
 }
 

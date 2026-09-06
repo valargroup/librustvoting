@@ -58,9 +58,11 @@ pub struct RoundRunConfig {
     pub wallet_db: PathBuf,
     /// A previous sidecar whose cached PIR proofs are copied in first.
     ///
-    /// Only the real notes' proofs are cacheable: padded-slot nullifiers are
-    /// freshly randomised per run, so this reduces the PIR the run must fetch
-    /// but never removes it.
+    /// Padded-slot secrets are copied from the same template, so the synthetic
+    /// nullifiers they generate are stable across runs and their proofs cache
+    /// like a real note's. A complete template removes the run's live PIR
+    /// entirely; an incomplete one leaves exactly the bundles it is missing to
+    /// fetch live.
     pub warm_pir_from: Option<PathBuf>,
     pub round_id: String,
     pub account_uuid: String,
@@ -76,6 +78,12 @@ pub struct RoundRunConfig {
     /// Upper bound on driver dispatches, so a plan that never shrinks ends the
     /// run instead of hanging a test.
     pub max_dispatches: usize,
+    /// Unix vote-end the round was provisioned with.
+    ///
+    /// Share recovery derives its retry and cutoff windows from the distance to
+    /// this time, so background tracking cannot classify a share as overdue
+    /// without it.
+    pub vote_end_time_seconds: u64,
 }
 
 impl RoundRunConfig {

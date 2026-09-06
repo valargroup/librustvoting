@@ -262,7 +262,7 @@ not exist. **Do not read them as tested.**
 
 | **B6** | Generation-identity immutability is trigger-enforced but not checked here. |
 | **C1, C2, C4, C6, C7** | Roster changes, per-proposal isolation, the ballot gate, tree-cache consistency, and generation binding have no assertion. |
-| **D1** | **Asserted, failing, cause narrowed but unresolved.** Inspecting a crashed sidecar directly (`--stage before-share-post`, fresh round) shows: the stage fires correctly; `helper_share_plans` has 1 row; `share_delegations` has 1 row for `share_index 0` with **both** `attempting_urls` and `sent_to_urls` empty — i.e. planned but never attempted. Yet the crash fires inside a POST to `/shielded-vote/v1/shares`, and `share.rs` documents the attempt marker as "persisted before `Started` is returned, so dispatch can safely occur only afterward". So a POST to the shares endpoint happened while no delivery attempt was journaled. Either something other than initial delivery POSTs there, or the reservation returned a non-`Started` outcome and a POST followed anyway. Reproduce in ~3 min with one worker invocation and inspect the sidecar. |
+| **D1** | **Asserted and passing.** Was failing; see the closed finding below. |
 | **D3-D5** | Ambiguity erasure, reloaded-plan target counts, and resuming only definite-delivery deficits are still unasserted. |
 | **E2, E3, E4** | Proposal-primary ordering, round-lock leakage, and run-relative tally are unasserted. |
 
@@ -313,11 +313,9 @@ than passing it against a round that simply finished.
 
 ## Open findings
 
-One finding remains. It reproduces deterministically and is cheap to
-re-observe, and it is not staging flakiness: it is `InvalidInput`-class, not
-transport.
+None. Both findings this suite raised against the SDK are closed; see below.
 
-### A crash inside a share POST leaves no attempt journaled
+### (closed) A crash inside a share POST leaves no attempt journaled
 
 ```
 --stage before-share-post             # ~3 min, needs a fresh round
@@ -330,6 +328,29 @@ holds 1 row, and `share_delegations` holds 1 row for `share_index 0` with
 Yet the crash fires inside a POST to `/shielded-vote/v1/shares`, and `share.rs`
 documents the marker as "persisted before `Started` is returned, so dispatch can
 safely occur only afterward".
+
+**Resolution: the marker was correct; the suite was reading a sidecar no
+recovery had ever run against.** Two things were wrong, neither in the marker.
+
+`begin()` performed its only state mutation inside a `debug_assert!`, so
+release builds journaled nothing at all (fixed in f1cbeb20). And the suite
+never ran helper-share recovery: `ConfirmShare` polls status through
+`confirm_pending_share` and never re-POSTs, while `track_pending_shares` — the
+one function that re-sends an interrupted attempt — appeared nowhere in this
+crate. The stage could not converge because nothing was ever going to re-send
+the share the crash abandoned.
+
+With the host's background tracking running, the stage passes in ~128s and the
+recovery is visible in the log:
+
+```
+run: tracking pass 1: 0 confirmed, 1 resubmitted, 0 ambiguous
+run: tracking pass 2: 1 confirmed, 0 resubmitted, 0 ambiguous
+```
+
+Exactly one share is re-sent — the interrupted one — out of 144, and nothing
+already accepted is touched. That is D1 and D5 demonstrated rather than
+asserted against a sidecar nothing had recovered.
 
 ## Closed findings
 
