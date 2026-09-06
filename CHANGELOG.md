@@ -451,6 +451,20 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- A vote chain is judged complete by its commitment-tree position rather than
+  its transaction hash, and a proposal-authority bit clears on either witness.
+  Both checks read `votes.tx_hash`, which exists only for hash-confirmed
+  submissions: the schema requires `confirmation_source = 'tree'` to carry none.
+  A vote confirmed by an exact-tree scan therefore looked unfinished forever —
+  it blocked every later proposal on its bundle with a message asking the caller
+  to confirm a vote already confirmed, and its authority bit stayed set so the
+  next vote rebuilt a stale vote-authority note and the chain rejected the
+  nullifier as already spent. Neither could be recovered from, because the
+  missing hash does not exist. The tree position is written by confirmation on
+  both routes and cleared when a generation is invalidated, so it tracks
+  completion; the hash still counts a submitted vote whose transaction has
+  landed but is not yet confirmed locally.
+
 - A vote whose POST was dispatched but never classified is now treated as
   having spent its delegation VAN. `load_van_tree_entries` skips the VAN-leaf
   expectation once a bundle has voted, because casting spends that VAN, but it
