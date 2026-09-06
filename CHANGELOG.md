@@ -451,6 +451,27 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- A vote whose POST was dispatched but never classified is now treated as
+  having spent its delegation VAN. `load_van_tree_entries` skips the VAN-leaf
+  expectation once a bundle has voted, because casting spends that VAN, but it
+  read only `votes.tx_hash`. A dispatched-and-unclassified vote has no hash yet
+  may already be on chain, so the bundle was still expected to hold its original
+  `gov_comm`, the witness failed to verify, and tree sync failed with "confirmed
+  delegation bundle N does not match its synced vote-tree leaf". The failure was
+  self-sustaining: tree sync failing aborted the cast that would have recorded
+  the hash, so the next pass failed identically, and one bundle's stale
+  expectation aborted the sync for every other bundle too. A committed
+  `chain_submissions` reservation is now consulted as well — the same evidence
+  the submission lifecycle uses to refuse a second POST, so the tree expectation
+  and the lifecycle no longer disagree about whether a transaction may exist.
+  A terminally `rejected` row is excluded, because it spent nothing and, being
+  terminal, can never acquire an outstanding POST afterwards; counting it would
+  retire the expectation for the rest of the round and silently skip the
+  delegation-leaf check. A `recovering` row carrying the same rejection is not
+  excluded: exact-tree recovery can reserve a retry and release a POST from it
+  without changing either column, so it cannot be told apart from a quiescent
+  rejection and must be read as possibly-spent.
+
 - The helper-attempt marker is now recorded in release builds. The reservation
   performed its only state mutation inside `debug_assert!(state.begin(&url)?)`,
   and `debug_assert!` compiles its argument out of a release build — so release
