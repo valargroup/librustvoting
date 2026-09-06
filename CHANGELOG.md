@@ -451,6 +451,20 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- The helper-attempt marker is now recorded in release builds. The reservation
+  performed its only state mutation inside `debug_assert!(state.begin(&url)?)`,
+  and `debug_assert!` compiles its argument out of a release build — so release
+  wrote `attempting_urls = []`, still saw its compare-and-swap succeed, and
+  returned `Started` for a reservation it had not made. A POST must be durably
+  journaled before dispatch so an interrupted attempt stays recoverable: on
+  restart the helper is known to have been tried with an unknown outcome, and is
+  polled rather than re-sent blindly or written off as never contacted. Release
+  builds wrote no such evidence, so a crash mid-POST left an attempt
+  indistinguishable from one never made. Tests never caught it because they run
+  with debug assertions enabled and therefore execute the call release drops;
+  it surfaced only by crashing a release binary mid-POST and reopening the
+  sidecar in another process.
+
 - Schema version 21 rebuilds `chain_submissions` onto the 50-proposal bound.
   A sidecar migrated by a build that carried the 15-proposal bound kept that
   CHECK at version 20; nothing rewrote it, and the version-20 fingerprint
