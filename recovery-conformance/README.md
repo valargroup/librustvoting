@@ -297,6 +297,48 @@ already the following boundary. Covering it would need a seam inside vote
 completion that does not exist. The matrix reports it as never reached rather
 than passing it against a round that simply finished.
 
+## Open findings
+
+Both reproduce deterministically and are cheap to re-observe. Neither is
+staging flakiness: both are `InvalidInput`-class, not transport.
+
+### 1. A resumed vote broadcast never reconverges
+
+```
+--stage after-vote-broadcast          # ~100s, needs a fresh round
+InvalidInput: confirmed delegation bundle 0 does not match its synced vote-tree leaf
+```
+
+Reproduced in three separate runs over three freshly provisioned rounds,
+failing identically on all six resume attempts each time — eighteen attempts,
+one error. It survives the tree-cache reset the SDK performs on this path
+(`tree_sync.rs:445-478` sets `RoundTreeClient::empty()`), so it is not a stale
+cache. Its blast radius crosses bundles: casts fail on bundles 1 and 2, which
+were never crashed. The delegation-side equivalent, `after-broadcast-unread`,
+recovers cleanly in every run.
+
+Either the synced tree does not hold that leaf at the anchor height, or the
+durably recorded confirmation position disagrees with what the tree holds.
+
+### 2. A crash inside a share POST leaves no attempt journaled
+
+```
+--stage before-share-post             # ~3 min, needs a fresh round
+D1 VIOLATED: no helper in `attempting_urls`
+```
+
+Inspecting the crashed sidecar directly: the stage fires, `helper_share_plans`
+holds 1 row, and `share_delegations` holds 1 row for `share_index 0` with
+**both** `attempting_urls` and `sent_to_urls` empty — planned, never attempted.
+Yet the crash fires inside a POST to `/shielded-vote/v1/shares`, and `share.rs`
+documents the marker as "persisted before `Started` is returned, so dispatch can
+safely occur only afterward".
+
+So a POST reached the shares endpoint while no delivery attempt was journaled.
+Either something other than initial delivery posts there, or the reservation
+returned a non-`Started` outcome and a POST followed regardless. Both sides of
+the POST behave identically, so it is not about ordering around dispatch.
+
 ## What this suite cannot cover
 
 - **Atomic vote batches.** `ATOMIC_VOTE_BATCHES_ENABLED = false`
