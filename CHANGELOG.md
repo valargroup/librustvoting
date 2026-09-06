@@ -451,6 +451,19 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Three guards that must refuse an action on a vote already on chain now
+  recognise one confirmed by an exact-tree scan. `ensure_vote_rebuild_allowed`,
+  `ensure_no_submitted_vote_conflict_for_intent` and `store_vote` each asked
+  whether `votes.tx_hash` was set — a hash that exists only for a hash-confirmed
+  submission, because the schema requires `confirmation_source = 'tree'` to
+  carry none. So a tree-confirmed vote could be rebuilt into a competing
+  generation, a ballot intent disagreeing with it was accepted, and its choice
+  and commitment could be overwritten outright, all silently: unlike the
+  completion checks above, these failed open, permitting what they exist to
+  refuse rather than blocking what should proceed. Each now accepts either
+  witness. A test scanning for the shape all of these shared guards against the
+  next one.
+
 - A vote chain is judged complete by its commitment-tree position rather than
   its transaction hash, and a proposal-authority bit clears on either witness.
   Both checks read `votes.tx_hash`, which exists only for hash-confirmed
