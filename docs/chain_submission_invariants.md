@@ -355,6 +355,55 @@ Domain transaction hashes and positions are written by atomic confirmation.
 Runtime planning and status reads begin with `chain_submissions` whenever a row
 exists; domain columns cannot override its state.
 
+A confirmation writes the witnesses its source has, and the two sources have
+different ones. Hash confirmation writes `votes.tx_hash`; tree confirmation
+writes `votes.vc_tree_position` and no hash, which the schema requires of it
+(`CHECK (confirmation_source != 'tree' OR confirmed_transaction_hash IS
+NULL)`). Neither witness is therefore sufficient alone, and a query asking
+whether a vote reached the chain must accept either: `tx_hash IS NOT NULL OR
+vc_tree_position IS NOT NULL`. Reading the hash alone answers a narrower
+question — whether *this* confirmation came with a hash — and a tree-confirmed
+vote answers it "no" permanently, because the hash it is missing does not
+exist.
+
+That distinction is load-bearing in both directions, and getting it wrong has
+cost this repository seven defects. A completion check reading the hash alone
+fails closed and stalls: the round waits forever for a witness that will never
+appear. A *refusal* reading the hash alone fails open and permits what it
+exists to prevent — rebuilding a vote already on chain into a competing
+generation, accepting a ballot intent that disagrees with one, or overwriting
+its choice and commitment. The second class is the more dangerous, because a
+stalled round announces itself and a permitted rebuild does not.
+`no_query_treats_a_transaction_hash_as_the_only_proof_a_vote_finished` scans
+the crate for the shape all seven shared.
+
+Vote-tree sync reads this record for a different question and inherits its
+distinctions. A bundle's delegation VAN is retired from the tree expectation
+once a POST that may have spent it was released, so the durable row answers
+where `votes.tx_hash` cannot — but only where the row can actually settle the
+question, and terminality is what decides that.
+
+`Rejected` settles it: no observation transitions out of that state and a
+recovery retry may be reserved only from `Recovering`, so the row can never
+acquire an outstanding POST after the fact, and a definite rejection spent
+nothing. It is never deleted either, so counting it would retire the
+expectation for the rest of the round and skip both the leaf-content and the
+leaf-presence check — the fail-open direction again, one layer down
+(`a_terminally_rejected_vote_keeps_its_bundles_van_expectation`).
+
+A `Recovering` row carrying `ChainRejected` does **not** settle it, and is
+therefore read as possibly-spent despite the same last classified outcome.
+Exact-tree recovery reaches any `Recovering` row whatever its diagnostic, and
+on a no-match it reserves a retry and releases a POST while leaving `state`
+and `diagnostic_kind` unchanged; only the reservation counter moves. Between
+that reservation and its classification the row is indistinguishable from a
+quiescent rejection, so restoring the expectation would fail tree sync against
+the successor leaf, aborting the cast that would classify the retry — the
+self-sustaining deadlock this rule exists to break
+(`a_rejection_still_in_recovery_retires_the_van_expectation`). Distinguishing
+the two would require the retry dispatch to be journaled against the
+reservation counter, which the row does not record today.
+
 ## Durable states
 
 The only durable states are:

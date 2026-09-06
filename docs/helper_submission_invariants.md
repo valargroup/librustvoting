@@ -89,6 +89,16 @@ observed before a fresh reservation dispatches is different: because the POST
 is definitely unsent, the reservation is cleared as a definite failure rather
 than retained as outcome-unknown.
 
+"Durably reserved before its POST is dispatched" is a claim about the shipped
+binary, not about a test run. The reservation's only state mutation must sit on
+the ordinary execution path, never inside an assertion the compiler removes: a
+`debug_assert!` erases its argument in release, so a marker written there is
+recorded in every test and in no released build. The failure is invisible to
+the whole suite, and its symptom is precisely the one this section exists to
+prevent — a crash mid-POST leaving no evidence the helper was ever contacted,
+so recovery treats a possibly-delivered share as untried.
+`no_debug_assert_hides_a_fallible_call` guards the obvious form of this.
+
 An **interrupted helper** is an attempting helper whose durable reservation is
 loaded by a later tracking operation with no corresponding live request in
 that operation. The earlier process may have stopped before dispatch, during

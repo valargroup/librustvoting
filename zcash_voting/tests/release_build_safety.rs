@@ -90,8 +90,8 @@ fn no_query_treats_a_transaction_hash_as_the_only_proof_a_vote_finished() {
                 if !asks_about_a_vote_hash || line.contains("delegation_tx_hash") {
                     continue;
                 }
-                let window = &lines[index.saturating_sub(WINDOW)
-                    ..lines.len().min(index + WINDOW + 1)];
+                let window =
+                    &lines[index.saturating_sub(WINDOW)..lines.len().min(index + WINDOW + 1)];
                 // A compare-and-swap that writes the hash asks whether *this
                 // column* already holds a different value, which is a
                 // concurrency guard on one write and not a claim about whether
@@ -105,12 +105,7 @@ fn no_query_treats_a_transaction_hash_as_the_only_proof_a_vote_finished() {
                     nearby.contains("vc_tree_position") || nearby.contains("chain_submissions")
                 });
                 if !considers_the_second_witness {
-                    offenders.push(format!(
-                        "{}:{}: {}",
-                        path.display(),
-                        index + 1,
-                        line.trim()
-                    ));
+                    offenders.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
                 }
             }
         },
