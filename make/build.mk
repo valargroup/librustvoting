@@ -18,7 +18,8 @@ VCT_PACKAGES  := -p vote-commitment-tree -p vote-commitment-tree-client
 # runs the whole suite without failing fast.
 NEXTEST_PROFILE ?= agent
 
-.PHONY: help check test test-lrz test-vct doc-test proofs msrv fmt clippy
+.PHONY: help check test test-lrz test-vct doc-test proofs msrv fmt clippy \
+	recovery-conformance-check recovery-conformance
 
 help: ## Show the canonical build and test targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \

@@ -88,9 +88,10 @@ make recovery-conformance         # run against staging (slow)
 ## Crash stages
 
 Each stage sits immediately next to a durable commit. `touches_chain()`
-partitions them: stages before the first POST leave staging untouched and can
-branch from one provisioned round by copying the sidecar; the rest each need a
-round of their own, because a delivered transaction cannot be rewound.
+distinguishes whether the armed run itself may have submitted anything. Every
+matrix case still gets its own round, because the post-crash resume drives that
+round to quiescence and therefore eventually submits even after a pre-POST
+crash.
 
 | Stage | Durable state it leaves |
 | --- | --- |
@@ -102,11 +103,11 @@ round of their own, because a delivered transaction cannot be rewound.
 | `before-broadcast` | `chain_submissions` `submitting`, bytes never sent |
 | `after-broadcast-unread` | `submitting`, transaction may be on chain, no hash |
 | `after-broadcast-read` | as above; the real response is captured for the parent |
-| `after-tracking` | `tracking` + candidate hash |
+| `after-tracking` | `tracking` + candidate hash — needs a one-pass chain policy, see below |
 | `before-cast` | delegation confirmed |
 | `after-tree-sync` | delegation confirmed; cached tree synced |
 | `after-vote-proof` | nothing new — the proof is lost by design |
-| `after-vote-commit` | `votes.commitment_bundle_json`, no POST reserved |
+| `after-vote-commit` | `votes.commitment_bundle_json`, no POST reserved — **not reachable**, see below |
 | `after-helper-plans` | `helper_share_plans` + `round_immediate_share` |
 | `before-vote-broadcast` | vote `submitting`, bytes never sent |
 | `after-vote-broadcast` | vote `submitting`, POST dispatched |
@@ -136,23 +137,18 @@ needs re-funding. It is the *round* that is one-shot, not the money.
 Two consequences shape the suite:
 
 1. **A stage that gets a POST onto the wire consumes its round.** Those stages
-   each need a freshly provisioned round. `touches_chain()` names them.
+   need a freshly provisioned round. `touches_chain()` names whether the armed
+   run can do so before crashing.
 2. **Driving a resumed round to quiescence is itself mutative**, even when the
    crash was pre-broadcast. A `before-broadcast` crash leaves a `Recovering`
    row that resume will dispatch, which consumes the round just the same.
 
-So the split is not "before/after the crash" but "does this test *mutate*":
-
-| Tier | Stages | Round | Asserts |
-| --- | --- | --- | --- |
-| Non-mutative | everything with `!touches_chain()` | one provisioned round, branched by copying the sidecar | crash, reopen, re-plan and durable state (A1 and the stage's own row assertions). Stops at inspection. |
-| Mutative | everything else, plus any test that drives to quiescence | one fresh round each | the above, then resume to quiescence (A2, A3, B2, B3) |
-
-This is what keeps the suite affordable. There is no mock prover — the
-`test-fixtures` seeding helpers skip proving, which is exactly what this suite
-must not do — so a 3-bundle, 2-proposal round costs 3 ZKP-1 and 6 ZKP-2 proofs,
-each minutes. The non-mutative tier pays that once for the whole group instead
-of once per stage.
+Therefore every matrix case provisions a distinct round. Sharing a round among
+pre-POST crash stages would still let the first case's resume consume that
+round, making every later case observe chain effects that its sidecar does not
+own. There is no mock prover — the `test-fixtures` seeding helpers skip
+proving, which is exactly what this suite must not do — so this isolation is
+expensive but required for the terminal convergence oracle.
 
 ## The fixed voter wallet
 
@@ -196,61 +192,110 @@ recovery bugs rather than configuration:
   named a snapshot height that was a plausible *mainnet* height while the
   published one was unambiguously testnet.
 
-## Invariants under test
+## Config authentication is bypassed, deliberately
 
-### A. Recovery oracle
+A wallet learns a round's parameters from the signed dynamic config: it fetches
+the document, verifies a `RoundAuthPayloadV2` signature over the round id,
+`ea_pk`, and PIR layout, and only then trusts the values. **This suite skips
+all of that** and reads the round straight off the chain that created it
+(`provisioning::fetch_round`).
 
-- **A1** The plan is a total function of durable state — two `resume_plan`
-  calls agree, and agree with what the child last read.
-- **A2** No crash produces an unrecoverable round: driving to quiescence after
-  reopen never ends in `Failures` or `PassBudgetExhausted`.
-- **A3** Convergence is stage-independent — the terminal
-  `RoundRecoverySnapshot` after crash-and-resume equals an uncrashed control
-  run's, field for field. The strongest assertion in the suite.
-- **A4** Resume is idempotent: crashing twice converges where crashing once did.
-- **A5** Recovery never fabricates a tree position — a helper share is never
-  sent with the `0` placeholder that `round_snapshot` may display.
+That trade is sound here and nowhere else. Config authentication answers "is
+this round genuine and endorsed" — a question about trusting a third party's
+document. The suite provisions the round itself, minutes earlier, with its own
+coordinator key, so it already knows the answer; signing a document to verify a
+fact it just created would exercise the config layer rather than recovery.
 
-### B. Chain submission (`docs/chain_submission_invariants.md`)
+What is *not* skipped is agreement: the parameters used to drive the round come
+from the chain's own record, so a provisioning mistake surfaces as a mismatch
+instead of being carried forward by a local copy.
 
-- **B1** An abandoned `Submitting` row normalizes to `Recovering` on restart.
-- **B2** A crash after dispatch never causes a second spend — exactly one
-  transaction per generation is accepted, verified against the chain.
-- **B3** Exact-tree recovery resolves a hashless dispatch to `Confirmed` with
-  `confirmation_source = 'tree'`.
-- **B4** Terminal rows are immutable across a crash.
-- **B5** `committed_post_reservations` is monotone across crash and resume.
-- **B6** Generation identity is immutable; two generations never claim one hash.
+## Invariants
 
-### C. Round orchestration (`docs/round_orchestration_invariants.md`)
+Split by whether the suite actually asserts them today. Everything in the
+second table is a property the SDK is designed to hold that this suite does
+**not** yet check — listed so the gap is visible, not as a claim.
 
-- **C1** Undispatched work follows the current roster; dispatched work survives
-  a roster change.
-- **C2** Vote work resumes per proposal without cross-contamination.
-- **C3** A listed step always resolves — no reopened plan yields
-  `InvariantViolation`.
-- **C4** The ballot gate survives a crash: an undecided round re-plans to
-  `NeedsBallot`, never to `CastVote`.
-- **C5** A committed vote is never broadcast without durable helper plans.
-- **C6** A crash during tree sync leaves a consistent cached tree or none.
-- **C7** Helper plans and the immediate-share designation stay bound to their
-  generation.
+### Asserted by the matrix
 
-### D. Helper submission (`docs/helper_submission_invariants.md`)
+| | Assertion | Where |
+| --- | --- | --- |
+| **A1** | Two `resume_plan` calls over the same durable state return identical plans | `deterministic_plan` |
+| **A2** | A resumed round reaches terminal quiescence, never `Failures` or `PassBudgetExhausted` | matrix, per stage |
+| **A3** | Terminal submission states match the uncrashed control | matrix, per stage |
+| **A4** | A second resume plans no further *foreground* work. `ConfirmShare` steps are excluded by design: a round ending in `BackgroundShareWorkOnly` has finished what the foreground owns, and the host's timer closes the rest | `assert_idempotent` |
+| **B1** (part) | After a `before-broadcast` crash the abandoned reservation **still exists**; a row that vanished would let the next pass reserve a fresh first attempt and build a second transaction | `assert_stage_state` |
+| **B2** | The crashed bundle is *advanced*, never re-delegated — a second delegation would spend its notes twice | `assert_stage_state` |
+| **B4** | Terminal rows (`confirmed`/`rejected`/`submitted_without_hash`) are byte-identical across resume | `assert_terminal_rows_unchanged` |
+| **B5** | `committed_post_reservations` never decreases | `assert_reservations_monotonic` |
+| **C5** | A vote submission never exists without a durable helper plan | `assert_plans_precede_broadcast` |
+| **E1** | Bundles other than the crashed one keep their pending work | `assert_other_bundles_untouched` |
+| **B3** (mechanism) | `after-broadcast-unread` must confirm with `confirmation_source = tree`. With no candidate hash to poll, only an exact-tree scan can resolve it — this separates "recovery worked" from "a usable hash happened to survive" | `assert_confirmed_by_tree` |
+| **B2/B3** (identity) | Where the stage captured the dispatched response, the transaction the round finally confirms is **the same one** the killed process had already sent — not merely "exactly one eventually confirmed" | `assert_recovered_the_same_transaction` |
 
-- **D1** `attempting_urls` is a durable crash marker; recovery treats that
-  helper as interrupted, not untried.
-- **D2** A recovery re-POST never downgrades a durable acceptance.
-- **D3** Ambiguity is never erased by a later definite failure.
-- **D4** A reloaded plan keeps its original target count.
-- **D5** Only definite-delivery deficits are resumed.
+| **D2** (part) | `after-share-accepted` records a definite acceptance in `sent_to_urls` | `assert_stage_state` |
+| — | Each stage leaves the durable state its row expects (PCZT persisted, proof persisted, vote committed, share journaled) | `assert_stage_state` |
 
-### E. Multi-bundle and multi-proposal
+### Not asserted yet
 
-- **E1** Failure isolation is per bundle across a crash.
-- **E2** Vote work stays proposal-primary after resume.
-- **E3** No round lock leaks across the crash.
-- **E4** `RoundWorkTally` reports run-relative progress after resume.
+These need either a stage that reliably reaches them or an assertion that does
+not exist. **Do not read them as tested.**
+
+| | Why not yet |
+| --- | --- |
+| **A5** | No assertion that a helper share is never sent with the `0` tree-position placeholder. |
+| **B1** (rest) | That the row becomes exactly `Recovering` is **not** asserted: normalization is lazy, happening inside the lifecycle's next admission rather than at open, so it needs an assertion that drives one admission and reads the row before the round advances past it. The safety-critical half — the row survives at all — *is* asserted. |
+
+| **B6** | Generation-identity immutability is trigger-enforced but not checked here. |
+| **C1, C2, C4, C6, C7** | Roster changes, per-proposal isolation, the ballot gate, tree-cache consistency, and generation binding have no assertion. |
+| **D1** | **Asserted, failing, cause narrowed but unresolved.** Inspecting a crashed sidecar directly (`--stage before-share-post`, fresh round) shows: the stage fires correctly; `helper_share_plans` has 1 row; `share_delegations` has 1 row for `share_index 0` with **both** `attempting_urls` and `sent_to_urls` empty — i.e. planned but never attempted. Yet the crash fires inside a POST to `/shielded-vote/v1/shares`, and `share.rs` documents the attempt marker as "persisted before `Started` is returned, so dispatch can safely occur only afterward". So a POST to the shares endpoint happened while no delivery attempt was journaled. Either something other than initial delivery POSTs there, or the reservation returned a non-`Started` outcome and a POST followed anyway. Reproduce in ~3 min with one worker invocation and inspect the sidecar. |
+| **D3-D5** | Ambiguity erasure, reloaded-plan target counts, and resuming only definite-delivery deficits are still unasserted. |
+| **E2, E3, E4** | Proposal-primary ordering, round-lock leakage, and run-relative tally are unasserted. |
+
+### The sharp submission cases
+
+`before-broadcast` and `after-broadcast-unread` are where a bug costs a voter a
+note. Three things are checked, in increasing strength:
+
+1. the crashed bundle is planned for *advancement*, never re-delegation;
+2. reservation counts are reported per stage and asserted monotonic — every
+   committed POST increments one, so the count is how many times the wallet
+   committed to sending;
+3. where the stage captured the response, the confirmed transaction hash must
+   equal the dispatched one. A round that quietly sent a replacement would
+   confirm a *different* hash while looking equally healthy, which counting
+   alone cannot detect.
+
+A stalled recovery is not a verdict: the specification separates
+`ChainRecoveryStalled` from `ChainTerminal` because running again later may
+resolve it, so the matrix waits and re-drives rather than failing.
+
+Neither is a stale vote-tree cache. A crash can leave the cached
+vote-commitment tree disagreeing with a delegation that confirmed; the tree sync
+detects that, **discards the cache**, and fails the pass so the next one
+re-syncs from scratch. That is the SDK repairing itself, so the matrix
+re-drives. The rule is deliberately narrow — matched on that one condition —
+because a broader one would retry past real findings.
+
+### Reaching the tracking window
+
+`ChainOutcome` is reported once per `advance_step`, at the end, and carries the
+episode's *terminal* outcome — not one event per poll. Under the shipped
+45-pass policy an episode polls until the submission confirms, so a stage
+waiting to observe one *still tracking* can never fire. The run therefore arms a
+single-pass chain policy for `after-tracking` alone; every other stage keeps the
+shipped cadence, so the control it is compared against is unaffected.
+
+### Stages that are not reachable
+
+`after-vote-commit` names a real durable boundary — a committed vote with no
+helper plan yet — but nothing observable marks it. Casting persists the vote,
+prepares the helper plans, and reserves the chain POST inside one
+`advance_step`, so the driver never re-plans in between, and the progress stream
+goes from `VoteCommit(Signing)` directly to `HelperPlansPrepared`, which is
+already the following boundary. Covering it would need a seam inside vote
+completion that does not exist. The matrix reports it as never reached rather
+than passing it against a round that simply finished.
 
 ## What this suite cannot cover
 

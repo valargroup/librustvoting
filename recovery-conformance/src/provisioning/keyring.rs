@@ -39,6 +39,24 @@ const DEFAULT_COIN_TYPE: u32 = 133;
 /// unique beyond this handle.
 const KEY_NAME: &str = "recovery-conformance-vote-manager";
 
+/// Derivation flags every key command must carry, in one place.
+///
+/// `svoted` defaults to coin type 118 and, when the flag is omitted, imports a
+/// different and unregistered account **without any error** — the mistake only
+/// surfaces later as a rejected authorization, which reads like a permissions
+/// problem rather than a wrong key. The verification path and the import path
+/// both build their flags here so the two cannot drift apart again.
+fn derivation_flags(coin_type: &str, account: &str, index: &str) -> Vec<String> {
+    vec![
+        "--coin-type".to_string(),
+        coin_type.to_string(),
+        "--account".to_string(),
+        account.to_string(),
+        "--index".to_string(),
+        index.to_string(),
+    ]
+}
+
 /// A temporary `svoted` home containing exactly one imported key.
 ///
 /// Dropping it removes the directory and the key inside.
@@ -87,27 +105,27 @@ impl VoteManagerKeyring {
         let index = index.to_string();
         let scratch = TempDir::new()?;
         let source = scratch.write_mnemonic(mnemonic)?;
-        let output = svoted(&[
-            "keys",
-            "add",
-            KEY_NAME,
-            "--recover",
-            "--dry-run",
-            "--source",
-            source.to_str().context("mnemonic path is not UTF-8")?,
-            "--keyring-backend",
-            KEYRING_BACKEND,
-            "--home",
-            scratch.path().to_str().context("home path is not UTF-8")?,
-            "--coin-type",
-            &coin_type,
-            "--account",
-            &account,
-            "--index",
-            &index,
-            "--output",
-            "json",
-        ])?;
+        let output = svoted(
+            [
+                "keys",
+                "add",
+                KEY_NAME,
+                "--recover",
+                "--dry-run",
+                "--source",
+                source.to_str().context("mnemonic path is not UTF-8")?,
+                "--keyring-backend",
+                KEYRING_BACKEND,
+                "--home",
+                scratch.path().to_str().context("home path is not UTF-8")?,
+                "--output",
+                "json",
+            ]
+            .iter()
+            .map(|flag| flag.to_string())
+            .chain(derivation_flags(&coin_type, &account, &index))
+            .collect::<Vec<_>>(),
+        )?;
         address_from(&output)
     }
 
@@ -118,20 +136,26 @@ impl VoteManagerKeyring {
         // import promotes it into a keyring the caller owns.
         let scratch = TempDir::new()?;
         let source = scratch.write_mnemonic(mnemonic)?;
-        let output = svoted(&[
-            "keys",
-            "add",
-            KEY_NAME,
-            "--recover",
-            "--source",
-            source.to_str().context("mnemonic path is not UTF-8")?,
-            "--keyring-backend",
-            KEYRING_BACKEND,
-            "--home",
-            scratch.path().to_str().context("home path is not UTF-8")?,
-            "--output",
-            "json",
-        ]);
+        let output = svoted(
+            [
+                "keys",
+                "add",
+                KEY_NAME,
+                "--recover",
+                "--source",
+                source.to_str().context("mnemonic path is not UTF-8")?,
+                "--keyring-backend",
+                KEYRING_BACKEND,
+                "--home",
+                scratch.path().to_str().context("home path is not UTF-8")?,
+                "--output",
+                "json",
+            ]
+            .iter()
+            .map(|flag| flag.to_string())
+            .chain(derivation_flags(&DEFAULT_COIN_TYPE.to_string(), "0", "0"))
+            .collect::<Vec<_>>(),
+        );
         // Remove the mnemonic file before inspecting the result, so a failed
         // import does not leave it behind.
         let _ = std::fs::remove_file(&source);
@@ -232,15 +256,15 @@ fn restrict(path: &Path, mode: u32) -> Result<()> {
 ///
 /// Errors carry stderr, never the arguments: an argument list for a key
 /// command can name paths that held the mnemonic.
-fn svoted(args: &[&str]) -> Result<String> {
+fn svoted(args: Vec<String>) -> Result<String> {
     let output = Command::new("svoted")
-        .args(args)
+        .args(&args)
         .output()
         .context("running svoted; is it on PATH?")?;
     if !output.status.success() {
         bail!(
             "svoted {} failed: {}",
-            args.first().copied().unwrap_or("?"),
+            args.first().map(String::as_str).unwrap_or("?"),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }

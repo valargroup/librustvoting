@@ -24,7 +24,11 @@ pub mod assertions;
 pub mod child;
 pub mod environment;
 pub mod provisioning;
+pub mod round_run;
+pub mod run_config;
+pub mod signing;
 pub mod stage_config;
 pub mod stages;
+pub mod wallet_sync;
 
 pub use stages::{BroadcastPoint, CrashStage, CrashTrigger, SubmissionKind};

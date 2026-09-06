@@ -18,6 +18,9 @@ use zcash_voting::helper::transport::{HelperFuture, HelperTransport};
 use super::crash::{crash_now, CrashLog, Observation};
 use crate::stages::CrashStage;
 
+/// Path a share submission is POSTed to.
+const SHARES_ENDPOINT: &str = "/shielded-vote/v1/shares";
+
 /// Wraps a real helper transport and kills the process around a share POST.
 ///
 /// GETs pass through: helper status polling changes nothing durable.
@@ -46,7 +49,12 @@ impl<T: HelperTransport> HelperTransport for CrashHelperTransport<T> {
     }
 
     fn post_json<'a>(&'a self, url: &'a str, body: Vec<u8>, timeout: Duration) -> HelperFuture<'a> {
-        let Some(armed) = self.armed else {
+        // Only a share submission. The helper client also POSTs during fleet
+        // preflight, which happens *before* any share is journaled, so firing
+        // there kills the process while `attempting_urls` is still legitimately
+        // empty — and makes a correctly ordered journal look like a missing
+        // one.
+        let Some(armed) = self.armed.filter(|_| url.ends_with(SHARES_ENDPOINT)) else {
             return self.inner.post_json(url, body, timeout);
         };
         let log = Arc::clone(&self.log);

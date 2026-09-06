@@ -14,9 +14,10 @@ use std::str::FromStr;
 ///
 /// The order of the variants is the order they occur in a round, so a stage
 /// that sorts earlier is always reachable from a run driving toward a later
-/// one. Tests rely on that when they branch one provisioned round into several
-/// pre-broadcast stages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// one.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum CrashStage {
     /// The delegation obligation was selected and nothing has run.
     BeforeDelegation,
@@ -40,6 +41,14 @@ pub enum CrashStage {
     /// The response body was read but never durably classified.
     AfterBroadcastRead,
     /// The submission is `Tracking` with a candidate hash.
+    ///
+    /// Reaching this needs a one-pass chain policy. `ChainOutcome` is reported
+    /// once per `advance_step`, at the end, carrying the episode's *terminal*
+    /// outcome rather than each poll — so under the default 45 passes the
+    /// episode polls through to confirmation and a stage waiting to see a
+    /// submission still tracking never fires. The run arms a single-pass policy
+    /// for this stage only, which ends the episode while the submission is
+    /// still pending.
     AfterTracking,
 
     /// The cast obligation was selected; the delegation is confirmed.
@@ -52,6 +61,18 @@ pub enum CrashStage {
     AfterVoteProof,
     /// The vote is committed: `votes.commitment_bundle_json` is durable and no
     /// POST has been reserved.
+    ///
+    /// **Not currently reachable.** The durable boundary is real and worth
+    /// covering — a crash here leaves a committed vote with no helper plan —
+    /// but nothing observable marks it. Casting persists the vote, prepares
+    /// helper plans, and reserves the chain POST inside a single `advance_step`,
+    /// so the driver never re-plans in between, and the step's own progress
+    /// stream jumps from `VoteCommit(Signing)` straight to
+    /// `HelperPlansPrepared`, which is already the *next* boundary
+    /// ([`AfterHelperPlans`](Self::AfterHelperPlans)). Reaching it would need a
+    /// seam inside vote completion that does not exist today; until then this
+    /// stage reports as never reached rather than silently passing against a
+    /// round that finished.
     AfterVoteCommit,
     /// Helper delivery plans and the round's immediate-share designation are
     /// durable. This is the commit that makes a confirmed-vote-without-a-plan
@@ -180,10 +201,9 @@ impl CrashStage {
 
     /// Whether reaching this stage may already have changed staging.
     ///
-    /// A stage that has not touched the chain can be branched from a copied
-    /// sidecar, because staging has seen nothing to disagree with. Once a POST
-    /// may have been delivered the chain has moved and cannot be rewound, so
-    /// the stage needs a round of its own.
+    /// This classifies the armed run only. Every full matrix exercise still
+    /// needs its own round because its unarmed resume continues to quiescence
+    /// and may submit after any crash stage.
     pub fn touches_chain(self) -> bool {
         !matches!(
             self,

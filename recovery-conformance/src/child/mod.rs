@@ -18,8 +18,8 @@ mod crash_reporter;
 mod crash_transport;
 mod spawn;
 
-pub use crash::{CrashLog, Observation, EXIT_STAGE_NEVER_REACHED};
+pub use crash::{CrashLog, Observation, EXIT_INFRASTRUCTURE_FAILURE, EXIT_STAGE_NEVER_REACHED};
 pub use crash_helper_transport::CrashHelperTransport;
 pub use crash_reporter::{CrashReporter, CrashTarget};
 pub use crash_transport::CrashTransport;
-pub use spawn::{run_until_crash, CrashOutcome, CrashRun};
+pub use spawn::{run_to_quiescence, run_until_crash, CrashOutcome, CrashRun};

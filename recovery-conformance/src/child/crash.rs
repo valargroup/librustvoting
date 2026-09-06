@@ -111,6 +111,15 @@ impl CrashLog {
 /// worker exits with this rather than zero.
 pub const EXIT_STAGE_NEVER_REACHED: i32 = 70;
 
+/// Exit code for a run the environment ended before any stage could fire.
+///
+/// Distinct from [`EXIT_STAGE_NEVER_REACHED`] on purpose. That code means the
+/// round completed and the crash seam did not fire, which is a defect in the
+/// suite. This one means the run never got far enough to find out, which is a
+/// statement about staging — and conflating them would either hide a broken
+/// seam or blame the suite for someone else's timeout.
+pub const EXIT_INFRASTRUCTURE_FAILURE: i32 = 71;
+
 /// Records that `stage` was reached, then kills the process.
 ///
 /// Never returns. The log is fsynced first; `abort` raises `SIGABRT` without
