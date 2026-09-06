@@ -356,6 +356,10 @@ returned on an outcome is a host-facing projection, not a control input.
 `round_drive` composes executor calls. It adds no facts about a round; every
 decision about what a step *means* stays in the planner and the executor.
 
+- **There is one way to choose work.** The executor runs the obligation a
+  host-selected step resolves to; the driver is what chooses steps. No entry
+  point advances a round from its plan head on its own, because that is a
+  second driver with none of this section's guarantees.
 - **Selection is always from a plan the driver read itself.** The plan on a
   `RoundStepOutcome` is a host-facing projection, not a control input, so it is
   reported to the host and never used to choose the next step.

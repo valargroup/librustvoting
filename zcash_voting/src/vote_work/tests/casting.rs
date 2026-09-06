@@ -7,7 +7,7 @@ async fn empty_plan_and_stale_steps_return_no_work_without_network_io() {
     let executor = executor();
     let control = ChainSubmissionControl::new(1);
     let outcome = executor
-        .advance_next(&host(), &control, &NoopRoundStepProgressReporter {})
+        .advance_plan_head(&host(), &control, &NoopRoundStepProgressReporter {})
         .await
         .unwrap();
     assert_eq!(outcome.disposition, RoundStepDisposition::NoWork);

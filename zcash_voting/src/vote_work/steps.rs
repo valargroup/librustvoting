@@ -91,12 +91,13 @@ impl<T: ChainTransport> RoundExecutor<T> {
         self.plan()
     }
 
-    /// Runs the first planned step, if any.
+    /// Runs the plan's first step, for tests that pin what one step does to a
+    /// round without also exercising the driver's scheduling.
     ///
-    /// The operation epoch is captured before planning, so an epoch change
-    /// while the initial plan waits on the database interrupts the step that
-    /// follows instead of being adopted by it.
-    pub async fn advance_next(
+    /// Hosts drive a round with `RoundDriver`; this is not a shipped entry
+    /// point, because a second way to advance a round is a second driver.
+    #[cfg(test)]
+    pub(crate) async fn advance_plan_head(
         &self,
         host: &RoundHostContext,
         control: &ChainSubmissionControl,
@@ -122,7 +123,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// re-selecting from a refreshed plan cannot loop on it forever. A step whose bundle still has a delegation step ahead of it
     /// in the plan fails with `InvalidInput` naming that prerequisite, before
     /// any lock-scoped work or network I/O; run the prerequisite first or use
-    /// `advance_next`. `Delegate` and `AdvanceDelegation` lock their bundle;
+    /// the driver. `Delegate` and `AdvanceDelegation` lock their bundle;
     /// every other step locks the round. A `ConfirmShare` whose share no
     /// helper has accepted yet (the plan's `blocking_share_work`) runs the
     /// share's delivery from its durable plan instead of polling for a
@@ -222,7 +223,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 None,
                 &ledger,
                 format!(
-                    "{:?} requires {prerequisite:?} to complete first; run that step or advance_next",
+                    "{:?} requires {prerequisite:?} to complete first; run that step or drive the round",
                     scope.step
                 ),
             ));

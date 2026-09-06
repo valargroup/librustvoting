@@ -8,7 +8,7 @@ async fn cancelled_control_short_circuits_before_any_work() {
     let control = ChainSubmissionControl::new(1);
     control.cancel();
     let outcome = executor
-        .advance_next(&host(), &control, &NoopRoundStepProgressReporter {})
+        .advance_plan_head(&host(), &control, &NoopRoundStepProgressReporter {})
         .await
         .unwrap();
     // No step exists, so the plan wins over cancellation.

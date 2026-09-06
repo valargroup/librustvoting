@@ -20,7 +20,7 @@ async fn a_host_wallet_switch_does_not_retarget_a_bound_executor() {
     );
     let control = ChainSubmissionControl::new(1);
     let outcome = executor
-        .advance_next(&host(), &control, &NoopRoundStepProgressReporter {})
+        .advance_plan_head(&host(), &control, &NoopRoundStepProgressReporter {})
         .await
         .unwrap();
     assert_eq!(outcome.disposition, RoundStepDisposition::NoWork);
@@ -40,7 +40,7 @@ async fn re_scoping_a_handle_from_database_does_not_reach_the_executor() {
     assert!(!plan.delegation_statuses.is_empty());
     let control = ChainSubmissionControl::new(1);
     let outcome = executor
-        .advance_next(&host(), &control, &NoopRoundStepProgressReporter {})
+        .advance_plan_head(&host(), &control, &NoopRoundStepProgressReporter {})
         .await
         .unwrap();
     assert_eq!(outcome.disposition, RoundStepDisposition::NoWork);

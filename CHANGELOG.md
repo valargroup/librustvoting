@@ -113,6 +113,10 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- **Breaking:** `RoundExecutor::advance_next` is removed. `RoundDriver` chooses
+  what to run from a plan it read itself, so a second way to advance a round
+  from its plan head is a second driver; hosts drive a round with the driver
+  and reach one obligation with `advance_step`.
 - **Breaking:** `RoundExecutor::advance_step` refuses a step that the plan it
   reads under the lock still lists but that resolves to no obligation, failing
   with `RoundStepFailureKind::InvariantViolation` instead of returning
