@@ -85,6 +85,20 @@ make recovery-conformance-check   # type-check and lint
 make recovery-conformance         # run against staging (slow)
 ```
 
+To re-run only the stages a change could have affected, name them in
+`RECOVERY_CONFORMANCE_STAGES`:
+
+```bash
+infisical run --env=staging -- env \
+  RECOVERY_CONFORMANCE_STAGES=after-vote-broadcast,after-vote-confirmed \
+  make recovery-conformance
+```
+
+The control run is unconditional whatever the selection, because every terminal
+comparison is against it. An unrecognized name fails the run rather than
+selecting nothing: a typo that silently ran no stages would report a green
+matrix having tested nothing.
+
 ## Crash stages
 
 Each stage sits immediately next to a durable commit. `touches_chain()`
@@ -299,28 +313,11 @@ than passing it against a round that simply finished.
 
 ## Open findings
 
-Both reproduce deterministically and are cheap to re-observe. Neither is
-staging flakiness: both are `InvalidInput`-class, not transport.
+One finding remains. It reproduces deterministically and is cheap to
+re-observe, and it is not staging flakiness: it is `InvalidInput`-class, not
+transport.
 
-### 1. A resumed vote broadcast never reconverges
-
-```
---stage after-vote-broadcast          # ~100s, needs a fresh round
-InvalidInput: confirmed delegation bundle 0 does not match its synced vote-tree leaf
-```
-
-Reproduced in three separate runs over three freshly provisioned rounds,
-failing identically on all six resume attempts each time — eighteen attempts,
-one error. It survives the tree-cache reset the SDK performs on this path
-(`tree_sync.rs:445-478` sets `RoundTreeClient::empty()`), so it is not a stale
-cache. Its blast radius crosses bundles: casts fail on bundles 1 and 2, which
-were never crashed. The delegation-side equivalent, `after-broadcast-unread`,
-recovers cleanly in every run.
-
-Either the synced tree does not hold that leaf at the anchor height, or the
-durably recorded confirmation position disagrees with what the tree holds.
-
-### 2. A crash inside a share POST leaves no attempt journaled
+### A crash inside a share POST leaves no attempt journaled
 
 ```
 --stage before-share-post             # ~3 min, needs a fresh round
@@ -333,6 +330,39 @@ holds 1 row, and `share_delegations` holds 1 row for `share_index 0` with
 Yet the crash fires inside a POST to `/shielded-vote/v1/shares`, and `share.rs`
 documents the marker as "persisted before `Started` is returned, so dispatch can
 safely occur only afterward".
+
+## Closed findings
+
+### A resumed vote broadcast never reconverged
+
+`after-vote-broadcast` failed identically on all six resume attempts across
+three freshly provisioned rounds — eighteen attempts, one error:
+`confirmed delegation bundle 0 does not match its synced vote-tree leaf`. Its
+blast radius crossed bundles, failing casts on bundles 1 and 2, which were
+never crashed.
+
+It was not a tree problem. Two SDK guards judged a vote finished by
+`votes.tx_hash`, which a vote confirmed by an exact-tree scan never carries, so
+the crashed bundle's delegation VAN was still expected in the tree after its
+vote had spent it, and the stale expectation failed sync on every pass. Fixed
+in 2177e8bf and ef72aba0, and pinned hermetically by
+`a_dispatched_vote_retires_its_bundles_van_expectation` and
+`a_tree_confirmed_vote_clears_its_proposal_authority_bit`.
+
+Verified closed on 2026-09-06 with the report visible:
+
+```
+=== staging conformance ===
+  PASS  after-vote-broadcast
+  PASS  after-vote-confirmed
+  2 passed, 0 failed, 0 skipped, of 2 attempted
+```
+
+Both stages drove `reservations 4 -> 12` with all twelve submissions
+`confirmed`. `after-vote-broadcast` took 322s, absorbing one
+`ChainRecoveryStalled` that resolved on the first resume; the control run
+absorbed one PIR timeout on bundle 2 that resolved the same way. Both are
+environmental and self-healing, not conformance failures.
 
 So a POST reached the shares endpoint while no delivery attempt was journaled.
 Either something other than initial delivery posts there, or the reservation

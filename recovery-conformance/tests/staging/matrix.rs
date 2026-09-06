@@ -169,8 +169,14 @@ async fn drive_matrix(fixture: Fixture) -> Report {
     };
     eprintln!("control terminal snapshot: {:?}", control.states());
 
+    let selected = selected_stages();
     for stage in CrashStage::ALL {
         let stage = *stage;
+        if let Some(selected) = &selected {
+            if !selected.contains(&stage) {
+                continue;
+            }
+        }
         report.attempted += 1;
         let started = Instant::now();
 
@@ -447,6 +453,38 @@ fn wallet_path() -> PathBuf {
     std::env::var("RECOVERY_CONFORMANCE_WALLET")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".cache/recovery-conformance/voter.db"))
+}
+
+/// The stages this run exercises, or `None` for the whole matrix.
+///
+/// Set `RECOVERY_CONFORMANCE_STAGES` to a comma-separated list of stage names
+/// to re-run only the stages a change could have affected. The control run is
+/// unconditional, because every terminal comparison is against it.
+///
+/// An unrecognized name is a hard error rather than an empty selection: a typo
+/// that silently ran nothing would report a green matrix having tested nothing,
+/// which is the failure mode this suite exists to avoid.
+fn selected_stages() -> Option<Vec<CrashStage>> {
+    let requested = std::env::var("RECOVERY_CONFORMANCE_STAGES").ok()?;
+    let stages: Vec<CrashStage> = requested
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            name.parse::<CrashStage>().unwrap_or_else(|_| {
+                panic!(
+                    "RECOVERY_CONFORMANCE_STAGES names an unknown stage {name:?}; \
+                     known stages are {}",
+                    CrashStage::ALL
+                        .iter()
+                        .map(|stage| stage.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+        })
+        .collect();
+    (!stages.is_empty()).then_some(stages)
 }
 
 fn warm_pir_path() -> Option<PathBuf> {

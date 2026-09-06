@@ -22,6 +22,21 @@ fn every_crash_stage_is_reached_and_recovers() {
         }
         matrix::Run::Completed(report) => {
             report.print();
+            // An empty failure list is not on its own evidence of conformance:
+            // it is also what a run that exercised nothing produces. A matrix
+            // that quietly attempts zero stages and reports green is the way a
+            // suite like this rots, so vacuity is a failure of its own.
+            assert!(
+                report.attempted > 0,
+                "the matrix attempted no stages; RECOVERY_CONFORMANCE_STAGES \
+                 may name only stages this build does not have"
+            );
+            assert!(
+                !report.passed.is_empty(),
+                "the matrix attempted {} stages and passed none of them, so \
+                 nothing was actually proven",
+                report.attempted
+            );
             assert!(
                 report.failed.is_empty(),
                 "{} of {} stages failed conformance",
