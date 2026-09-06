@@ -3110,6 +3110,12 @@ pub fn store_vote(
     }
 }
 
+/// Refuses a ballot intent that disagrees with a vote already on chain.
+///
+/// A vote counts as on chain by either witness. The transaction hash exists
+/// only for hash-confirmed submissions, so reading it alone missed every vote
+/// confirmed by an exact-tree scan and accepted an intent that could no longer
+/// be honoured — the proposal's authority had already moved.
 pub fn ensure_no_submitted_vote_conflict_for_intent(
     conn: &Connection,
     round_id: &str,
@@ -3125,7 +3131,7 @@ pub fn ensure_no_submitted_vote_conflict_for_intent(
              WHERE round_id = :round_id
                AND wallet_id = :wallet_id
                AND proposal_id = :proposal_id
-               AND tx_hash IS NOT NULL
+               AND (tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL)
                AND (:skipped != 0 OR choice != :choice)
              ORDER BY bundle_index
              LIMIT 1",

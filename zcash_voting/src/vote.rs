@@ -3680,9 +3680,14 @@ fn ensure_vote_rebuild_allowed(
 ) -> Result<(), VotingError> {
     let conn = db.conn();
     let wallet_id = db.wallet_id();
-    let has_tx_hash = conn
+    // Either witness of the vote having reached the chain refuses a rebuild.
+    // A hash exists only for hash-confirmed submissions — the schema requires
+    // `confirmation_source = 'tree'` to carry none — so asking for it alone let
+    // a vote confirmed by an exact-tree scan be rebuilt, producing a competing
+    // generation for a proposal whose authority had already moved.
+    let has_reached_chain = conn
         .query_row(
-            "SELECT tx_hash IS NOT NULL FROM votes
+            "SELECT tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL FROM votes
              WHERE round_id = :round_id
                AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index
@@ -3701,7 +3706,7 @@ fn ensure_vote_rebuild_allowed(
         })?
         .unwrap_or(false);
 
-    if has_tx_hash {
+    if has_reached_chain {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote that conflicts with requested draft"
@@ -3711,9 +3716,8 @@ fn ensure_vote_rebuild_allowed(
     Ok(())
 }
 
-/// Rejects another pending commitment that would spend the bundle's same current VAN.
 /// Refuses a new vote chain while an earlier one on the same bundle is still
-/// unconfirmed.
+/// unconfirmed, because both would spend the bundle's same current VAN.
 ///
 /// Completion is the commitment-tree position, not the transaction hash.
 /// Confirmation writes the position on both routes, and clears it when a
@@ -5333,6 +5337,69 @@ mod tests {
             "{err}"
         );
         assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    /// A ballot intent that conflicts with a tree-confirmed vote must be
+    /// refused.
+    ///
+    /// Once a vote is on chain its proposal's authority has moved, so a
+    /// different choice for it can no longer be honoured. The guard used to
+    /// find the conflicting bundle by reading the transaction hash alone, which
+    /// an exact-tree confirmation leaves absent by construction. Like the
+    /// rebuild guard it failed open: the conflicting intent was accepted and
+    /// the disagreement surfaced later, if at all.
+    #[test]
+    fn an_intent_conflicting_with_a_tree_confirmed_vote_is_refused() {
+        let db = db_with_vote();
+        db.conn()
+            .execute(
+                "UPDATE votes SET tx_hash = NULL, vc_tree_position = 7, choice = 2
+                 WHERE round_id = ?1 AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::params![ROUND_ID],
+            )
+            .unwrap();
+
+        // A different choice for a proposal already voted on chain.
+        let error = queries::ensure_no_submitted_vote_conflict_for_intent(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            1,
+            false,
+            Some(0),
+        )
+        .expect_err("a choice conflicting with an on-chain vote must be refused");
+        assert!(error.to_string().contains("submitted"), "{error}");
+    }
+
+    /// A vote confirmed by an exact-tree scan must not be rebuildable.
+    ///
+    /// Rebuilding a vote already on chain would produce a competing generation
+    /// for a proposal whose authority has already moved. The guard used to ask
+    /// only whether a transaction hash was recorded — but a hash exists only
+    /// for hash-confirmed submissions, so an exact-tree confirmation left none
+    /// and the refusal had nothing to fire on. That failed open, which is why
+    /// it is tested rather than assumed: a stuck round announces itself, a
+    /// permitted rebuild does not.
+    #[test]
+    fn a_tree_confirmed_vote_cannot_be_rebuilt() {
+        let db = db_with_vote();
+        // Exactly what an exact-tree confirmation leaves: a commitment-tree
+        // position and no transaction hash, which the schema requires of it.
+        db.conn()
+            .execute(
+                "UPDATE votes SET tx_hash = NULL, vc_tree_position = 7
+                 WHERE round_id = ?1 AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::params![ROUND_ID],
+            )
+            .unwrap();
+
+        let error = ensure_vote_rebuild_allowed(&db, ROUND_ID, 0, 1)
+            .expect_err("a vote already on chain must not be rebuilt");
+        assert!(
+            error.to_string().contains("submitted") || error.to_string().contains("rebuild"),
+            "{error}"
+        );
     }
 
     #[test]
