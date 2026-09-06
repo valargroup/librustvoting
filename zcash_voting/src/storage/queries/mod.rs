@@ -1903,11 +1903,23 @@ pub fn load_zkp2_inputs(
         message: format!("failed to load ZKP2 inputs for round={}, bundle={} ({})", round_id, bundle_index, e),
     })?;
 
-    // Compute current proposal_authority by clearing bits for votes with a
-    // durable tx hash for THIS bundle specifically.
+    // Clear a bit for every vote of THIS bundle that has reached the chain,
+    // by either of the two facts that can witness it.
+    //
+    // A transaction hash marks a submitted vote, and the VAN is spent as soon
+    // as that transaction lands, so the bit must clear then. But a hash is
+    // route-specific: the schema requires `confirmation_source = 'tree'` to
+    // carry none, so a vote confirmed by an exact-tree scan has none and never
+    // will. Testing the hash alone left such a vote's bit set, the next vote on
+    // the bundle rebuilt its VAN as though that proposal had never voted, and
+    // the chain rejected the stale nullifier as already spent — permanently,
+    // since no later pass could supply a hash that does not exist.
+    //
+    // Either fact is sufficient and neither is redundant: the hash covers a
+    // vote still in flight, the position covers one confirmed without a hash.
     let mut authority = MAX_PROPOSAL_AUTHORITY;
     let mut stmt = conn
-        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND tx_hash IS NOT NULL")
+        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND (tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL)")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare proposal_authority query: {}", e),
         })?;
