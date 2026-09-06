@@ -219,7 +219,14 @@ pub(crate) fn add_attempting_server_for_generation(
         if placement_capacity_reached {
             return Ok(ShareAttemptReservation::PlacementCapacityReached);
         }
-        debug_assert!(state.begin(&server_url)?);
+        // Called unconditionally: `begin` is what puts the helper in the
+        // in-flight set, and `debug_assert!` compiles its argument out of
+        // release builds entirely. Inside the assertion, a release build wrote
+        // `attempting_urls = []` and still reported `Started`, so the marker
+        // this reservation exists to create was never recorded — while every
+        // test, running with debug assertions on, saw it work.
+        let began = state.begin(&server_url)?;
+        debug_assert!(began, "a reserved helper must not already be in flight");
         let updated_attempting_json = serialize_url_list(
             state.in_flight_urls(),
             &preserved_legacy_in_flight_urls,
