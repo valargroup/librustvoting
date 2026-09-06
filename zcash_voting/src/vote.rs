@@ -3712,6 +3712,18 @@ fn ensure_vote_rebuild_allowed(
 }
 
 /// Rejects another pending commitment that would spend the bundle's same current VAN.
+/// Refuses a new vote chain while an earlier one on the same bundle is still
+/// unconfirmed.
+///
+/// Completion is the commitment-tree position, not the transaction hash.
+/// Confirmation writes the position on both routes, and clears it when a
+/// generation is invalidated, so it is the fact that tracks the vote. A hash
+/// exists only for hash confirmation: the schema requires
+/// `confirmation_source = 'tree'` to carry none, so a vote confirmed by an
+/// exact-tree scan has no hash and never will. Treating a missing hash as
+/// "pending" left such a vote blocking its bundle permanently — every later
+/// proposal on it refused, with a message asking the caller to confirm a vote
+/// that was already confirmed.
 fn ensure_no_competing_pending_vote_chain_with_conn(
     conn: &rusqlite::Connection,
     wallet_id: &str,
@@ -3726,7 +3738,7 @@ fn ensure_no_competing_pending_vote_chain_with_conn(
                AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index
                AND commitment_bundle_json IS NOT NULL
-               AND (tx_hash IS NULL OR vc_tree_position IS NULL)
+               AND vc_tree_position IS NULL
              ORDER BY proposal_id",
         )
         .map_err(|e| VotingError::Internal {
