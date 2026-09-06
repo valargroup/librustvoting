@@ -603,6 +603,42 @@ mod tests {
         );
     }
 
+    /// A vote confirmed by an exact-tree scan must not be replaceable.
+    ///
+    /// `store_vote` refuses to change the choice or commitment of a vote that
+    /// reached the chain, because the proposal's authority has already moved
+    /// and a replacement would describe a vote that cannot be cast. It used to
+    /// decide that by reading the transaction hash alone, which an exact-tree
+    /// confirmation leaves absent by construction — so the refusal never fired
+    /// and the replacement silently overwrote an on-chain vote.
+    #[test]
+    fn a_tree_confirmed_vote_cannot_be_replaced() {
+        let db = test_db();
+        let conn = db.conn();
+        queries::insert_round(&conn, W, Network::Testnet, &test_params(), None).unwrap();
+        queries::insert_bundle(&conn, "test-round-1", W, 0, &[]).unwrap();
+
+        let commitment = vec![0xCC; 128];
+        queries::store_vote(&conn, "test-round-1", W, 0, 0, 0, &commitment).unwrap();
+        // Exactly what an exact-tree confirmation leaves: a commitment-tree
+        // position and no hash, which the schema requires of it.
+        conn.execute(
+            "UPDATE votes SET tx_hash = NULL, vc_tree_position = 7
+             WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0 AND proposal_id = 0",
+            rusqlite::params!["test-round-1", W],
+        )
+        .unwrap();
+
+        let replace_err =
+            queries::store_vote(&conn, "test-round-1", W, 0, 0, 1, &commitment).unwrap_err();
+        assert!(
+            replace_err
+                .to_string()
+                .contains("cannot replace submitted vote"),
+            "{replace_err}"
+        );
+    }
+
     #[test]
     fn test_vote_storage() {
         let db = test_db();

@@ -3025,9 +3025,17 @@ pub fn store_vote(
         })?;
 
     let result: Result<(), VotingError> = (|| {
+        // Either witness of the vote having reached the chain forbids a
+        // replacement. A hash exists only for hash-confirmed submissions — the
+        // schema requires `confirmation_source = 'tree'` to carry none — so
+        // asking for it alone let a vote confirmed by an exact-tree scan have
+        // its choice and commitment silently overwritten, describing a vote
+        // whose proposal authority had already moved.
         let existing_vote: Option<(i64, Option<Vec<u8>>, bool)> = conn
             .query_row(
-                "SELECT choice, commitment, tx_hash IS NOT NULL FROM votes
+                "SELECT choice, commitment,
+                        tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL
+                 FROM votes
                  WHERE round_id = :round_id
                    AND wallet_id = :wallet_id
                    AND bundle_index = :bundle_index
