@@ -2292,6 +2292,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "recovery-conformance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "voting-crypto-deps",
+ "zcash_voting",
+ "zeroize",
+]
+
+[[package]]
 name = "reddsa"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

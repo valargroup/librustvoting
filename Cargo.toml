@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "recovery-conformance",
     "zcash_voting",
     "vote-commitment-tree",
     "vote-commitment-tree-client",

@@ -76,3 +76,17 @@ fmt: ## Check formatting
 clippy: ## Lint the default Zakura stack
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
 		cargo clippy $(APP_PACKAGES) --all-targets --features test-fixtures --locked
+
+# Staging crash-recovery conformance. Deliberately not in APP_PACKAGES: this
+# package drives a real staging round over the network and kills its own child
+# processes, so it must never join `check`, `test`, or CI's hermetic jobs. It
+# shares the Zakura target dir so it reuses the main build's artifacts.
+RECOVERY_CONFORMANCE_PACKAGE = -p recovery-conformance
+
+recovery-conformance-check: ## Type-check the staging crash-recovery suite
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo clippy $(RECOVERY_CONFORMANCE_PACKAGE) --all-targets --locked
+
+recovery-conformance: ## Run the staging crash-recovery suite (network, slow)
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked
