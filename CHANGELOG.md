@@ -576,6 +576,18 @@ This release is `zcash_voting` 4.0.0.
   it surfaced only by crashing a release binary mid-POST and reopening the
   sidecar in another process.
 
+- A bundle can persist its delegation proof after another bundle has already
+  advanced the round-wide display phase to `VoteReady`. The proof transaction
+  wrote `DelegationProved` through `advance_round_phase`, which refuses a
+  regression by returning an error rather than moving the marker backwards.
+  That error aborted the enclosing immediate transaction, so the proof and
+  proof-result rows were rolled back with it and a valid multi-bundle recovery
+  lost work it had already completed. `rounds.phase` is a lossy round-wide
+  high-water mark, not an authority for per-bundle completion, so the write is
+  now a `queries::advance_round_phase_to_at_least` that leaves a later marker
+  alone and commits the bundle-local artifacts either way. The delegation
+  capability import, which open-coded the same rule, shares that helper.
+
 - Schema version 21 rebuilds `chain_submissions` onto the 50-proposal bound.
   A sidecar migrated by a build that carried the 15-proposal bound kept that
   CHECK at version 20; nothing rewrote it, and the version-20 fingerprint

@@ -288,6 +288,15 @@ fresh plan taken under the lock, or to no work.
 | roster, vote end, last-moment window, helper fleet | host, per call | never persisted; classification input |
 | lifecycle ownership of an intent | derived from the unit's lifecycle position | never persisted |
 
+The legacy `rounds.phase` column is a lossy round-wide high-water mark, not an
+authority for bundle completion. Bundles progress independently: one bundle may
+persist a vote and move the marker to `VoteReady` while another still owes its
+delegation proof. Persisting that later proof must commit its bundle-local
+artifacts and preserve `VoteReady`; it must not regress the marker, reject the
+valid completion, or infer that the proof can be skipped. Proof reuse is
+decided from the bundle's canonical durable delegation phase and target
+binding.
+
 The immediate-share designation is the one orchestration decision that must
 survive restarts and roster changes exactly as first made, so it is durable
 state, not a value re-derived from whichever roster the host passed. A
@@ -778,6 +787,9 @@ Conformance is demonstrated by behavior. Tests cover:
 
 - a failure after chain confirmation carries the chain outcome and the
   deliveries that succeeded, at every failure site;
+- a bundle that persists its delegation proof after another bundle advanced
+  the round marker to `VoteReady` keeps that later marker and commits the proof
+  (`a_late_bundle_proof_preserves_vote_ready_round_phase`);
 - the epoch and binding captured at entry are the ones a step uses after a
   long proof even if the host rebinds meanwhile;
 - a step with an unresolved delegation prerequisite is refused before I/O;

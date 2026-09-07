@@ -136,6 +136,12 @@ Terminal submission rejection preserves and reuses the proof bound to the
 rejected generation; proof preparation cannot replace it with new randomized
 bytes.
 
+The legacy round-wide phase is only a high-water display marker. If one bundle
+has already advanced it to `VoteReady`, a different bundle may still complete
+and persist its delegation proof. That proof transaction preserves the later
+marker and commits the bundle-local proof; round phase never substitutes for
+the bundle's durable proof and target-binding checks.
+
 ## Identity and semantic generation
 
 A submission identity contains:
@@ -1393,6 +1399,9 @@ Tests cover:
 - concurrent work cannot reserve two generations for one identity;
 - concurrent producers generate at most one delegation proof for one
   wallet/round/bundle while distinct bundles remain parallel;
+- `a_late_bundle_proof_preserves_vote_ready_round_phase` proves that a
+  bundle-local proof can commit after another bundle advances the lossy
+  round-wide marker;
 - reused delegation proofs still reject mismatched notes or keys, and an
   account switch cannot retarget a waiting proof operation or its PIR cache;
 - a same-round hotkey substitution cannot reuse a persisted proof, and
