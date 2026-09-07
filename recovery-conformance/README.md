@@ -235,11 +235,21 @@ exercised and none skipped:
 | 2 | 20 passed, 0 failed, 0 skipped | 2567s |
 | 3 | 20 passed, 0 failed, 0 skipped | 2781s |
 
-Under test: this crate at `47ceb0e4`, plus the delegation-proof phase fix that
-`52d0229c` carries on another branch. That fix is **not** on this branch, and
-the runs are honest only with it named: without it `after-signing` fails
-deterministically, because a bundle persisting its proof after another bundle
-advanced the round-wide phase to `VoteReady` is refused as a phase regression.
+Under test: this crate, plus **two sets of SDK fixes that are not on this
+branch**. The runs are honest only with both named, and this branch does not
+pass without them.
+
+- The seven `votes.tx_hash` completion fixes, which this suite found and which
+  are in review separately. Without them the vote and share stages cannot
+  converge at all.
+- The delegation-proof phase fix that `52d0229c` carries on another branch.
+  Without it `after-signing` fails deterministically: a bundle persisting its
+  proof after another bundle advanced the round-wide phase to `VoteReady` is
+  refused as a phase regression.
+
+Both need to land before this branch's own base turns the matrix green. Running
+it here today reproduces the defects rather than passing over them, which is
+the suite working as intended, not a broken branch.
 
 Each run provisions a control round plus one per stage — roughly twenty fresh
 rounds, every delegation and vote real and on `svote-1`. Sixty rounds across
