@@ -4,13 +4,18 @@ use std::collections::BTreeSet;
 
 use crate::round_planning::{Obligation, RoundObligations};
 
-/// How much of what this run set out to do is done.
+/// How much of the vote work the driver is measuring against is done.
 ///
-/// Progress is **run-relative**: the total is the vote work the run's first
-/// plan owed, and a proposal is complete once no `Cast` and no
-/// `ReconcileChain` obligation covers it any more. A round resumed with two
-/// questions left reports two, not the whole ballot, which is what a host
-/// showing "question N of M" for this run wants.
+/// A proposal is complete once no `Cast` and no `ReconcileChain` obligation
+/// covers it any more. What the total counts is the host's choice, made by
+/// [`ProgressBaseline`](super::ProgressBaseline):
+///
+/// - `Run` (the default) is **run-relative**: the total is the vote work the
+///   run's first plan owed, so a round resumed with two questions left reports
+///   two.
+/// - `Ballot` is **ballot-relative**: the total is every proposal the durable
+///   ballot recorded a choice for, so the same resume still reports the whole
+///   ballot and "question N of M" does not renumber across a restart.
 ///
 /// The counts are exact for atomic batches. Obligation membership names every
 /// ordered member, where a host counting `NextStep`s sees one
@@ -51,6 +56,25 @@ impl BallotBaseline {
     pub(super) fn capture(obligations: &RoundObligations) -> Self {
         Self {
             proposals: covered_proposals(obligations),
+        }
+    }
+
+    /// Captures every proposal the durable ballot recorded a choice for.
+    ///
+    /// The measure is the same; only the total differs. A run baseline asks
+    /// "how much of what this run picked up is done", which renumbers when a
+    /// resume picks up less than the whole ballot. This asks "how much of the
+    /// ballot is done", which is what a host showing "question N of M" across a
+    /// quit and reopen wants: the denominator is the voter's ballot, so it does
+    /// not move between runs.
+    ///
+    /// Skipped proposals are excluded, because `choice_proposals` holds only
+    /// roster proposals with a durable `Choice`. A skip is terminal and owes no
+    /// vote work, so counting one would leave the label permanently short of
+    /// its total on a ballot that is in fact complete.
+    pub(super) fn for_ballot(obligations: &RoundObligations) -> Self {
+        Self {
+            proposals: obligations.choice_proposals.iter().copied().collect(),
         }
     }
 

@@ -43,7 +43,7 @@ pub(crate) mod tally;
 #[cfg(test)]
 mod tests;
 
-pub use policy::{FailureIsolation, RoundDrivePolicy};
+pub use policy::{FailureIsolation, ProgressBaseline, RoundDrivePolicy};
 pub use progress::{
     NoopRoundDriveReporter, RoundDriveEvent, RoundDriveReporter, RoundDriveReporterBridge,
 };

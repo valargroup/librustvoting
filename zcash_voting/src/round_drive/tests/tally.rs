@@ -1,4 +1,5 @@
-//! Ballot progress is exact for batches and run-relative.
+//! Ballot progress is exact for batches, and counted against whichever
+//! baseline the host's policy selected.
 
 use super::fixtures::*;
 
@@ -153,4 +154,107 @@ fn a_retire_is_not_work_the_tally_reports_as_owed() {
         "the driver has no entry point that executes a retire alone"
     );
     assert_eq!(tally.total_proposals, 0, "a retire owes no vote of its own");
+}
+
+#[test]
+fn the_ballot_baseline_keeps_its_total_across_a_resume() {
+    // The same resumed round as above: one of three proposals still owed. The
+    // run baseline reports "1 of 1" for this run; the ballot baseline reports
+    // the ballot, so a host label keeps the M the voter saw before quitting and
+    // resumes at the right N instead of renumbering.
+    let resumed = batch_obligations(&[1, 2, 3], &[3]);
+    let baseline = BallotBaseline::for_ballot(&resumed);
+
+    let owed = baseline.tally(&resumed);
+    assert_eq!((owed.completed_proposals, owed.total_proposals), (2, 3));
+
+    let done = baseline.tally(&batch_obligations(&[1, 2, 3], &[]));
+    assert_eq!((done.completed_proposals, done.total_proposals), (3, 3));
+}
+
+#[test]
+fn the_ballot_baseline_counts_every_member_of_an_atomic_batch() {
+    // Same exactness the run baseline has: membership comes from the
+    // obligation, not from the single anchor id an `AdvanceVoteBatch` carries.
+    let baseline = BallotBaseline::for_ballot(&batch_obligations(&[1, 2, 3], &[1, 2, 3]));
+
+    let owed = baseline.tally(&batch_obligations(&[1, 2, 3], &[1, 2, 3]));
+    assert_eq!((owed.completed_proposals, owed.total_proposals), (0, 3));
+
+    let landed = baseline.tally(&batch_obligations(&[1, 2, 3], &[]));
+    assert_eq!((landed.completed_proposals, landed.total_proposals), (3, 3));
+}
+
+#[tokio::test]
+async fn a_skipped_proposal_is_not_a_ballot_question() {
+    // `choice_proposals` excludes skips, so the ballot total matches the run
+    // total here. A skip owes no vote work, and counting one would leave the
+    // label short of its total on a complete ballot.
+    let executor = executor();
+    executor
+        .set_ballot_intents(&[
+            BallotIntent {
+                proposal_id: 1,
+                decision: Decision::Choice(0),
+            },
+            BallotIntent {
+                proposal_id: 2,
+                decision: Decision::Skipped,
+            },
+        ])
+        .unwrap();
+    let control = ChainSubmissionControl::new(1);
+    let events = RecordingReporter::default();
+    let report = RoundDriver::new(&executor)
+        .with_policy(RoundDrivePolicy {
+            progress_baseline: ProgressBaseline::Ballot,
+            ..RoundDrivePolicy::default()
+        })
+        .run(&FixedHost, &control, &events)
+        .await;
+
+    assert_eq!(report.tally.total_proposals, 1);
+}
+
+#[tokio::test]
+async fn selecting_a_baseline_does_not_disturb_a_ballot_both_agree_on() {
+    // Both baselines are the same set while nothing has completed yet, so the
+    // policy is observable only on a resume (see the two tests above). This
+    // pins the wiring: selecting `Ballot` runs the driver to the same tally,
+    // rather than, say, capturing an empty baseline.
+    for baseline in [ProgressBaseline::Run, ProgressBaseline::Ballot] {
+        let executor = executor();
+        executor
+            .set_ballot_intents(&[
+                BallotIntent {
+                    proposal_id: 1,
+                    decision: Decision::Choice(0),
+                },
+                BallotIntent {
+                    proposal_id: 2,
+                    decision: Decision::Choice(1),
+                },
+            ])
+            .unwrap();
+        let control = ChainSubmissionControl::new(1);
+        let events = RecordingReporter::default();
+        let report = RoundDriver::new(&executor)
+            .with_policy(RoundDrivePolicy {
+                progress_baseline: baseline,
+                ..RoundDrivePolicy::default()
+            })
+            .run(&FixedHost, &control, &events)
+            .await;
+
+        assert_eq!(report.tally.total_proposals, 2, "baseline {baseline:?}");
+        assert_eq!(report.tally.completed_proposals, 0, "baseline {baseline:?}");
+    }
+}
+
+#[test]
+fn the_default_baseline_is_the_run_so_existing_hosts_are_unchanged() {
+    assert_eq!(
+        RoundDrivePolicy::default().progress_baseline,
+        ProgressBaseline::Run
+    );
 }

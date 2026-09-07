@@ -620,15 +620,36 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   several device rounds, and delegations would already be on the wire before
   the first of them. Absence yields `NeedsDelegationSignatures` before anything
   is dispatched; malformed stored material remains an executor failure.
-- **Progress is run-relative and exact.** A proposal is complete when no `Cast`
-  and no `ReconcileChain` obligation covers it, measured against the vote work
-  the run's first plan owed. `remaining_obligations` counts only what this
-  layer can execute: `Blocked` and `Retire` are both excluded, because neither
-  is ever dispatched on its own and a `Retire` without a surviving `Cast` would
-  otherwise report work owed beside a `NoWorkLeft` quiescence
-  (`a_retire_is_not_work_the_tally_reports_as_owed`). Obligation membership names every member of an
-  atomic batch, which a host counting `NextStep`s cannot see: a batch projects
-  to one `AdvanceVoteBatch` carrying only its first member's id.
+- **Progress is exact, and measured against a baseline the host selects.** A
+  proposal is complete when no `Cast` and no `ReconcileChain` obligation covers
+  it. Obligation membership names every member of an atomic batch, which a host
+  counting `NextStep`s cannot see: a batch projects to one `AdvanceVoteBatch`
+  carrying only its first member's id, so a host counting steps reads a
+  six-proposal batch as one question.
+
+  `remaining_obligations` counts only what this layer can execute: `Blocked`
+  and `Retire` are both excluded, because neither is ever dispatched on its own
+  and a `Retire` without a surviving `Cast` would otherwise report work owed
+  beside a `NoWorkLeft` quiescence
+  (`a_retire_is_not_work_the_tally_reports_as_owed`).
+
+  `RoundDrivePolicy::progress_baseline` chooses only what the *total* counts.
+  Both baselines are captured from the run's first plan and share the same
+  completion measure.
+
+  - `ProgressBaseline::Run` (the default, and the historical behavior) counts
+    the vote work that first plan owed. A round resumed with two questions left
+    reports a total of two.
+  - `ProgressBaseline::Ballot` counts every proposal the durable ballot recorded
+    a `Decision::Choice` for, read from `RoundObligations::choice_proposals`.
+    Skipped proposals are excluded: a skip is terminal and owes no vote work, so
+    counting one would leave a host label permanently short of its total on a
+    ballot that is in fact complete. The same resume reports the whole ballot,
+    which is what a host showing "question N of M" across a quit and reopen
+    needs — the denominator does not move between runs.
+
+  The choice belongs to the host because it depends on what the host's progress
+  label claims to be counting, which the driver cannot know.
 - **Every event names the step it came from.** `RoundStepProgress::ChainOutcome`
   and `TreeSynced` carry no subject of their own, so a run that interleaves
   bundles must attribute them or a host will misread per-bundle progress.
@@ -775,6 +796,14 @@ Conformance is demonstrated by behavior. Tests cover:
   progress is measured against what the run started owing
   (`a_batch_counts_every_ordered_member_not_just_its_anchor`,
   `progress_is_measured_against_what_the_run_started_owing`);
+- the ballot baseline keeps its total across a resume, counts every member of an
+  atomic batch, and excludes a skipped proposal, while the default baseline stays
+  run-relative
+  (`the_ballot_baseline_keeps_its_total_across_a_resume`,
+  `the_ballot_baseline_counts_every_member_of_an_atomic_batch`,
+  `a_skipped_proposal_is_not_a_ballot_question`,
+  `selecting_a_baseline_does_not_disturb_a_ballot_both_agree_on`,
+  `the_default_baseline_is_the_run_so_existing_hosts_are_unchanged`);
 - a share a helper accepted or may hold is left to the host's background
   tracking, and neither can outrank a later share the foreground can deliver
   (`a_share_a_helper_already_holds_is_left_to_background_tracking`,

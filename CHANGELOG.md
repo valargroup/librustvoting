@@ -56,6 +56,16 @@ This release is `zcash_voting` 4.0.0.
   cross-language binding sees what a native caller sees. The prelude exports
   the driver types. `RoundRunReport` and `RoundStepFailureRecord` are
   `#[non_exhaustive]`: hosts read a report, never build one.
+- `RoundDrivePolicy::progress_baseline` chooses what a run's progress total is
+  measured against. `ProgressBaseline::Run`, the default, keeps the historical
+  run-relative total: a round resumed with two questions left reports two.
+  `ProgressBaseline::Ballot` counts every proposal the durable ballot recorded
+  a choice for, skips excluded, so a host label like "question N of M" keeps
+  the same M across a quit and reopen. Both are captured from the run's first
+  plan and share one completion measure — a proposal is done once no `Cast` and
+  no `ReconcileChain` obligation covers it — so only the denominator differs.
+  The choice belongs to the host because it depends on what the host's label
+  claims to be counting, which the driver cannot know.
 - `RoundPlan::needs_bundle_setup` reports a round that holds a ballot choice
   but has no bundle rows yet. Eligibility checks do not persist a bundle
   plan, so a host that records a ballot before running setup previously made

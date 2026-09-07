@@ -119,7 +119,7 @@ pub use pir::{
 };
 pub use pir::{PirFleet, PirProofSource, PirSession};
 pub use round_drive::{
-    FailureIsolation, NoopRoundDriveReporter, RoundDriveEvent, RoundDrivePolicy,
+    FailureIsolation, NoopRoundDriveReporter, ProgressBaseline, RoundDriveEvent, RoundDrivePolicy,
     RoundDriveReporter, RoundDriveReporterBridge, RoundDriver, RoundHostSource,
     RoundHostSourceBridge, RoundQuiescence, RoundRunReport, RoundStepFailureRecord, RoundWorkTally,
 };
