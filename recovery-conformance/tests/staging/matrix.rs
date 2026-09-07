@@ -263,9 +263,19 @@ async fn exercise(
     let crash = match crash {
         Ok(crash) => crash,
         Err(error) => {
-            return Err(Outcome::Skipped(format!(
-                "never reached the stage: {error:#}"
-            )))
+            let detail = format!("{error:#}");
+            // A stage that stops firing is the way this suite rots: it becomes
+            // a skip, skips do not fail the matrix, and the run stays green
+            // having proven nothing about that boundary. Only the stages known
+            // to be unreachable may skip; for any other, a trigger that never
+            // fires is a failure.
+            if detail.contains("never reached") && !is_known_unreachable(stage) {
+                return Err(Outcome::Failed(format!(
+                    "{stage} was never reached, and it is not a stage known to be \
+                     unreachable, so its crash seam has stopped firing: {detail}"
+                )));
+            }
+            return Err(Outcome::Skipped(detail));
         }
     };
 
@@ -300,25 +310,22 @@ async fn exercise(
     assert_other_bundles_untouched(&plan, bundle, 3)
         .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
 
-    // A stage that left the chain untouched stops here.
+    // Every stage resumes, including the ones that never reached the chain.
     //
-    // This is not a shortcut. Resuming such a stage to quiescence would
-    // delegate and vote on the shared pre-chain round, and a delegation is
-    // consumed on the vote chain: the next non-mutative stage's copy of that
-    // round would then fail with `nullifier already spent`, which is a
-    // statement about round accounting rather than about recovery. The
-    // alternative — a fresh round per stage — is what `touches_chain()`
-    // already selects for the stages that need it.
+    // They used to stop here, and the reason was sound while it held: a
+    // pre-chain stage resumed on a *shared* round would delegate and vote on
+    // it, and a delegation is consumed on the vote chain, so the next stage's
+    // copy of that round would fail with `nullifier already spent` — a
+    // statement about round accounting rather than about recovery.
     //
-    // What is verified for these stages is everything the crash itself
-    // determines: the stage was reached by a real abort, the durable state is
-    // what that boundary leaves, and the plan derived from it is deterministic
-    // and names the right work. Convergence is proven by the chain-touching
-    // stages, which each get their own round.
-    if !stage.touches_chain() {
-        return Ok(());
-    }
-
+    // That sharing is gone. Every stage now provisions its own round, so a
+    // pre-chain resume consumes only its own delegation and cannot reach
+    // another stage. Stopping early would leave the whole delegation-side
+    // family proving that the crash was real and its durable state correct,
+    // while never proving the round recovers — no A2 convergence and no A3
+    // equality with the control, for six of twenty stages, including
+    // `before-broadcast`, the conservative-by-design case this suite exists
+    // for.
     // (h) resume to quiescence in a new process
     let resumed = config_for(fixture, &sidecar, round, RunMode::Unarmed);
     if started.elapsed() > STAGE_BUDGET {
@@ -503,6 +510,21 @@ fn refresh_warm_pir(
         )
         .map_err(|error| anyhow::anyhow!("copying cached PIR proofs: {error}"))?;
     Ok(added)
+}
+
+/// Stages whose crash seam cannot fire, with the reason.
+///
+/// `AfterVoteCommit` sits between persisting the committed vote and preparing
+/// helper plans, and vote completion has no seam there: the run goes from
+/// `VoteCommit(Signing)` straight to `HelperPlansPrepared`, which is already
+/// the next stage's boundary. Covering it would mean adding a seam to
+/// production vote completion for the sole benefit of this test, which the
+/// repository's standards rule out.
+///
+/// Membership is deliberately narrow. Everything not listed here must actually
+/// crash where it claims to, or the matrix fails rather than skipping.
+fn is_known_unreachable(stage: CrashStage) -> bool {
+    matches!(stage, CrashStage::AfterVoteCommit)
 }
 
 async fn provision(fixture: &Fixture) -> anyhow::Result<ProvisionedRound> {
