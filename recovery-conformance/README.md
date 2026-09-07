@@ -134,7 +134,7 @@ second table is a property the SDK is designed to hold that this suite does
 | **B5** | `committed_post_reservations` never decreases | `assert_reservations_monotonic` |
 | **C5** | A vote submission never exists without a durable helper plan | `assert_plans_precede_broadcast` |
 | **E1** | Bundles other than the crashed one keep their pending work | `assert_other_bundles_untouched` |
-| **B3** (mechanism) | `after-broadcast-unread` must confirm with `confirmation_source = tree`. With no candidate hash to poll, only an exact-tree scan can resolve it — this separates "recovery worked" from "a usable hash happened to survive" | `assert_confirmed_by_tree` |
+| **B3** (part) | A hashless dispatch confirms by one of the two routes open to it, tree scan or same-generation retry, and the route is reported every run. Which one wins is the SDK's choice and not assertable; that no *second* generation was built is what carries the safety claim | `assert_confirmed_by_a_legal_route` |
 | **B2/B3** (identity) | Where the stage captured the dispatched response, the transaction the round finally confirms is **the same one** the killed process had already sent — not merely "exactly one eventually confirmed" | `assert_recovered_the_same_transaction` |
 | **D2** (part) | `after-share-accepted` records a definite acceptance in `sent_to_urls` | `assert_stage_state` |
 | — | Each stage leaves the durable state its row expects (PCZT persisted, proof persisted, vote committed, share journaled) | `assert_stage_state` |
@@ -206,6 +206,17 @@ was noticed. Nothing is excused from firing now: a stage that does not crash
 where it claims to fails the matrix.
 
 ## What this suite cannot cover
+
+- **Which route resolves a hashless dispatch.** A crash between dispatch and
+  response leaves no candidate hash, and recovery may resolve it either by
+  scanning the tree or by re-POSTing the same generation and being handed the
+  hash back. Both are specified. Requiring the tree route appeared to work for a
+  long time only because the crash boundary was wrong: aborting after the whole
+  response had been read let the chain include the transaction first, so the
+  tree won the race. At the real boundary the retry usually wins, and waiting
+  for block inclusion before resuming does not change it. The route is printed
+  every run so a change is visible; the safety claim rests on no second
+  generation being built, which is asserted.
 
 - **Atomic vote batches.** `ATOMIC_VOTE_BATCHES_ENABLED = false`
   (`zcash_voting/src/lib.rs`) while no deployed chain serves `cast-vote-batch`,

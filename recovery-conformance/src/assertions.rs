@@ -79,7 +79,7 @@ impl Submission {
 /// The comparable shape of a finished round. See [`DurableSnapshot::shape`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoundShape {
-    submissions: BTreeMap<(String, i64, Option<i64>), (String, bool)>,
+    submissions: BTreeMap<(String, i64, Option<i64>), String>,
     bundles: i64,
     proofs: i64,
     votes: i64,
@@ -190,10 +190,16 @@ impl DurableSnapshot {
     /// by list position, and carries the durable counts alongside.
     ///
     /// What it deliberately omits is anything that legitimately differs
-    /// between two distinct rounds: identity keys, generation digests,
-    /// transaction hashes, tree positions, and the confirmation *source* — a
-    /// crashed round may confirm by tree where the control confirmed by hash,
-    /// which is recovery working, not a divergence.
+    /// between two distinct rounds: identity keys, generation digests, tree
+    /// positions, and everything that records *how* a submission confirmed
+    /// rather than that it did. A crashed round may confirm by tree where the
+    /// control confirmed by hash, which is recovery working, not a divergence.
+    ///
+    /// That covers the confirmed transaction hash as well as
+    /// `confirmation_source`. The two say the same thing — the schema forbids
+    /// a tree confirmation from carrying a hash — so keeping the hash would
+    /// reintroduce the very difference this excludes, and fail every stage
+    /// whose recovery went through the tree.
     pub fn shape(&self) -> RoundShape {
         RoundShape {
             submissions: self
@@ -206,7 +212,7 @@ impl DurableSnapshot {
                             submission.bundle_index,
                             submission.proposal_id,
                         ),
-                        (submission.state.clone(), submission.has_confirmed_hash),
+                        submission.state.clone(),
                     )
                 })
                 .collect(),
@@ -499,14 +505,39 @@ pub fn confirmation_source(sidecar: &std::path::Path) -> Result<Option<String>> 
         .ok())
 }
 
-/// A hashless dispatch must confirm through the tree, not through a hash.
-pub fn assert_confirmed_by_tree(source: Option<&str>) -> Result<()> {
+/// A hashless dispatch must confirm, by one of the two routes open to it.
+///
+/// It used to require `tree`, on the reasoning that a submission whose response
+/// was never read has no candidate hash to poll, so only an exact-tree scan can
+/// resolve it. The first half is right and the conclusion is not: the
+/// specification also allows a bounded *same-generation* retry from
+/// `Recovering`, and states that "a canonical accepted hash from a hashless
+/// retry resumes `Tracking`". Re-POSTing the identical transaction and being
+/// handed back its hash is therefore a legal resolution, and on staging it is
+/// the one that usually wins.
+///
+/// Requiring `tree` looked sound for a long time because the crash boundary was
+/// wrong: aborting only after the full HTTP response had been read gave the
+/// chain time to include the transaction, so the tree route won the race. Once
+/// the crash moved to the real dispatch boundary the retry began winning
+/// instead — and waiting for block inclusion before resuming does not change
+/// that, so the route is the SDK's choice rather than a function of what the
+/// chain holds.
+///
+/// What must hold either way is that the round confirmed *this* generation and
+/// built no other, which [`assert_no_second_generation`] carries. This is
+/// deliberately the weaker claim: the route is reported for every run so a
+/// change in it is visible, but a suite cannot assert a choice the
+/// specification leaves open.
+pub fn assert_confirmed_by_a_legal_route(source: Option<&str>) -> Result<()> {
     let source = source.context(
-        "B3 VIOLATED: the delegation confirmed without recording what the confirmation          rested on",
+        "B3 VIOLATED: the delegation confirmed without recording what the confirmation \
+         rested on",
     )?;
     anyhow::ensure!(
-        source.eq_ignore_ascii_case("tree"),
-        "B3 VIOLATED: a submission whose response was never read confirmed from {source:?};          with no candidate hash to poll, only an exact-tree scan can resolve it"
+        source.eq_ignore_ascii_case("tree") || source.eq_ignore_ascii_case("hash"),
+        "B3 VIOLATED: a submission confirmed from {source:?}, which is neither of the two \
+         routes a hashless dispatch may take"
     );
     Ok(())
 }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use recovery_conformance::assertions::{
-    assert_confirmed_by_tree, assert_idempotent, assert_matches_control,
+    assert_confirmed_by_a_legal_route, assert_idempotent, assert_matches_control,
     assert_no_second_generation, assert_other_bundles_untouched, assert_plans_precede_broadcast,
     assert_recovered_the_same_transaction, assert_reservations_monotonic, assert_stage_state,
     assert_terminal_rows_unchanged, assert_untouched_bundles_did_not_reserve, confirmation_source,
@@ -37,6 +37,13 @@ const STAGE_BUDGET: Duration = Duration::from_secs(45 * 60);
 /// it may be retried — bounded by the timing policy the suite passes to
 /// background tracking.
 const VOTE_WINDOW_SECONDS: i64 = 14 * 24 * 3600;
+
+/// How long a dispatched transaction is given to reach a block.
+///
+/// Only the stages whose premise is "the chain already holds this" wait. Long
+/// enough for inclusion on `svote-1`, and paid once by two stages rather than
+/// by the whole matrix.
+const CHAIN_INCLUSION_WAIT: Duration = Duration::from_secs(45);
 
 /// Dispatch ceiling for one drive, so a plan that never shrinks ends the run.
 ///
@@ -326,6 +333,19 @@ async fn exercise(
     // equality with the control, for six of twenty stages, including
     // `before-broadcast`, the conservative-by-design case this suite exists
     // for.
+    // A dispatched transaction needs to reach a block before the premise of
+    // these stages holds. Their whole point is that the chain *has* the
+    // transaction while the wallet has no hash for it, and exact-tree recovery
+    // resolves the gap. Resuming the instant the bytes leave tests something
+    // else: the tree pass runs, correctly finds nothing yet, and a
+    // same-generation retry supplies the hash instead — spec-legal, but it
+    // means the tree route is never the thing that resolved the round, and
+    // whether it was came down to a race with block inclusion.
+    if stage.settles_on_chain_before_resume() {
+        eprintln!("  {stage}: waiting {CHAIN_INCLUSION_WAIT:?} for the dispatched transaction");
+        tokio::time::sleep(CHAIN_INCLUSION_WAIT).await;
+    }
+
     // (h) resume to quiescence in a new process
     let resumed = config_for(fixture, &sidecar, round, RunMode::Unarmed);
     if started.elapsed() > STAGE_BUDGET {
@@ -383,14 +403,15 @@ async fn exercise(
         terminal.states()
     );
 
-    // The mechanism, for the one stage that can only have used it: a crash
-    // after dispatch but before the response was read leaves no candidate hash,
-    // so confirmation can only come from scanning the tree.
+    // A crash after dispatch but before the response was read leaves no
+    // candidate hash, so recovery must resolve it either by scanning the tree
+    // or by re-POSTing the same generation. The route is reported every run:
+    // it is not assertable, but a change in it should not pass unseen.
     if stage == CrashStage::AfterBroadcastUnread {
         let source =
             confirmation_source(&sidecar).map_err(|error| Outcome::Failed(format!("{error:#}")))?;
         eprintln!("  {stage}: confirmation source {:?}", source.as_deref());
-        assert_confirmed_by_tree(source.as_deref())
+        assert_confirmed_by_a_legal_route(source.as_deref())
             .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     }
 

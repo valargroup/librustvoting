@@ -221,6 +221,17 @@ impl CrashStage {
         )
     }
 
+    /// Whether the resume must wait for the dispatched transaction to land.
+    ///
+    /// True only where the stage's premise is that the chain already holds a
+    /// transaction the wallet cannot name. Resuming before inclusion leaves the
+    /// tree with nothing to find, so recovery resolves by same-generation retry
+    /// instead — legal, but it exercises the retry path under a stage that
+    /// exists to exercise the tree one.
+    pub fn settles_on_chain_before_resume(self) -> bool {
+        matches!(self, Self::AfterBroadcastUnread | Self::AfterBroadcastRead)
+    }
+
     /// Whether this stage is one of the two double-spend-adjacent cases.
     ///
     /// `BeforeBroadcast` is conservative-by-design: nothing was sent, yet the
