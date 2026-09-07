@@ -5,9 +5,11 @@
 //! module is the part in between: it asks helpers what they know, decides what
 //! their answers mean, and drives the durable state forward.
 //!
-//! Wallets should call [`track_pending_shares`] on a timer and keep only the
-//! lifecycle concerns — the timer itself, app lock, and round expiry — on their
-//! side, surfaced through the `cancel` callback.
+//! [`track_pending_shares`] performs one pass and reports what the next one
+//! needs: the shares still unconfirmed, and how long to wait before asking
+//! again. A caller repeats it on that cadence and keeps only the lifecycle
+//! concerns — the timer itself, app lock, and round expiry — on its side,
+//! surfaced through the `cancel` callback.
 //!
 //! # Trust model
 //!
@@ -389,6 +391,13 @@ pub struct ShareTrackingReport {
     pub cancelled: bool,
     /// Seconds to wait before the next pass, or `None` when nothing is pending.
     pub next_delay_seconds: Option<u64>,
+    /// Shares still unconfirmed when the pass finished.
+    ///
+    /// Read against `unrecoverable`: equal counts mean every share left is
+    /// beyond repair, so polling again cannot change anything. Without it a
+    /// caller cannot tell that state from shares that are merely waiting,
+    /// because both keep producing a next delay.
+    pub remaining_unconfirmed: usize,
 }
 
 /// Inputs for a focused confirmation check over one durable helper share.
@@ -872,12 +881,34 @@ async fn track_pending_shares_with_elapsed(
     // Recompute from storage so explicit confirmations made by another task
     // during this pass do not remain in the next-delay calculation.
     let current_time = params.now_seconds.saturating_add(elapsed_seconds());
-    report.next_delay_seconds = next_tracking_delay_seconds(
-        &share::unconfirmed_for_scope(db, &scope, params.round_id)?,
-        current_time,
-        params.policy,
-    );
+    let still_unconfirmed = share::unconfirmed_for_scope(db, &scope, params.round_id)?;
+    report.remaining_unconfirmed = still_unconfirmed.len();
+    report.next_delay_seconds =
+        next_tracking_delay_seconds(&still_unconfirmed, current_time, params.policy)
+            .map(|delay| cap_delay_at_vote_end(delay, current_time, params.vote_end_time_seconds));
     Ok(report)
+}
+
+/// Shortens a next-pass delay so it never lands past the round's vote end.
+///
+/// Recovery closes at vote end, so a delay that steps over it would skip the
+/// last pass that could still resubmit or confirm a share. Without a vote-end
+/// time there is no boundary to respect and the delay stands. A round already
+/// at or past its end yields `0`: whether to run a final pass at all is the
+/// caller's decision, not something to encode as a wait.
+///
+/// A `0` is safe to act on only because a caller re-reads the boundary before
+/// its next pass. A caller that waits `0` against a clock that never advances
+/// gets a pass loop with no delay in it.
+fn cap_delay_at_vote_end(
+    delay_seconds: u64,
+    now_seconds: u64,
+    vote_end_time_seconds: Option<u64>,
+) -> u64 {
+    let Some(vote_end) = vote_end_time_seconds else {
+        return delay_seconds;
+    };
+    delay_seconds.min(vote_end.saturating_sub(now_seconds))
 }
 
 fn dedupe_preserving_order(urls: impl Iterator<Item = String>) -> Vec<String> {

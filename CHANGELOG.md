@@ -95,6 +95,11 @@ This release is `zcash_voting` 4.0.0.
   `share::next_tracking_delay_for_round` let a host schedule background share
   tracking without holding durable share rows: the plan says whether any share
   is still unconfirmed, and the delay is computed from the round's own records.
+- `ShareTrackingReport::remaining_unconfirmed` counts the shares a tracking
+  pass left behind. Read against `unrecoverable`, equal counts mean every
+  share left is beyond repair and polling again cannot change anything; a
+  caller could not otherwise tell that from shares merely waiting, because
+  both keep producing a next delay.
 - `PirFleet`, `PirSession`, and `PirProofSource`: ordered PIR endpoints with
   failover on typed retryable failures, serviced from a dedicated thread so
   proving can run inside another runtime's blocking pool.
@@ -586,6 +591,15 @@ This release is `zcash_voting` 4.0.0.
   structured fields. Their display text keeps the earlier wording.
 
 ### Fixed
+
+- A helper-share tracking pass no longer reports a next delay that lands past
+  the round's vote end. Recovery closes there, so a delay stepping over it
+  skipped the last pass that could still resubmit or confirm a share — with
+  the default cadence, a round entering its final seconds asked to be polled
+  again fifteen seconds after it had closed. The delay is now shortened to the
+  boundary, and a round already at or past its end yields `0` rather than the
+  three-second floor, leaving the decision to run a final pass to the caller.
+  A round with no vote-end time has no boundary to respect and is unchanged.
 
 - Three guards that must refuse an action on a vote already on chain now
   recognise one confirmed by an exact-tree scan. `ensure_vote_rebuild_allowed`,

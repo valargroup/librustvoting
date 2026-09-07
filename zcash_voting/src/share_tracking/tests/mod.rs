@@ -584,5 +584,6 @@ mod batch_report;
 mod confirmation;
 mod delivery_plan;
 mod initial_delivery;
+mod next_pass;
 mod recovery;
 mod timing_policy;

@@ -591,9 +591,26 @@ and a share still before its boundary is waited for until it arrives, capped at
 queueing behind an unrelated share whose check is further out. Every nonempty
 delay is at least three seconds. No unconfirmed shares yields no next delay.
 
+That delay is then shortened so it never lands past the round's vote end,
+because recovery closes there and a delay stepping over it would skip the last
+pass that could still act. A round with no vote-end time has no boundary to
+respect and keeps the delay unchanged. A round already at or past its end
+yields `0` rather than the three-second floor: whether to run a final pass at
+all is the caller's decision, not something to encode as a wait. Acting on a
+`0` is safe only for a caller that re-reads the boundary before its next pass.
+
+`ShareTrackingReport::next_delay_seconds` carries the result, and
+`ShareTrackingReport::remaining_unconfirmed` carries how many shares the pass
+left behind. The second is read against `unrecoverable`: equal counts mean
+every share left is beyond repair, so polling again cannot change anything,
+and a next delay alone cannot distinguish that from shares merely waiting,
+because both keep producing one.
+
 Enforcement: `share_recovery_base_time`, `should_resubmit_share`,
 `is_share_resubmission_window_open`, and `next_tracking_delay_seconds` in
-[`share_policy/timing.rs`](../zcash_voting/src/share_policy/timing.rs).
+[`share_policy/timing.rs`](../zcash_voting/src/share_policy/timing.rs), and
+`cap_delay_at_vote_end` in
+[`share_tracking/mod.rs`](../zcash_voting/src/share_tracking/mod.rs).
 
 Regression tests: `immediate_shares_use_created_at_for_status_and_retry`,
 `delayed_shares_use_submit_at_for_status_and_retry`,
@@ -609,6 +626,17 @@ Facade-level timing behavior is covered by
 `missing_vote_end_suppresses_overdue_but_not_status_checks`, and
 `young_share_is_idle_until_the_status_grace_passes` in
 [`share_tracking/tests/timing_policy.rs`](../zcash_voting/src/share_tracking/tests/timing_policy.rs).
+
+What a pass reports to the next one is covered by
+`a_delay_landing_before_the_vote_end_is_left_alone`,
+`a_delay_stepping_over_the_vote_end_is_shortened_to_it`,
+`a_round_at_or_past_its_vote_end_yields_no_wait`,
+`a_round_without_a_vote_end_keeps_its_delay`,
+`a_pass_that_confirms_nothing_reports_the_share_still_unconfirmed`,
+`a_confirmed_share_leaves_nothing_unconfirmed_and_no_next_delay`,
+`the_next_delay_a_pass_reports_never_steps_over_the_vote_end`, and
+`a_round_with_no_vote_end_keeps_the_delay_the_shares_asked_for` in
+[`share_tracking/tests/next_pass.rs`](../zcash_voting/src/share_tracking/tests/next_pass.rs).
 
 ## Transport and timeout invariants
 
