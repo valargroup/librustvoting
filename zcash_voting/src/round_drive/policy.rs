@@ -10,14 +10,24 @@ use std::{num::NonZeroUsize, time::Duration};
 /// calls.
 #[derive(Clone, Debug)]
 pub struct RoundDrivePolicy {
-    /// Wait between two episodes of the same still-tracking obligation.
+    /// Wait between two attempts at the same unfinished obligation.
     ///
-    /// Applied only when the step returned `Pending` and its chain outcome is
-    /// still `Tracking`. A submission that ended an episode in recovery
+    /// Applied whenever a step returns `Pending`, which is more than chain
+    /// tracking. All three of these are paced by it:
+    ///
+    /// - a chain submission still `Tracking`;
+    /// - a share confirmation the helpers have not answered yet, which carries
+    ///   no chain outcome at all;
+    /// - a vote already `Confirmed` on chain whose helper delivery is waiting
+    ///   on ambiguous attempts.
+    ///
+    /// So this is helper retry latency as well as chain re-poll latency; there
+    /// is one control for both. A submission that ended an episode in recovery
     /// quiesces instead, so a stuck row surfaces to the host rather than being
     /// retried silently for the rest of the round. The wait ends early on
     /// cancellation or an operation-epoch change, so a host that closes the
-    /// session does not pay it.
+    /// session does not pay it, and it is not taken at all once the dispatch
+    /// budget is spent.
     pub pending_repoll: Duration,
 
     /// How many bundle-locked obligations run at once.

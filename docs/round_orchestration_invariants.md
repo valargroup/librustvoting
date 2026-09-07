@@ -421,9 +421,26 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   stand rather than replacing it
   (`a_rejected_submission_stops_the_run_carrying_its_diagnostic`,
   `a_run_cancelled_after_a_wave_still_reports_what_the_wave_did`).
+- **The foreground never dispatches a share a helper already accepted.** Not
+  only when such shares are all that is left: they are filtered out of the
+  candidate stream whatever else the plan lists. Plan order can put one ahead
+  of a share no helper has reached, and a re-poll promotes the step it named,
+  so leaving them selectable let a background poll starve the delivery the
+  round actually owed — indefinitely, until the dispatch budget ran out
+  (`an_accepted_share_never_outranks_the_delivery_the_round_owes`).
+- **A step callback is a boundary too.** `StepFinished` and `StepFailed` run
+  host code, so a cancellation or an epoch switch can arrive during the fold. A
+  wave that also produced a terminal or stalled outcome reports `Cancelled`
+  rather than that outcome, which is what `RoundDriver::run` promises; the
+  diagnostic is not lost, since `chain_outcomes` and `failures` carry it either
+  way (`a_cancellation_raised_by_a_step_callback_outranks_the_wave_s_own_stop`).
 - **A report's fields say what they hold.** `chain_outcomes` is every chain
   outcome the run observed, tracking results included, not only terminal ones.
-  `delegations` is what the run *signed*, which is not what it submitted: a
+  `RoundDrivePolicy::pending_repoll` paces every unfinished obligation, not
+  only chain tracking: a share confirmation the helpers have not answered and a
+  confirmed vote whose delivery waits on ambiguous attempts use the same delay,
+  so it is helper retry latency as well. `delegations` is what the run
+  *signed*, which is not what it submitted: a
   step cancelled between signing and building its chain request produces a
   bundle, and `SignedDelegationBundle` carries no submission state — its wire
   `status` is always `ready_for_submission`. The durable answer for a bundle is

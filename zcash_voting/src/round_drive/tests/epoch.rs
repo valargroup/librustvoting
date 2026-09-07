@@ -227,3 +227,58 @@ async fn a_run_cancelled_after_a_wave_still_reports_what_the_wave_did() {
         "the report describes the round the wave left"
     );
 }
+
+#[tokio::test]
+async fn a_cancellation_raised_by_a_step_callback_outranks_the_wave_s_own_stop() {
+    // `StepFinished` runs host code, so the fold is a place a cancellation
+    // arrives. A wave that also produced a terminal chain outcome reported
+    // that instead, against `run`'s promise that an interruption ends the run
+    // as `Cancelled` at the next boundary. The rejection is not lost: it is in
+    // `chain_outcomes` either way.
+    let database = database_with_imported_delegation();
+    let chain = Arc::new(ScriptedChain::default());
+    let executor = executor_over_chain(Arc::clone(&database), Arc::clone(&chain));
+    let one_dispatch = crate::RoundDrivePolicy {
+        max_dispatches: 1,
+        ..crate::RoundDrivePolicy::default()
+    };
+    let control = ChainSubmissionControl::new(1);
+
+    chain.queue_not_found();
+    let _ = crate::RoundDriver::new(&executor)
+        .with_policy(one_dispatch.clone())
+        .run(&SinglePassHost, &control, &RecordingReporter::default())
+        .await;
+    database
+        .conn()
+        .execute(
+            "UPDATE chain_submissions
+             SET state = 'recovering', diagnostic_kind = 'tracking_window_expired',
+                 diagnostic = 'tracking expired'",
+            [],
+        )
+        .unwrap();
+    chain.queue_rejected();
+
+    let report = crate::RoundDriver::new(&executor)
+        .with_policy(one_dispatch)
+        .run(
+            &SinglePassHost,
+            &control,
+            &CancellingOnStepFinished {
+                control: control.clone(),
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(report.quiescence, crate::RoundQuiescence::Cancelled),
+        "the host abandoned the run during the fold: {:?}",
+        report.quiescence
+    );
+    assert_eq!(
+        report.chain_outcomes.len(),
+        1,
+        "the rejection the wave observed is still reported"
+    );
+}

@@ -176,17 +176,39 @@ fn background_share_handoff(
                 bundle_index,
                 proposal_id,
                 share_index,
-            } => {
-                let share = ShareKey {
-                    bundle_index: *bundle_index,
-                    proposal_id: *proposal_id,
-                    share_index: *share_index,
-                };
-                accepted_by_a_helper(obligations, &share).then_some(share)
-            }
+            } if is_background_share(step, obligations) => Some(ShareKey {
+                bundle_index: *bundle_index,
+                proposal_id: *proposal_id,
+                share_index: *share_index,
+            }),
             _ => None,
         })
         .collect()
+}
+
+/// Whether this step is a share the host's background timer owns.
+///
+/// The foreground never dispatches one, whatever else the plan lists. It is
+/// finished by polling, and a run that polled it would not only hold the vote
+/// flow open for work that does not block it — plan order could put it ahead of
+/// a share no helper has reached, and a re-poll promotes the step it named, so
+/// the undelivered share would never be submitted at all.
+pub(super) fn is_background_share(step: &NextStep, obligations: &[Obligation]) -> bool {
+    match step {
+        NextStep::ConfirmShare {
+            bundle_index,
+            proposal_id,
+            share_index,
+        } => accepted_by_a_helper(
+            obligations,
+            &ShareKey {
+                bundle_index: *bundle_index,
+                proposal_id: *proposal_id,
+                share_index: *share_index,
+            },
+        ),
+        _ => false,
+    }
 }
 
 /// Whether the classifier says some helper already holds `share`.

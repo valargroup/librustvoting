@@ -963,7 +963,9 @@ pub struct RoundDriveEventView {
     /// `StepFailed`: why it failed.
     pub failure_kind: Option<RoundStepFailureKindView>,
     pub message: Option<String>,
-    /// `AwaitingRepoll`: how long the driver waits before polling again.
+    /// `AwaitingRepoll`: how long the driver waits before trying the step
+    /// again. Paces chain tracking and unfinished helper work alike, so read
+    /// `step` rather than labelling the wait as chain work.
     pub delay_seconds: Option<f64>,
     /// `BundleSkipped`: the bundle isolated for the rest of the run.
     pub bundle_index: Option<u32>,

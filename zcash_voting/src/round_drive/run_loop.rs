@@ -6,13 +6,16 @@
 //! records what happened and whether it ends the run, and `quiescence` says
 //! why a plan with nothing dispatchable stops.
 
-use crate::{round_planning::ClassifiedPlan, ChainSubmissionControl, ChainTransport, VotingError};
+use crate::{
+    round_planning::ClassifiedPlan, session::NextStep, ChainSubmissionControl, ChainTransport,
+    VotingError,
+};
 
 use super::{
     dispatch,
     policy::FailureIsolation,
     progress::{RoundDriveEvent, RoundDriveReporter},
-    quiescence::{quiesce_before_dispatch, RoundQuiescence},
+    quiescence::{is_background_share, quiesce_before_dispatch, RoundQuiescence},
     run_ledger::Run,
     selection, signing,
     tally::BallotBaseline,
@@ -127,13 +130,25 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                 let remaining = classified.plan.next_steps.clone();
                 return run.finish(RoundQuiescence::PassBudgetExhausted { remaining });
             }
+            // Shares a helper already accepted are never dispatched by the
+            // foreground, even when other work makes this plan dispatchable.
+            // Plan order can put one ahead of a share no helper has reached,
+            // and a re-poll promotes the step it named, so leaving them in the
+            // stream let a background poll starve the delivery the round
+            // actually owed.
+            let dispatchable: Vec<NextStep> = classified
+                .plan
+                .next_steps
+                .iter()
+                .filter(|step| !is_background_share(step, &classified.obligations.obligations))
+                .cloned()
+                .collect();
             run.awaiting_repoll.retain(|step| {
-                classified.plan.next_steps.contains(step)
-                    && !run.skipped.contains(&selection::bundle_index(step))
+                dispatchable.contains(step) && !run.skipped.contains(&selection::bundle_index(step))
             });
             let remaining_budget = self.policy.max_dispatches - run.dispatches;
             let steps = selection::next_dispatches(
-                &classified.plan.next_steps,
+                &dispatchable,
                 &run.skipped,
                 &run.awaiting_repoll,
                 self.policy.max_bundle_concurrency.get(),
@@ -213,6 +228,16 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                         }
                     }
                 }
+            }
+            // `StepFinished` and `StepFailed` run host code, so the fold above
+            // can be where a cancellation or an epoch switch arrives. A wave
+            // that also produced a terminal or stalled outcome would otherwise
+            // report that instead, and `run` promises an interruption ends the
+            // run as `Cancelled` at the next boundary. The diagnostic is not
+            // lost: it is in `chain_outcomes` and `failures` either way.
+            if interrupted() {
+                self.refresh_progress(&mut run);
+                return run.finish(RoundQuiescence::Cancelled);
             }
             if let Some(quiescence) = wave_quiescence {
                 // The wave made durable progress before it stopped, so the

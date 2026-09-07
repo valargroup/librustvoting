@@ -44,8 +44,15 @@ pub enum RoundDriveEvent {
         kind: RoundStepFailureKind,
         message: String,
     },
-    /// The step's chain work is still tracking; the driver waits `delay` and
-    /// dispatches it again.
+    /// The step did not finish; the driver waits `delay` and dispatches it
+    /// again.
+    ///
+    /// Not only chain tracking: a share confirmation the helpers have not
+    /// answered, and a confirmed vote whose delivery waits on ambiguous
+    /// attempts, are paced by the same
+    /// [`pending_repoll`](super::RoundDrivePolicy::pending_repoll). Read the
+    /// step to tell them apart rather than labelling every one of these as
+    /// chain work.
     AwaitingRepoll { step: NextStep, delay: Duration },
     /// Every remaining obligation on this bundle is skipped for this run.
     BundleSkipped { bundle_index: u32, after: NextStep },

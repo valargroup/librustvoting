@@ -306,3 +306,85 @@ async fn a_share_a_helper_already_holds_is_left_to_background_tracking() {
         "the run polls nothing itself"
     );
 }
+
+#[tokio::test]
+async fn an_accepted_share_never_outranks_the_delivery_the_round_owes() {
+    // Plan order puts the accepted share first, and only the foreground can
+    // deliver the one no helper reached. Leaving the accepted share in the
+    // dispatch stream let the run poll it, and a re-poll promotes the step it
+    // named, so the undelivered share was never submitted at all.
+    let helpers = vec!["http://helper.invalid".to_string()];
+    let database = crate::share_tracking::tests::db_with_share(&helpers);
+    // Share 1 was attempted and reached nobody: it owes delivery, not polling.
+    crate::share::record_delivery(
+        &database,
+        &crate::share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 1,
+            submission: &crate::share_tracking::ShareSubmissionReport {
+                accepted_urls: Vec::new(),
+                ambiguous_urls: Vec::new(),
+                target_count: helpers.len(),
+            },
+            submit_at: 1_700_000_000,
+        },
+    )
+    .unwrap();
+    database
+        .conn()
+        .execute(
+            "UPDATE votes SET tx_hash = 'aa' WHERE round_id = :round_id
+               AND wallet_id = :wallet_id AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": database.wallet_id(),
+            },
+        )
+        .unwrap();
+    let executor = executor_over_share_round(Arc::new(database));
+    let classified = executor.plan_classified().unwrap();
+
+    let accepted = NextStep::ConfirmShare {
+        bundle_index: 0,
+        proposal_id: 1,
+        share_index: 0,
+    };
+    let undelivered = NextStep::ConfirmShare {
+        bundle_index: 0,
+        proposal_id: 1,
+        share_index: 1,
+    };
+    assert_eq!(
+        classified.plan.next_steps,
+        vec![accepted.clone(), undelivered.clone()],
+        "the accepted share sorts ahead of the one that owes delivery"
+    );
+    assert!(
+        classified.plan.blocking_share_work,
+        "share 1 has reached no helper"
+    );
+
+    let control = ChainSubmissionControl::new(1);
+    let (_report, events) = drive(&executor, &control).await;
+
+    let selected: Vec<_> = events
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            RoundDriveEvent::StepSelected { step } => Some(step.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        selected.contains(&undelivered),
+        "the run owes this delivery: {selected:?}"
+    );
+    assert!(
+        !selected.contains(&accepted),
+        "the accepted share is the timer's, not this run's: {selected:?}"
+    );
+}
