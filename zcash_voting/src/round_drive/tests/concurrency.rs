@@ -121,7 +121,7 @@ async fn observe_wave(
     max_dispatches: usize,
 ) -> (RoundRunReport, usize, Vec<u32>) {
     let database = database_with_bundles(bundle_count);
-    let executor = executor_over(Arc::clone(&database));
+    let executor = executor_over_unreachable_chain(Arc::clone(&database));
     decide_ballot(&executor);
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let probe = Arc::new(ConcurrencyProbe::default());

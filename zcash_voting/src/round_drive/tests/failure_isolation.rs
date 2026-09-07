@@ -6,7 +6,7 @@ use super::fixtures::*;
 /// reached. Each bundle's delegation proves and signs, then fails at dispatch.
 async fn run_two_failing_bundles(isolation: FailureIsolation) -> (RoundRunReport, Vec<String>) {
     let database = database_with_bundles(2);
-    let executor = executor_over(Arc::clone(&database));
+    let executor = executor_over_unreachable_chain(Arc::clone(&database));
     decide_ballot(&executor);
     let plan = executor.plan().unwrap();
     assert_eq!(
@@ -98,7 +98,7 @@ async fn stop_round_ends_at_the_first_failure() {
 #[tokio::test]
 async fn a_skipped_bundle_is_reported_as_it_happens() {
     let database = database_with_bundles(2);
-    let executor = executor_over(Arc::clone(&database));
+    let executor = executor_over_unreachable_chain(Arc::clone(&database));
     decide_ballot(&executor);
     let control = ChainSubmissionControl::new(1);
     let events = RecordingReporter::default();

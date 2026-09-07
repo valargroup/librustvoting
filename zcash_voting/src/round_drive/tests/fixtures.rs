@@ -218,9 +218,9 @@ pub(super) async fn drive(
 
 /// A delegation driver that proves and signs without touching a network.
 ///
-/// The chain endpoint the fixture executor is built with is unreachable, so a
-/// bundle that gets this far still fails at dispatch. That is what the failure
-/// isolation tests need: a step that runs and then fails, per bundle.
+/// Paired with [`UnreachableChain`], a bundle that gets this far still fails at
+/// dispatch. That is what the failure isolation tests need: a step that runs
+/// and then fails, per bundle.
 pub(super) struct SigningDriver {
     pub(super) database: Arc<crate::round::VotingDb>,
 }
@@ -387,7 +387,7 @@ fn signing_host_context(
 
 /// Records both proposals as choices, so the bundle's cast is due and its
 /// delegation becomes the plan's first step.
-pub(super) fn decide_ballot(executor: &RoundExecutor<HyperTransport>) {
+pub(super) fn decide_ballot<T: crate::ChainTransport>(executor: &RoundExecutor<T>) {
     executor
         .set_ballot_intents(&[
             BallotIntent {
@@ -480,6 +480,76 @@ impl crate::ChainTransport for Arc<ScriptedChain> {
     ) -> crate::ChainTransportFuture<'a> {
         Box::pin(async move { panic!("these tests never dispatch a transaction") })
     }
+}
+
+/// A chain that is never reachable, without involving a network.
+///
+/// The failure-isolation and concurrency tests need a step that runs and then
+/// fails, once per bundle. They got that by pointing the executor at a
+/// hostname under `.invalid` and relying on the machine's resolver to refuse
+/// it, which makes a hermetic test depend on how and how fast DNS fails. This
+/// returns the same `DefinitelyUnsent` a refused connection produces, with
+/// nothing outside the process involved.
+pub(super) struct UnreachableChain;
+
+impl crate::ChainTransport for Arc<UnreachableChain> {
+    fn chain_get<'a>(
+        &'a self,
+        _request: crate::ChainHttpRequest,
+    ) -> crate::ChainTransportFuture<'a> {
+        Box::pin(async {
+            Err(crate::ChainTransportError::definitely_unsent(
+                "the chain is unreachable",
+            ))
+        })
+    }
+
+    fn chain_post_json<'a>(
+        &'a self,
+        _request: crate::ChainHttpRequest,
+        _json: Vec<u8>,
+    ) -> crate::ChainTransportFuture<'a> {
+        Box::pin(async {
+            Err(crate::ChainTransportError::definitely_unsent(
+                "the chain is unreachable",
+            ))
+        })
+    }
+}
+
+/// The two-proposal executor of [`executor_over`], over a chain that always
+/// refuses, so a dispatch fails for a reason the test states rather than one
+/// the environment supplies.
+pub(super) fn executor_over_unreachable_chain(
+    database: Arc<crate::round::VotingDb>,
+) -> RoundExecutor<Arc<UnreachableChain>> {
+    let helper_client = HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
+    RoundExecutor::with_transport(
+        database,
+        Arc::new(UnreachableChain),
+        ChainSubmissionClientConfig::for_network(
+            Network::Testnet,
+            vec!["https://vote.example".to_string()],
+        ),
+        helper_client,
+    )
+    .unwrap()
+    .with_binding(RoundBinding {
+        round_id: ROUND_ID.to_string(),
+        network: Network::Testnet,
+        proposals: vec![
+            ProposalRosterEntry {
+                proposal_id: 1,
+                num_options: 2,
+            },
+            ProposalRosterEntry {
+                proposal_id: 2,
+                num_options: 3,
+            },
+        ],
+        hotkey_secret: Some(zeroize::Zeroizing::new(vec![HOTKEY_SECRET_BYTE; 64])),
+    })
+    .unwrap()
 }
 
 /// The transaction hash the imported delegation below is adopted from.
