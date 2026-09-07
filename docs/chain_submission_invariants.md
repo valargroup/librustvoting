@@ -649,6 +649,107 @@ from an executor that declares `hook_precedes_connection_setup` (the SDK's
 and reports connect failures distinctly). An executor must fail closed when
 its route is unavailable and must never fall back to a direct connection.
 
+A caller may bound connection setup more tightly than the request as a whole,
+through the request's `connect_timeout`. Such a budget only ever tightens the
+connect deadline, never relaxes it: the derived lead stays the upper bound, so
+connection setup still gives up before the whole-request backstop can fire and
+a stalled connect stays a definite pre-dispatch failure.
+
+Only the executor can enforce that budget, because only the executor observes
+connection setup; the SDK never does. An executor therefore declares whether it
+bounds setup by `connect_timeout` through `RouteHttp::enforces_connect_timeout`,
+and only for such an executor does the SDK read a pre-dispatch failure at or
+after the budget as the budget expiring rather than as the endpoint's answer.
+An executor that ignores the budget is bounded by `timeout` alone and has its
+pre-dispatch failures read as the definite answers they are, so a refusal that
+merely arrived late is never reinterpreted as a timeout. This mirrors
+`hook_precedes_connection_setup`: a classification the SDK cannot verify is
+drawn only from an executor that declares the property it depends on.
+
+The declaration is a property of how an executor was built, not of its type.
+The SDK's `DirectRoute` declares enforcement only when constructed by `new` or
+`with_http_connector`, which install the connection-setup deadline around the
+connector; `with_connector` takes a fully configured connector as given, adds
+no deadline, and so declares nothing. An executor must not declare enforcement
+it does not perform: doing so is the one way a definite pre-dispatch refusal
+that merely arrived late gets repeated.
+
+Enforcement covers the whole of connection setup, connector readiness included,
+not only the connection attempt itself. A connector that withholds readiness
+past the deadline and then reports a failure would otherwise produce a
+pre-dispatch failure arriving after the budget from a route that claims to
+enforce it. Past the deadline the answer is that connection setup ran out of
+time, whatever the connector would have said next.
+
+Readiness is bounded by racing the connector against a timer that registers the
+caller's waker, not by sampling the clock when readiness happens to be polled.
+The distinction is the difference between a bound and an observation: a
+connector that returns pending decides when it is polled again, so a clock read
+on entry may never run after the deadline, and the stall would be caught only
+by the looser whole-request backstop. An executor that declares enforcement
+must bound readiness this way.
+
+A connect deadline that expires is reported to the SDK distinctly from the
+backstop firing. Both are "no answer yet" rather than an answer, but only the
+connect case is also definitely unsent. Neither declaration can make an
+ambiguous failure look safe: only `BeforeDispatch` is ever eligible, and that
+already means no request byte left.
+
+### PIR request budget
+
+A PIR request spends one finite budget of 60 seconds against one endpoint,
+split across at most two attempts: the first bounded at 5 seconds of connection
+setup and 15 seconds overall, the second at 10 seconds of connection setup and
+whatever remains of the budget. The two attempts share the budget rather than
+each getting their own, so the total is no longer than the single deadline this
+replaced. That ceiling is the per-endpoint one; `PirFleet` failover multiplies
+it by the endpoint count.
+
+The split exists because a wall clock cannot distinguish an endpoint that never
+answers from a link that is merely slow. Bounding connection setup separately
+can: its duration says nothing about how much work remains, so abandoning it
+early costs a slow-but-progressing transfer nothing, while a bound on the
+request as a whole must stay generous or a large tier over a slow link becomes
+unreachable rather than late — every attempt restarts the transfer from zero,
+so a schedule that is uniformly too short never converges.
+
+Only running out of time is retried, whether the whole-request backstop or the
+connect deadline. Every other failure is a definite answer about this endpoint
+— a refused connection, a protocol error, a non-success status — and is
+returned rather than repeated.
+
+Repeating is permitted for PIR where it is not for helper or chain POSTs. A PIR
+query is an idempotent read, so a second attempt cannot double an effect, and
+re-sending the identical encrypted query tells the server nothing it did not
+already have: which item is being fetched is exactly what PIR hides. A retried
+attempt must therefore carry a byte-identical body. A connect timeout is
+definitely unsent and so is repeatable on any method; the backstop case is
+repeatable because it repeats only a read. The dispatch classification itself
+is unchanged — PIR acts on it, it is not weakened for PIR.
+
+The budget applies per endpoint and reaches the executor on every attempt, so a
+host executor that enforces it gets the same fast-fail as the built-in route. A
+host executor that does not is bounded by the whole-request deadline alone,
+which still ends each attempt and still permits the retry; it forfeits only the
+early abandon, never correctness.
+
+Tests cover: a stalled attempt retried under the remaining budget; a stalled
+connect retried, which a whole-request deadline alone cannot see; the connect
+budget reaching the executor on each attempt; a late refusal retried from an
+executor that enforces the budget and *not* retried from one that ignores it;
+an immediate refusal and a non-success status each ending the request on one
+attempt; the budget finite and no longer than the deadline it replaced; a
+retried POST carrying the identical body; and a connect budget only ever
+tightening the deadline (`http_transport/tests/pir_retry.rs`). That only a
+deadline-wrapped `DirectRoute` declares enforcement is covered by
+`only_a_deadline_wrapped_direct_route_claims_to_enforce_the_connect_budget`;
+that a stalled connector readiness is abandoned at the deadline rather than at
+the backstop by `a_stalled_connector_readiness_is_abandoned_at_the_connect_deadline`,
+which awaits readiness rather than re-polling it so only a registered timer can
+end the wait; and that the bound does not pre-empt a connector merely not ready
+yet by `connector_readiness_within_the_deadline_defers_to_the_inner_connector`
+(`http_transport/tests/route.rs`).
+
 ## Reconciliation and retry
 
 One lifecycle facade provides typed local delegation, imported-delegation,

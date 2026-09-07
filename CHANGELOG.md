@@ -131,6 +131,69 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- A PIR request now splits one 60-second budget across two bounded attempts
+  instead of spending it on a single deadline. A fetch that succeeds does so in
+  a few seconds; one against a dead endpoint stalls and never returns, so a
+  single long deadline spent its whole budget discovering what a few seconds
+  already showed. A shorter deadline is not the fix, though: a wall clock
+  cannot tell a stalled endpoint from a slow one, and cutting every request
+  short turns a large tier over a congested link from late into unreachable,
+  because each attempt restarts the transfer from zero. Each attempt is
+  therefore bounded on two axes — connection setup, where a dead endpoint
+  reveals itself, and the request as a whole, where a slow link needs room.
+  The first attempt gets 5 seconds of connection setup and 15 seconds overall;
+  the second gets 10 seconds and the remainder of the budget. A healthy fetch
+  never reaches the second attempt, a blackholed endpoint costs 5 seconds
+  rather than a minute, and a link that merely needs 40 seconds still finishes.
+  Only running out of time is retried, whether the whole-request backstop or
+  the connect deadline; a refused connection, a protocol error, or a
+  non-success status is a definite answer and is returned as before. Retrying
+  is safe for PIR in a way it is not for helper or chain POSTs: the query is an
+  idempotent read, and re-sending the identical encrypted query reveals nothing
+  — which item is fetched is what PIR hides. The dispatch classification is
+  unchanged; PIR acts on it rather than weakening it. Endpoint failover is
+  unchanged and still moves on only after the budget is spent, which matters
+  most for a deployment publishing a single endpoint, where there is nowhere to
+  fail over to.
+
+- **Breaking:** `RouteRequest` gains `connect_timeout: Option<Duration>`, an
+  optional bound on connection setup alone, so a caller can abandon an endpoint
+  that never answers without also cutting short one that is merely slow. It
+  only ever tightens the connect deadline, so connection setup still gives up
+  before the whole-request backstop and a stalled connect stays a definite
+  pre-dispatch failure. Only PIR supplies one; helper, chain, and tree-sync
+  requests pass `None` and are unchanged.
+
+  Only an executor observes connection setup, so `RouteHttp` gains
+  `enforces_connect_timeout`, defaulting to `false`, by which an executor
+  declares that it bounds setup by that budget. The SDK reads a pre-dispatch
+  failure at or after the budget as the budget expiring only from an executor
+  that declares it; one that ignores the budget has its pre-dispatch failures
+  read as the definite answers they are, so a refusal that merely arrived late
+  is never reinterpreted as a timeout and repeated. This mirrors the existing
+  `hook_precedes_connection_setup`: a classification the SDK cannot verify is
+  drawn only from an executor that declares the property it rests on. A host
+  executor that does nothing keeps today's behavior and forfeits only the early
+  abandon.
+
+  The declaration follows how an executor was built, not its type.
+  `DirectRoute` declares enforcement only when constructed by `new` or
+  `with_http_connector`, which wrap the connector in the connection-setup
+  deadline. `DirectRoute::with_connector` and `HyperTransport::with_connector`
+  take a fully configured connector as given and add no deadline, so a route
+  built that way declares nothing: `connect_timeout` does not apply to it, and
+  its pre-dispatch failures stay the definite answers they are.
+
+  Enforcement covers connector readiness as well as the connection attempt, so
+  a connector that withholds readiness past the deadline reports a connect
+  timeout rather than whatever it would have said next. Readiness is bounded by
+  racing the connector against a timer that registers the caller's waker rather
+  than by sampling the clock: a connector that returns pending decides when it
+  is polled again, so a clock read on entry may never run after the deadline and
+  the stall would fall through to the looser whole-request backstop. A `connect_timeout` too
+  large to represent as an instant leaves the derived deadline unchanged rather
+  than panicking.
+
 - **Breaking:** `RoundExecutor::advance_next` is removed. `RoundDriver` chooses
   what to run from a plan it read itself, so a second way to advance a round
   from its plan head is a second driver; hosts drive a round with the driver
