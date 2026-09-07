@@ -102,9 +102,10 @@ pub(super) enum RecoveryMaterialState {
 /// POST for, so a share whose material is gone is recognized as beyond repair
 /// whether or not the resubmission window is still open.
 ///
-/// A nullifier that does not match the share row is [`Self::Unusable`] only
-/// while the loaded generation is still the current one; otherwise the mismatch
-/// is simply a share that was replaced underneath the caller.
+/// A nullifier that does not match the share row is
+/// [`RecoveryMaterialState::Unusable`] only while the loaded generation is
+/// still the current one; otherwise the mismatch is simply a share that was
+/// replaced underneath the caller.
 pub(super) fn rebuild_share_recovery(
     db: &VotingDb,
     scope: &share::ShareOperationScope,

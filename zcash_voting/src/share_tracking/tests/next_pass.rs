@@ -95,6 +95,25 @@ fn a_delay_stepping_over_the_last_recovery_second_is_shortened_to_it() {
 }
 
 #[test]
+fn a_pass_on_the_last_open_second_waits_for_the_vote_end_not_for_itself() {
+    // 1_000 *is* the last second a resubmission is permitted, so there is no
+    // later open second to wake for and the vote end is the only boundary
+    // left. Treating the current second as the boundary would cap the delay to
+    // zero and spend a pass re-waking on the second it is already inside.
+    assert_eq!(capped(15, 1_000, Some(1_011)), 11);
+    assert!(is_share_resubmission_window_open(
+        1_000,
+        1_011,
+        ShareTimingPolicy::default()
+    ));
+    assert!(!is_share_resubmission_window_open(
+        1_001,
+        1_011,
+        ShareTimingPolicy::default()
+    ));
+}
+
+#[test]
 fn a_round_past_its_recovery_cutoff_still_wakes_by_the_vote_end() {
     // No open recovery second is left, so the vote end is the only boundary
     // still ahead and confirmation is all a final pass could do.

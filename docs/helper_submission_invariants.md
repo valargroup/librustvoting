@@ -654,6 +654,7 @@ The boundary the cap inverts is covered by
 What a pass reports to the next one is covered by
 `a_delay_landing_before_every_boundary_is_left_alone`,
 `a_delay_stepping_over_the_last_recovery_second_is_shortened_to_it`,
+`a_pass_on_the_last_open_second_waits_for_the_vote_end_not_for_itself`,
 `a_round_past_its_recovery_cutoff_still_wakes_by_the_vote_end`,
 `a_round_at_or_past_its_vote_end_yields_no_wait`,
 `a_round_without_a_vote_end_keeps_its_delay`,
