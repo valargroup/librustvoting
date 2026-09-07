@@ -6,12 +6,21 @@ use super::fixtures::*;
 async fn empty_plan_and_stale_steps_return_no_work_without_network_io() {
     let executor = executor();
     let control = ChainSubmissionControl::new(1);
-    let outcome = executor
-        .advance_next(&host(), &control, &NoopRoundStepProgressReporter {})
+    assert!(
+        executor.plan().unwrap().next_steps.is_empty(),
+        "an undecided round owes nothing"
+    );
+    assert!(
+        advance_plan_head(
+            &executor,
+            &host(),
+            &control,
+            &NoopRoundStepProgressReporter {},
+        )
         .await
-        .unwrap();
-    assert_eq!(outcome.disposition, RoundStepDisposition::NoWork);
-    assert!(outcome.step.is_none());
+        .is_none(),
+        "an empty plan has no head to run"
+    );
 
     let stale = NextStep::AdvanceVote {
         bundle_index: 0,

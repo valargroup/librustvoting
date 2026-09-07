@@ -102,28 +102,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         step: Option<&NextStep>,
         ledger: &StepLedger,
     ) -> RoundStepFailure {
-        let kind = match error.kind() {
-            VotingErrorKind::InvalidInput | VotingErrorKind::SetupAlreadyPersisted => {
-                RoundStepFailureKind::InvalidInput
-            }
-            VotingErrorKind::InsufficientEligibility => {
-                RoundStepFailureKind::InsufficientEligibility
-            }
-            VotingErrorKind::NoSpendableNotes => RoundStepFailureKind::NoSpendableNotes,
-            VotingErrorKind::Busy | VotingErrorKind::DbBusy => RoundStepFailureKind::Busy,
-            VotingErrorKind::Storage => RoundStepFailureKind::Storage,
-            VotingErrorKind::PirUnavailable => RoundStepFailureKind::Transport,
-            VotingErrorKind::ProofFailed => RoundStepFailureKind::ProofFailed,
-            VotingErrorKind::KeystoneSignatureConflict => RoundStepFailureKind::Signing,
-            VotingErrorKind::Internal => RoundStepFailureKind::InvariantViolation,
-            VotingErrorKind::DelegationTargetMismatch => {
-                RoundStepFailureKind::DelegationTargetMismatch
-            }
-            // A refusal to clear recovery state is a host asking for something
-            // the round no longer permits, not a step that failed on its own
-            // terms.
-            VotingErrorKind::DelegationAlreadyBroadcast => RoundStepFailureKind::InvalidInput,
-        };
+        let kind = failure_kind_for(&error);
         self.step_failure(kind, step, None, ledger, error.to_string())
     }
 
@@ -163,6 +142,31 @@ impl<T: ChainTransport> RoundExecutor<T> {
             message: bounded_message(message.as_ref()),
             plan: self.plan().ok().map(Box::new),
             share_deliveries: ledger.share_deliveries.clone(),
+            delegation: ledger.delegation.clone(),
         }
+    }
+}
+
+/// The step failure kind a [`VotingError`] presents as.
+///
+/// Shared with the round driver, which classifies a planning error the same
+/// way a step would so a host reads one taxonomy.
+pub(crate) fn failure_kind_for(error: &VotingError) -> RoundStepFailureKind {
+    match error.kind() {
+        VotingErrorKind::InvalidInput | VotingErrorKind::SetupAlreadyPersisted => {
+            RoundStepFailureKind::InvalidInput
+        }
+        VotingErrorKind::InsufficientEligibility => RoundStepFailureKind::InsufficientEligibility,
+        VotingErrorKind::NoSpendableNotes => RoundStepFailureKind::NoSpendableNotes,
+        VotingErrorKind::Busy | VotingErrorKind::DbBusy => RoundStepFailureKind::Busy,
+        VotingErrorKind::Storage => RoundStepFailureKind::Storage,
+        VotingErrorKind::PirUnavailable => RoundStepFailureKind::Transport,
+        VotingErrorKind::ProofFailed => RoundStepFailureKind::ProofFailed,
+        VotingErrorKind::KeystoneSignatureConflict => RoundStepFailureKind::Signing,
+        VotingErrorKind::Internal => RoundStepFailureKind::InvariantViolation,
+        VotingErrorKind::DelegationTargetMismatch => RoundStepFailureKind::DelegationTargetMismatch,
+        // A refusal to clear recovery state is a host asking for something the
+        // round no longer permits, not a step that failed on its own terms.
+        VotingErrorKind::DelegationAlreadyBroadcast => RoundStepFailureKind::InvalidInput,
     }
 }

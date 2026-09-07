@@ -31,15 +31,17 @@ use crate::{
         CompletedVoteDisplayView, DelegationPirPrecomputeResultView, DelegationProgressKind,
         DelegationRecoveryView, DelegationRecoveryWorkView, DelegationSetupFieldView,
         DelegationStatusView, DelegationSubmissionWire, NextStepView, PendingShareRoundView,
-        RoundPlanView, RoundRecoveryStateView, RoundStepDispositionView, RoundStepFailureKindView,
+        RoundChainOutcomeView, RoundDriveEventKind, RoundDriveEventView, RoundPlanView,
+        RoundQuiescenceKind, RoundQuiescenceView, RoundRecoveryStateView, RoundRunReportView,
+        RoundStepDispositionView, RoundStepFailureKindView, RoundStepFailureRecordView,
         RoundStepFailureView, RoundStepOutcomeView, RoundStepProgressKind, RoundStepProgressView,
-        ShareBatchDeliveryReportView, ShareDelegationRecordView, ShareDeliveryOutcomeView,
-        ShareKeyView, ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteBatchView,
-        SignedVoteCommitmentView, SignedVoteCommitmentsView, SubmissionDiagnosticView,
-        VoteCommitStageKind, VoteCommitmentBatchWire, VoteCommitmentWire, VoteKeyView,
-        VoteRecoveryView, VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView,
-        VotingErrorView, VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView,
-        VotingRoundParams,
+        RoundWorkTallyView, ShareBatchDeliveryReportView, ShareDelegationRecordView,
+        ShareDeliveryOutcomeView, ShareKeyView, ShareWorkflowRecoveryView,
+        SignedDelegationPayloadView, SignedVoteBatchView, SignedVoteCommitmentView,
+        SignedVoteCommitmentsView, SubmissionDiagnosticView, VoteCommitStageKind,
+        VoteCommitmentBatchWire, VoteCommitmentWire, VoteKeyView, VoteRecoveryView,
+        VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView, VotingErrorView,
+        VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView, VotingRoundParams,
     },
     BundlePolicy,
 };
@@ -1147,6 +1149,10 @@ impl TryFrom<crate::RoundStepFailure> for RoundStepFailureView {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            delegation: failure
+                .delegation
+                .map(SignedDelegationPayloadView::try_from)
+                .transpose()?,
         })
     }
 }
@@ -1399,9 +1405,193 @@ impl std::fmt::Display for VotingErrorView {
 
 impl std::error::Error for VotingErrorView {}
 
+impl From<crate::round_drive::RoundWorkTally> for RoundWorkTallyView {
+    fn from(tally: crate::round_drive::RoundWorkTally) -> Self {
+        Self {
+            completed_proposals: tally.completed_proposals,
+            total_proposals: tally.total_proposals,
+            remaining_obligations: tally.remaining_obligations,
+        }
+    }
+}
+
+impl TryFrom<crate::round_drive::RoundQuiescence> for RoundQuiescenceView {
+    type Error = VotingError;
+
+    fn try_from(quiescence: crate::round_drive::RoundQuiescence) -> Result<Self, Self::Error> {
+        use crate::round_drive::RoundQuiescence as Q;
+        let mut view = Self {
+            kind: RoundQuiescenceKind::NoWorkLeft,
+            open_proposals: Vec::new(),
+            unrostered_intents: Vec::new(),
+            bundles: Vec::new(),
+            shares: Vec::new(),
+            step: None,
+            chain_outcome: None,
+            remaining: Vec::new(),
+        };
+        match quiescence {
+            Q::NoWorkLeft => {}
+            Q::NeedsBundleSetup => view.kind = RoundQuiescenceKind::NeedsBundleSetup,
+            Q::PersistedChainTerminal => view.kind = RoundQuiescenceKind::PersistedChainTerminal,
+            Q::NeedsBallot {
+                open_proposals,
+                unrostered_intents,
+            } => {
+                view.kind = RoundQuiescenceKind::NeedsBallot;
+                view.open_proposals = open_proposals;
+                view.unrostered_intents = unrostered_intents;
+            }
+            Q::NeedsDelegationSignatures { bundles } => {
+                view.kind = RoundQuiescenceKind::NeedsDelegationSignatures;
+                view.bundles = bundles;
+            }
+            Q::BackgroundShareWorkOnly { shares } => {
+                view.kind = RoundQuiescenceKind::BackgroundShareWorkOnly;
+                view.shares = shares.into_iter().map(ShareKeyView::from).collect();
+            }
+            Q::Cancelled => view.kind = RoundQuiescenceKind::Cancelled,
+            Q::ChainTerminal { step, outcome } => {
+                view.kind = RoundQuiescenceKind::ChainTerminal;
+                view.step = Some(step.try_into()?);
+                view.chain_outcome = Some(outcome.into());
+            }
+            Q::ChainRecoveryStalled { step, outcome } => {
+                view.kind = RoundQuiescenceKind::ChainRecoveryStalled;
+                view.step = Some(step.try_into()?);
+                view.chain_outcome = Some(outcome.into());
+            }
+            Q::Failures => view.kind = RoundQuiescenceKind::Failures,
+            Q::PassBudgetExhausted { remaining } => {
+                view.kind = RoundQuiescenceKind::PassBudgetExhausted;
+                view.remaining = remaining
+                    .into_iter()
+                    .map(NextStepView::try_from)
+                    .collect::<Result<_, _>>()?;
+            }
+        }
+        Ok(view)
+    }
+}
+
+impl TryFrom<crate::round_drive::RoundStepFailureRecord> for RoundStepFailureRecordView {
+    type Error = VotingError;
+
+    fn try_from(record: crate::round_drive::RoundStepFailureRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            step: record.step.map(NextStepView::try_from).transpose()?,
+            bundle_index: record.bundle_index,
+            failure: record.failure.try_into()?,
+        })
+    }
+}
+
+impl TryFrom<crate::round_drive::RoundRunReport> for RoundRunReportView {
+    type Error = VotingError;
+
+    fn try_from(report: crate::round_drive::RoundRunReport) -> Result<Self, Self::Error> {
+        Ok(Self {
+            quiescence: report.quiescence.try_into()?,
+            plan: report.plan.map(RoundPlanView::try_from).transpose()?,
+            tally: report.tally.into(),
+            failures: report
+                .failures
+                .into_iter()
+                .map(RoundStepFailureRecordView::try_from)
+                .collect::<Result<_, _>>()?,
+            skipped_bundles: report.skipped_bundles,
+            chain_outcomes: report
+                .chain_outcomes
+                .into_iter()
+                .map(|(step, outcome)| {
+                    Ok(RoundChainOutcomeView {
+                        step: step.try_into()?,
+                        outcome: outcome.into(),
+                    })
+                })
+                .collect::<Result<_, VotingError>>()?,
+            share_deliveries: report
+                .share_deliveries
+                .into_iter()
+                .map(ShareBatchDeliveryReportView::from)
+                .collect(),
+            delegations: report
+                .delegations
+                .into_iter()
+                .map(SignedDelegationPayloadView::try_from)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<crate::round_drive::RoundDriveEvent> for RoundDriveEventView {
+    type Error = VotingError;
+
+    fn try_from(event: crate::round_drive::RoundDriveEvent) -> Result<Self, Self::Error> {
+        use crate::round_drive::RoundDriveEvent as E;
+        let mut view = Self {
+            kind: RoundDriveEventKind::StepSelected,
+            step: None,
+            plan: None,
+            tally: None,
+            progress: None,
+            disposition: None,
+            failure_kind: None,
+            message: None,
+            delay_seconds: None,
+            bundle_index: None,
+        };
+        match event {
+            E::PlanRefreshed { plan, tally } => {
+                view.kind = RoundDriveEventKind::PlanRefreshed;
+                view.plan = Some((*plan).try_into()?);
+                view.tally = Some(tally.into());
+            }
+            E::StepSelected { step } => {
+                view.step = Some(step.try_into()?);
+            }
+            E::StepProgress { step, progress } => {
+                view.kind = RoundDriveEventKind::StepProgress;
+                view.step = Some(step.try_into()?);
+                view.progress = Some(progress.try_into()?);
+            }
+            E::StepFinished { step, disposition } => {
+                view.kind = RoundDriveEventKind::StepFinished;
+                view.step = Some(step.try_into()?);
+                view.disposition = Some(disposition.into());
+            }
+            E::StepFailed {
+                step,
+                kind,
+                message,
+            } => {
+                view.kind = RoundDriveEventKind::StepFailed;
+                view.step = Some(step.try_into()?);
+                view.failure_kind = Some(kind.into());
+                view.message = Some(message);
+            }
+            E::AwaitingRepoll { step, delay } => {
+                view.kind = RoundDriveEventKind::AwaitingRepoll;
+                view.step = Some(step.try_into()?);
+                view.delay_seconds = Some(delay.as_secs_f64());
+            }
+            E::BundleSkipped {
+                bundle_index,
+                after,
+            } => {
+                view.kind = RoundDriveEventKind::BundleSkipped;
+                view.bundle_index = Some(bundle_index);
+                view.step = Some(after.try_into()?);
+            }
+        }
+        Ok(view)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod error_view;
+    mod round_drive_view;
     mod step_failure_view;
 
     use super::*;

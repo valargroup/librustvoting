@@ -10,6 +10,52 @@ This release is `zcash_voting` 4.0.0.
 
 ### Added
 
+- `round_drive` composes `RoundExecutor` calls into one run: `RoundDriver::run`
+  re-plans from durable state, dispatches the obligations the plan lists, paces
+  a still-tracking submission by `RoundDrivePolicy::pending_repoll`, isolates
+  failures per bundle, and returns a `RoundRunReport` whose `RoundQuiescence`
+  names the state only the host can resolve — an open ballot, delegation
+  signatures it does not hold, a terminal or stalled chain submission,
+  background share work, cancellation, or nothing left to do. `RoundHostSource`
+  supplies the host context once per dispatch rather than once per run, so a
+  long proof cannot leave the following step planning against a stale clock,
+  and `RoundDriveEvent` names the step every observation came from, which a
+  bare `RoundStepProgress` does not. `RoundWorkTally` reports run-relative
+  ballot progress from obligation membership, so an atomic batch counts as
+  every proposal in it rather than as its anchor alone. Independent
+  bundle-locked delegation work runs up to
+  `RoundDrivePolicy::max_bundle_concurrency`, while round-locked work and
+  `StopRound` failure isolation remain serial. Dispatch-budget reports are
+  taken from a fresh plan after the last allowed wave, and absent per-bundle
+  stored Keystone signatures stop before dispatch as a signature handoff.
+  The stop reason is decided from what the run can still dispatch rather than
+  from a round-wide flag, so a persisted terminal submission, a bundle a
+  failure isolated, missing bundle setup and an unfinished ballot are each
+  reported in their own right instead of being polled past. A signature handoff
+  names every bundle the round still owes a delegation for, not only the ones
+  the current wave would run, so a voter signs once rather than a wave at a
+  time and nothing is dispatched before the first of them, and every admitted
+  admitted bundle is judged by its own signer context rather than one mode
+  standing for the wave. A
+  failure keeps the durable effects its step already made — the chain outcome
+  it observed, and, through the new `RoundStepFailure::delegation`, a bundle it
+  signed before losing the chain. A wave-ending report refreshes its plan and
+  tally from durable state, so it describes the round the run left rather than
+  the one it found.
+  Driver dispatches
+  inherit the run's operation epoch, so a host that switches session or account
+  while the driver is planning interrupts the step instead of having it adopt
+  the new epoch. `round_lock::bundle_scope` is the single definition of which
+  lock a step takes, read by both the executor that locks and the driver that
+  schedules. Hosts previously wrote this loop
+  themselves; `docs/round_orchestration_invariants.md` specifies it. `wire`
+  carries the host-facing projections — `RoundRunReportView`,
+  `RoundQuiescenceView`, `RoundWorkTallyView`, `RoundDriveEventView` and
+  `RoundStepFailureRecordView` — in the same flat, serde-stable shape the other
+  views use, including the signed delegation bundles a run produced, so a
+  cross-language binding sees what a native caller sees. The prelude exports
+  the driver types. `RoundRunReport` and `RoundStepFailureRecord` are
+  `#[non_exhaustive]`: hosts read a report, never build one.
 - `RoundPlan::needs_bundle_setup` reports a round that holds a ballot choice
   but has no bundle rows yet. Eligibility checks do not persist a bundle
   plan, so a host that records a ballot before running setup previously made
@@ -85,6 +131,17 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- **Breaking:** `RoundExecutor::advance_next` is removed. `RoundDriver` chooses
+  what to run from a plan it read itself, so a second way to advance a round
+  from its plan head is a second driver; hosts drive a round with the driver
+  and reach one obligation with `advance_step`.
+- **Breaking:** `RoundExecutor::advance_step` refuses a step that the plan it
+  reads under the lock still lists but that resolves to no obligation, failing
+  with `RoundStepFailureKind::InvariantViolation` instead of returning
+  `NoWork`. A step the plan no longer lists is still `NoWork`. The two facts
+  come from one read and can only disagree if projection and classification
+  have; answering `NoWork` let any host that re-selects from a refreshed plan
+  loop on that step forever, so each host had to guard it itself.
 - **Breaking:** `RoundStepFailureKind` (and its wire view) gains
   `InsufficientEligibility` and `NoSpendableNotes` so hosts can tell an
   eligibility problem from malformed input without parsing messages.
@@ -119,6 +176,12 @@ This release is `zcash_voting` 4.0.0.
   delegation target before the first tree request.
 - The wallet example builds one `HyperTransport` for helpers, the chain, and
   the vote tree.
+- **Breaking:** the wallet example's `advance_round_until_idle` runs over
+  `RoundDriver` instead of its own `advance_next` loop. It takes a
+  `RoundDrivePolicy` and returns a `RoundRunReport`, so a caller reads why the
+  run stopped rather than inferring it from the last outcome's disposition, and
+  `RoundAdvanceError` no longer carries a step failure: the driver isolates
+  failures and keeps them, with their durable effects, in the report.
 
 - `advance_until_terminal` escalates to the exact tree immediately after a
   `Recovering` result; `pending_repoll` paces only `Tracking` polls.
@@ -212,11 +275,11 @@ This release is `zcash_voting` 4.0.0.
   nothing.
 - A sidecar's identity canonicalizes the full path when the file exists, so a
   symlink to a sidecar and its real path share one sidecar id.
-- The wallet example's `advance_round_until_idle` returns a structured
-  `RoundAdvanceError` that keeps the executor's `RoundStepFailure` (chain
-  outcome, strongest state, delivery reports, refreshed plan) instead of only
-  its message, and gains `routed_pir_fleet` for building the host's PIR fleet
-  over the same route.
+- The wallet example's `advance_round_until_idle` gains `routed_pir_fleet` for
+  building the host's PIR fleet over the same route. It no longer returns step
+  failures through `RoundAdvanceError`: the driver isolates a failed step and
+  keeps it, with everything that step had already done, in
+  `RoundRunReport::failures`.
 - `VotingDb::ensure_round` refuses an existing round whose stored parameters
   (snapshot height, election key, roots) differ from the supplied ones, not
   only one stored for another network, so bundles are never set up under

@@ -89,6 +89,11 @@ pub use crate::round::{
     quantized_bundle_weight, raw_bundle_weight, validate_bundle_index, BundleLayout, RoundInfo,
     RoundParams, VotingDb,
 };
+pub use crate::round_drive::{
+    FailureIsolation, NoopRoundDriveReporter, RoundDriveEvent, RoundDrivePolicy,
+    RoundDriveReporter, RoundDriveReporterBridge, RoundDriver, RoundHostSource,
+    RoundHostSourceBridge, RoundQuiescence, RoundRunReport, RoundStepFailureRecord, RoundWorkTally,
+};
 pub use crate::selection::select_notes_with_lwd;
 pub use crate::selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,

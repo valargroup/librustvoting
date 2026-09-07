@@ -1057,14 +1057,23 @@ plans durable before the broadcast (regression test
 carries whenever one exists (regression test
 `the_plan_reports_the_persisted_immediate_share_after_its_proposal_leaves_the_roster`).
 
-A share row with no accepted helper (`sent_to_urls` empty: every initial POST
-failed definitely, or a reservation was cleared before dispatch) is
+A share row with no accepted, ambiguous, or attempting helper (every initial
+POST failed definitely, or a reservation was cleared before dispatch) is
 `RoundPlan::blocking_share_work`. The planner still lists it as
 `NextStep::ConfirmShare` but classifies it as `SubmitShares` recovery work,
 and `RoundExecutor::advance_step` runs that delivery from the durable plan
 instead of the focused confirmation poll, which could never confirm a share
 no helper holds (regression test
 `a_blocking_confirm_share_step_delivers_before_polling`).
+
+`RoundDriver` dispatches only that safely repeatable share work in the
+foreground. A share with a definite acceptance or an ambiguous or attempting
+helper is handed to background tracking, which owns confirmation,
+duplicate-safe reconciliation, and replenishment. Such a step is filtered even
+when the same plan contains a later deliverable share: polling it would return
+`Pending`, promote it ahead of plan order again, and starve the delivery until
+the round dispatch budget was exhausted
+(`an_outcome_unknown_share_never_outranks_the_delivery_the_round_owes`).
 
 ### Replenishment and ordering
 
@@ -1476,8 +1485,11 @@ host wallet:
    invokes `track_pending_shares`, and supplies cancellation.
 5. **Initial delivery invocation.** Supported wallet integrations bind a
    `RoundExecutor` to the complete proposal roster from the authenticated round
-   configuration and call `advance_next` or `advance_step` with the complete
-   current configured fleet, timing, and cancellation. The executor obtains
+   configuration and drive it with `RoundDriver::run`, which supplies the
+   complete current configured fleet, timing, and cancellation once per
+   dispatch through `RoundHostSource`. An integration that runs one obligation
+   at a time calls `advance_step` with a step it selected from a plan it read.
+   The executor obtains
    `HelperFleetPreflight`, prepares every affected delivery plan, advances the
    chain until confirmation is durable, recovers fresh `CommittedVote` handles,
    converts them to `ConfirmedVote`, and submits the prepared shares. Lower-level

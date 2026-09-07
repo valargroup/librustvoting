@@ -3,16 +3,26 @@
 use super::fixtures::*;
 
 #[tokio::test]
-async fn cancelled_control_short_circuits_before_any_work() {
+async fn a_cancelled_control_does_not_invent_work_for_an_idle_round() {
+    // Planning is a read of durable state and answers the same whether or not
+    // the host has cancelled: an undecided round owes nothing yet. There is
+    // therefore no step for cancellation to short-circuit.
     let executor = executor();
     let control = ChainSubmissionControl::new(1);
     control.cancel();
-    let outcome = executor
-        .advance_next(&host(), &control, &NoopRoundStepProgressReporter {})
-        .await
-        .unwrap();
-    // No step exists, so the plan wins over cancellation.
-    assert_eq!(outcome.disposition, RoundStepDisposition::NoWork);
+
+    assert!(
+        executor.plan().unwrap().next_steps.is_empty(),
+        "an undecided round lists no step, cancelled or not"
+    );
+    assert!(advance_plan_head(
+        &executor,
+        &host(),
+        &control,
+        &NoopRoundStepProgressReporter {}
+    )
+    .await
+    .is_none());
 }
 
 #[tokio::test]

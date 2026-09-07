@@ -124,8 +124,8 @@ async fn a_share_with_only_ambiguous_evidence_is_polled_not_redelivered() {
     let plan = executor.plan().unwrap();
     assert!(plan.next_steps.contains(&step), "{:?}", plan.next_steps);
     assert!(
-        plan.blocking_share_work,
-        "no helper accepted it, so it still blocks the foreground"
+        !plan.blocking_share_work,
+        "the outcome-unknown attempt belongs to background tracking"
     );
 
     let progress = RecordingProgress::default();

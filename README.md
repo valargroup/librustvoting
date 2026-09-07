@@ -65,12 +65,19 @@ labels and the rules for what may ship on a maintenance line, and
 ## Wallet API Lifecycle
 
 New wallet integrations should import `zcash_voting::prelude::*` and drive a
-round through `RoundExecutor`: bind the round, its proposal roster, and the
-voting hotkey secret once, record decisions with `set_ballot_intents`, then
-call `advance_next` (or `advance_step`) in a loop until the plan has no
-actionable step, re-scheduling on a `Pending` disposition. The executor owns
-the ordering between helper-plan persistence, chain advancement, confirmation,
-and share delivery, proves off the async runtime, and reports typed progress.
+round through `RoundDriver`: bind the round, its proposal roster, and the
+voting hotkey secret to a `RoundExecutor` once, record decisions with
+`set_ballot_intents`, then call `RoundDriver::run` and read the
+`RoundRunReport` it returns. The driver owns the loop — it re-plans from
+durable state, chooses what to run, overlaps independent bundles, paces a
+still-tracking submission, and isolates a failure to its bundle — and stops
+with a `RoundQuiescence` naming the state only a host can resolve: an open
+ballot, delegation signatures it has not collected, a terminal submission, or
+nothing left to do. Hosts that need one obligation at a time, rather than a
+run, call `advance_step` with a step they selected from a plan they read.
+The executor owns the ordering between helper-plan persistence, chain
+advancement, confirmation, and share delivery, proves off the async runtime,
+and reports typed progress.
 Supply transports once (`HyperTransport::with_route` over a host `RouteHttp`
 for Tor or proxies), a `DelegationPipeline` for delegation steps, and a
 `PirFleet` for PIR proofs. PIR and vote-tree traffic use whatever transports
@@ -227,8 +234,11 @@ upgrading the crate.
 - Replace per-stage delegation orchestration with `DelegationPipeline` and
   `DelegationSigner`; keep only the seed-owning `SpendAuthSigner`.
 - Replace host sequencing of plan steps, and the removed
-  `VoteRecoveryExecutor::advance` driver, with `RoundExecutor::advance_next`.
-  Helper shares are submitted through `ConfirmedVote`.
+  `VoteRecoveryExecutor::advance` driver, with `RoundDriver::run`. A host loop
+  around `RoundExecutor::advance_step` is no longer needed and
+  `RoundExecutor::advance_next` is removed: a second way to advance a round
+  from its plan head is a second driver. Helper shares are submitted through
+  `ConfirmedVote`.
 - Start chain submissions with `ChainSubmissionClientConfig::for_network` and
   drive them with `advance_until_terminal` instead of a host polling loop.
 
