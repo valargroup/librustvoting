@@ -164,6 +164,20 @@ impl RoundDriveReporter for RecordingReporter {
     }
 }
 
+/// A step failure with nothing durable attached, for tests about what the run
+/// does with a failure rather than what produced it.
+pub(super) fn step_failure(message: &str) -> crate::RoundStepFailure {
+    crate::RoundStepFailure {
+        kind: crate::RoundStepFailureKind::Storage,
+        step: None,
+        strongest_chain_state: None,
+        chain_outcome: None,
+        message: message.to_string(),
+        plan: None,
+        share_deliveries: Vec::new(),
+    }
+}
+
 /// Runs `executor`'s round to quiescence with the default policy.
 pub(super) async fn drive(
     executor: &RoundExecutor<HyperTransport>,

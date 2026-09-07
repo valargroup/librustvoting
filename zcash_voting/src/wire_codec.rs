@@ -1511,6 +1511,11 @@ impl TryFrom<crate::round_drive::RoundRunReport> for RoundRunReportView {
                 .into_iter()
                 .map(ShareBatchDeliveryReportView::from)
                 .collect(),
+            delegations: report
+                .delegations
+                .into_iter()
+                .map(SignedDelegationPayloadView::try_from)
+                .collect::<Result<_, _>>()?,
         })
     }
 }

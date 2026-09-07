@@ -369,13 +369,31 @@ decision about what a step *means* stays in the planner and the executor.
   under. This does not weaken "scope is captured once": each step still
   captures one context at entry and reads it for its whole duration.
 - **Round-locked obligations never run concurrently; bundle-locked ones may.**
-  The split is the same one the executor uses to choose a lock scope. Two
-  round-locked steps in flight would queue on one lock and gain nothing but a
-  held proving thread. One fresh plan admits an ordered wave of distinct
+  Two round-locked steps in flight would queue on one lock and gain nothing but
+  a held proving thread. One fresh plan admits an ordered wave of distinct
   bundle-locked steps up to `max_bundle_concurrency` and the remaining dispatch
   budget; the wave stops before the first round-locked step. Every admitted
   step captures its own host context. Results are folded in dispatch order
   after the complete wave drains, so every durable effect is retained.
+- **Scheduling and locking read one table, not two.** `round_lock::bundle_scope`
+  is the single definition of which lock a step takes; the executor locks with
+  it and the driver schedules with it. They must not be two matches that can
+  drift, because a driver that believed a round-locked step was bundle-locked
+  would admit a wave of steps that then serialize on one lock, each holding a
+  proving worker open for the wait. The bundle a wave deduplicates on is the
+  same bundle the executor locks, so no two admitted steps can contend
+  (`the_driver_schedules_by_the_executors_own_lock_scope`,
+  `only_delegation_proving_is_bundle_scoped`).
+- **A dispatch belongs to the epoch its run captured.** The driver decides to
+  dispatch, then plans, builds each host context and reads stored signing
+  material before the step begins. A step that captured its own epoch on entry
+  would adopt an epoch the host switched to across that gap and prove, persist
+  or broadcast for a session already left. Driver dispatches therefore inherit
+  the run's `entry_epoch` through `advance_step_in_epoch`, and stop at the
+  step's first boundary instead
+  (`a_dispatch_decided_in_an_earlier_epoch_is_cancelled_not_adopted`,
+  `a_dispatch_in_the_run_s_own_epoch_still_runs`). `advance_step` still
+  captures on entry, which is the right answer for a host calling it directly.
 - **Stop-round failure isolation is strictly serial.** When
   `FailureIsolation::StopRound` is selected, the driver admits one step at a
   time so no later obligation can already be running when the first failure
@@ -400,10 +418,36 @@ decision about what a step *means* stays in the planner and the executor.
   would hide the failure. For the same reason a terminal chain disposition that
   carries no outcome is reported as a failure rather than as a finished round:
   the outcome is the only place the rejection survives.
-- **An empty step list is not necessarily success.** Persisted terminal
-  submissions, missing bundle setup, and ballot blockers all project no
-  executable step. The driver reports them in that precedence after recorded
-  failures; only an empty plan with none of those conditions is `NoWorkLeft`.
+- **The stop reason is decided from what the run can still dispatch, never
+  from a round-wide flag.** A run stops when the plan lists no step it would
+  admit: no step at all, or only `ConfirmShare` steps for shares a helper has
+  already accepted, or only steps on bundles a failure isolated. It reports, in
+  this precedence: a recorded failure, then a persisted submission it cannot
+  advance, then missing bundle setup, then an unfinished ballot, then the
+  background share handoff, and only then `NoWorkLeft`. Anything the host must
+  act on outranks a handoff that asks nothing of it.
+
+  `RoundPlan::blocking_recovery` is deliberately not the predicate. It is a
+  property of the whole round, so it stays true for a terminal submission that
+  plans no step at all and for a step on a skipped bundle. Reading it as
+  "foreground work remains" made a round whose only remaining steps were shares
+  a helper already held poll them for the entire dispatch budget and then
+  report `PassBudgetExhausted` — an invariant-level event — in place of the
+  rejection or the failure the host had to act on. Once nothing dispatchable is
+  left, `blocking_recovery` means exactly "durable submission state this run
+  cannot advance", which is why it maps to `PersistedChainTerminal` there and
+  nowhere else
+  (`a_terminal_submission_outranks_shares_the_timer_would_finish`,
+  `a_skipped_bundles_own_work_does_not_keep_the_run_dispatching`,
+  `a_recorded_failure_outranks_every_healthy_handoff`,
+  `an_open_ballot_outranks_the_share_handoff`,
+  `bundle_setup_outranks_the_ballot_it_blocks`,
+  `an_empty_plan_with_nothing_owed_is_no_work_left`).
+
+  `blocking_share_work` is the one round-wide flag that does hold the
+  foreground open: a share row no helper has reached is delivered rather than
+  polled, and background tracking cannot finish it
+  (`an_undelivered_share_is_foreground_work_even_on_a_skipped_bundle`).
 - **The dispatch budget is evaluated against a fresh plan.** After the final
   admitted dispatch or wave, the driver re-plans, refreshes the tally, and
   prefers natural quiescence when the work completed. If work remains,
@@ -430,6 +474,11 @@ decision about what a step *means* stays in the planner and the executor.
 The host-facing projections of a run live in `wire` beside the plan and step
 views, in the same flat serde-stable shape, and are built only from a report
 the driver produced. They are a projection, never a second source of truth.
+The projection must be *total*: a cross-language binding sees what a native
+caller sees, so every field of `RoundRunReport` — the signed delegation bundles
+included — reaches `RoundRunReportView`. Dropping one silently gives two
+different answers to "what did this run do" depending on which side of the
+boundary asked.
 
 ## Required conformance coverage
 

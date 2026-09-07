@@ -28,16 +28,26 @@ This release is `zcash_voting` 4.0.0.
   `StopRound` failure isolation remain serial. Dispatch-budget reports are
   taken from a fresh plan after the last allowed wave, and absent per-bundle
   stored Keystone signatures stop before dispatch as a signature handoff.
-  Empty plans distinguish missing bundle setup and persisted terminal
-  submissions from completed work. A signature handoff names every bundle the
-  round still owes a delegation for, not only the ones the current wave would
-  run, so a voter signs once rather than a wave at a time and nothing is
-  dispatched before the first of them. Hosts previously wrote this loop
+  The stop reason is decided from what the run can still dispatch rather than
+  from a round-wide flag, so a persisted terminal submission, a bundle a
+  failure isolated, missing bundle setup and an unfinished ballot are each
+  reported in their own right instead of being polled past. A signature handoff
+  names every bundle the round still owes a delegation for, not only the ones
+  the current wave would run, so a voter signs once rather than a wave at a
+  time and nothing is dispatched before the first of them. Driver dispatches
+  inherit the run's operation epoch, so a host that switches session or account
+  while the driver is planning interrupts the step instead of having it adopt
+  the new epoch. `round_lock::bundle_scope` is the single definition of which
+  lock a step takes, read by both the executor that locks and the driver that
+  schedules. Hosts previously wrote this loop
   themselves; `docs/round_orchestration_invariants.md` specifies it. `wire`
   carries the host-facing projections — `RoundRunReportView`,
   `RoundQuiescenceView`, `RoundWorkTallyView`, `RoundDriveEventView` and
   `RoundStepFailureRecordView` — in the same flat, serde-stable shape the other
-  views use, and the prelude exports the driver types.
+  views use, including the signed delegation bundles a run produced, so a
+  cross-language binding sees what a native caller sees. The prelude exports
+  the driver types. `RoundRunReport` and `RoundStepFailureRecord` are
+  `#[non_exhaustive]`: hosts read a report, never build one.
 - `RoundPlan::needs_bundle_setup` reports a round that holds a ballot choice
   but has no bundle rows yet. Eligibility checks do not persist a bundle
   plan, so a host that records a ballot before running setup previously made

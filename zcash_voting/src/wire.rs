@@ -895,6 +895,13 @@ pub struct RoundRunReportView {
     pub chain_outcomes: Vec<RoundChainOutcomeView>,
     #[serde(default)]
     pub share_deliveries: Vec<ShareBatchDeliveryReportView>,
+    /// Delegation bundles the run signed, in the order it produced them.
+    ///
+    /// The driver has already submitted these; they are here so a host reading
+    /// only the report sees the same artifacts a host watching every
+    /// `StepFinished` would.
+    #[serde(default)]
+    pub delegations: Vec<SignedDelegationPayloadView>,
 }
 
 /// A terminal chain outcome bound to the step that produced it.

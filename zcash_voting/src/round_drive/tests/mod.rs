@@ -2,6 +2,7 @@
 
 mod attribution;
 mod concurrency;
+mod epoch;
 mod failure_isolation;
 mod fixtures;
 
@@ -9,4 +10,5 @@ mod quiescence;
 mod repoll;
 mod selection;
 mod signatures;
+mod stop_precedence;
 mod tally;

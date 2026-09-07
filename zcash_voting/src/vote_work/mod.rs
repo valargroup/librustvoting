@@ -7,7 +7,7 @@
 
 mod cast_vote;
 mod delegation_steps;
-mod round_lock;
+pub(crate) mod round_lock;
 mod share_confirmation;
 mod step_control;
 mod step_ledger;

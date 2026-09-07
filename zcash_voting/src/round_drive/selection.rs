@@ -1,6 +1,6 @@
 //! Which obligation the driver dispatches next, and under which lock.
 
-use crate::session::NextStep;
+use crate::{session::NextStep, vote_work::round_lock};
 
 /// The lock scope the executor takes for a step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9,16 +9,17 @@ pub(super) enum StepLockScope {
     Round,
 }
 
-/// Mirrors the executor's exhaustive lock-scope decision.
+/// The lock scope `step` runs under.
+///
+/// Read from [`round_lock::bundle_scope`], the executor's own decision, rather
+/// than restated here. Scheduling and locking must not be two tables that can
+/// drift: a driver that thought a round-locked step was bundle-locked would
+/// admit a wave of steps that then serialize on one lock, each holding a
+/// proving worker open for the wait.
 pub(super) fn lock_scope(step: &NextStep) -> StepLockScope {
-    match step {
-        NextStep::Delegate { .. } | NextStep::AdvanceDelegation { .. } => StepLockScope::Bundle,
-        NextStep::AdvanceImportedDelegation { .. }
-        | NextStep::CastVote { .. }
-        | NextStep::AdvanceVote { .. }
-        | NextStep::AdvanceVoteBatch { .. }
-        | NextStep::SubmitShares { .. }
-        | NextStep::ConfirmShare { .. } => StepLockScope::Round,
+    match round_lock::bundle_scope(step) {
+        Some(_) => StepLockScope::Bundle,
+        None => StepLockScope::Round,
     }
 }
 

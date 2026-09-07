@@ -120,11 +120,13 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// obligation it executes; a step another pass already completed returns
     /// `NoWork`. A step that plan still lists but that resolves to no
     /// obligation is an `InvariantViolation` rather than `NoWork`, so a caller
-    /// re-selecting from a refreshed plan cannot loop on it forever. A step whose bundle still has a delegation step ahead of it
-    /// in the plan fails with `InvalidInput` naming that prerequisite, before
-    /// any lock-scoped work or network I/O; run the prerequisite first or use
-    /// the driver. `Delegate` and `AdvanceDelegation` lock their bundle;
-    /// every other step locks the round. A `ConfirmShare` whose share no
+    /// re-selecting from a refreshed plan cannot loop on it forever. A step
+    /// whose bundle still has a delegation step ahead of it in the plan fails
+    /// with `InvalidInput` naming that prerequisite, before any lock-scoped
+    /// work or network I/O; run the prerequisite first or use the driver.
+    /// `round_lock::bundle_scope` decides the lock: `Delegate` and
+    /// `AdvanceDelegation` lock their bundle, and every other step locks the
+    /// round. A `ConfirmShare` whose share no
     /// helper has accepted yet (the plan's `blocking_share_work`) runs the
     /// share's delivery from its durable plan instead of polling for a
     /// confirmation no helper can give. The operation epoch is captured on
@@ -142,6 +144,32 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .await
     }
 
+    /// Runs one step as part of a longer run that captured `entry_epoch`.
+    ///
+    /// [`Self::advance_step`] captures the epoch when the step begins, which
+    /// is the right answer for a host calling it directly. A driver decides to
+    /// dispatch earlier than that — before planning, building the host
+    /// context, and reading stored signing material — and an epoch switch
+    /// across that gap must interrupt the step rather than be adopted by it.
+    /// The step then stops at its first boundary, before any proving, durable
+    /// write or broadcast.
+    pub(crate) async fn advance_step_in_epoch(
+        &self,
+        step: NextStep,
+        host: &RoundHostContext,
+        control: &ChainSubmissionControl,
+        entry_epoch: u64,
+        progress: &dyn RoundStepProgressReporter,
+    ) -> Result<RoundStepOutcome, RoundStepFailure> {
+        self.advance_step_under(
+            step,
+            host,
+            StepControl::in_epoch(control, entry_epoch),
+            progress,
+        )
+        .await
+    }
+
     /// Runs one step under a control captured by the public entry point.
     async fn advance_step_under(
         &self,
@@ -152,12 +180,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let scope = StepScope::capture(self, step, host, control)?;
         let ledger = StepLedger::default();
-        let lock_scope = match &scope.step {
-            NextStep::Delegate { bundle_index } | NextStep::AdvanceDelegation { bundle_index } => {
-                Some(*bundle_index)
-            }
-            _ => None,
-        };
+        // The driver schedules from this same function, so what it believes
+        // can run concurrently is what actually takes separate locks.
+        let lock_scope = round_lock::bundle_scope(&scope.step);
         let Some(guard) = round_lock::acquire(
             self.database.sidecar_id(),
             scope.wallet_id.clone(),

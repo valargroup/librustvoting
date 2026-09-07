@@ -1,6 +1,6 @@
 //! Which step the driver takes next.
 
-use crate::round_drive::selection::{lock_scope, next_dispatches, StepLockScope};
+use crate::round_drive::selection::{bundle_index, lock_scope, next_dispatches, StepLockScope};
 use crate::session::NextStep;
 
 fn steps() -> Vec<NextStep> {
@@ -119,42 +119,71 @@ fn multiple_repolls_lead_the_next_wave() {
     );
 }
 
-#[test]
-fn every_step_has_the_executors_lock_scope() {
-    assert_eq!(
-        lock_scope(&NextStep::Delegate { bundle_index: 0 }),
-        StepLockScope::Bundle
-    );
-    assert_eq!(
-        lock_scope(&NextStep::AdvanceDelegation { bundle_index: 0 }),
-        StepLockScope::Bundle
-    );
-    for step in [
-        NextStep::AdvanceImportedDelegation { bundle_index: 0 },
+/// Every `NextStep` variant, so a new one is a compile error here too.
+fn every_step_variant() -> Vec<NextStep> {
+    vec![
+        NextStep::Delegate { bundle_index: 7 },
+        NextStep::AdvanceDelegation { bundle_index: 7 },
+        NextStep::AdvanceImportedDelegation { bundle_index: 7 },
         NextStep::CastVote {
-            bundle_index: 0,
+            bundle_index: 7,
             proposal_id: 1,
             choice: 0,
         },
         NextStep::AdvanceVote {
-            bundle_index: 0,
+            bundle_index: 7,
             proposal_id: 1,
         },
         NextStep::AdvanceVoteBatch {
-            bundle_index: 0,
+            bundle_index: 7,
             proposal_id: 1,
         },
         NextStep::SubmitShares {
-            bundle_index: 0,
+            bundle_index: 7,
             proposal_id: 1,
             share_index: 0,
         },
         NextStep::ConfirmShare {
-            bundle_index: 0,
+            bundle_index: 7,
             proposal_id: 1,
             share_index: 0,
         },
-    ] {
-        assert_eq!(lock_scope(&step), StepLockScope::Round);
+    ]
+}
+
+#[test]
+fn the_driver_schedules_by_the_executors_own_lock_scope() {
+    // Derived from `round_lock::bundle_scope`, not restated: if scheduling and
+    // locking were two tables, a drift between them would admit a wave of
+    // steps that then serialize on one lock.
+    for step in every_step_variant() {
+        let executor_scope = crate::vote_work::round_lock::bundle_scope(&step);
+        let expected = match executor_scope {
+            Some(_) => StepLockScope::Bundle,
+            None => StepLockScope::Round,
+        };
+        assert_eq!(lock_scope(&step), expected, "{step:?}");
+        // A wave admits one step per `bundle_index`, so that must be the very
+        // bundle the executor locks, or two admitted steps could contend.
+        if let Some(locked_bundle) = executor_scope {
+            assert_eq!(locked_bundle, bundle_index(&step), "{step:?}");
+        }
     }
+}
+
+#[test]
+fn only_delegation_proving_is_bundle_scoped() {
+    // Pins which variants overlap, so widening or narrowing concurrency is a
+    // deliberate edit to `round_lock::bundle_scope` and shows up here.
+    let bundle_scoped: Vec<_> = every_step_variant()
+        .into_iter()
+        .filter(|step| lock_scope(step) == StepLockScope::Bundle)
+        .collect();
+    assert_eq!(
+        bundle_scoped,
+        vec![
+            NextStep::Delegate { bundle_index: 7 },
+            NextStep::AdvanceDelegation { bundle_index: 7 },
+        ]
+    );
 }

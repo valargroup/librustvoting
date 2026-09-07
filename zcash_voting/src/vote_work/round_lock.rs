@@ -6,9 +6,37 @@ use std::{
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use crate::ChainSubmissionControl;
+use crate::{session::NextStep, ChainSubmissionControl};
 
 const ROUND_LOCK_CANCEL_CHECK_MILLISECONDS: u64 = 50;
+
+/// The lock `step` takes: `Some(bundle_index)` for work scoped to one bundle,
+/// `None` for the round-wide scope.
+///
+/// This is the **only** place that decision is made. The executor locks with
+/// it and the round driver schedules with it, because a scheduler that
+/// believed two round-locked steps were independent would admit them together
+/// and leave them queueing on one lock, each holding a proving worker open.
+///
+/// The match is exhaustive rather than a wildcard so that a new [`NextStep`]
+/// variant is a compile error here, where the choice belongs, instead of
+/// silently defaulting to the round scope.
+pub(crate) fn bundle_scope(step: &NextStep) -> Option<u32> {
+    match step {
+        NextStep::Delegate { bundle_index } | NextStep::AdvanceDelegation { bundle_index } => {
+            Some(*bundle_index)
+        }
+        // Imported delegation advancement is chain work on the round's
+        // submission rows, not proving; it takes the round scope like every
+        // other chain and share step.
+        NextStep::AdvanceImportedDelegation { .. }
+        | NextStep::CastVote { .. }
+        | NextStep::AdvanceVote { .. }
+        | NextStep::AdvanceVoteBatch { .. }
+        | NextStep::SubmitShares { .. }
+        | NextStep::ConfirmShare { .. } => None,
+    }
+}
 
 /// `(sidecar connection, wallet_id, round_id, bundle)`. `None` is the
 /// round-wide scope used by chain and share steps; `Some(bundle)` scopes
