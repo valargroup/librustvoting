@@ -74,6 +74,50 @@ fn validate_delegation_keys_for_round(
     keys.validate_target_round(params)
 }
 
+/// Persists one bundle's delegation proof while treating the round phase as a
+/// lossy high-water mark.
+///
+/// Bundles progress independently, so another bundle may already have moved
+/// the round to `VoteReady`. In that case this proof still commits and the
+/// later round phase is preserved.
+fn persist_delegation_proof_result(
+    conn: &mut rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    delegation_proof: &DelegationProofResult,
+) -> Result<(), VotingError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::from_sqlite("failed to begin proof result transaction", &e))?;
+    queries::store_proof(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        &delegation_proof.proof,
+    )?;
+    queries::store_proof_result_fields_with_van_comm(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        &delegation_proof.rk,
+        &delegation_proof.gov_nullifiers,
+        &delegation_proof.nf_signed,
+        &delegation_proof.cmx_new,
+        &delegation_proof.van_comm,
+    )?;
+    queries::advance_round_phase_to_at_least(
+        &tx,
+        round_id,
+        wallet_id,
+        RoundPhase::DelegationProved,
+    )?;
+    tx.commit()
+        .map_err(|e| VotingError::from_sqlite("failed to commit proof result transaction", &e))
+}
+
 fn validate_delegation_target_for_bundle(
     conn: &rusqlite::Connection,
     params: &VotingRoundParams,
@@ -1783,7 +1827,8 @@ impl VotingDb {
     /// Fetches IMT exclusion proofs from the PIR server for each note's nullifier.
     /// For padded notes (< 5 real notes), the prover fetches proofs internally via PIR.
     ///
-    /// Stores the proof result and advances phase to `DelegationProved`.
+    /// Stores the proof result and advances the round to at least
+    /// `DelegationProved`.
     pub(crate) fn generate_and_persist_delegation_proof(
         &self,
         identity: &DelegationProofIdentity,
@@ -1967,27 +2012,13 @@ impl VotingDb {
         // inputs are checked against the PCZT fields before any partial proof
         // success state is committed.
         let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| {
-                VotingError::from_sqlite("failed to begin proof result transaction", &e)
-            })?;
-        queries::store_proof(&tx, round_id, wallet_id, bundle_index, &result.proof)?;
-        queries::store_proof_result_fields_with_van_comm(
-            &tx,
-            round_id,
-            wallet_id,
-            bundle_index,
-            &result.rk,
-            &result.gov_nullifiers,
-            &result.nf_signed,
-            &result.cmx_new,
-            &result.van_comm,
+        persist_delegation_proof_result(
+            &mut conn,
+            identity.round_id(),
+            identity.wallet_id(),
+            identity.bundle_index(),
+            &result,
         )?;
-        queries::advance_round_phase(&tx, round_id, wallet_id, RoundPhase::DelegationProved)?;
-        tx.commit().map_err(|e| {
-            VotingError::from_sqlite("failed to commit proof result transaction", &e)
-        })?;
 
         let total_elapsed = total_start.elapsed();
         eprintln!(
@@ -3219,6 +3250,7 @@ mod pir_wallet_scope_tests;
 mod tests {
     mod broadcast_protection;
     mod fixtures;
+    mod proof_phase;
     mod setup_target_rebuild;
 
     use super::*;

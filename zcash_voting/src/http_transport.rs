@@ -54,7 +54,51 @@ where
 // unbounded allocation before the client validates the negotiated geometry,
 // and bound the complete request so a slow or endless body cannot stall setup.
 const MAX_PIR_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const PIR_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Total wall-clock budget for one PIR request, across both attempts.
+///
+/// A PIR fetch that succeeds does so in a few seconds; one against a dead
+/// endpoint does not slow down, it stalls and never returns. Measured against a
+/// staging endpoint, successful fetches completed in 6-8 seconds while failures
+/// ran the full deadline. A single long deadline therefore spends a minute
+/// discovering what a few seconds already showed.
+///
+/// The fix is not a shorter deadline, though. A wall clock cannot tell a
+/// stalled endpoint from a slow one, and cutting every request short to fail
+/// fast turns a link that merely needs longer — a congested mobile network, a
+/// distant endpoint, a multi-megabyte tier under [`MAX_PIR_RESPONSE_BYTES`] —
+/// from slow into broken, because each attempt restarts the transfer from
+/// zero. So the budget is split along two axes instead: a tight bound on
+/// connection setup, where a dead endpoint reveals itself, and a generous
+/// bound on the request as a whole, where a slow link needs room.
+///
+/// Two attempts share this one budget, so the worst case is unchanged from the
+/// single 60-second deadline this replaces and no caller waits longer than
+/// before. That ceiling matters because [`crate::pir::PirFleet`] failover
+/// multiplies it by the endpoint count.
+const PIR_REQUEST_BUDGET: Duration = Duration::from_secs(60);
+/// Connection-setup bound for the first PIR attempt.
+///
+/// Short enough that a blackholed endpoint costs seconds rather than the whole
+/// budget, and a retry still has room. Connection setup is the one phase whose
+/// duration says nothing about how much work remains, so bounding it tightly
+/// costs a slow-but-working link nothing.
+const PIR_FIRST_ATTEMPT_CONNECT: Duration = Duration::from_secs(5);
+/// Whole-request bound for the first PIR attempt.
+///
+/// Comfortably above the measured 6-8 second success path, so a healthy fetch
+/// never reaches a second attempt, while a stalled one is abandoned with most
+/// of the budget still unspent.
+const PIR_FIRST_ATTEMPT_OVERALL: Duration = Duration::from_secs(15);
+/// Connection-setup bound for the final PIR attempt.
+///
+/// Looser than the first: having already failed once, the cost of waiting a
+/// little longer is lower than the cost of giving up on a slow connection.
+const PIR_FINAL_ATTEMPT_CONNECT: Duration = Duration::from_secs(10);
+/// Floor on what must remain of [`PIR_REQUEST_BUDGET`] to attempt again.
+///
+/// Guards against issuing a request with a deadline too short to be worth the
+/// round trip, if a first attempt somehow consumed nearly the whole budget.
+const PIR_MIN_RETRY_BUDGET: Duration = Duration::from_secs(1);
 // Tree pages are JSON encoded and can be larger than the compact state
 // responses. Bound every tree response before buffering or parsing it, and
 // cover connection setup plus the complete body read with one deadline.
@@ -137,6 +181,17 @@ pub struct RouteRequest<'a> {
     /// Deadline for the complete request: connection setup, dispatch, and
     /// body read. The SDK enforces the same deadline as a backstop.
     pub timeout: Duration,
+    /// Optional tighter bound on connection setup alone, when the caller wants
+    /// to abandon an endpoint that never answers without also cutting short
+    /// one that is merely slow. Connection setup is the one phase whose
+    /// duration says nothing about how much work remains.
+    ///
+    /// An executor that enforces this must say so through
+    /// [`RouteHttp::enforces_connect_timeout`] and must report the expiry as
+    /// [`RoutePhase::BeforeDispatch`]; the SDK draws no conclusion from the
+    /// clock otherwise. `None` leaves connection setup bounded only by
+    /// `timeout`.
+    pub connect_timeout: Option<Duration>,
     /// Response body ceiling. Executors stop reading at this size and fail
     /// with [`RoutePhase::ResponseRead`].
     pub max_response_bytes: usize,
@@ -225,6 +280,12 @@ pub type RouteFuture<'a> =
 /// - Honor `max_response_bytes`, and `timeout` where the executor can bound
 ///   work the SDK cannot cancel. The SDK enforces `timeout` around the whole
 ///   call and classifies its own deadline by whether the hook was called.
+/// - `connect_timeout` is optional to honor, because only the executor can see
+///   connection setup. An executor that does bound setup by it says so through
+///   [`RouteHttp::enforces_connect_timeout`], and only then does the SDK read
+///   a pre-dispatch failure at or after that budget as the budget expiring
+///   rather than as the endpoint's answer. An executor that ignores it is
+///   bounded by `timeout` alone and loses nothing else.
 /// - Report `phase` truthfully. It is consulted for failures the dispatch hook
 ///   cannot classify, such as a body-read failure after headers arrived. A
 ///   `BeforeDispatch` phase reported after the hook was called is not
@@ -254,6 +315,26 @@ pub trait RouteHttp: Send + Sync + 'static {
     /// for one that may have followed a write. The default is `false`: any
     /// failure after the hook is possibly dispatched.
     fn hook_precedes_connection_setup(&self) -> bool {
+        false
+    }
+
+    /// Whether this executor bounds connection setup by
+    /// [`RouteRequest::connect_timeout`] and reports its expiry as
+    /// [`RoutePhase::BeforeDispatch`].
+    ///
+    /// The SDK cannot see connection setup, so it can only tell a budget that
+    /// expired from an endpoint that refused by asking. An executor that
+    /// declares this has its pre-dispatch failures at or after the budget read
+    /// as "no answer yet", which a caller free to repeat the request may act
+    /// on. The default is `false`: an executor that ignores the budget has its
+    /// pre-dispatch failures read as the definite answers they are, so a
+    /// refusal that happens to arrive late is never mistaken for a timeout.
+    ///
+    /// Declaring this without enforcing the budget is the one way to get a
+    /// definite refusal repeated. It never makes an ambiguous failure look
+    /// safe, though: only `BeforeDispatch` is eligible, and that already means
+    /// no request byte left.
+    fn enforces_connect_timeout(&self) -> bool {
         false
     }
 }
@@ -286,15 +367,66 @@ fn direct_connect_deadline(
     backstop.checked_sub(lead).unwrap_or(backstop)
 }
 
+/// The connection-setup deadline for a request, honoring an optional budget.
+///
+/// A caller-supplied budget only tightens the deadline. Relaxing it would let
+/// connection setup outlive the backstop, and the classification the whole
+/// dispatch model rests on depends on connect giving up first — so the derived
+/// lead stays the upper bound whatever the caller asks for.
+///
+/// A tighter budget is what lets a caller distinguish an endpoint that never
+/// answers from one that is merely slow: connection setup is bounded on its
+/// own, so abandoning it early costs a slow-but-progressing transfer nothing.
+fn connect_deadline(
+    backstop: tokio::time::Instant,
+    timeout: Duration,
+    started: tokio::time::Instant,
+    budget: Option<Duration>,
+) -> tokio::time::Instant {
+    let derived = direct_connect_deadline(backstop, timeout);
+    // A budget too large to represent as an instant cannot tighten anything,
+    // so it falls back to the derived lead rather than panicking. The budget
+    // is caller-supplied through a public field, so it must not be trusted to
+    // be addable to the current instant.
+    match budget.and_then(|budget| started.checked_add(budget)) {
+        Some(bounded) => derived.min(bounded),
+        None => derived,
+    }
+}
+
 /// Applies the in-flight request deadline to connection setup.
 ///
 /// Wrapping the complete TCP+TLS connector matters: a stalled TLS handshake
 /// has still not dispatched an HTTP request, so it must surface as a connect
 /// failure rather than race the whole-request deadline into an ambiguous
 /// outcome.
-#[derive(Clone)]
 struct ConnectDeadlineConnector<C> {
     inner: C,
+    /// Timer that wakes this connector when the current request's connect
+    /// deadline passes, held across polls so its registration survives, and
+    /// tagged with the deadline it was armed for.
+    ///
+    /// Checking the clock on entry to `poll_ready` is not enough on its own: a
+    /// connector that withholds readiness is polled once and then only when it
+    /// says so, which may be long after the deadline or never. Holding a timer
+    /// that registered the caller's waker is what turns the bound into one
+    /// this connector enforces rather than one it happens to notice.
+    ///
+    /// The deadline is kept alongside because a pooled connector outlives one
+    /// request: a timer armed for an earlier request must not bound a later
+    /// one, in either direction.
+    readiness_timer: Option<(tokio::time::Instant, Pin<Box<tokio::time::Sleep>>)>,
+}
+
+/// Cloning drops any armed timer: a clone serves a different connection, whose
+/// readiness runs under its own request deadline.
+impl<C: Clone> Clone for ConnectDeadlineConnector<C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            readiness_timer: None,
+        }
+    }
 }
 
 impl<C, T, E> tower_service::Service<http::Uri> for ConnectDeadlineConnector<C>
@@ -307,13 +439,67 @@ where
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<T, Self::Error>> + Send>>;
 
+    /// Readiness is part of connection setup, so the deadline covers it too,
+    /// by racing the inner connector against a timer rather than by sampling
+    /// the clock.
+    ///
+    /// Wrapping only the future returned by `call` would leave a gap: a
+    /// connector that withholds readiness past the deadline and then reports a
+    /// failure would produce a pre-dispatch error arriving after the budget,
+    /// which the SDK reads as the budget expiring because this route declares
+    /// that it enforces the budget. Past the deadline the answer is that
+    /// connection setup ran out of time, whatever the inner connector would
+    /// have said next.
+    ///
+    /// The timer is what makes that a bound rather than an observation. A
+    /// connector that returns `Pending` decides when this is polled again, so
+    /// a clock check alone runs once and may never run after the deadline; the
+    /// stall would then be caught only by the whole-request backstop, which is
+    /// looser than the budget this route promises to enforce. Holding a
+    /// `Sleep` that registered `cx.waker()` guarantees a poll at the deadline.
     fn poll_ready(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
-        self.inner
+        let deadline = DIRECT_CONNECT_DEADLINE
+            .try_with(|deadline| *deadline)
+            .ok()
+            .flatten();
+        if let Some(deadline) = deadline {
+            // Re-arm whenever the deadline is not the one the held timer was
+            // armed for, so a pooled connector never bounds a request by a
+            // previous request's deadline.
+            if self
+                .readiness_timer
+                .as_ref()
+                .is_none_or(|(armed_for, _)| *armed_for != deadline)
+            {
+                self.readiness_timer =
+                    Some((deadline, Box::pin(tokio::time::sleep_until(deadline))));
+            }
+            let (_, timer) = self
+                .readiness_timer
+                .as_mut()
+                .expect("the timer was just armed");
+            // Polling the held timer both answers "has the deadline passed"
+            // and registers this waker with the timer wheel, so a stalled
+            // readiness is woken at the deadline instead of never.
+            if timer.as_mut().poll(cx).is_ready() {
+                self.readiness_timer = None;
+                return std::task::Poll::Ready(Err(connect_timeout_error()));
+            }
+        }
+        let readiness = self
+            .inner
             .poll_ready(cx)
-            .map(|result| result.map_err(Into::into))
+            .map(|result| result.map_err(Into::into));
+        // The timer belongs to the request whose readiness is still pending.
+        // Once the inner connector is ready the wait is over, so drop it
+        // rather than let it outlive its deadline into the next request.
+        if readiness.is_ready() {
+            self.readiness_timer = None;
+        }
+        readiness
     }
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
@@ -326,12 +512,7 @@ where
             match deadline {
                 Some(deadline) => tokio::time::timeout_at(deadline, future)
                     .await
-                    .map_err(|_| {
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "connection setup timed out before request dispatch",
-                        )) as Self::Error
-                    })?
+                    .map_err(|_| connect_timeout_error())?
                     .map_err(Into::into),
                 None => future.await.map_err(Into::into),
             }
@@ -339,12 +520,33 @@ where
     }
 }
 
+/// The failure both connection-setup phases report when the deadline expires.
+///
+/// Hyper attributes this to connection setup, so [`DirectRoute`] reports it as
+/// [`RoutePhase::BeforeDispatch`] and the SDK reads it as the connect budget
+/// expiring rather than as the endpoint's answer.
+fn connect_timeout_error() -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "connection setup timed out before request dispatch",
+    ))
+}
+
 /// SDK-owned direct HTTP/HTTPS executor with a pooled Hyper client.
 ///
-/// Connection setup runs under the request deadline, so a TCP or TLS stall
-/// is reported as a connect failure and classified as pre-dispatch.
+/// Built by [`Self::new`] or [`Self::with_http_connector`], connection setup
+/// runs under the request deadline, so a TCP or TLS stall is reported as a
+/// connect failure and classified as pre-dispatch. [`Self::with_connector`]
+/// uses the connector exactly as given and so bounds nothing itself; a route
+/// built that way is bounded by the whole-request deadline alone.
 pub struct DirectRoute {
     client: Box<dyn HyperRequestClient>,
+    /// Whether this route's connector stack includes
+    /// [`ConnectDeadlineConnector`], and so actually bounds connection setup
+    /// by [`RouteRequest::connect_timeout`]. Only a route that does may have
+    /// its late pre-dispatch failures read as that budget expiring, so this
+    /// tracks how the route was built rather than assuming the wrapper.
+    enforces_connect_timeout: bool,
 }
 
 impl DirectRoute {
@@ -384,20 +586,46 @@ impl DirectRoute {
             .enable_http1()
             .enable_http2()
             .wrap_connector(connector);
-        Self::with_connector(ConnectDeadlineConnector { inner: https })
+        Self::from_connector(
+            ConnectDeadlineConnector {
+                inner: https,
+                readiness_timer: None,
+            },
+            true,
+        )
     }
 
     /// Uses a fully configured Hyper connector without adding TLS.
     ///
-    /// The connector is used as given; only [`Self::with_http_connector`]
-    /// and [`Self::new`] bound connection setup by the request deadline.
+    /// The connector is used as given, so this route bounds nothing itself:
+    /// only [`Self::with_http_connector`] and [`Self::new`] wrap the connector
+    /// in the request's connection-setup deadline. Such a route reports
+    /// [`RouteHttp::enforces_connect_timeout`] as `false`, so a caller's
+    /// `connect_timeout` has no effect on it and its pre-dispatch failures
+    /// stay the definite answers they are, never re-read as a budget
+    /// expiring. A host that wants both behaviors should wrap its connector
+    /// in its own deadline and route through its own [`RouteHttp`], or use
+    /// [`Self::with_http_connector`].
     pub fn with_connector<C>(connector: C) -> Self
+    where
+        C: Connect + Clone + Send + Sync + 'static,
+    {
+        Self::from_connector(connector, false)
+    }
+
+    /// Builds the route over `connector`, recording whether that connector
+    /// stack bounds connection setup by the request's `connect_timeout`.
+    ///
+    /// The flag is passed rather than inferred because only the constructor
+    /// that installs [`ConnectDeadlineConnector`] knows it is there.
+    fn from_connector<C>(connector: C, enforces_connect_timeout: bool) -> Self
     where
         C: Connect + Clone + Send + Sync + 'static,
     {
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Self {
             client: Box::new(client),
+            enforces_connect_timeout,
         }
     }
 }
@@ -429,15 +657,18 @@ impl RouteHttp for DirectRoute {
             // The SDK transport sets the connection-setup deadline before it
             // polls this future, so that connection setup fails as a connect
             // error before the SDK backstop fires. A caller driving the route
-            // directly gets the same lead derived from `request.timeout`.
+            // directly gets the same deadline derived here instead, honoring
+            // `connect_timeout` the same way.
+            let connect_timeout = request.connect_timeout;
             let deadline = DIRECT_CONNECT_DEADLINE
                 .try_with(|deadline| *deadline)
                 .ok()
                 .flatten()
                 .or_else(|| {
-                    tokio::time::Instant::now()
-                        .checked_add(request.timeout)
-                        .map(|backstop| direct_connect_deadline(backstop, request.timeout))
+                    let started = tokio::time::Instant::now();
+                    started.checked_add(request.timeout).map(|backstop| {
+                        connect_deadline(backstop, request.timeout, started, connect_timeout)
+                    })
                 });
             DIRECT_CONNECT_DEADLINE
                 .scope(deadline, async move {
@@ -491,6 +722,19 @@ impl RouteHttp for DirectRoute {
     fn hook_precedes_connection_setup(&self) -> bool {
         true
     }
+
+    /// True only when this route was built with [`ConnectDeadlineConnector`]
+    /// in its stack, which wraps the complete TCP+TLS connector in the
+    /// request's connect deadline and reports its expiry as a connect error —
+    /// surfaced distinctly by Hyper and reported here as pre-dispatch. For
+    /// such a route, a connect failure at or after that deadline is the
+    /// deadline, not a refusal that arrived late.
+    ///
+    /// [`Self::with_connector`] installs no such wrapper, so a route built
+    /// that way claims nothing and keeps its pre-dispatch failures definite.
+    fn enforces_connect_timeout(&self) -> bool {
+        self.enforces_connect_timeout
+    }
 }
 
 /// Failure of one routed request with the SDK's own dispatch observation.
@@ -499,6 +743,12 @@ struct RoutedFailure {
     dispatched: bool,
     /// Whether the SDK backstop deadline fired.
     timed_out: bool,
+    /// Whether the connection-setup deadline expired rather than the endpoint
+    /// answering. Distinct from `timed_out`, which is the whole-request
+    /// backstop: a connect deadline ends the attempt before any request byte
+    /// can have left, so the failure stays definite. A caller free to repeat
+    /// the request can treat this as "no answer yet" rather than an answer.
+    connect_deadline_expired: bool,
     error: RouteError,
 }
 
@@ -542,7 +792,9 @@ impl HyperTransport<DirectRoute> {
 
     /// Creates a direct transport from a fully configured Hyper connector.
     ///
-    /// See [`DirectRoute::with_connector`].
+    /// The connector is used as given, so connection setup is bounded only by
+    /// the whole-request deadline and a caller's `connect_timeout` has no
+    /// effect. See [`DirectRoute::with_connector`].
     pub fn with_connector<C>(connector: C) -> Self
     where
         C: Connect + Clone + Send + Sync + 'static,
@@ -590,8 +842,14 @@ impl<R: RouteHttp> HyperTransport<R> {
         // route gives up on connection setup slightly before the backstop, so
         // a stalled connect is reported as a definite pre-dispatch failure
         // rather than reaching the backstop after the dispatch marker is set.
-        let backstop = tokio::time::Instant::now() + request.timeout;
-        let connect_deadline = direct_connect_deadline(backstop, request.timeout);
+        //
+        // A caller-supplied connect budget only ever tightens that deadline,
+        // never relaxes it, so the derived lead remains the upper bound and
+        // connection setup still gives up before the backstop can fire.
+        let started = tokio::time::Instant::now();
+        let backstop = started + request.timeout;
+        let connect_deadline =
+            connect_deadline(backstop, request.timeout, started, request.connect_timeout);
         let outcome = DIRECT_CONNECT_DEADLINE
             .scope(
                 Some(connect_deadline),
@@ -610,6 +868,20 @@ impl<R: RouteHttp> HyperTransport<R> {
             // failure after the hook is possibly dispatched, as the hook
             // contract promises.
             Ok(Err(error)) => {
+                // A pre-dispatch failure at or after the connect deadline is
+                // that deadline expiring, not the endpoint refusing: the route
+                // was still setting the connection up when its budget ran out.
+                //
+                // Only an executor that enforces the budget can be read this
+                // way. One that ignores it never had a deadline to expire, so
+                // a refusal it happens to report late is exactly what it says
+                // it is, and the clock would only manufacture a timeout out of
+                // a definite answer. Only pre-dispatch qualifies either way,
+                // so this can never mark a possibly-dispatched failure as safe
+                // to repeat.
+                let connect_deadline_expired = error.phase == RoutePhase::BeforeDispatch
+                    && self.route.enforces_connect_timeout()
+                    && tokio::time::Instant::now() >= connect_deadline;
                 let dispatched = match error.phase {
                     RoutePhase::BeforeDispatch => {
                         dispatched && !self.route.hook_precedes_connection_setup()
@@ -619,12 +891,14 @@ impl<R: RouteHttp> HyperTransport<R> {
                 Err(RoutedFailure {
                     dispatched,
                     timed_out: false,
+                    connect_deadline_expired,
                     error,
                 })
             }
             Err(_) => Err(RoutedFailure {
                 dispatched,
                 timed_out: true,
+                connect_deadline_expired: false,
                 error: RouteError {
                     phase: if dispatched {
                         RoutePhase::AfterDispatch
@@ -658,40 +932,80 @@ impl<R: RouteHttp> HyperTransport<R> {
             }
             .wrap(format!("build PIR request URL {url:?}: {error}")));
         }
-        let response = self
+        // Two attempts share one budget. Only a request that ran out of time
+        // is repeated — either the whole-request backstop or the connect
+        // deadline. Every other failure is a definite answer about this
+        // endpoint: a refused connection, a protocol error, a non-success
+        // status. Repeating one would neither change it nor be free.
+        //
+        // Repeating is safe here in a way it is not for helper or chain POSTs.
+        // A PIR query is an idempotent read, so a second attempt cannot double
+        // an effect, and re-sending the identical encrypted query tells the
+        // server nothing it did not already have — which item is being fetched
+        // is exactly what PIR hides. A connect timeout is definitely unsent,
+        // and the backstop case only repeats a read.
+        let started = tokio::time::Instant::now();
+        // The first attempt gets the only copy of the body the retry needs;
+        // the final attempt takes ownership, so one clone covers both.
+        let first = self
             .execute(
                 RouteRequest {
-                    method,
+                    method: method.clone(),
                     url,
                     headers: &[],
-                    body,
-                    timeout: PIR_REQUEST_TIMEOUT,
+                    body: body.clone(),
+                    timeout: PIR_FIRST_ATTEMPT_OVERALL,
+                    connect_timeout: Some(PIR_FIRST_ATTEMPT_CONNECT),
                     max_response_bytes: MAX_PIR_RESPONSE_BYTES,
                 },
                 None,
             )
-            .await
-            .map_err(|failure| {
-                let phase = if failure.timed_out {
-                    Phase::Timeout
+            .await;
+        let response = match first {
+            Ok(response) => Ok(response),
+            Err(failure) if failure.timed_out || failure.connect_deadline_expired => {
+                let remaining = PIR_REQUEST_BUDGET.saturating_sub(started.elapsed());
+                if remaining < PIR_MIN_RETRY_BUDGET {
+                    Err(failure)
                 } else {
-                    match failure.error.phase {
-                        RoutePhase::BeforeDispatch => Phase::Connect,
-                        RoutePhase::AfterDispatch => Phase::Send,
-                        RoutePhase::ResponseRead => Phase::Body,
-                    }
-                };
-                let message = if failure.timed_out {
-                    "PIR HTTP request timed out".to_string()
-                } else {
-                    failure.error.message
-                };
-                PirHttpFailure {
-                    phase,
-                    http_status: None,
+                    self.execute(
+                        RouteRequest {
+                            method,
+                            url,
+                            headers: &[],
+                            body,
+                            timeout: remaining,
+                            connect_timeout: Some(PIR_FINAL_ATTEMPT_CONNECT),
+                            max_response_bytes: MAX_PIR_RESPONSE_BYTES,
+                        },
+                        None,
+                    )
+                    .await
                 }
-                .wrap(message)
-            })?;
+            }
+            Err(failure) => Err(failure),
+        };
+        let response = response.map_err(|failure| {
+            let phase = if failure.timed_out {
+                Phase::Timeout
+            } else {
+                match failure.error.phase {
+                    RoutePhase::BeforeDispatch => Phase::Connect,
+                    RoutePhase::AfterDispatch => Phase::Send,
+                    RoutePhase::ResponseRead => Phase::Body,
+                }
+            };
+            let message = if failure.timed_out {
+                "PIR HTTP request timed out".to_string()
+            } else {
+                failure.error.message
+            };
+            PirHttpFailure {
+                phase,
+                http_status: None,
+            }
+            .wrap(message)
+        })?;
         let status = response.status;
         if !(200..300).contains(&status) {
             let preview: String = String::from_utf8_lossy(&response.body)
@@ -737,6 +1051,7 @@ impl<R: RouteHttp> HyperTransport<R> {
                     headers: &headers,
                     body,
                     timeout,
+                    connect_timeout: None,
                     max_response_bytes: MAX_HELPER_RESPONSE_BYTES,
                 },
                 None,
@@ -789,6 +1104,7 @@ impl<R: RouteHttp> HyperTransport<R> {
                     headers: metadata.headers(),
                     body,
                     timeout: metadata.timeout(),
+                    connect_timeout: None,
                     max_response_bytes: metadata.max_response_bytes(),
                 },
                 Some(&mark_possible),
@@ -889,6 +1205,7 @@ impl<R: RouteHttp> vote_commitment_tree_client::transport::Transport for HyperTr
                     headers: &[],
                     body: Vec::new(),
                     timeout: TREE_REQUEST_TIMEOUT,
+                    connect_timeout: None,
                     max_response_bytes: MAX_TREE_RESPONSE_BYTES,
                 },
                 None,
@@ -955,6 +1272,7 @@ impl<R: RouteHttp> ChainTransport for HyperTransport<R> {
 #[cfg(test)]
 mod tests {
     mod pir_request;
+    mod pir_retry;
     mod route;
     mod typed_pir_failure;
 

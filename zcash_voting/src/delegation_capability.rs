@@ -437,18 +437,12 @@ pub fn import_delegation_capability(
             "stored bundle count conflicts with the complete capability",
         ));
     }
-    tx.execute(
-        "UPDATE rounds SET phase = :phase
-         WHERE round_id = :round_id AND wallet_id = :wallet_id AND phase < :phase",
-        named_params! {
-            ":phase": RoundPhase::DelegationProved as i32,
-            ":round_id": capability.vote_round_id,
-            ":wallet_id": wallet_id,
-        },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("advance imported round phase failed: {e}"),
-    })?;
+    queries::advance_round_phase_to_at_least(
+        &tx,
+        &capability.vote_round_id,
+        &wallet_id,
+        RoundPhase::DelegationProved,
+    )?;
     tx.commit()
         .map_err(|e| VotingError::from_sqlite("commit delegation capability import failed", &e))?;
     Ok(digest)

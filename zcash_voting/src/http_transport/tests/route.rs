@@ -278,3 +278,113 @@ fn the_connect_deadline_leads_the_backstop_by_a_bounded_fraction_of_the_timeout(
 
     assert!(long < backstop && short < backstop);
 }
+
+#[test]
+fn only_a_deadline_wrapped_direct_route_claims_to_enforce_the_connect_budget() {
+    use super::super::DirectRoute;
+    use hyper_util::client::legacy::connect::HttpConnector;
+
+    // `new` and `with_http_connector` install `ConnectDeadlineConnector`, so
+    // their connect failures at or after the budget really are the budget.
+    assert!(DirectRoute::new().enforces_connect_timeout());
+    assert!(DirectRoute::with_http_connector(HttpConnector::new()).enforces_connect_timeout());
+
+    // `with_connector` uses the connector as given and installs no deadline,
+    // so it must claim nothing: a refusal this route reports late is a
+    // refusal, and re-reading it as a timeout would repeat a definite answer.
+    assert!(!DirectRoute::with_connector(HttpConnector::new()).enforces_connect_timeout());
+}
+
+#[test]
+fn an_unrepresentable_connect_budget_leaves_the_derived_deadline_unchanged() {
+    use super::super::{connect_deadline, DIRECT_CONNECT_DEADLINE_LEAD};
+    let started = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(15);
+    let backstop = started + timeout;
+
+    // `connect_timeout` is a public field, so a budget too large to add to the
+    // current instant must fall back to the derived lead rather than panic.
+    let huge = connect_deadline(backstop, timeout, started, Some(Duration::MAX));
+
+    assert_eq!(backstop - huge, DIRECT_CONNECT_DEADLINE_LEAD);
+}
+
+/// Connector that never becomes ready, so readiness alone decides the outcome.
+#[derive(Clone)]
+struct NeverReadyConnector;
+
+impl tower_service::Service<http::Uri> for NeverReadyConnector {
+    type Response = ();
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<(), std::io::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        std::task::Poll::Pending
+    }
+
+    fn call(&mut self, _uri: http::Uri) -> Self::Future {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_connector_readiness_is_abandoned_at_the_connect_deadline() {
+    use super::super::{ConnectDeadlineConnector, DIRECT_CONNECT_DEADLINE};
+    use tower_service::Service;
+
+    // Readiness is part of connection setup, and the bound has to hold for a
+    // connector that never wakes anyone: it decides when it is polled again,
+    // so a clock sampled on entry may never be read after the deadline. This
+    // awaits readiness the way Hyper does rather than re-polling by hand, so
+    // only a timer that registered the waker can end the wait.
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(5);
+    let ready = DIRECT_CONNECT_DEADLINE
+        .scope(Some(deadline), async {
+            let mut connector = ConnectDeadlineConnector {
+                inner: NeverReadyConnector,
+                readiness_timer: None,
+            };
+            std::future::poll_fn(|cx| connector.poll_ready(cx)).await
+        })
+        .await;
+
+    let error = ready.expect_err("the deadline ended the wait");
+    assert!(
+        error.to_string().contains("timed out"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(5),
+        "the wait ended at the connect deadline, not at some looser bound"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn connector_readiness_within_the_deadline_defers_to_the_inner_connector() {
+    use super::super::{ConnectDeadlineConnector, DIRECT_CONNECT_DEADLINE};
+    use tower_service::Service;
+
+    // The bound must not pre-empt a connector that is simply not ready yet.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    DIRECT_CONNECT_DEADLINE
+        .scope(Some(deadline), async {
+            let mut connector = ConnectDeadlineConnector {
+                inner: NeverReadyConnector,
+                readiness_timer: None,
+            };
+            let polled =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(connector.poll_ready(cx))).await;
+            assert!(
+                polled.is_pending(),
+                "before the deadline the inner connector decides"
+            );
+        })
+        .await;
+}

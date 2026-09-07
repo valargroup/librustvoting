@@ -584,10 +584,12 @@ shares, it is the durable `created_at`.
 6. Under-placement is independent of overdue status and can trigger early
    replenishment when no vote-end time is available.
 
-After a tracking pass, the next delay is the earliest future grace boundary,
-capped at 30 seconds. If every remaining share is already ready, the delay is
-15 seconds. Every nonempty delay is at least three seconds. No unconfirmed
-shares yields no next delay.
+After a tracking pass, two clocks compete and the next delay is whichever comes
+first: a share already past its grace boundary is re-polled after 15 seconds,
+and a share still before its boundary is waited for until it arrives, capped at
+30 seconds. Taking the sooner of the two is what keeps a ready share from
+queueing behind an unrelated share whose check is further out. Every nonempty
+delay is at least three seconds. No unconfirmed shares yields no next delay.
 
 Enforcement: `share_recovery_base_time`, `should_resubmit_share`,
 `is_share_resubmission_window_open`, and `next_tracking_delay_seconds` in
@@ -597,8 +599,10 @@ Regression tests: `immediate_shares_use_created_at_for_status_and_retry`,
 `delayed_shares_use_submit_at_for_status_and_retry`,
 `overdue_threshold_is_quarter_window_with_bounds`,
 `resubmission_window_closes_exactly_at_the_cutoff`,
-`next_tracking_delay_applies_minimum_and_future_cap`, and
-`next_tracking_delay_uses_ready_poll_interval_for_ready_pending_shares` in
+`next_tracking_delay_applies_minimum_and_future_cap`,
+`next_tracking_delay_uses_ready_poll_interval_for_ready_pending_shares`,
+`a_ready_share_is_not_left_waiting_behind_a_later_one`, and
+`a_check_sooner_than_the_ready_cadence_still_wins` in
 [`share_policy/tests/timing.rs`](../zcash_voting/src/share_policy/tests/timing.rs).
 Facade-level timing behavior is covered by
 `confirmed_shares_are_never_ready_or_overdue`,

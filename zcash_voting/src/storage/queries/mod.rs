@@ -411,6 +411,68 @@ pub fn advance_round_phase(
     }
 }
 
+/// Raise a round phase to `phase`, leaving a later phase alone.
+///
+/// `rounds.phase` is a lossy round-wide high-water mark, not an authority for
+/// per-bundle completion. Bundles progress independently, so a caller that
+/// reaches `phase` for its own bundle may find the round already further along
+/// because a different bundle got there first. That is a valid state, not a
+/// conflict: the marker keeps the later value and the caller continues.
+///
+/// This is the difference from [`advance_round_phase`], which rejects a
+/// regression as caller error. Use this when the phase is incidental to the
+/// work being committed, and `advance_round_phase` when moving the round
+/// backwards would mean the caller had lost track of the lifecycle.
+///
+/// A round that does not exist is an error rather than a silent no-op.
+pub fn advance_round_phase_to_at_least(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    phase: RoundPhase,
+) -> Result<(), VotingError> {
+    let rows = conn
+        .execute(
+            "UPDATE rounds
+             SET phase = :phase
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND phase < :phase",
+            named_params! {
+                ":phase": phase as i32,
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to advance round phase to at least {phase:?}: {e}"),
+        })?;
+    if rows > 0 {
+        return Ok(());
+    }
+
+    // No row changed: either the round is already at or past `phase`, which is
+    // the case this function exists to accept, or there is no such round.
+    let round_exists = conn
+        .query_row(
+            "SELECT 1 FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| row.get::<_, i32>(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to look up round {round_id}: {e}"),
+        })?
+        .is_some();
+    if round_exists {
+        Ok(())
+    } else {
+        Err(VotingError::InvalidInput {
+            message: format!("round not found: {round_id}"),
+        })
+    }
+}
+
 pub fn load_round_params(
     conn: &Connection,
     round_id: &str,
