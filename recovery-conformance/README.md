@@ -319,9 +319,13 @@ exercised and none skipped:
 
 | Run | Result | Duration |
 | --- | --- | --- |
-| 1 | 20 passed, 0 failed, 0 skipped | 2482s |
-| 2 | 20 passed, 0 failed, 0 skipped | 2567s |
-| 3 | 20 passed, 0 failed, 0 skipped | 2781s |
+| 1 | 20 passed, 0 failed, 0 skipped | 2938s |
+| 2 | 20 passed, 0 failed, 0 skipped | 3082s |
+| 3 | 20 passed, 0 failed, 0 skipped | 3167s |
+
+Each run provisions a control round plus one per stage — roughly twenty fresh
+rounds, sixty across the three, every delegation and vote real and on
+`svote-1`.
 
 Under test: this crate, plus **two sets of SDK fixes that are not on this
 branch**. The runs are honest only with both named, and this branch does not
@@ -339,9 +343,16 @@ Both need to land before this branch's own base turns the matrix green. Running
 it here today reproduces the defects rather than passing over them, which is
 the suite working as intended, not a broken branch.
 
-Each run provisions a control round plus one per stage — roughly twenty fresh
-rounds, every delegation and vote real and on `svote-1`. Sixty rounds across
-the three.
+### What these runs are worth
+
+Earlier runs of this matrix also reported green, and meant considerably less. A
+review found four ways a run could pass over ground it had not tested: the
+matrix could skip every stage and still report success, the no-second-POST
+claim was printed rather than asserted, the control comparison read only
+submission state names, and two crash boundaries did not fire where their names
+said. The runs above are the first taken after those were closed, so they are
+not a repeat of the earlier ones at a higher number — they are the first that
+carry the weight the table implies.
 
 ### What it caught
 
