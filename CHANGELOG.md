@@ -275,11 +275,11 @@ This release is `zcash_voting` 4.0.0.
   nothing.
 - A sidecar's identity canonicalizes the full path when the file exists, so a
   symlink to a sidecar and its real path share one sidecar id.
-- The wallet example's `advance_round_until_idle` returns a structured
-  `RoundAdvanceError` that keeps the executor's `RoundStepFailure` (chain
-  outcome, strongest state, delivery reports, refreshed plan) instead of only
-  its message, and gains `routed_pir_fleet` for building the host's PIR fleet
-  over the same route.
+- The wallet example's `advance_round_until_idle` gains `routed_pir_fleet` for
+  building the host's PIR fleet over the same route. It no longer returns step
+  failures through `RoundAdvanceError`: the driver isolates a failed step and
+  keeps it, with everything that step had already done, in
+  `RoundRunReport::failures`.
 - `VotingDb::ensure_round` refuses an existing round whose stored parameters
   (snapshot height, election key, roots) differ from the supplied ones, not
   only one stored for another network, so bundles are never set up under

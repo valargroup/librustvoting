@@ -377,3 +377,36 @@ async fn a_submission_stuck_in_recovery_stops_instead_of_being_polled_forever() 
         "{outcome:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_exhausted_budget_does_not_pay_a_wait_that_leads_nowhere() {
+    // The final allowed dispatch returned `Pending`, so the run wanted to
+    // re-poll. A re-poll is a pause before another dispatch, and there is no
+    // dispatch left to make: sleeping first would hold the run open for the
+    // host's whole interval before the next pass could report the exhaustion.
+    let database = database_with_imported_delegation();
+    let chain = Arc::new(ScriptedChain::default());
+    chain.queue_not_found();
+    let executor = executor_over_chain(database, chain);
+    let control = ChainSubmissionControl::new(1);
+
+    let started = tokio::time::Instant::now();
+    let report = RoundDriver::new(&executor)
+        .with_policy(RoundDrivePolicy {
+            max_dispatches: 1,
+            pending_repoll: Duration::from_secs(3600),
+            ..RoundDrivePolicy::default()
+        })
+        .run(&SinglePassHost, &control, &RecordingReporter::default())
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(matches!(
+        report.quiescence,
+        RoundQuiescence::PassBudgetExhausted { .. }
+    ));
+    assert!(
+        elapsed < Duration::from_secs(3600),
+        "the run waited out an interval it could never use: {elapsed:?}"
+    );
+}

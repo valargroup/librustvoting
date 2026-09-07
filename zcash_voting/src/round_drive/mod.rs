@@ -102,6 +102,12 @@ pub struct RoundRunReport {
     /// Terminal chain outcomes observed, in order.
     pub chain_outcomes: Vec<(NextStep, ChainSubmissionResult)>,
     pub share_deliveries: Vec<VoteShareDeliveryReport>,
+    /// Delegation bundles the run signed, in the order it produced them.
+    ///
+    /// Signed, not necessarily submitted: a step cancelled between signing and
+    /// building its chain request returns the bundle it produced, and so does
+    /// one that failed at dispatch. Read the bundle's own submission state
+    /// rather than treating presence here as a broadcast.
     pub delegations: Vec<SignedDelegationBundle>,
 }
 
@@ -109,6 +115,27 @@ pub struct RoundRunReport {
 ///
 /// Called once per dispatch. See the module documentation for why a run cannot
 /// freeze one context for its whole duration.
+///
+/// # The signer is a property of the round, not of the bundle
+///
+/// A context names no bundle, so repeated calls cannot tell the driver *which*
+/// bundle each answer is for. An implementation must therefore offer the same
+/// [`DelegationSigner`] mode for every bundle of a round; what may change
+/// between calls is timing, the fleet, and cancellation.
+///
+/// This matters because the signature handoff is round-wide by design: with a
+/// Keystone device the voter signs every bundle before any of them is
+/// broadcast, so the driver reports every bundle still owing a stored
+/// signature rather than one wave's worth at a time. It can only know the mode
+/// of bundles it has admitted, and it takes those as speaking for the round.
+/// A source that answered `Keystone(Stored)` for one bundle and a
+/// self-signing mode for another it had not yet been asked about would be told
+/// to store a signature for a bundle that never needed one, and the run would
+/// not progress until it did.
+///
+/// Within a single wave the driver does not rely on that: a bundle whose own
+/// admitted context signs during its step is never reported as owing stored
+/// material.
 pub trait RoundHostSource: Send + Sync {
     fn host_context(&self) -> RoundHostContext;
 }

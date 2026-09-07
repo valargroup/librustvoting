@@ -75,6 +75,18 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
             let classified = match self.plan_off_the_worker() {
                 Ok(classified) => classified,
                 Err(error) => {
+                    // The read spans the same window as a successful one, so
+                    // an abandoned run must not be reported differently just
+                    // because its concurrent database read happened to fail.
+                    //
+                    // Untested: a cancellation observable here is observable
+                    // at the check one statement above unless it lands inside
+                    // the read itself, and nothing in the API can place it
+                    // there deterministically. The guard closes a real race
+                    // rather than a reproducible one.
+                    if interrupted() {
+                        return run.finish(RoundQuiescence::Cancelled);
+                    }
                     run.record_plan_failure(error);
                     return run.finish(RoundQuiescence::Failures);
                 }
@@ -208,6 +220,14 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                 return run.finish(quiescence);
             }
 
+            // A re-poll is a wait before another dispatch. With none left in
+            // the budget the wait leads nowhere, and a host-configured
+            // interval would hold the run open for its whole length before the
+            // next pass could report the exhaustion.
+            if run.dispatches >= self.policy.max_dispatches {
+                run.repoll.clear();
+                continue;
+            }
             if !run.repoll.is_empty() {
                 let repolls = std::mem::take(&mut run.repoll);
                 let delay = repolls

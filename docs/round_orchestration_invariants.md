@@ -397,6 +397,17 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   reading stored signing material
   (`an_epoch_switch_during_planning_is_not_reported_as_a_round_state`,
   `an_epoch_switch_while_gathering_contexts_is_not_a_signature_handoff`).
+- **A wait must lead somewhere.** A re-poll is a pause before another
+  dispatch, so it is not scheduled once the dispatch budget is spent: the wait
+  could not produce another poll, and a host-configured interval would hold the
+  run open for its whole length before the next pass could report the
+  exhaustion.
+- **A failed plan read does not outrank an interruption.** The read spans the
+  same window as a successful one, so an abandoned run is not reported
+  differently merely because its concurrent database read happened to fail.
+  This guard has no conformance test: a cancellation observable on the error
+  path is observable at the check one statement earlier unless it lands inside
+  the read itself, and nothing in the API can place it there deterministically.
 - **A report describes the round the run left, not the one it found.** A wave
   makes durable progress and can then stop the run, so the plan and tally read
   before it no longer describe the round: a rejection the wave persisted would
@@ -508,6 +519,19 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   not condemn a bundle whose row already exists
   (`each_bundle_is_judged_by_its_own_signer_context`,
   `a_bundle_that_cannot_sign_does_not_condemn_one_that_already_has`).
+
+  The driver can only know the mode of bundles it has admitted, and it takes
+  those as speaking for the round. That is a **contract on the host**, stated
+  on `RoundHostSource`: a context names no bundle, so repeated calls cannot
+  attribute their answers, and an implementation must offer the same signer
+  mode for every bundle of a round. The round-wide handoff exists for the
+  Keystone device flow, where the voter signs every bundle before any is
+  broadcast, and that flow is uniform by construction. A source that answered
+  with a stored signer for one bundle and a self-signing mode for another it
+  had not yet been asked about would be told to store a signature for a bundle
+  that never needed one, and the run would not progress until it did; the API
+  cannot detect this, because learning an un-dispatched bundle's mode would
+  require dispatching it.
 - **Missing stored Keystone signatures are a host handoff.** Before admitting
   signer-requiring bundle work, the driver verifies that **every bundle the
   round still owes a delegation for** has a durable signature row — not only

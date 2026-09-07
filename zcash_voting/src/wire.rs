@@ -906,9 +906,13 @@ pub struct RoundRunReportView {
     pub share_deliveries: Vec<ShareBatchDeliveryReportView>,
     /// Delegation bundles the run signed, in the order it produced them.
     ///
-    /// The driver has already submitted these; they are here so a host reading
-    /// only the report sees the same artifacts a host watching every
-    /// `StepFinished` would.
+    /// Signed, not necessarily submitted: a step cancelled between signing and
+    /// building its chain request returns the bundle it produced, and a step
+    /// that failed at dispatch carries one too. Read the bundle's own
+    /// submission state rather than treating presence here as a broadcast, or
+    /// a host will suppress a resume the round still needs. They are projected
+    /// so a host reading only the report sees the artifacts a host watching
+    /// every step would.
     #[serde(default)]
     pub delegations: Vec<SignedDelegationPayloadView>,
 }
