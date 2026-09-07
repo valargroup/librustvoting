@@ -9,7 +9,9 @@
 use std::path::PathBuf;
 
 use recovery_conformance::assertions::{
-    assert_reservations_monotonic, assert_terminal_rows_unchanged, DurableSnapshot,
+    assert_matches_control, assert_no_second_generation, assert_reservations_monotonic,
+    assert_terminal_rows_unchanged, assert_untouched_bundles_did_not_reserve, DurableSnapshot,
+    Submission,
 };
 use recovery_conformance::run_config::{
     Endpoints, FailureRecord, RoundRunConfig, RunMode, RunOutcome, Target,
@@ -45,13 +47,24 @@ fn config(mode: RunMode) -> RoundRunConfig {
     }
 }
 
-fn snapshot(submissions: Vec<(&str, &str, bool, i64)>) -> DurableSnapshot {
+/// `(kind, bundle_index, generation_digest, state, reservations)`.
+fn snapshot(submissions: Vec<(&str, i64, &str, &str, i64)>) -> DurableSnapshot {
     DurableSnapshot {
         submissions: submissions
             .into_iter()
-            .map(|(kind, state, hash, reservations)| {
-                (kind.to_string(), state.to_string(), hash, reservations)
-            })
+            .map(
+                |(kind, bundle_index, generation_digest, state, reservations)| Submission {
+                    kind: kind.to_string(),
+                    bundle_index,
+                    proposal_id: None,
+                    generation_digest: generation_digest.to_string(),
+                    state: state.to_string(),
+                    has_candidate_hash: state == "tracking",
+                    has_confirmed_hash: state == "confirmed",
+                    confirmation_source: (state == "confirmed").then(|| "hash".to_string()),
+                    reservations,
+                },
+            )
             .collect(),
         bundles: 3,
         proofs: 1,
@@ -184,11 +197,11 @@ fn only_a_finished_round_counts_as_terminal_success() {
 
 #[test]
 fn reservations_may_grow_but_never_shrink() {
-    let before = snapshot(vec![("delegation", "submitting", false, 1)]);
-    let grown = snapshot(vec![("delegation", "tracking", true, 2)]);
+    let before = snapshot(vec![("delegation", 0, "AA", "submitting", 1)]);
+    let grown = snapshot(vec![("delegation", 0, "AA", "tracking", 2)]);
     assert!(assert_reservations_monotonic(&before, &grown).is_ok());
 
-    let shrunk = snapshot(vec![("delegation", "submitting", false, 0)]);
+    let shrunk = snapshot(vec![("delegation", 0, "AA", "submitting", 0)]);
     assert!(
         assert_reservations_monotonic(&before, &shrunk).is_err(),
         "a decreasing reservation count hides a redispatch"
@@ -197,10 +210,10 @@ fn reservations_may_grow_but_never_shrink() {
 
 #[test]
 fn a_terminal_row_may_not_change_across_a_resume() {
-    let before = snapshot(vec![("delegation", "confirmed", true, 1)]);
+    let before = snapshot(vec![("delegation", 0, "AA", "confirmed", 1)]);
     assert!(assert_terminal_rows_unchanged(&before, &before).is_ok());
 
-    let altered = snapshot(vec![("delegation", "recovering", false, 1)]);
+    let altered = snapshot(vec![("delegation", 0, "AA", "recovering", 1)]);
     assert!(
         assert_terminal_rows_unchanged(&before, &altered).is_err(),
         "a confirmed row that moved back to recovering is an immutability breach"
@@ -211,16 +224,16 @@ fn a_terminal_row_may_not_change_across_a_resume() {
 fn a_non_terminal_row_is_free_to_advance() {
     // Only terminal rows are immutable; `submitting` becoming `confirmed` is
     // the ordinary path and must not be flagged.
-    let before = snapshot(vec![("delegation", "submitting", false, 1)]);
-    let after = snapshot(vec![("delegation", "confirmed", true, 1)]);
+    let before = snapshot(vec![("delegation", 0, "AA", "submitting", 1)]);
+    let after = snapshot(vec![("delegation", 0, "AA", "confirmed", 1)]);
     assert!(assert_terminal_rows_unchanged(&before, &after).is_ok());
 }
 
 #[test]
 fn total_reservations_sums_every_submission() {
     let snapshot = snapshot(vec![
-        ("delegation", "confirmed", true, 2),
-        ("vote", "tracking", true, 3),
+        ("delegation", 0, "AA", "confirmed", 2),
+        ("vote", 0, "BB", "tracking", 3),
     ]);
     assert_eq!(snapshot.total_reservations(), 5);
     assert_eq!(snapshot.states(), vec!["confirmed", "tracking"]);
@@ -302,4 +315,71 @@ fn a_tree_confirmation_carries_no_hash_and_must_not_be_asked_for_one() {
 
     // No confirmation at all leaves the dispatched transaction unresolved.
     assert!(assert_recovered_the_same_transaction("abc123", None, None).is_err());
+}
+
+/// A second generation for work that already had one is a second transaction.
+///
+/// This is the failure the reservation count cannot see. A duplicate POST
+/// raises the count exactly as a legitimate retry does, so counting alone
+/// cannot separate "tried again" from "built another transaction spending the
+/// same notes". The digest can, and that distinction is the whole no-double-
+/// spend claim.
+#[test]
+fn a_second_generation_for_the_same_target_is_refused() {
+    let before = snapshot(vec![("delegation", 0, "AA", "recovering", 1)]);
+
+    let retried = snapshot(vec![("delegation", 0, "AA", "tracking", 2)]);
+    assert!(
+        assert_no_second_generation(&before, &retried).is_ok(),
+        "a same-generation retry is permitted; only a new generation is not"
+    );
+
+    let rebuilt = snapshot(vec![
+        ("delegation", 0, "AA", "recovering", 1),
+        ("delegation", 0, "CC", "tracking", 1),
+    ]);
+    let error = assert_no_second_generation(&before, &rebuilt)
+        .expect_err("a second generation for one bundle must be refused");
+    assert!(format!("{error}").contains("second transaction"), "{error}");
+}
+
+/// A bundle the crash never touched must not reserve another POST.
+#[test]
+fn an_untouched_bundle_that_reserves_again_is_refused() {
+    let before = snapshot(vec![
+        ("delegation", 0, "AA", "submitting", 1),
+        ("delegation", 1, "BB", "confirmed", 1),
+    ]);
+    // Bundle 0 crashed and may reserve again; bundle 1 was idle and may not.
+    let after = snapshot(vec![
+        ("delegation", 0, "AA", "confirmed", 2),
+        ("delegation", 1, "BB", "confirmed", 1),
+    ]);
+    assert!(assert_untouched_bundles_did_not_reserve(&before, &after, 0).is_ok());
+
+    let meddled = snapshot(vec![
+        ("delegation", 0, "AA", "confirmed", 2),
+        ("delegation", 1, "BB", "confirmed", 2),
+    ]);
+    let error = assert_untouched_bundles_did_not_reserve(&before, &meddled, 0)
+        .expect_err("an idle bundle reserving again is a POST nothing asked for");
+    assert!(format!("{error}").contains("uncrashed bundle 1"), "{error}");
+}
+
+/// The control comparison must see more than submission state names.
+///
+/// Comparing states alone accepts a round that reached the right state names
+/// while losing the votes, plans and share rows underneath them.
+#[test]
+fn the_control_comparison_notices_a_round_that_lost_its_votes() {
+    let control = snapshot(vec![("vote", 0, "AA", "confirmed", 1)]);
+    assert!(assert_matches_control(&control, &control).is_ok());
+
+    let mut hollow = control.clone();
+    hollow.votes = 0;
+    let mut full = control.clone();
+    full.votes = 9;
+    let error = assert_matches_control(&hollow, &full)
+        .expect_err("identical state names must not hide a round with no votes");
+    assert!(format!("{error}").contains("A3 VIOLATED"), "{error}");
 }

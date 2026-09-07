@@ -12,6 +12,8 @@
 //!   tests nothing about recovery, and an earlier version of this suite nearly
 //!   reported that as a violation.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 
 use zcash_voting::round::VotingDb;
@@ -26,8 +28,12 @@ use crate::stages::CrashStage;
 /// projection bug cannot hide one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableSnapshot {
-    /// `(kind, state, has_candidate_hash, reservations)` per submission.
-    pub submissions: Vec<(String, String, bool, i64)>,
+    /// One row per chain submission, identity included.
+    ///
+    /// Identity is what makes "no second POST" checkable. Counting alone
+    /// cannot distinguish a generation that retried from a second generation
+    /// built to spend the same notes again; the digest can.
+    pub submissions: Vec<Submission>,
     pub bundles: i64,
     pub proofs: i64,
     pub votes: i64,
@@ -48,6 +54,41 @@ pub struct DurableSnapshot {
     pub cached_tree: bool,
 }
 
+/// One durable chain submission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Submission {
+    pub kind: String,
+    pub bundle_index: i64,
+    pub proposal_id: Option<i64>,
+    /// Hex of the generation digest: the identity of the transaction built.
+    pub generation_digest: String,
+    pub state: String,
+    pub has_candidate_hash: bool,
+    pub has_confirmed_hash: bool,
+    pub confirmation_source: Option<String>,
+    pub reservations: i64,
+}
+
+impl Submission {
+    /// What the submission is for, ignoring which generation served it.
+    pub fn target(&self) -> (String, i64, Option<i64>) {
+        (self.kind.clone(), self.bundle_index, self.proposal_id)
+    }
+}
+
+/// The comparable shape of a finished round. See [`DurableSnapshot::shape`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoundShape {
+    submissions: BTreeMap<(String, i64, Option<i64>), (String, bool)>,
+    bundles: i64,
+    proofs: i64,
+    votes: i64,
+    helper_share_plans: i64,
+    share_delegations: i64,
+    accepted_urls: usize,
+    pczt_persisted: bool,
+}
+
 impl DurableSnapshot {
     /// Reads the snapshot from a sidecar path, opening its own connection.
     pub fn read(sidecar: &std::path::Path) -> Result<Self> {
@@ -55,19 +96,27 @@ impl DurableSnapshot {
             rusqlite::Connection::open(sidecar).context("opening the sidecar for inspection")?;
         let mut statement = connection
             .prepare(
-                "select kind, state, candidate_transaction_hash is not null,
-                        committed_post_reservations
-                 from chain_submissions order by kind, state",
+                "select kind, bundle_index, proposal_id, hex(generation_digest), state,
+                        candidate_transaction_hash is not null,
+                        confirmed_transaction_hash is not null,
+                        confirmation_source, committed_post_reservations
+                 from chain_submissions
+                 order by kind, bundle_index, proposal_id, hex(generation_digest)",
             )
             .context("querying chain_submissions")?;
         let submissions = statement
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, bool>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
+                Ok(Submission {
+                    kind: row.get(0)?,
+                    bundle_index: row.get(1)?,
+                    proposal_id: row.get(2)?,
+                    generation_digest: row.get(3)?,
+                    state: row.get(4)?,
+                    has_candidate_hash: row.get(5)?,
+                    has_confirmed_hash: row.get(6)?,
+                    confirmation_source: row.get(7)?,
+                    reservations: row.get(8)?,
+                })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
@@ -121,7 +170,7 @@ impl DurableSnapshot {
     pub fn total_reservations(&self) -> i64 {
         self.submissions
             .iter()
-            .map(|(_, _, _, reservations)| *reservations)
+            .map(|submission| submission.reservations)
             .sum()
     }
 
@@ -129,7 +178,63 @@ impl DurableSnapshot {
     pub fn states(&self) -> Vec<&str> {
         self.submissions
             .iter()
-            .map(|(_, state, _, _)| state.as_str())
+            .map(|submission| submission.state.as_str())
+            .collect()
+    }
+
+    /// The shape a resumed round must share with the uncrashed control.
+    ///
+    /// Comparing state names alone accepts substantial corruption: a round can
+    /// lose votes, plans or share rows and still report twelve submissions all
+    /// named `confirmed`. This keys each submission by what it is rather than
+    /// by list position, and carries the durable counts alongside.
+    ///
+    /// What it deliberately omits is anything that legitimately differs
+    /// between two distinct rounds: identity keys, generation digests,
+    /// transaction hashes, tree positions, and the confirmation *source* — a
+    /// crashed round may confirm by tree where the control confirmed by hash,
+    /// which is recovery working, not a divergence.
+    pub fn shape(&self) -> RoundShape {
+        RoundShape {
+            submissions: self
+                .submissions
+                .iter()
+                .map(|submission| {
+                    (
+                        (
+                            submission.kind.clone(),
+                            submission.bundle_index,
+                            submission.proposal_id,
+                        ),
+                        (submission.state.clone(), submission.has_confirmed_hash),
+                    )
+                })
+                .collect(),
+            bundles: self.bundles,
+            proofs: self.proofs,
+            votes: self.votes,
+            helper_share_plans: self.helper_share_plans,
+            share_delegations: self.share_delegations,
+            accepted_urls: self.accepted_urls,
+            pczt_persisted: self.pczt_persisted,
+        }
+    }
+
+    /// Submissions keyed by generation, for cross-snapshot comparison.
+    pub fn by_generation(&self) -> BTreeMap<(String, i64, Option<i64>, String), &Submission> {
+        self.submissions
+            .iter()
+            .map(|submission| {
+                (
+                    (
+                        submission.kind.clone(),
+                        submission.bundle_index,
+                        submission.proposal_id,
+                        submission.generation_digest.clone(),
+                    ),
+                    submission,
+                )
+            })
             .collect()
     }
 }
@@ -231,7 +336,7 @@ pub fn assert_stage_state(
                 snapshot
                     .submissions
                     .iter()
-                    .any(|(kind, state, _, _)| kind == "delegation" && state == "submitting"),
+                    .any(|submission| submission.kind == "delegation" && submission.state == "submitting"),
                 "B1 VIOLATED: the abandoned reservation is gone after reopen (states {:?});                  a restarted process cannot prove the bytes never left, so the row must                  survive as in-flight work rather than be discarded",
                 snapshot.states()
             );
@@ -311,7 +416,7 @@ pub fn assert_stage_state(
                     snapshot
                         .submissions
                         .iter()
-                        .all(|(kind, ..)| kind == "delegation"),
+                        .all(|submission| submission.kind == "delegation"),
                     "{stage}: a vote reached the chain before its helper plans were \
                      durable, which the ordering rule forbids"
                 );
@@ -364,7 +469,7 @@ pub fn assert_plans_precede_broadcast(snapshot: &DurableSnapshot) -> Result<()> 
     let vote_submission = snapshot
         .submissions
         .iter()
-        .any(|(kind, _, _, _)| kind == "vote" || kind == "vote_batch");
+        .any(|submission| submission.kind == "vote" || submission.kind == "vote_batch");
     if vote_submission {
         anyhow::ensure!(
             snapshot.helper_share_plans > 0,
@@ -498,24 +603,132 @@ pub fn assert_reservations_monotonic(
     Ok(())
 }
 
+/// Requires that recovery never built a second transaction for the same work.
+///
+/// Monotonic totals cannot show this. A duplicate POST also raises the count,
+/// so "the number went up" is consistent both with a legitimate same-generation
+/// retry and with a second transaction spending the same notes — the failure
+/// this suite exists to catch. Generation identity separates them: the digest
+/// is immutable per submission, so a second transaction for the same target can
+/// only appear as a *new* generation.
+///
+/// Two things are therefore required of every target that already had a
+/// submission when the process died:
+///
+/// - it still has exactly one generation, so nothing was rebuilt; and
+/// - that generation's digest is unchanged, so nothing was rewritten in place.
+pub fn assert_no_second_generation(
+    before: &DurableSnapshot,
+    after: &DurableSnapshot,
+) -> Result<()> {
+    for submission in &before.submissions {
+        let target = submission.target();
+        let generations: Vec<&Submission> = after
+            .submissions
+            .iter()
+            .filter(|candidate| candidate.target() == target)
+            .collect();
+        anyhow::ensure!(
+            generations.len() == 1,
+            "B2/B6 VIOLATED: {} bundle {} proposal {:?} has {} generations after resume, so a \
+             second transaction was built for work that already had one: {:?}",
+            submission.kind,
+            submission.bundle_index,
+            submission.proposal_id,
+            generations.len(),
+            generations
+                .iter()
+                .map(|generation| generation.generation_digest.as_str())
+                .collect::<Vec<_>>()
+        );
+        anyhow::ensure!(
+            generations[0].generation_digest == submission.generation_digest,
+            "B6 VIOLATED: {} bundle {} changed generation digest across resume, {} -> {}",
+            submission.kind,
+            submission.bundle_index,
+            submission.generation_digest,
+            generations[0].generation_digest
+        );
+    }
+    Ok(())
+}
+
+/// Requires that bundles the crash did not touch reserved nothing further.
+///
+/// The crashed bundle may legitimately reserve again — an abandoned
+/// `Submitting` row normalizes to `Recovering`, and recovery is allowed a
+/// bounded same-generation retry. No such licence extends to the other
+/// bundles: they were idle across the crash, so any movement in their
+/// reservation counts is a POST nothing asked for. This is the exact-count
+/// half of the no-second-POST claim, on the submissions where an exact count
+/// is actually determined.
+pub fn assert_untouched_bundles_did_not_reserve(
+    before: &DurableSnapshot,
+    after: &DurableSnapshot,
+    crashed_bundle: u32,
+) -> Result<()> {
+    let settled = after.by_generation();
+    for (key, submission) in before.by_generation() {
+        if submission.bundle_index == i64::from(crashed_bundle) {
+            continue;
+        }
+        let Some(after_row) = settled.get(&key) else {
+            continue;
+        };
+        anyhow::ensure!(
+            after_row.reservations == submission.reservations,
+            "B2 VIOLATED: uncrashed bundle {} ({}) reserved a further POST across resume, {} -> {}",
+            submission.bundle_index,
+            submission.kind,
+            submission.reservations,
+            after_row.reservations
+        );
+    }
+    Ok(())
+}
+
+/// Requires the resumed round to match the control in shape, not just in
+/// state names.
+///
+/// See [`DurableSnapshot::shape`] for what is compared and what is
+/// deliberately allowed to differ between two distinct rounds.
+pub fn assert_matches_control(terminal: &DurableSnapshot, control: &DurableSnapshot) -> Result<()> {
+    anyhow::ensure!(
+        terminal.shape() == control.shape(),
+        "A3 VIOLATED: the resumed round does not match the uncrashed control.\n  \
+         resumed: {:?}\n  control: {:?}",
+        terminal.shape(),
+        control.shape()
+    );
+    Ok(())
+}
+
 /// Terminal rows are immutable: a confirmed submission stays exactly as it was.
 pub fn assert_terminal_rows_unchanged(
     before: &DurableSnapshot,
     after: &DurableSnapshot,
 ) -> Result<()> {
-    for (kind, state, hash, reservations) in &before.submissions {
+    let settled = after.by_generation();
+    for (key, submission) in before.by_generation() {
         if !matches!(
-            state.as_str(),
+            submission.state.as_str(),
             "confirmed" | "rejected" | "submitted_without_hash"
         ) {
             continue;
         }
+        let after_row = settled.get(&key).with_context(|| {
+            format!(
+                "B4 VIOLATED: terminal {} row for bundle {} generation {} vanished across resume",
+                submission.kind, submission.bundle_index, submission.generation_digest
+            )
+        })?;
         anyhow::ensure!(
-            after
-                .submissions
-                .iter()
-                .any(|(k, s, h, r)| k == kind && s == state && h == hash && r == reservations),
-            "B4 VIOLATED: terminal {kind} row in state {state} changed across resume"
+            *after_row == submission,
+            "B4 VIOLATED: terminal {} row for bundle {} changed across resume: {:?} -> {:?}",
+            submission.kind,
+            submission.bundle_index,
+            submission,
+            after_row
         );
     }
     Ok(())

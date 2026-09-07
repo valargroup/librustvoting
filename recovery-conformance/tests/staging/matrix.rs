@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use recovery_conformance::assertions::{
-    assert_confirmed_by_tree, assert_idempotent, assert_other_bundles_untouched,
-    assert_plans_precede_broadcast, assert_recovered_the_same_transaction,
-    assert_reservations_monotonic, assert_stage_state, assert_terminal_rows_unchanged,
-    confirmation_source, confirmed_transaction_hash, deterministic_plan,
-    dispatched_transaction_hash, DurableSnapshot,
+    assert_confirmed_by_tree, assert_idempotent, assert_matches_control,
+    assert_no_second_generation, assert_other_bundles_untouched, assert_plans_precede_broadcast,
+    assert_recovered_the_same_transaction, assert_reservations_monotonic, assert_stage_state,
+    assert_terminal_rows_unchanged, assert_untouched_bundles_did_not_reserve, confirmation_source,
+    confirmed_transaction_hash, deterministic_plan, dispatched_transaction_hash, DurableSnapshot,
 };
 use recovery_conformance::child::{run_to_quiescence, run_until_crash};
 use recovery_conformance::environment::{
@@ -359,6 +359,12 @@ async fn exercise(
         .map_err(|error| Outcome::Failed(format!("unreadable sidecar: {error:#}")))?;
     assert_reservations_monotonic(&after_crash, &terminal)
         .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+    // The half the count cannot prove: no target gained a second generation,
+    // and no bundle the crash left alone reserved another POST.
+    assert_no_second_generation(&after_crash, &terminal)
+        .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+    assert_untouched_bundles_did_not_reserve(&after_crash, &terminal, bundle)
+        .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     assert_terminal_rows_unchanged(&after_crash, &terminal)
         .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
 
@@ -413,12 +419,8 @@ async fn exercise(
     }
 
     // (j) the terminal shape must match the uncrashed control
-    if terminal.states() != control.states() {
-        return Err(Outcome::Failed(format!(
-            "A3 VIOLATED: terminal submission states {:?} differ from the control's {:?}",
-            terminal.states(),
-            control.states()
-        )));
+    if let Err(error) = assert_matches_control(&terminal, control) {
+        return Err(Outcome::Failed(format!("{error:#}")));
     }
 
     // (k) a second resume must find nothing to do

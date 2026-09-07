@@ -10,10 +10,19 @@
 //! wallet would use, so the transaction that reaches staging is a real one.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use zcash_voting::{ChainHttpRequest, ChainPostDispatch, ChainTransport, ChainTransportFuture};
+use zcash_voting::{
+    ChainHttpRequest, ChainPostDispatch, ChainTransport, ChainTransportError, ChainTransportFuture,
+};
 
 use super::crash::{crash_now, CrashLog, Observation};
+
+/// How often the dispatch marker is checked while the POST is in flight.
+///
+/// Short enough that the crash lands close behind the handoff, long enough not
+/// to spin a core while the network works.
+const DISPATCH_POLL: Duration = Duration::from_micros(200);
 use crate::stages::{BroadcastPoint, CrashStage, CrashTrigger, SubmissionKind};
 
 /// Wraps a real chain transport and kills the process at a broadcast point.
@@ -101,6 +110,10 @@ impl<T: ChainTransport> ChainTransport for CrashTransport<T> {
         };
         let log = Arc::clone(&self.log);
         let url = request.url().to_string();
+        // The SDK sets this immediately before releasing the request to its
+        // network stack, and exposes it, so the handoff is observable without
+        // any hook of our own.
+        let released = dispatch.clone();
 
         Box::pin(async move {
             // Nothing has been released yet, and `dispatch` is still clear, so
@@ -113,13 +126,45 @@ impl<T: ChainTransport> ChainTransport for CrashTransport<T> {
 
             log.record(&Observation::PostDispatched { url: url.clone() });
 
+            let mut post = Box::pin(
+                self.inner
+                    .chain_post_json_with_dispatch(request, json, dispatch),
+            );
+
+            // `AfterDispatch` must die between the bytes leaving and the reply
+            // arriving. Awaiting the POST first and aborting afterwards -- which
+            // is what this did -- is the *next* boundary wearing this one's
+            // name: the response has been read by then, so the two stages
+            // become one test and the hardest recovery case, a dispatch with no
+            // hash to poll, is never actually exercised.
+            //
+            // Polling the marker races it honestly: it is set before the
+            // request is released, so the first observation of it strictly
+            // precedes any reply.
+            if armed.point == BroadcastPoint::AfterDispatch {
+                loop {
+                    if released.is_possible() {
+                        crash_now(&log, armed.stage);
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = &mut post => break,
+                        _ = tokio::time::sleep(DISPATCH_POLL) => {}
+                    }
+                }
+                // The POST resolved without the marker ever being set, so
+                // nothing was released and this boundary was never reached.
+                // Returning fails the stage as never-reached rather than
+                // crashing at a point the run did not visit.
+                return Err(ChainTransportError::definitely_unsent(
+                    "the dispatch boundary was never reached",
+                ));
+            }
+
             // Let the real POST complete so the transaction genuinely reaches
             // staging. Only then is the durable state interesting: the chain
             // holds a transaction the wallet has no hash for.
-            let response = self
-                .inner
-                .chain_post_json_with_dispatch(request, json, dispatch)
-                .await;
+            let response = post.await;
 
             if armed.point == BroadcastPoint::AfterResponse {
                 if let Ok(response) = &response {
@@ -131,11 +176,10 @@ impl<T: ChainTransport> ChainTransport for CrashTransport<T> {
                 }
             }
 
-            // `AfterDispatch` and `AfterResponse` leave identical durable
-            // state — an unclassified POST either way. They differ only in
-            // what the parent is told: `AfterResponse` hands it the real
-            // transaction hash, which is what lets a test check the chain for
-            // a second spend by identity rather than by counting.
+            // `AfterResponse`: the chain answered and the wallet never wrote
+            // the outcome down. The parent is handed the real transaction
+            // hash, which is what lets it check for a second spend by identity
+            // rather than by counting.
             crash_now(&log, armed.stage);
         })
     }

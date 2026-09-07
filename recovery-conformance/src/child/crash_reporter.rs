@@ -145,10 +145,15 @@ impl CrashReporter {
     /// The stages that map one-to-one onto a step's own progress events.
     fn crash_on_progress(&self, armed: CrashStage, step: &NextStep, progress: &RoundStepProgress) {
         let matched = match (armed, progress) {
+            // `PcztBuilding`, not `SelectingNotes`. The latter is announced
+            // *before* `prepare` runs, so crashing on it lands before any note
+            // has been chosen -- the same durable state `before-delegation`
+            // already covers, under a name claiming otherwise. `PcztBuilding`
+            // is the first event after selection returns.
             (
                 CrashStage::AfterNoteSelection,
                 RoundStepProgress::Delegation {
-                    progress: DelegationProgress::SelectingNotes,
+                    progress: DelegationProgress::PcztBuilding,
                     ..
                 },
             )

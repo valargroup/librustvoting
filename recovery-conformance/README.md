@@ -84,7 +84,7 @@ crash.
 | Stage | Durable state it leaves |
 | --- | --- |
 | `before-delegation` | bundles only |
-| `after-note-selection` | bundles only (selection writes nothing) |
+| `after-note-selection` | bundles only; notes chosen, nothing written yet |
 | `after-pczt` | `bundles.pczt_sighash` + TX1 effects, write-once |
 | `after-proof` | `proofs` row |
 | `after-signing` | proof + any Keystone signature |

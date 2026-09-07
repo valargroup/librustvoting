@@ -21,7 +21,12 @@ use std::str::FromStr;
 pub enum CrashStage {
     /// The delegation obligation was selected and nothing has run.
     BeforeDelegation,
-    /// Notes were selected. Selection reads the wallet and writes nothing.
+    /// Notes have been selected and nothing is written yet.
+    ///
+    /// Fires on `PcztBuilding`, the first event after selection returns.
+    /// `SelectingNotes` announces the intent to select and is emitted before
+    /// any note is chosen, so arming on it would repeat `BeforeDelegation`
+    /// under a name promising more.
     AfterNoteSelection,
     /// The PCZT is durable: `bundles.pczt_sighash` and its TX1 effects, which
     /// are write-once. A resumed run must reuse them, never rebuild them.
