@@ -84,6 +84,14 @@ async fn stop_round_ends_at_the_first_failure() {
         report.skipped_bundles.is_empty(),
         "stopping the round isolates nothing"
     );
+    // The record still names the bundle the failure came from. That field is
+    // attribution, not isolation: a host reading it as "suppressed for the
+    // rest of the run" would be wrong here, which is why `skipped_bundles`
+    // above is the authoritative list.
+    assert!(
+        report.failures[0].bundle_index.is_some(),
+        "a bundle-attributable failure names its bundle under either policy"
+    );
     assert!(matches!(report.quiescence, RoundQuiescence::Failures));
 }
 

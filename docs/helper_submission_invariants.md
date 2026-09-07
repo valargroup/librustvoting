@@ -1466,8 +1466,11 @@ host wallet:
    invokes `track_pending_shares`, and supplies cancellation.
 5. **Initial delivery invocation.** Supported wallet integrations bind a
    `RoundExecutor` to the complete proposal roster from the authenticated round
-   configuration and call `advance_next` or `advance_step` with the complete
-   current configured fleet, timing, and cancellation. The executor obtains
+   configuration and drive it with `RoundDriver::run`, which supplies the
+   complete current configured fleet, timing, and cancellation once per
+   dispatch through `RoundHostSource`. An integration that runs one obligation
+   at a time calls `advance_step` with a step it selected from a plan it read.
+   The executor obtains
    `HelperFleetPreflight`, prepares every affected delivery plan, advances the
    chain until confirmation is durable, recovers fresh `CommittedVote` handles,
    converts them to `ConfirmedVote`, and submits the prepared shares. Lower-level

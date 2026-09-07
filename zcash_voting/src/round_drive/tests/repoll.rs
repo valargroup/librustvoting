@@ -2,7 +2,7 @@
 
 use super::fixtures::*;
 
-use crate::round_drive::sleep_until_interrupted;
+use crate::round_drive::run_loop::sleep_until_interrupted;
 
 #[tokio::test(start_paused = true)]
 async fn the_repoll_wait_runs_to_completion_when_nothing_interrupts() {
@@ -138,7 +138,7 @@ async fn confirmed_chain_work_pending_on_helpers_is_replanned_not_stalled() {
     // helper delivery has only ambiguous attempts left to track.
     outcome.disposition = crate::RoundStepDisposition::Pending;
     let delay = Duration::from_secs(2);
-    let mut run = crate::round_drive::Run::default();
+    let mut run = crate::round_drive::run_ledger::Run::default();
     let quiescence = run.record_outcome(&step, outcome, delay, &RecordingReporter::default());
 
     assert!(

@@ -8,6 +8,7 @@ mod fixtures;
 
 mod quiescence;
 mod repoll;
+mod reporting;
 mod selection;
 mod signatures;
 mod stop_precedence;

@@ -873,7 +873,11 @@ pub struct RoundWorkTallyView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundStepFailureRecordView {
     pub step: Option<NextStepView>,
-    /// The bundle skipped for the rest of the run, when the failure named one.
+    /// The bundle this failure is attributed to, when it belongs to one.
+    ///
+    /// Attribution, not isolation: `StopRound` ends the run without
+    /// suppressing anything, so `skipped_bundles` is the authoritative list of
+    /// what was skipped.
     pub bundle_index: Option<u32>,
     pub failure: RoundStepFailureView,
 }
@@ -889,6 +893,8 @@ pub struct RoundRunReportView {
     /// `Failures` quiescence: a run can isolate one bundle and finish the rest.
     #[serde(default)]
     pub failures: Vec<RoundStepFailureRecordView>,
+    /// Bundles a failure isolated for the rest of the run. Empty under
+    /// `StopRound`, which stops instead of suppressing.
     #[serde(default)]
     pub skipped_bundles: Vec<u32>,
     #[serde(default)]

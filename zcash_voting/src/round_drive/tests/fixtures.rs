@@ -290,6 +290,44 @@ impl RoundHostSource for StoredSigningHost {
     }
 }
 
+/// A host whose signer changes between samples.
+///
+/// `RoundHostSource` is read once per dispatch and nothing requires two
+/// samples to agree, so a driver that treated the first as representative
+/// would mis-handle every later bundle in the same wave. The first sample
+/// carries its own signature; every one after it reads stored material, which
+/// must already exist for every bundle the round owes.
+pub(super) struct DriftingSigningHost {
+    pub(super) database: Arc<crate::round::VotingDb>,
+    pub(super) samples: std::sync::atomic::AtomicUsize,
+}
+
+impl DriftingSigningHost {
+    pub(super) fn new(database: Arc<crate::round::VotingDb>) -> Self {
+        Self {
+            database,
+            samples: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl RoundHostSource for DriftingSigningHost {
+    fn host_context(&self) -> RoundHostContext {
+        let sample = self
+            .samples
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let signer = if sample == 0 {
+            crate::DelegationSigner::Keystone(crate::KeystoneSignatureSource::Provided {
+                sig: vec![0x68; 64],
+                sighash: vec![0x69; 32],
+            })
+        } else {
+            crate::DelegationSigner::Keystone(crate::KeystoneSignatureSource::Stored)
+        };
+        signing_host_context(&self.database, signer)
+    }
+}
+
 fn signing_host_context(
     database: &Arc<crate::round::VotingDb>,
     signer: crate::DelegationSigner,

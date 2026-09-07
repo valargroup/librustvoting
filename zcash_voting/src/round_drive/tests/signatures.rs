@@ -166,3 +166,47 @@ async fn the_handoff_names_every_unsigned_bundle_not_only_one_wave() {
     };
     assert_eq!(bundles, vec![0, 1, 2, 3]);
 }
+
+#[tokio::test]
+async fn a_later_dispatch_s_signer_is_not_ignored_because_the_first_could_sign() {
+    // `RoundHostSource` is sampled once per dispatch, and nothing requires two
+    // samples to agree. Reading only the first context let a wave whose first
+    // step carried its own signature skip the stored-material gate entirely,
+    // so a bundle whose own context needed a stored signature that did not
+    // exist was dispatched anyway — proving and broadcasting the signed
+    // bundles before the host was ever asked for the rest.
+    let database = database_with_bundles(2);
+    let executor = executor_over(Arc::clone(&database));
+    decide_ballot(&executor);
+    let control = ChainSubmissionControl::new(1);
+    let events = RecordingReporter::default();
+
+    let report = RoundDriver::new(&executor)
+        .with_policy(RoundDrivePolicy {
+            max_bundle_concurrency: std::num::NonZeroUsize::new(2).unwrap(),
+            ..RoundDrivePolicy::default()
+        })
+        .run(
+            &DriftingSigningHost::new(Arc::clone(&database)),
+            &control,
+            &events,
+        )
+        .await;
+
+    let RoundQuiescence::NeedsDelegationSignatures { bundles } = report.quiescence else {
+        panic!(
+            "the second context reads stored material that does not exist: {:?}",
+            report.quiescence
+        );
+    };
+    assert_eq!(bundles, vec![0, 1]);
+    assert!(
+        !events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, RoundDriveEvent::StepSelected { .. })),
+        "nothing is dispatched before the host is asked"
+    );
+}

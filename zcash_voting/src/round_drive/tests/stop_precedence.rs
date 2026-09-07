@@ -6,7 +6,7 @@
 //! forge end to end and easy to get wrong in exactly one of them.
 
 use super::fixtures::*;
-use crate::round_drive::{quiesce_before_dispatch, RoundQuiescence, Run};
+use crate::round_drive::{quiescence::quiesce_before_dispatch, run_ledger::Run, RoundQuiescence};
 use crate::session::{NextStep, RoundPlan};
 
 /// A real plan for the single-proposal share round, so every field except the

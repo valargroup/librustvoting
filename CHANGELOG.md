@@ -34,7 +34,11 @@ This release is `zcash_voting` 4.0.0.
   reported in their own right instead of being polled past. A signature handoff
   names every bundle the round still owes a delegation for, not only the ones
   the current wave would run, so a voter signs once rather than a wave at a
-  time and nothing is dispatched before the first of them. Driver dispatches
+  time and nothing is dispatched before the first of them, and every admitted
+  signer context is validated rather than the first standing for the wave. A
+  failure keeps the chain outcome its step observed before it, so a step that
+  confirmed and then failed on helper work still reports that confirmation.
+  Driver dispatches
   inherit the run's operation epoch, so a host that switches session or account
   while the driver is planning interrupts the step instead of having it adopt
   the new epoch. `round_lock::bundle_scope` is the single definition of which

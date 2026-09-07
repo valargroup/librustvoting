@@ -1,6 +1,12 @@
-//! Why a round run stopped.
+//! Why a round run stopped, and how that reason is chosen.
 
-use crate::{session::NextStep, share_tracking::ShareKey, ChainSubmissionResult};
+use crate::{
+    session::{NextStep, RoundPlan},
+    share_tracking::ShareKey,
+    ChainSubmissionResult,
+};
+
+use super::{run_ledger::Run, selection};
 
 /// The state a run ended in.
 ///
@@ -83,4 +89,98 @@ pub enum RoundQuiescence {
     /// tally come from the same fresh read after the final allowed dispatch.
     /// An invariant-level event: report it.
     PassBudgetExhausted { remaining: Vec<NextStep> },
+}
+
+/// The reason to stop before dispatching anything from this plan, if any.
+///
+/// Ordered so that anything the host must act on outranks a handoff that asks
+/// nothing of it: a recorded failure, then a persisted submission, then the
+/// two setup blockers, then a ballot the voter has not finished, and only then
+/// the shares a timer will finish on its own.
+pub(super) fn quiesce_before_dispatch(plan: &RoundPlan, run: &Run) -> Option<RoundQuiescence> {
+    // Foreground work remains: drive it. Anything below describes a plan this
+    // run cannot advance itself.
+    let Some(background_shares) = background_share_handoff(plan, &run.skipped) else {
+        return None;
+    };
+
+    if !run.failures.is_empty() {
+        // Something failed and nothing dispatchable is left. Reporting one of
+        // the healthy handoffs below would read as "the round is fine" and
+        // hide the failure.
+        return Some(RoundQuiescence::Failures);
+    }
+    // Nothing dispatchable is left, so the only thing that can still be
+    // holding the foreground open is durable submission state: a terminal
+    // submission plans no retry, and a managed one that projects no step
+    // cannot be advanced from here either. Both are the host's to handle.
+    if plan.blocking_recovery {
+        return Some(RoundQuiescence::PersistedChainTerminal);
+    }
+    if plan.needs_bundle_setup {
+        return Some(RoundQuiescence::NeedsBundleSetup);
+    }
+    // A withheld cast plans nothing at all, not even its delegation
+    // prerequisite, so an open ballot is the host's to resolve rather than a
+    // finished round. It outranks the share handoff below because it is the
+    // one of the two the voter can still act on; the report's plan carries
+    // `has_unconfirmed_shares` for a host that shows both.
+    if !plan.open_proposals.is_empty() || !plan.unrostered_intents.is_empty() {
+        return Some(RoundQuiescence::NeedsBallot {
+            open_proposals: plan.open_proposals.clone(),
+            unrostered_intents: plan.unrostered_intents.clone(),
+        });
+    }
+    if !background_shares.is_empty() {
+        return Some(RoundQuiescence::BackgroundShareWorkOnly {
+            shares: background_shares,
+        });
+    }
+    Some(RoundQuiescence::NoWorkLeft)
+}
+
+/// The shares this plan leaves to background tracking, or `None` when it still
+/// lists a step this run would dispatch.
+///
+/// A `ConfirmShare` for a share some helper already accepted is finished by
+/// polling, which the host's background tracking timer owns; a foreground run
+/// that polled it would hold the vote flow open for work that does not block
+/// it. An empty plan yields an empty handoff, since it too has nothing the
+/// foreground can dispatch.
+///
+/// Steps on a bundle a failure isolated are excluded, because selection will
+/// never admit them: counting them as foreground work would keep the run
+/// dispatching the healthy bundles' background shares instead of reporting the
+/// failure.
+///
+/// `RoundPlan::blocking_recovery` is deliberately *not* the question asked
+/// here. It is a property of the whole round, so it stays true for a persisted
+/// terminal submission that plans no step at all, and for a step on a skipped
+/// bundle — and in both cases a round whose only remaining steps are shares a
+/// helper already accepted would read as ordinary work and be polled for the
+/// entire dispatch budget.
+fn background_share_handoff(plan: &RoundPlan, skipped: &[u32]) -> Option<Vec<ShareKey>> {
+    // A share row no helper has reached is delivered, not polled, and the
+    // planner reports exactly that class as blocking. It is round-wide, so a
+    // skipped bundle's undelivered share still counts: the run cannot hand
+    // the round to background tracking while one exists.
+    if plan.blocking_share_work {
+        return None;
+    }
+    plan.next_steps
+        .iter()
+        .filter(|step| !skipped.contains(&selection::bundle_index(step)))
+        .map(|step| match step {
+            NextStep::ConfirmShare {
+                bundle_index,
+                proposal_id,
+                share_index,
+            } => Some(ShareKey {
+                bundle_index: *bundle_index,
+                proposal_id: *proposal_id,
+                share_index: *share_index,
+            }),
+            _ => None,
+        })
+        .collect()
 }

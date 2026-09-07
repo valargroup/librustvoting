@@ -354,7 +354,11 @@ returned on an outcome is a host-facing projection, not a control input.
 ## Round driving
 
 `round_drive` composes executor calls. It adds no facts about a round; every
-decision about what a step *means* stays in the planner and the executor.
+decision about what a step *means* stays in the planner and the executor. Its
+`mod.rs` is a facade holding the host-facing types and the entry point; the
+mechanism is in children, one per responsibility — `run_loop`, `selection`,
+`signing`, `dispatch`, `run_ledger`, `quiescence`, `tally`, `policy`,
+`progress` — so a change to one decision has one place to go.
 
 - **There is one way to choose work.** The executor runs the obligation a
   host-selected step resolves to; the driver is what chooses steps. No entry
@@ -412,6 +416,16 @@ decision about what a step *means* stays in the planner and the executor.
   next whenever the refreshed plan still lists it, so a pending submission is
   not starved by a step that sorts earlier, and the run cannot poll forever:
   every dispatch, re-polls included, counts against `max_dispatches`.
+- **A failure keeps everything its step already did.** Durable effects survive
+  the failure that followed them: share deliveries that reached helpers, and
+  the chain outcome a step observed before failing on the helper work after it.
+  A step that confirms and then fails is reported in `chain_outcomes` exactly
+  as a successful one is, because the run did observe it
+  (`a_chain_outcome_survives_a_failure_that_followed_it`). The
+  `bundle_index` on a failure record is *attribution*, not isolation:
+  `StopRound` names the bundle too while suppressing nothing, so
+  `RoundRunReport::skipped_bundles` is the authoritative list of what was
+  actually skipped (`stop_round_ends_at_the_first_failure`).
 - **A recorded failure outranks a healthy-looking handoff.** A run that failed
   and then finds only background share work left reports the failure, not
   `BackgroundShareWorkOnly`; the latter reads as "the timer finishes it" and
@@ -453,6 +467,12 @@ decision about what a step *means* stays in the planner and the executor.
   prefers natural quiescence when the work completed. If work remains,
   `PassBudgetExhausted::remaining`, `RoundRunReport::plan`, and the tally all
   describe that same read. A zero budget still performs and reports one plan.
+- **Every admitted signer context is validated, not just the first.** The host
+  source is sampled once per dispatch and nothing requires two samples to
+  agree. Treating the first as representative would broadcast a bundle under a
+  signer the host had already stopped offering, or demand stored material for a
+  bundle whose own context could sign itself
+  (`a_later_dispatch_s_signer_is_not_ignored_because_the_first_could_sign`).
 - **Missing stored Keystone signatures are a host handoff.** Before admitting
   signer-requiring bundle work, the driver verifies that **every bundle the
   round still owes a delegation for** has a durable signature row — not only
