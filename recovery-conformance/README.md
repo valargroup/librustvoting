@@ -226,24 +226,33 @@ instead of being carried forward by a local copy.
 
 ## Verification record
 
-Three consecutive clean runs of the full matrix, against staging, on commit
-`0c5abc30`:
+Three consecutive runs of the full matrix against staging, every stage
+exercised and none skipped:
 
 | Run | Result | Duration |
 | --- | --- | --- |
-| 1 | 19 passed, 0 failed, 1 skipped | 2684s |
-| 2 | 19 passed, 0 failed, 1 skipped | 2603s |
-| 3 | 19 passed, 0 failed, 1 skipped | 2638s |
+| 1 | 20 passed, 0 failed, 0 skipped | 2482s |
+| 2 | 20 passed, 0 failed, 0 skipped | 2567s |
+| 3 | 20 passed, 0 failed, 0 skipped | 2781s |
 
-Each run provisions its own control round plus one per stage — roughly twenty
-fresh rounds, every delegation and vote real and on `svote-1`. The skip is
-`after-vote-commit`, whose crash seam does not exist; every other stage must
-crash where it claims to or the matrix fails.
+Under test: this crate at `47ceb0e4`, plus the delegation-proof phase fix that
+`52d0229c` carries on another branch. That fix is **not** on this branch, and
+the runs are honest only with it named: without it `after-signing` fails
+deterministically, because a bundle persisting its proof after another bundle
+advanced the round-wide phase to `VoteReady` is refused as a phase regression.
 
-The consistency is part of the result. Durations agree within a few percent and
-no stage flaked across three runs, where earlier in this suite's life the same
-stages produced twenty-minute hangs, exhausted budgets, and PIR failures that
-differed run to run.
+Each run provisions a control round plus one per stage — roughly twenty fresh
+rounds, every delegation and vote real and on `svote-1`. Sixty rounds across
+the three.
+
+### What the matrix caught
+
+The phase regression above is the case worth recording, because the suite found
+it rather than confirming something already known here. It is a race between
+bundles: it passed three consecutive earlier runs and then failed twice in a
+row once `after-vote-commit` was made reachable and the stage list was complete.
+Applying the fix turns it green and removing it turns it red again, so the suite
+both reproduces the defect and verifies its repair.
 
 ## Invariants
 
