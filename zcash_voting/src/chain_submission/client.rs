@@ -186,13 +186,21 @@ impl ChainAdvanceOutcome {
 
 /// Host-owned cancellation and session-epoch authority for bounded calls.
 ///
-/// Clones share both values. Cancellation and epoch changes are observed at
+/// Clones share all of it, so a waiter is woken by whichever clone changed.
+/// Cancellation and epoch changes are observed at
 /// lifecycle boundaries but do not roll back a reservation, dispatch
 /// classification, or confirmation that is already durable.
 #[derive(Clone, Debug)]
 pub struct ChainSubmissionControl {
     cancelled: Arc<AtomicBool>,
     operation_epoch: Arc<AtomicU64>,
+    /// Wakes anything waiting on this control the moment it changes.
+    ///
+    /// Without it a waiter has to poll the two atomics, and a wait can be
+    /// long: helper-share tracking sleeps until a share is actually due, which
+    /// is hours for a delayed share. Polling that at a latency a destructive
+    /// drain would accept means waking tens of times a second for hours.
+    interrupt: Arc<tokio::sync::Notify>,
 }
 
 /// Selects whether a bounded advancement may use exact commitment-tree
@@ -212,12 +220,14 @@ impl ChainSubmissionControl {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             operation_epoch: Arc::new(AtomicU64::new(operation_epoch)),
+            interrupt: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     /// Permanently cancels this control and every clone of it.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.interrupt.notify_waiters();
     }
 
     /// Replaces the shared epoch, invalidating calls that captured another one.
@@ -227,6 +237,16 @@ impl ChainSubmissionControl {
     pub fn set_operation_epoch(&self, operation_epoch: u64) {
         self.operation_epoch
             .store(operation_epoch, Ordering::Release);
+        self.interrupt.notify_waiters();
+    }
+
+    /// A future that completes when this control is cancelled or re-epoched.
+    ///
+    /// Enable it **before** reading the flags: a `Notified` registers when it
+    /// is enabled or first polled, so checking first would drop a signal that
+    /// arrived in between and leave the waiter asleep for its whole delay.
+    pub(crate) fn interrupted(&self) -> tokio::sync::futures::Notified<'_> {
+        self.interrupt.notified()
     }
 
     /// Returns whether this control or one of its clones was cancelled.
@@ -874,10 +894,6 @@ where
     }
 }
 
-/// How often a repoll wait re-checks host cancellation. Matches the control
-/// check cadence used by the submission coordinator.
-const REPOLL_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(25);
-
 /// Whether an episode that began under `entry_epoch` must stop: the host
 /// cancelled, or it has moved to another operation epoch since.
 fn interrupted(control: &ChainSubmissionControl, entry_epoch: u64) -> bool {
@@ -889,8 +905,9 @@ fn interrupted(control: &ChainSubmissionControl, entry_epoch: u64) -> bool {
 ///
 /// `ChainAdvancePolicy::pending_repoll` is host-configured and unbounded, so
 /// an unconditional sleep would defer shutdown or account-switch cancellation
-/// by the whole interval. Interruption is observed within
-/// [`REPOLL_CANCELLATION_CHECK_INTERVAL`] instead.
+/// by the whole interval. The wait is woken by the control instead: it races
+/// the delay against [`ChainSubmissionControl::interrupted`], so an
+/// interruption is observed at once and an uninterrupted wait costs one timer.
 async fn interrupted_during(
     delay: Duration,
     control: &ChainSubmissionControl,
@@ -901,20 +918,32 @@ async fn interrupted_during(
     // until cancelled" rather than overflowing.
     let deadline = tokio::time::Instant::now().checked_add(delay);
     loop {
+        let interrupt = control.interrupted();
+        tokio::pin!(interrupt);
+        // Registered before the flags are read, because `notify_waiters`
+        // stores no permit: a change landing between the read and the
+        // registration would wake nothing and leave the wait asleep for the
+        // whole delay.
+        interrupt.as_mut().enable();
         if interrupted(control, entry_epoch) {
             return true;
         }
-        let remaining = match deadline {
+        match deadline {
             Some(deadline) => {
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    return false;
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => return false,
+                    // A wake is not itself the answer: `set_operation_epoch`
+                    // notifies whatever it stores, so re-storing the entry
+                    // epoch must not read as an interruption. The loop
+                    // re-reads the flags instead.
+                    _ = &mut interrupt => continue,
                 }
-                deadline - now
             }
-            None => REPOLL_CANCELLATION_CHECK_INTERVAL,
-        };
-        tokio::time::sleep(remaining.min(REPOLL_CANCELLATION_CHECK_INTERVAL)).await;
+            None => {
+                interrupt.await;
+                continue;
+            }
+        }
     }
 }
 

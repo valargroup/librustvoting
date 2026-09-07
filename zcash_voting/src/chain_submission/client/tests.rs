@@ -34,6 +34,37 @@ async fn a_cancellation_during_the_repoll_wait_returns_promptly() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_cancelled_repoll_wait_ends_without_advancing_the_clock() {
+    // The mechanism, not just the latency. A wait that re-read the control on
+    // a tick would need the clock to reach that tick before it noticed, and
+    // under paused time the runtime supplies exactly that by auto-advancing
+    // whenever every task is idle — so the test above passes either way. Being
+    // woken by the control costs no clock movement, which is what makes an
+    // unbounded `pending_repoll` free to wait out.
+    let control = ChainSubmissionControl::new(1);
+    let waiter = {
+        let control = control.clone();
+        tokio::spawn(
+            async move { interrupted_during(Duration::from_secs(86_400), &control, 1).await },
+        )
+    };
+    // Deliberately not a multiple of any poll tick: landing on one would leave
+    // a polling implementation already runnable at `at_cancel` and let it pass.
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    assert!(!waiter.is_finished());
+
+    let at_cancel = tokio::time::Instant::now();
+    control.cancel();
+
+    assert!(waiter.await.unwrap());
+    assert_eq!(
+        tokio::time::Instant::now(),
+        at_cancel,
+        "the wait is woken by the control, not by the clock reaching a poll tick",
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_uncancelled_repoll_wait_lasts_the_full_delay() {
     let control = ChainSubmissionControl::new(1);
     let started = tokio::time::Instant::now();
