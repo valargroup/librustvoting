@@ -98,6 +98,12 @@ This release is `zcash_voting` 4.0.0.
 - `PirFleet`, `PirSession`, and `PirProofSource`: ordered PIR endpoints with
   failover on typed retryable failures, serviced from a dedicated thread so
   proving can run inside another runtime's blocking pool.
+- `wire::PirSnapshotEndpointStatusView` and
+  `wire::PirSnapshotEndpointDiagnosticView` project a PIR snapshot-height probe
+  for hosts. `pir_snapshot` already reported which endpoints could answer for a
+  round's snapshot and why the others could not; the diagnostics had no wire
+  form, so a cross-language host could see that endpoint selection failed but
+  not whether a server was behind, ahead, or unreachable.
 - `RouteHttp`: a request-level executor a host implements once to route every
   SDK transport (PIR, tree sync, helper, vote chain) through Tor or a proxy.
   `HyperTransport` is generic over it; `DirectRoute` is the SDK default.
