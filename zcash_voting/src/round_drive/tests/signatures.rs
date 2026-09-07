@@ -168,13 +168,15 @@ async fn the_handoff_names_every_unsigned_bundle_not_only_one_wave() {
 }
 
 #[tokio::test]
-async fn a_later_dispatch_s_signer_is_not_ignored_because_the_first_could_sign() {
+async fn each_bundle_is_judged_by_its_own_signer_context() {
     // `RoundHostSource` is sampled once per dispatch, and nothing requires two
     // samples to agree. Reading only the first context let a wave whose first
     // step carried its own signature skip the stored-material gate entirely,
     // so a bundle whose own context needed a stored signature that did not
-    // exist was dispatched anyway — proving and broadcasting the signed
-    // bundles before the host was ever asked for the rest.
+    // exist was dispatched anyway. Collapsing the modes the other way is just
+    // as wrong: it would demand a durable row for the bundle that signs during
+    // its own step, a handoff the host could never satisfy because there is
+    // nothing for it to store.
     let database = database_with_bundles(2);
     let executor = executor_over(Arc::clone(&database));
     decide_ballot(&executor);
@@ -199,7 +201,11 @@ async fn a_later_dispatch_s_signer_is_not_ignored_because_the_first_could_sign()
             report.quiescence
         );
     };
-    assert_eq!(bundles, vec![0, 1]);
+    assert_eq!(
+        bundles,
+        vec![1],
+        "bundle 0 carries its own signature and is owed nothing"
+    );
     assert!(
         !events
             .events

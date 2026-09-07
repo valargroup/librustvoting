@@ -22,12 +22,13 @@ use super::selection;
 /// collect signatures in several rounds, and work would already have happened
 /// before the first of them.
 ///
-/// Every admitted step that asks for a signer is examined, not just the first.
-/// [`RoundHostSource`](super::RoundHostSource) is sampled once per dispatch and
-/// nothing requires two samples to agree, so treating the first as
-/// representative could broadcast one bundle under a signer the host had
-/// already stopped offering, or demand a stored signature for a bundle whose
-/// own context could sign it.
+/// Each admitted step is read against **its own** bundle's context, not one
+/// context taken for the wave. [`RoundHostSource`](super::RoundHostSource) is
+/// sampled once per dispatch and nothing requires two samples to agree, so a
+/// single mode applied to every bundle would either broadcast one under a
+/// signer the host had stopped offering, or demand a durable row for a bundle
+/// whose own context signs during its step — a handoff the host can never
+/// satisfy, because there is nothing for it to store.
 pub(super) fn missing_signer_bundles<T: ChainTransport>(
     executor: &RoundExecutor<T>,
     dispatches: &[(NextStep, RoundHostContext)],
@@ -42,37 +43,49 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
     // A wave with no delegation work cannot be blocked by a signature: plan
     // order puts a bundle's delegation ahead of everything that depends on it,
     // so its vote and share work is not selected yet.
-    let signer_contexts: Vec<&RoundHostContext> = dispatches
+    let admitted: Vec<(u32, &RoundHostContext)> = dispatches
         .iter()
         .filter(|(step, _)| selection::needs_delegation_signer(step))
-        .map(|(_, context)| context)
+        .map(|(step, context)| (selection::bundle_index(step), context))
         .collect();
-    if signer_contexts.is_empty() {
+    if admitted.is_empty() {
         return Ok(Vec::new());
     }
-    // One admitted step with no delegation inputs at all cannot sign, and the
-    // round-wide rule then applies to every bundle it owes.
-    if signer_contexts
-        .iter()
-        .any(|context| context.delegation.is_none())
-    {
-        return Ok(required);
+
+    // A bundle whose own context produces its signature during the step is
+    // owed nothing, whatever the rest of the wave uses.
+    let mut signs_itself = Vec::new();
+    let mut cannot_sign = false;
+    let mut reads_stored_material = false;
+    for (bundle_index, context) in &admitted {
+        match context.delegation.as_ref().map(|inputs| &inputs.signer) {
+            // No delegation inputs at all: this step cannot sign, and the
+            // round-wide rule below then applies to what it owes.
+            None => cannot_sign = true,
+            Some(DelegationSigner::Keystone(KeystoneSignatureSource::Stored)) => {
+                reads_stored_material = true;
+            }
+            Some(_) => signs_itself.push(*bundle_index),
+        }
     }
-    // Every other signer produces its signature during the step, so the
-    // stored-material gate applies exactly when some admitted step depends on
-    // material that must already exist.
-    let reads_stored_material = signer_contexts.iter().any(|context| {
-        matches!(
-            context.delegation.as_ref().map(|inputs| &inputs.signer),
-            Some(DelegationSigner::Keystone(KeystoneSignatureSource::Stored))
-        )
-    });
+    let owed: Vec<u32> = required
+        .into_iter()
+        .filter(|bundle_index| !signs_itself.contains(bundle_index))
+        .collect();
+    if owed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cannot_sign {
+        return Ok(owed);
+    }
     if !reads_stored_material {
         return Ok(Vec::new());
     }
 
+    // The round-wide part: bundles this wave has not reached are owed a
+    // durable row too, so the voter signs once rather than a wave at a time.
     let stored = executor.database().get_keystone_signatures(round_id)?;
-    Ok(required
+    Ok(owed
         .into_iter()
         .filter(|bundle_index| {
             !stored

@@ -72,3 +72,47 @@ async fn a_dispatch_in_the_run_s_own_epoch_still_runs() {
 
     assert_ne!(outcome.disposition, RoundStepDisposition::Cancelled);
 }
+
+/// A reporter that switches the host's epoch when the plan is first reported,
+/// standing in for host code that runs on that callback.
+struct EpochSwitchingReporter {
+    control: ChainSubmissionControl,
+    switched: std::sync::atomic::AtomicBool,
+}
+
+impl crate::RoundDriveReporter for EpochSwitchingReporter {
+    fn report(&self, event: crate::RoundDriveEvent) {
+        if matches!(event, crate::RoundDriveEvent::PlanRefreshed { .. })
+            && !self
+                .switched
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.control.set_operation_epoch(2);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_epoch_switch_during_planning_is_not_reported_as_a_round_state() {
+    // The plan read blocks on the database and the plan callback runs host
+    // code, so either can span the switch. Every pre-dispatch early return
+    // describes a state of the round; an abandoned run must not describe one.
+    // This round has an undecided ballot, so without the recheck the run would
+    // answer `NeedsBallot` for a session the host had already left.
+    let executor = executor();
+    let control = ChainSubmissionControl::new(1);
+    let events = EpochSwitchingReporter {
+        control: control.clone(),
+        switched: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    let report = crate::RoundDriver::new(&executor)
+        .run(&FixedHost, &control, &events)
+        .await;
+
+    assert!(
+        matches!(report.quiescence, crate::RoundQuiescence::Cancelled),
+        "an abandoned run reports only that it was abandoned: {:?}",
+        report.quiescence
+    );
+}

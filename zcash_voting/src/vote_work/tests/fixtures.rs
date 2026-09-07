@@ -608,3 +608,24 @@ impl crate::chain_submission::ChainTransport for UnreachableChainTransport {
         self.fail()
     }
 }
+
+/// Runs the plan's first step through the public step entry point.
+///
+/// Tests that pin what one step does to a round want exactly one obligation,
+/// not a whole run. `RoundDriver` is the shipped way to choose work, so this
+/// selects from a plan the test read and hands the step to `advance_step`,
+/// the same call a host makes — rather than a plan-head entry point compiled
+/// only for tests, which could let selection or cancellation behaviour drift
+/// from both public paths while the suite stayed green.
+///
+/// Returns `None` when the plan lists nothing to run, so a test asserting an
+/// idle round says so explicitly.
+pub(super) async fn advance_plan_head<T: crate::ChainTransport>(
+    executor: &RoundExecutor<T>,
+    host: &RoundHostContext,
+    control: &ChainSubmissionControl,
+    progress: &dyn crate::RoundStepProgressReporter,
+) -> Option<Result<crate::RoundStepOutcome, crate::RoundStepFailure>> {
+    let step = executor.plan().ok()?.next_steps.first().cloned()?;
+    Some(executor.advance_step(step, host, control, progress).await)
+}

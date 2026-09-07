@@ -19,11 +19,17 @@ async fn a_host_wallet_switch_does_not_retarget_a_bound_executor() {
         bound_plan.delegation_statuses
     );
     let control = ChainSubmissionControl::new(1);
-    let outcome = executor
-        .advance_plan_head(&host(), &control, &NoopRoundStepProgressReporter {})
+    assert!(
+        advance_plan_head(
+            &executor,
+            &host(),
+            &control,
+            &NoopRoundStepProgressReporter {}
+        )
         .await
-        .unwrap();
-    assert_eq!(outcome.disposition, RoundStepDisposition::NoWork);
+        .is_none(),
+        "the bound round owes nothing, so there is no step to run"
+    );
 }
 
 #[tokio::test]
@@ -39,9 +45,15 @@ async fn re_scoping_a_handle_from_database_does_not_reach_the_executor() {
     let plan = executor.plan().unwrap();
     assert!(!plan.delegation_statuses.is_empty());
     let control = ChainSubmissionControl::new(1);
-    let outcome = executor
-        .advance_plan_head(&host(), &control, &NoopRoundStepProgressReporter {})
+    assert!(
+        advance_plan_head(
+            &executor,
+            &host(),
+            &control,
+            &NoopRoundStepProgressReporter {}
+        )
         .await
-        .unwrap();
-    assert_eq!(outcome.disposition, RoundStepDisposition::NoWork);
+        .is_none(),
+        "the bound round owes nothing, so there is no step to run"
+    );
 }

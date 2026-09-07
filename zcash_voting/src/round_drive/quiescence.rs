@@ -1,6 +1,7 @@
 //! Why a round run stopped, and how that reason is chosen.
 
 use crate::{
+    round_planning::Obligation,
     session::{NextStep, RoundPlan},
     share_tracking::ShareKey,
     ChainSubmissionResult,
@@ -97,10 +98,14 @@ pub enum RoundQuiescence {
 /// nothing of it: a recorded failure, then a persisted submission, then the
 /// two setup blockers, then a ballot the voter has not finished, and only then
 /// the shares a timer will finish on its own.
-pub(super) fn quiesce_before_dispatch(plan: &RoundPlan, run: &Run) -> Option<RoundQuiescence> {
+pub(super) fn quiesce_before_dispatch(
+    plan: &RoundPlan,
+    obligations: &[Obligation],
+    run: &Run,
+) -> Option<RoundQuiescence> {
     // Foreground work remains: drive it. Anything below describes a plan this
     // run cannot advance itself.
-    let Some(background_shares) = background_share_handoff(plan, &run.skipped) else {
+    let Some(background_shares) = background_share_handoff(plan, obligations, &run.skipped) else {
         return None;
     };
 
@@ -145,28 +150,24 @@ pub(super) fn quiesce_before_dispatch(plan: &RoundPlan, run: &Run) -> Option<Rou
 /// A `ConfirmShare` for a share some helper already accepted is finished by
 /// polling, which the host's background tracking timer owns; a foreground run
 /// that polled it would hold the vote flow open for work that does not block
-/// it. An empty plan yields an empty handoff, since it too has nothing the
-/// foreground can dispatch.
+/// it. A share no helper has reached is delivered rather than polled, so it is
+/// foreground work. An empty plan yields an empty handoff, since it too has
+/// nothing the foreground can dispatch.
 ///
-/// Steps on a bundle a failure isolated are excluded, because selection will
-/// never admit them: counting them as foreground work would keep the run
-/// dispatching the healthy bundles' background shares instead of reporting the
-/// failure.
-///
-/// `RoundPlan::blocking_recovery` is deliberately *not* the question asked
-/// here. It is a property of the whole round, so it stays true for a persisted
-/// terminal submission that plans no step at all, and for a step on a skipped
-/// bundle — and in both cases a round whose only remaining steps are shares a
-/// helper already accepted would read as ordinary work and be polled for the
-/// entire dispatch budget.
-fn background_share_handoff(plan: &RoundPlan, skipped: &[u32]) -> Option<Vec<ShareKey>> {
-    // A share row no helper has reached is delivered, not polled, and the
-    // planner reports exactly that class as blocking. It is round-wide, so a
-    // skipped bundle's undelivered share still counts: the run cannot hand
-    // the round to background tracking while one exists.
-    if plan.blocking_share_work {
-        return None;
-    }
+/// Both questions are asked per share, of the obligation the classifier
+/// produced for it, and only of steps this run would admit. Every round-wide
+/// answer is wrong here for the same reason: `blocking_recovery` stays true for
+/// a terminal submission that plans no step and for a step on a skipped
+/// bundle, and `blocking_share_work` stays true for an undelivered share on a
+/// bundle a failure isolated. Each of those made a round whose only admissible
+/// steps were shares a helper already held poll them for the entire dispatch
+/// budget and report `PassBudgetExhausted` in place of what the host had to act
+/// on.
+fn background_share_handoff(
+    plan: &RoundPlan,
+    obligations: &[Obligation],
+    skipped: &[u32],
+) -> Option<Vec<ShareKey>> {
     plan.next_steps
         .iter()
         .filter(|step| !skipped.contains(&selection::bundle_index(step)))
@@ -175,12 +176,35 @@ fn background_share_handoff(plan: &RoundPlan, skipped: &[u32]) -> Option<Vec<Sha
                 bundle_index,
                 proposal_id,
                 share_index,
-            } => Some(ShareKey {
-                bundle_index: *bundle_index,
-                proposal_id: *proposal_id,
-                share_index: *share_index,
-            }),
+            } => {
+                let share = ShareKey {
+                    bundle_index: *bundle_index,
+                    proposal_id: *proposal_id,
+                    share_index: *share_index,
+                };
+                accepted_by_a_helper(obligations, &share).then_some(share)
+            }
             _ => None,
         })
         .collect()
+}
+
+/// Whether the classifier says some helper already holds `share`.
+///
+/// A share nothing accepted cannot be finished by polling: no helper has it.
+fn accepted_by_a_helper(obligations: &[Obligation], share: &ShareKey) -> bool {
+    obligations.iter().any(|obligation| {
+        matches!(
+            obligation,
+            Obligation::Confirm {
+                bundle_index,
+                proposal_id,
+                share_index,
+                accepted: true,
+                ..
+            } if *bundle_index == share.bundle_index
+                && *proposal_id == share.proposal_id
+                && *share_index == share.share_index
+        )
+    })
 }

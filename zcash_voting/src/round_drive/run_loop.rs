@@ -6,10 +6,7 @@
 //! records what happened and whether it ends the run, and `quiescence` says
 //! why a plan with nothing dispatchable stops.
 
-use crate::{
-    round_planning::ClassifiedPlan, ChainSubmissionControl, ChainTransport, RoundExecutor,
-    VotingError,
-};
+use crate::{round_planning::ClassifiedPlan, ChainSubmissionControl, ChainTransport, VotingError};
 
 use super::{
     dispatch,
@@ -77,7 +74,19 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                 tally: run.tally,
             });
 
-            if let Some(quiescence) = quiesce_before_dispatch(&classified.plan, &run) {
+            // The plan read blocks on the database and the callback above runs
+            // host code, so either can span a cancellation or an epoch switch.
+            // Every early return below reports a state of the round, and a run
+            // the host has abandoned must not describe one: it would answer
+            // `NoWorkLeft` or `NeedsBallot` for a session already left, and no
+            // dispatch follows whose epoch binding could correct it.
+            if interrupted() {
+                return run.finish(RoundQuiescence::Cancelled);
+            }
+
+            if let Some(quiescence) =
+                quiesce_before_dispatch(&classified.plan, &classified.obligations.obligations, &run)
+            {
                 return run.finish(quiescence);
             }
             if run.dispatches >= self.policy.max_dispatches {

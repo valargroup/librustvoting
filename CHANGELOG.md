@@ -35,7 +35,8 @@ This release is `zcash_voting` 4.0.0.
   names every bundle the round still owes a delegation for, not only the ones
   the current wave would run, so a voter signs once rather than a wave at a
   time and nothing is dispatched before the first of them, and every admitted
-  signer context is validated rather than the first standing for the wave. A
+  admitted bundle is judged by its own signer context rather than one mode
+  standing for the wave. A
   failure keeps the chain outcome its step observed before it, so a step that
   confirmed and then failed on helper work still reports that confirmation.
   Driver dispatches

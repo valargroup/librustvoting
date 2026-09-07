@@ -91,29 +91,6 @@ impl<T: ChainTransport> RoundExecutor<T> {
         self.plan()
     }
 
-    /// Runs the plan's first step, for tests that pin what one step does to a
-    /// round without also exercising the driver's scheduling.
-    ///
-    /// Hosts drive a round with `RoundDriver`; this is not a shipped entry
-    /// point, because a second way to advance a round is a second driver.
-    #[cfg(test)]
-    pub(crate) async fn advance_plan_head(
-        &self,
-        host: &RoundHostContext,
-        control: &ChainSubmissionControl,
-        progress: &dyn RoundStepProgressReporter,
-    ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        let step_control = StepControl::capture(control);
-        let plan = self
-            .plan()
-            .map_err(|error| self.step_voting_failure(error, None, &StepLedger::default()))?;
-        let Some(step) = plan.next_steps.first().cloned() else {
-            return Ok(self.no_work(None, plan));
-        };
-        self.advance_step_under(step, host, step_control, progress)
-            .await
-    }
-
     /// Runs one planned step by one bounded pass.
     ///
     /// The step is resolved against a fresh plan under the lock to the

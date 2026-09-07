@@ -388,6 +388,13 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   same bundle the executor locks, so no two admitted steps can contend
   (`the_driver_schedules_by_the_executors_own_lock_scope`,
   `only_delegation_proving_is_bundle_scoped`).
+- **An abandoned run reports only that it was abandoned.** The plan read blocks
+  on the database and the plan callback runs host code, so a cancellation or an
+  epoch switch can span either. Every pre-dispatch early return describes a
+  state of the round, and a run the host has left must not describe one — there
+  is no dispatch after it whose epoch binding could correct the answer — so the
+  loop re-checks for an interruption after planning and reporting
+  (`an_epoch_switch_during_planning_is_not_reported_as_a_round_state`).
 - **A dispatch belongs to the epoch its run captured.** The driver decides to
   dispatch, then plans, builds each host context and reads stored signing
   material before the step begins. A step that captured its own epoch on entry
@@ -458,21 +465,30 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   `bundle_setup_outranks_the_ballot_it_blocks`,
   `an_empty_plan_with_nothing_owed_is_no_work_left`).
 
-  `blocking_share_work` is the one round-wide flag that does hold the
-  foreground open: a share row no helper has reached is delivered rather than
-  polled, and background tracking cannot finish it
-  (`an_undelivered_share_is_foreground_work_even_on_a_skipped_bundle`).
+  Both halves of that question are asked **per share, of its own obligation**,
+  and only of steps this run would admit. `blocking_share_work` is round-wide
+  too, so it stayed true for an undelivered share on a bundle a failure had
+  isolated, and polled the healthy bundles' accepted shares for the same
+  budget. A share no helper has reached is delivered rather than polled and is
+  foreground work; a share some helper accepted can only be finished by the
+  host's background tracking
+  (`an_undelivered_share_is_foreground_work`,
+  `an_undelivered_share_on_a_skipped_bundle_does_not_hold_the_run_open`).
 - **The dispatch budget is evaluated against a fresh plan.** After the final
   admitted dispatch or wave, the driver re-plans, refreshes the tally, and
   prefers natural quiescence when the work completed. If work remains,
   `PassBudgetExhausted::remaining`, `RoundRunReport::plan`, and the tally all
   describe that same read. A zero budget still performs and reports one plan.
-- **Every admitted signer context is validated, not just the first.** The host
-  source is sampled once per dispatch and nothing requires two samples to
-  agree. Treating the first as representative would broadcast a bundle under a
-  signer the host had already stopped offering, or demand stored material for a
-  bundle whose own context could sign itself
-  (`a_later_dispatch_s_signer_is_not_ignored_because_the_first_could_sign`).
+- **Each admitted bundle is judged by its own signer context.** The host source
+  is sampled once per dispatch and nothing requires two samples to agree, so no
+  single mode stands for the wave. A bundle whose own context signs during its
+  step is owed nothing; the stored-material requirement falls only on bundles
+  that read it, plus the ones this wave has not reached. Collapsing the modes
+  either way is wrong: taking the first context would broadcast a bundle under
+  a signer the host had stopped offering, and applying one bundle's stored
+  requirement to all would demand a durable row for a bundle that signs itself
+  — a handoff the host can never satisfy, because there is nothing to store
+  (`each_bundle_is_judged_by_its_own_signer_context`).
 - **Missing stored Keystone signatures are a host handoff.** Before admitting
   signer-requiring bundle work, the driver verifies that **every bundle the
   round still owes a delegation for** has a durable signature row — not only
