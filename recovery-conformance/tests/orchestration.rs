@@ -73,6 +73,7 @@ fn snapshot(submissions: Vec<(&str, i64, &str, &str, i64)>) -> DurableSnapshot {
         share_delegations: 0,
         attempting_urls: 0,
         accepted_urls: 0,
+        confirmed_shares: 0,
         pczt_persisted: true,
         cached_tree: false,
     }

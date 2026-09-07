@@ -49,6 +49,11 @@ pub struct DurableSnapshot {
     pub attempting_urls: usize,
     /// Helpers that definitely accepted a share.
     pub accepted_urls: usize,
+    /// Shares durably confirmed by the helper quorum.
+    ///
+    /// Completion, as distinct from placement: a share confirms whether its
+    /// acceptance was recorded as definite or merely as outcome-unknown.
+    pub confirmed_shares: i64,
     pub pczt_persisted: bool,
     /// Whether a cached vote-commitment tree exists.
     pub cached_tree: bool,
@@ -85,7 +90,7 @@ pub struct RoundShape {
     votes: i64,
     helper_share_plans: i64,
     share_delegations: i64,
-    accepted_urls: usize,
+    confirmed_shares: i64,
     pczt_persisted: bool,
 }
 
@@ -151,6 +156,13 @@ impl DurableSnapshot {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap_or(0) as usize,
+            confirmed_shares: connection
+                .query_row(
+                    "select count(*) from share_delegations where confirmed = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0),
             pczt_persisted: connection
                 .query_row(
                     "select count(*) from bundles where pczt_sighash is not null",
@@ -200,6 +212,13 @@ impl DurableSnapshot {
     /// a tree confirmation from carrying a hash — so keeping the hash would
     /// reintroduce the very difference this excludes, and fail every stage
     /// whose recovery went through the tree.
+    ///
+    /// It covers helper placement for the same reason. A crash around a share
+    /// POST leaves that helper outcome-unknown rather than a definite
+    /// acceptance, which the helper specification treats as poll-only and not
+    /// a placement — so `sent_to_urls` records how a share was delivered, not
+    /// whether it arrived. Shares are compared by how many are *confirmed*,
+    /// which is the completion the round actually owes.
     pub fn shape(&self) -> RoundShape {
         RoundShape {
             submissions: self
@@ -221,7 +240,7 @@ impl DurableSnapshot {
             votes: self.votes,
             helper_share_plans: self.helper_share_plans,
             share_delegations: self.share_delegations,
-            accepted_urls: self.accepted_urls,
+            confirmed_shares: self.confirmed_shares,
             pczt_persisted: self.pczt_persisted,
         }
     }
