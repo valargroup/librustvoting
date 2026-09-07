@@ -224,6 +224,27 @@ What is *not* skipped is agreement: the parameters used to drive the round come
 from the chain's own record, so a provisioning mistake surfaces as a mismatch
 instead of being carried forward by a local copy.
 
+## Verification record
+
+Three consecutive clean runs of the full matrix, against staging, on commit
+`0c5abc30`:
+
+| Run | Result | Duration |
+| --- | --- | --- |
+| 1 | 19 passed, 0 failed, 1 skipped | 2684s |
+| 2 | 19 passed, 0 failed, 1 skipped | 2603s |
+| 3 | 19 passed, 0 failed, 1 skipped | 2638s |
+
+Each run provisions its own control round plus one per stage — roughly twenty
+fresh rounds, every delegation and vote real and on `svote-1`. The skip is
+`after-vote-commit`, whose crash seam does not exist; every other stage must
+crash where it claims to or the matrix fails.
+
+The consistency is part of the result. Durations agree within a few percent and
+no stage flaked across three runs, where earlier in this suite's life the same
+stages produced twenty-minute hangs, exhausted budgets, and PIR failures that
+differed run to run.
+
 ## Invariants
 
 Split by whether the suite actually asserts them today. Everything in the
