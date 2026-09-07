@@ -1,0 +1,110 @@
+//! The helper transport that dies mid-share-POST.
+//!
+//! The two share crash points sit either side of one helper POST, and neither
+//! is announced by the driver: `share_tracking` journals the helper, sends, and
+//! resolves the outcome inside a single step. Only the transport sees the gap.
+//!
+//! That gap is the whole reason `attempting_urls` exists. A helper is written
+//! there before any byte is sent, so a process killed in between leaves durable
+//! evidence that this helper was tried and its answer is unknown — which is
+//! what stops recovery from either re-sending blindly or writing the attempt
+//! off as never made.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use zcash_voting::helper::transport::{HelperFuture, HelperTransport};
+
+use super::crash::{crash_now, CrashLog, Observation};
+use crate::stages::CrashStage;
+
+/// Path a share submission is POSTed to.
+const SHARES_ENDPOINT: &str = "/shielded-vote/v1/shares";
+
+/// Path the fleet preflight probes.
+///
+/// Vote completion probes the fleet *after* the vote is durably committed and
+/// *before* helper plans are written, so this request is the seam between those
+/// two commits. It is a real network round trip to every helper, which makes
+/// the window wide rather than theoretical.
+const STATUS_ENDPOINT: &str = "/status";
+
+/// Wraps a real helper transport and kills the process around a share POST.
+///
+/// GETs pass through: helper status polling changes nothing durable.
+pub struct CrashHelperTransport<T> {
+    inner: T,
+    armed: Option<CrashStage>,
+    log: Arc<CrashLog>,
+}
+
+impl<T> CrashHelperTransport<T> {
+    /// Wraps `inner`, arming only for the two share-POST stages.
+    pub fn new(inner: T, stage: Option<CrashStage>, log: Arc<CrashLog>) -> Self {
+        let armed = stage.filter(|stage| {
+            matches!(
+                stage,
+                CrashStage::BeforeSharePost
+                    | CrashStage::AfterSharePost
+                    | CrashStage::AfterVoteCommit
+            )
+        });
+        Self { inner, armed, log }
+    }
+}
+
+impl<T: HelperTransport> HelperTransport for CrashHelperTransport<T> {
+    fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> HelperFuture<'a> {
+        // Helper status polling changes nothing durable and passes through. The
+        // exception is the fleet preflight, which is the one observable point
+        // between a committed vote and its durable helper plans.
+        if self.armed == Some(CrashStage::AfterVoteCommit) && url.ends_with(STATUS_ENDPOINT) {
+            crash_now(&self.log, CrashStage::AfterVoteCommit);
+        }
+        self.inner.get(url, timeout)
+    }
+
+    fn post_json<'a>(&'a self, url: &'a str, body: Vec<u8>, timeout: Duration) -> HelperFuture<'a> {
+        // Only a share submission arms the crash. Every other helper call this
+        // transport sees must pass through untouched, or the process dies at a
+        // point where no delivery attempt has been journaled yet and a
+        // correctly ordered journal looks like a missing one. Fleet preflight
+        // is `GET /status` and share status is `GET /share-status/...`, so
+        // neither reaches this method; the path check is what keeps that true
+        // if a future call POSTs somewhere else.
+        let Some(armed) = self.armed.filter(|_| url.ends_with(SHARES_ENDPOINT)) else {
+            return self.inner.post_json(url, body, timeout);
+        };
+        let log = Arc::clone(&self.log);
+        let recorded = url.to_string();
+
+        Box::pin(async move {
+            // The share is already journaled in `attempting_urls`: journalling
+            // happens before dispatch, so reaching the transport at all means
+            // the durable marker exists. Dying here is the untried-helper case
+            // that must still be treated as outcome-unknown.
+            if armed == CrashStage::BeforeSharePost {
+                crash_now(&log, armed);
+            }
+
+            log.record(&Observation::PostDispatched {
+                url: recorded.clone(),
+            });
+            let response = self.inner.post_json(url, body, timeout).await;
+
+            if let Ok(response) = &response {
+                log.record(&Observation::PostResponse {
+                    url: recorded,
+                    status: response.status(),
+                    body: response.body_text(),
+                });
+            }
+
+            // The helper answered and the wallet never wrote the outcome down.
+            // Indistinguishable, from the sidecar, from a POST that never
+            // returned — which is precisely why resume must treat it as
+            // ambiguous rather than as a failure it can retry freely.
+            crash_now(&log, armed);
+        })
+    }
+}

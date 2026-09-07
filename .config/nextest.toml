@@ -32,3 +32,26 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.ci.overrides]]
 filter = 'test(/real_delegation_proof|zkp2/)'
 slow-timeout = { period = "300s", terminate-after = 4 }
+
+# The staging crash-recovery matrix drives real rounds: it provisions on chain,
+# waits for a validator ceremony, generates Halo2 proofs, and crashes and
+# resumes child processes. One stage can legitimately take tens of minutes, so
+# the ordinary slow-timeout — 20s x 4 on the `agent` profile — would terminate
+# it long before it could reach a verdict, and every result would be a timeout
+# rather than a conformance answer.
+#
+# `terminate-after` is deliberately omitted: the matrix bounds itself per stage
+# and kills its own children, and a runner-level kill would strand a child
+# holding a sidecar whose submission row is the only record that a transaction
+# may exist.
+[[profile.default.overrides]]
+filter = 'binary(staging_conformance)'
+slow-timeout = { period = "10m" }
+
+[[profile.agent.overrides]]
+filter = 'binary(staging_conformance)'
+slow-timeout = { period = "10m" }
+
+[[profile.ci.overrides]]
+filter = 'binary(staging_conformance)'
+slow-timeout = { period = "10m" }

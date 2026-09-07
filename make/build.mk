@@ -18,7 +18,8 @@ VCT_PACKAGES  := -p vote-commitment-tree -p vote-commitment-tree-client
 # runs the whole suite without failing fast.
 NEXTEST_PROFILE ?= agent
 
-.PHONY: help check test test-lrz test-vct doc-test proofs msrv fmt clippy
+.PHONY: help check test test-lrz test-vct doc-test proofs msrv fmt clippy \
+	recovery-conformance-check recovery-conformance
 
 help: ## Show the canonical build and test targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -76,3 +77,17 @@ fmt: ## Check formatting
 clippy: ## Lint the default Zakura stack
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
 		cargo clippy $(APP_PACKAGES) --all-targets --features test-fixtures --locked
+
+# Staging crash-recovery conformance. Deliberately not in APP_PACKAGES: this
+# package drives a real staging round over the network and kills its own child
+# processes, so it must never join `check`, `test`, or CI's hermetic jobs. It
+# shares the Zakura target dir so it reuses the main build's artifacts.
+RECOVERY_CONFORMANCE_PACKAGE = -p recovery-conformance
+
+recovery-conformance-check: ## Type-check the staging crash-recovery suite
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo clippy $(RECOVERY_CONFORMANCE_PACKAGE) --all-targets --locked
+
+recovery-conformance: ## Run the staging crash-recovery suite (network, slow)
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked
