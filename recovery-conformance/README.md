@@ -4,89 +4,38 @@ Staging crash-recovery conformance for `zcash_voting`.
 
 ## Why this exists
 
-The crate's ~1200 unit tests prove that durable rows are written in the right
+The crate's ~1400 unit tests prove that durable rows are written in the right
 order. They cannot prove the claim those rows exist to support: that an app
 **killed** mid-round — no unwinding, no `Drop`, no flush, no graceful SQLite
 close — restarts against the same sidecar and the same live chain and
 converges, without spending a note twice or losing a vote.
 
-Every existing test ends in a clean `drop(db)`, and a clean drop is the one
-thing a crash is not. `docs/chain_submission_invariants.md` even lists "a
-process crash while a `Submitting` reservation exists" as possibly-dispatched,
-and specifies `abandoned Submitting on restart -> Recovering`. Nothing killed a
-process to check.
+Every unit test ends in a clean `drop(db)`, and a clean drop is the one thing a
+crash is not. `docs/chain_submission_invariants.md` lists "a process crash while
+a `Submitting` reservation exists" as possibly-dispatched and specifies
+`abandoned Submitting on restart -> Recovering`; nothing killed a process to
+check.
 
 This package does. It provisions a real multi-proposal, multi-bundle round on
 staging, drives it in a child process, `abort()`s that child at a named durable
-boundary, then reopens the same sidecar and asks the only question that
-matters: **does the round still know what it owes?**
+boundary, then reopens the same sidecar and asks the only question that matters:
+**does the round still know what it owes?**
 
 The oracle is `session::resume_plan`, a pure function of durable state. Nothing
 in memory survives the crash, so the plan after reopen *is* the complete
 definition of the remaining work.
 
-## Credentials
-
-No secret lives in this repository. Values are read from the process
-environment at run time, and Infisical is the source of truth.
-
-| What | Where |
-| --- | --- |
-| Vote-manager key for `svote-1` round creation | Infisical `vote` project `40862c6d-a089-4355-b405-0477be0ee3b1`, key `VOTE_MANAGER_VOTE_SDK`, present in `dev`/`staging`/`prod`; the suite uses **`staging`** |
-| Voting wallet seed (fixed across runs) | Infisical, same project, key `VOTE_SDK_VOTER_TEST`, present in `dev`/`staging`/`prod` |
-
-`VOTE_SDK_VOTER_TEST` is the fixed voter's **24-word BIP39 mnemonic** — a Zcash
-wallet seed derived through ZIP-32, not a cosmos key. Its notes are what every
-round delegates. All three credentials have different shapes (24 words, 12
-words, 64-char hex), so no parsing path is shared.
-
-`VOTE_MANAGER_VOTE_SDK` is a **12-word BIP39 mnemonic** (the older
-`VOTE_MANAGER` is a 64-char hex seed — different shape, don't reuse the parsing
-path). Derive with secp256k1 over **`m/44'/133'/0'/0/0`** — Zcash's coin type, **not**
-the cosmos default of 118 — and bech32 prefix `sv`. Verified against staging:
-133 reproduces the registered coordinator
-`sv1z4rawnk8ny0pzsewyzm3egdd7296fr8p20fkf8`; 118, 60 and 1 each produce a
-well-formed address for an account the chain has never seen.
-
-It is the scoped coordinator key. It authorizes
-`MsgCreateVotingSession`, which the chain restricts to the vote manager
-(`ValidateVoteManagerOnly` in `x/vote/keeper/msg_server.go`). It is **not** an
-attestation key: the suite self-signs the dynamic config it trusts rather than
-having anyone attest a throwaway round.
-
-Run the suite under Infisical so nothing touches disk:
-
-```bash
-infisical run --env=staging -- make recovery-conformance
-```
-
-Check a key is present without printing it. Test the **value**, not the exit
-code: `infisical secrets get` returns 0 for a key that does not exist and
-substitutes the literal `*not found*`, so an `rc`-based check reports every key
-as present.
-
-```bash
-infisical secrets get VOTE_MANAGER_VOTE_SDK --env=staging -o json \
-  | grep -q '"secretValue":"\*not found\*"' && echo absent || echo present
-```
-
-The suite reads these live from Infisical on every run. Do not point it at a
-local snapshot of exported secrets: such a file goes stale the moment a key is
-added or rotated, and a stale value fails as a rejected authorization, which
-reads like a permissions problem rather than a wrong key.
-
 ## Running it
 
-Not part of `make test`, and not in CI: it needs the network and it kills
+Not part of `make test` and not in CI: it needs the network and it kills
 processes.
 
-```
-make recovery-conformance-check   # type-check and lint
-make recovery-conformance         # run against staging (slow)
+```bash
+infisical run --env=staging -- make recovery-conformance   # the full matrix
+make recovery-conformance-check                            # type-check and lint
 ```
 
-To re-run only the stages a change could have affected, name them in
-`RECOVERY_CONFORMANCE_STAGES`:
+To re-run only the stages a change could affect:
 
 ```bash
 infisical run --env=staging -- env \
@@ -95,9 +44,34 @@ infisical run --env=staging -- env \
 ```
 
 The control run is unconditional whatever the selection, because every terminal
-comparison is against it. An unrecognized name fails the run rather than
-selecting nothing: a typo that silently ran no stages would report a green
-matrix having tested nothing.
+comparison is against it. An unrecognized stage name fails the run rather than
+selecting nothing, and a matrix that attempts no stages, or passes none of the
+stages it attempts, fails as well: a green run over untested ground is the way
+a suite like this rots.
+
+### Credentials
+
+No secret lives in this repository, and none is written to disk. Two values are
+read from the environment at run time:
+
+| | |
+| --- | --- |
+| `VOTE_MANAGER_VOTE_SDK` | Scoped coordinator key. Authorizes `MsgCreateVotingSession`, which the chain restricts to the vote manager. **Not** an attestation key — the suite self-signs the dynamic config it trusts. |
+| `VOTE_SDK_VOTER_TEST` | The fixed voter's 24-word BIP39 mnemonic. |
+
+Read them live from Infisical on every run. Do not point the suite at a local
+snapshot of exported secrets: such a file goes stale the moment a key is added
+or rotated, and a stale value fails as a rejected authorization, which reads
+like a permissions problem rather than a wrong key.
+
+To check a key is present without printing it, test the **value**, not the exit
+code — `infisical secrets get` returns 0 for a key that does not exist and
+substitutes the literal `*not found*`:
+
+```bash
+infisical secrets get VOTE_MANAGER_VOTE_SDK --env=staging -o json \
+  | grep -q '"secretValue":"\*not found\*"' && echo absent || echo present
+```
 
 ## Crash stages
 
@@ -121,7 +95,7 @@ crash.
 | `before-cast` | delegation confirmed |
 | `after-tree-sync` | delegation confirmed; cached tree synced |
 | `after-vote-proof` | nothing new — the proof is lost by design |
-| `after-vote-commit` | `votes.commitment_bundle_json`, no POST reserved — **not reachable**, see below |
+| `after-vote-commit` | `votes.commitment_bundle_json`, no POST reserved; the seam is the fleet preflight |
 | `after-helper-plans` | `helper_share_plans` + `round_immediate_share` |
 | `before-vote-broadcast` | vote `submitting`, bytes never sent |
 | `after-vote-broadcast` | vote `submitting`, POST dispatched |
@@ -139,130 +113,6 @@ crash.
 - **`after-broadcast-unread`** — the transaction is on staging and the wallet
   has no hash for it. Resume must reach `Confirmed` by exact-tree scanning and
   must never POST a second transaction spending the same notes.
-
-## Round consumption, and what that costs
-
-A delegation is consumed **on the vote chain**: once a bundle's delegation is
-registered for a round, that round's gov nullifier is spent and the bundle
-cannot delegate again. The Zcash notes themselves are untouched — TX1 is a
-PCZT-only signing artifact and is never broadcast — so the voting wallet never
-needs re-funding. It is the *round* that is one-shot, not the money.
-
-Two consequences shape the suite:
-
-1. **A stage that gets a POST onto the wire consumes its round.** Those stages
-   need a freshly provisioned round. `touches_chain()` names whether the armed
-   run can do so before crashing.
-2. **Driving a resumed round to quiescence is itself mutative**, even when the
-   crash was pre-broadcast. A `before-broadcast` crash leaves a `Recovering`
-   row that resume will dispatch, which consumes the round just the same.
-
-Therefore every matrix case provisions a distinct round. Sharing a round among
-pre-POST crash stages would still let the first case's resume consume that
-round, making every later case observe chain effects that its sidecar does not
-own. There is no mock prover — the `test-fixtures` seeding helpers skip
-proving, which is exactly what this suite must not do — so this isolation is
-expensive but required for the terminal convergence oracle.
-
-## The fixed voter wallet
-
-`VOTE_SDK_VOTER_TEST` holds **11 notes, which bundle into 3**. That shape is
-deliberate and worth not breaking.
-
-Bundling packs notes value-descending, five to a bundle
-(`BUNDLE_NOTE_SLOTS = 5`), so 11 notes fill 5/5/1. The privacy trim then tries
-to shed the smallest bundle down to `DEFAULT_MAX_PRIVACY_BUNDLES = 2`, but it
-may only spend `DEFAULT_PRIVACY_DROP_BPS` — 1% of selected value. With
-near-equal notes the last bundle is about 9% of the balance, far over budget,
-so the trim breaks immediately and all three survive. The lone note in bundle 3
-must still be worth at least `BALLOT_DIVISOR` (0.125 TAZ) by itself or step 4
-drops it as sub-ballot.
-
-Three bundles rather than two is what makes the multi-bundle invariants real:
-`E1` crashes one bundle mid-proof and asserts the others are untouched, which
-needs a bundle to spare. The cost is one extra delegation proof and one extra
-vote proof per proposal.
-
-Because bundling is value-sensitive, rebalancing this wallet can silently
-change the bundle count and quietly weaken `E1`. The suite asserts the layout
-it expects at provisioning time rather than trusting it.
-
-## Which chains this runs against
-
-| | |
-| --- | --- |
-| Zcash | **testnet**, via `https://testnet.zec.rocks:443` |
-| Vote chain | `svote-1` (staging), RPC `https://stage.vote-rpc-primary.valargroup.org` |
-| Coordinator | `sv1z4rawnk8ny0pzsewyzm3egdd7296fr8p20fkf8`, derived at `m/44'/133'/0'/0/0` |
-
-Two things here are easy to get wrong, and both fail in ways that look like
-recovery bugs rather than configuration:
-
-- **Stardust is mainnet-only.** Every Stardust host reports `chainName:
-  "main"`, and no testnet Stardust exists. Pointed at one, the voter wallet
-  finds no notes and the run reports "no eligible notes".
-- **Read the published config, never a local checkout.** The
-  `token-holder-voting-config` working copy can be stale; its `stage/pir.json`
-  named a snapshot height that was a plausible *mainnet* height while the
-  published one was unambiguously testnet.
-
-## Config authentication is bypassed, deliberately
-
-A wallet learns a round's parameters from the signed dynamic config: it fetches
-the document, verifies a `RoundAuthPayloadV2` signature over the round id,
-`ea_pk`, and PIR layout, and only then trusts the values. **This suite skips
-all of that** and reads the round straight off the chain that created it
-(`provisioning::fetch_round`).
-
-That trade is sound here and nowhere else. Config authentication answers "is
-this round genuine and endorsed" — a question about trusting a third party's
-document. The suite provisions the round itself, minutes earlier, with its own
-coordinator key, so it already knows the answer; signing a document to verify a
-fact it just created would exercise the config layer rather than recovery.
-
-What is *not* skipped is agreement: the parameters used to drive the round come
-from the chain's own record, so a provisioning mistake surfaces as a mismatch
-instead of being carried forward by a local copy.
-
-## Verification record
-
-Three consecutive runs of the full matrix against staging, every stage
-exercised and none skipped:
-
-| Run | Result | Duration |
-| --- | --- | --- |
-| 1 | 20 passed, 0 failed, 0 skipped | 2482s |
-| 2 | 20 passed, 0 failed, 0 skipped | 2567s |
-| 3 | 20 passed, 0 failed, 0 skipped | 2781s |
-
-Under test: this crate, plus **two sets of SDK fixes that are not on this
-branch**. The runs are honest only with both named, and this branch does not
-pass without them.
-
-- The seven `votes.tx_hash` completion fixes, which this suite found and which
-  are in review separately. Without them the vote and share stages cannot
-  converge at all.
-- The delegation-proof phase fix that `52d0229c` carries on another branch.
-  Without it `after-signing` fails deterministically: a bundle persisting its
-  proof after another bundle advanced the round-wide phase to `VoteReady` is
-  refused as a phase regression.
-
-Both need to land before this branch's own base turns the matrix green. Running
-it here today reproduces the defects rather than passing over them, which is
-the suite working as intended, not a broken branch.
-
-Each run provisions a control round plus one per stage — roughly twenty fresh
-rounds, every delegation and vote real and on `svote-1`. Sixty rounds across
-the three.
-
-### What the matrix caught
-
-The phase regression above is the case worth recording, because the suite found
-it rather than confirming something already known here. It is a race between
-bundles: it passed three consecutive earlier runs and then failed twice in a
-row once `after-vote-commit` was made reachable and the stage list was complete.
-Applying the fix turns it green and removing it turns it red again, so the suite
-both reproduces the defect and verifies its repair.
 
 ## Invariants
 
@@ -286,7 +136,6 @@ second table is a property the SDK is designed to hold that this suite does
 | **E1** | Bundles other than the crashed one keep their pending work | `assert_other_bundles_untouched` |
 | **B3** (mechanism) | `after-broadcast-unread` must confirm with `confirmation_source = tree`. With no candidate hash to poll, only an exact-tree scan can resolve it — this separates "recovery worked" from "a usable hash happened to survive" | `assert_confirmed_by_tree` |
 | **B2/B3** (identity) | Where the stage captured the dispatched response, the transaction the round finally confirms is **the same one** the killed process had already sent — not merely "exactly one eventually confirmed" | `assert_recovered_the_same_transaction` |
-
 | **D2** (part) | `after-share-accepted` records a definite acceptance in `sent_to_urls` | `assert_stage_state` |
 | — | Each stage leaves the durable state its row expects (PCZT persisted, proof persisted, vote committed, share journaled) | `assert_stage_state` |
 
@@ -340,95 +189,21 @@ waiting to observe one *still tracking* can never fire. The run therefore arms a
 single-pass chain policy for `after-tracking` alone; every other stage keeps the
 shipped cadence, so the control it is compared against is unaffected.
 
-### Stages that are not reachable
+### Reaching after-vote-commit
 
-`after-vote-commit` names a real durable boundary — a committed vote with no
-helper plan yet — but nothing observable marks it. Casting persists the vote,
-prepares the helper plans, and reserves the chain POST inside one
-`advance_step`, so the driver never re-plans in between, and the progress stream
-goes from `VoteCommit(Signing)` directly to `HelperPlansPrepared`, which is
-already the following boundary. Covering it would need a seam inside vote
-completion that does not exist. The matrix reports it as never reached rather
-than passing it against a round that simply finished.
+`after-vote-commit` names a narrow boundary — a committed vote whose helper
+plans are not yet durable — and the progress stream does not mark it: casting
+goes from `VoteCommit(Signing)` straight to `HelperPlansPrepared`, which is
+already the *next* stage's boundary.
 
-## Open findings
+The seam is not in the event stream but in the work. Vote completion probes the
+helper fleet between those two commits, and that probe is a real network round
+trip through the transport this suite already wraps, so a crash on it lands
+squarely in the window with no production change.
 
-None. Both findings this suite raised against the SDK are closed; see below.
-
-### (closed) A crash inside a share POST leaves no attempt journaled
-
-```
---stage before-share-post             # ~3 min, needs a fresh round
-D1 VIOLATED: no helper in `attempting_urls`
-```
-
-Inspecting the crashed sidecar directly: the stage fires, `helper_share_plans`
-holds 1 row, and `share_delegations` holds 1 row for `share_index 0` with
-**both** `attempting_urls` and `sent_to_urls` empty — planned, never attempted.
-Yet the crash fires inside a POST to `/shielded-vote/v1/shares`, and `share.rs`
-documents the marker as "persisted before `Started` is returned, so dispatch can
-safely occur only afterward".
-
-**Resolution: the marker was correct; the suite was reading a sidecar no
-recovery had ever run against.** Two things were wrong, neither in the marker.
-
-`begin()` performed its only state mutation inside a `debug_assert!`, so
-release builds journaled nothing at all (fixed in f1cbeb20). And the suite
-never ran helper-share recovery: `ConfirmShare` polls status through
-`confirm_pending_share` and never re-POSTs, while `track_pending_shares` — the
-one function that re-sends an interrupted attempt — appeared nowhere in this
-crate. The stage could not converge because nothing was ever going to re-send
-the share the crash abandoned.
-
-With the host's background tracking running, the stage passes in ~128s and the
-recovery is visible in the log:
-
-```
-run: tracking pass 1: 0 confirmed, 1 resubmitted, 0 ambiguous
-run: tracking pass 2: 1 confirmed, 0 resubmitted, 0 ambiguous
-```
-
-Exactly one share is re-sent — the interrupted one — out of 144, and nothing
-already accepted is touched. That is D1 and D5 demonstrated rather than
-asserted against a sidecar nothing had recovered.
-
-## Closed findings
-
-### A resumed vote broadcast never reconverged
-
-`after-vote-broadcast` failed identically on all six resume attempts across
-three freshly provisioned rounds — eighteen attempts, one error:
-`confirmed delegation bundle 0 does not match its synced vote-tree leaf`. Its
-blast radius crossed bundles, failing casts on bundles 1 and 2, which were
-never crashed.
-
-It was not a tree problem. Two SDK guards judged a vote finished by
-`votes.tx_hash`, which a vote confirmed by an exact-tree scan never carries, so
-the crashed bundle's delegation VAN was still expected in the tree after its
-vote had spent it, and the stale expectation failed sync on every pass. Fixed
-in 2177e8bf and ef72aba0, and pinned hermetically by
-`a_dispatched_vote_retires_its_bundles_van_expectation` and
-`a_tree_confirmed_vote_clears_its_proposal_authority_bit`.
-
-Verified closed on 2026-09-06 with the report visible:
-
-```
-=== staging conformance ===
-  PASS  after-vote-broadcast
-  PASS  after-vote-confirmed
-  2 passed, 0 failed, 0 skipped, of 2 attempted
-```
-
-Both stages drove `reservations 4 -> 12` with all twelve submissions
-`confirmed`. `after-vote-broadcast` took 322s, absorbing one
-`ChainRecoveryStalled` that resolved on the first resume; the control run
-absorbed one PIR timeout on bundle 2 that resolved the same way. Both are
-environmental and self-healing, not conformance failures.
-
-So a POST reached the shares endpoint while no delivery attempt was journaled.
-Either something other than initial delivery posts there, or the reservation
-returned a non-`Started` outcome and a POST followed regardless. Both sides of
-the POST behave identically, so it is not about ordering around dispatch.
+The stage was documented as unreachable and skipped in every run before this
+was noticed. Nothing is excused from firing now: a stage that does not crash
+where it claims to fails the matrix.
 
 ## What this suite cannot cover
 
@@ -445,6 +220,134 @@ the POST behave identically, so it is not about ordering around dispatch.
 - **Rewinding staging.** A delegation consumed on the vote chain stays
   consumed, which is why every mutative stage needs its own round. See
   [Round consumption](#round-consumption-and-what-that-costs).
+
+## Environment
+
+| | |
+| --- | --- |
+| Zcash | **testnet**, via `https://testnet.zec.rocks:443` |
+| Vote chain | `svote-1` (staging), RPC `https://stage.vote-rpc-primary.valargroup.org` |
+| Coordinator | `sv1z4rawnk8ny0pzsewyzm3egdd7296fr8p20fkf8`, derived at `m/44'/133'/0'/0/0` |
+
+Two things here are easy to get wrong, and both fail in ways that look like
+recovery bugs rather than configuration:
+
+- **Stardust is mainnet-only.** Every Stardust host reports `chainName:
+  "main"`, and no testnet Stardust exists. Pointed at one, the voter wallet
+  finds no notes and the run reports "no eligible notes".
+- **Read the published config, never a local checkout.** The
+  `token-holder-voting-config` working copy can be stale; its `stage/pir.json`
+  named a snapshot height that was a plausible *mainnet* height while the
+  published one was unambiguously testnet.
+
+`VOTE_SDK_VOTER_TEST` holds **11 notes, which bundle into 3**. That shape is
+deliberate and worth not breaking.
+
+Bundling packs notes value-descending, five to a bundle
+(`BUNDLE_NOTE_SLOTS = 5`), so 11 notes fill 5/5/1. The privacy trim then tries
+to shed the smallest bundle down to `DEFAULT_MAX_PRIVACY_BUNDLES = 2`, but it
+may only spend `DEFAULT_PRIVACY_DROP_BPS` — 1% of selected value. With
+near-equal notes the last bundle is about 9% of the balance, far over budget,
+so the trim breaks immediately and all three survive. The lone note in bundle 3
+must still be worth at least `BALLOT_DIVISOR` (0.125 TAZ) by itself or step 4
+drops it as sub-ballot.
+
+Three bundles rather than two is what makes the multi-bundle invariants real:
+`E1` crashes one bundle mid-proof and asserts the others are untouched, which
+needs a bundle to spare. The cost is one extra delegation proof and one extra
+vote proof per proposal.
+
+Because bundling is value-sensitive, rebalancing this wallet can silently
+change the bundle count and quietly weaken `E1`. The suite asserts the layout
+it expects at provisioning time rather than trusting it.
+
+A wallet learns a round's parameters from the signed dynamic config: it fetches
+the document, verifies a `RoundAuthPayloadV2` signature over the round id,
+`ea_pk`, and PIR layout, and only then trusts the values. **This suite skips
+all of that** and reads the round straight off the chain that created it
+(`provisioning::fetch_round`).
+
+That trade is sound here and nowhere else. Config authentication answers "is
+this round genuine and endorsed" — a question about trusting a third party's
+document. The suite provisions the round itself, minutes earlier, with its own
+coordinator key, so it already knows the answer; signing a document to verify a
+fact it just created would exercise the config layer rather than recovery.
+
+What is *not* skipped is agreement: the parameters used to drive the round come
+from the chain's own record, so a provisioning mistake surfaces as a mismatch
+instead of being carried forward by a local copy.
+
+## Round consumption, and what that costs
+
+A delegation is consumed **on the vote chain**: once a bundle's delegation is
+registered for a round, that round's gov nullifier is spent and the bundle
+cannot delegate again. The Zcash notes themselves are untouched — TX1 is a
+PCZT-only signing artifact and is never broadcast — so the voting wallet never
+needs re-funding. It is the *round* that is one-shot, not the money.
+
+Two consequences shape the suite:
+
+1. **A stage that gets a POST onto the wire consumes its round.** Those stages
+   need a freshly provisioned round. `touches_chain()` names whether the armed
+   run can do so before crashing.
+2. **Driving a resumed round to quiescence is itself mutative**, even when the
+   crash was pre-broadcast. A `before-broadcast` crash leaves a `Recovering`
+   row that resume will dispatch, which consumes the round just the same.
+
+Therefore every matrix case provisions a distinct round. Sharing a round among
+pre-POST crash stages would still let the first case's resume consume that
+round, making every later case observe chain effects that its sidecar does not
+own. There is no mock prover — the `test-fixtures` seeding helpers skip
+proving, which is exactly what this suite must not do — so this isolation is
+expensive but required for the terminal convergence oracle.
+
+## Verification record
+
+Three consecutive runs of the full matrix against staging, every stage
+exercised and none skipped:
+
+| Run | Result | Duration |
+| --- | --- | --- |
+| 1 | 20 passed, 0 failed, 0 skipped | 2482s |
+| 2 | 20 passed, 0 failed, 0 skipped | 2567s |
+| 3 | 20 passed, 0 failed, 0 skipped | 2781s |
+
+Under test: this crate, plus **two sets of SDK fixes that are not on this
+branch**. The runs are honest only with both named, and this branch does not
+pass without them.
+
+- The seven `votes.tx_hash` completion fixes, which this suite found and which
+  are in review separately. Without them the vote and share stages cannot
+  converge at all.
+- The delegation-proof phase fix that `52d0229c` carries on another branch.
+  Without it `after-signing` fails deterministically: a bundle persisting its
+  proof after another bundle advanced the round-wide phase to `VoteReady` is
+  refused as a phase regression.
+
+Both need to land before this branch's own base turns the matrix green. Running
+it here today reproduces the defects rather than passing over them, which is
+the suite working as intended, not a broken branch.
+
+Each run provisions a control round plus one per stage — roughly twenty fresh
+rounds, every delegation and vote real and on `svote-1`. Sixty rounds across
+the three.
+
+### What it caught
+
+Seven SDK defects, all from one root cause — `votes.tx_hash` read as proof a
+vote finished, when a vote confirmed by an exact-tree scan never carries one.
+Three failed closed and stalled rounds; three failed **open**, permitting a
+rebuild of an on-chain vote, a conflicting ballot intent, and silent overwrite
+of an on-chain vote. A seventh erased the helper attempt marker in release
+builds only, invisible to a suite running with debug assertions on.
+
+Plus an intermittent multi-bundle phase regression: a bundle persisting its
+delegation proof after another advanced the round phase to `VoteReady` was
+refused. It passed three earlier runs, then failed twice consecutively once
+coverage was complete — the kind of race this matrix exists for.
+
+Each fix carries its own commit and hermetic regression test; the specifications
+in `docs/` state the rules they restored.
 
 ## Design notes
 
