@@ -299,8 +299,11 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
 
 /// Waits `delay`, returning `false` if the host interrupted meanwhile.
 ///
-/// The wait is polled rather than slept through so a host that closes the
-/// session does not pay the rest of it.
+/// The wait is woken by the control rather than slept through, so a host that
+/// closes the session does not pay the rest of it. A share tracking pass can
+/// ask for a delay measured in hours, so the wait races the delay against
+/// [`ChainSubmissionControl::interrupted`] instead of re-reading the control on
+/// a tick: an uninterrupted wait costs one timer however long it lasts.
 ///
 /// `pending_repoll` is host-configured and unbounded, so an absolute deadline
 /// that far out may not be representable. `None` means "wait until
@@ -312,22 +315,33 @@ pub(crate) async fn sleep_until_interrupted(
     control: &ChainSubmissionControl,
     entry_epoch: u64,
 ) -> bool {
-    const CHECK: std::time::Duration = std::time::Duration::from_millis(50);
     let deadline = tokio::time::Instant::now().checked_add(delay);
     loop {
+        let interrupt = control.interrupted();
+        tokio::pin!(interrupt);
+        // Registered before the flags are read, because `notify_waiters`
+        // stores no permit: a change landing between the read and the
+        // registration would wake nothing and leave the wait asleep for the
+        // whole delay.
+        interrupt.as_mut().enable();
         if control.is_cancelled() || control.operation_epoch() != entry_epoch {
             return false;
         }
-        let remaining = match deadline {
+        match deadline {
             Some(deadline) => {
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    return true;
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => return true,
+                    // A wake is not itself the answer: `set_operation_epoch`
+                    // notifies whatever it stores, so re-storing the entry
+                    // epoch must not read as an interruption. The loop
+                    // re-reads the flags instead.
+                    _ = &mut interrupt => continue,
                 }
-                deadline - now
             }
-            None => CHECK,
-        };
-        tokio::time::sleep(remaining.min(CHECK)).await;
+            None => {
+                interrupt.await;
+                continue;
+            }
+        }
     }
 }

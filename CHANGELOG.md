@@ -535,6 +535,16 @@ This release is `zcash_voting` 4.0.0.
   during the `pending_repoll` wait between passes, within 25 ms, instead of
   only at the start of the next pass.
 
+- A `ChainSubmissionControl` now wakes whatever is waiting on it the moment it
+  is cancelled or re-epoched, instead of being re-read on a 25 ms or 50 ms
+  tick. Both waits that honour it — the `pending_repoll` wait between chain
+  passes and the round driver's repoll wait — race their delay against the
+  control, so an interruption is observed at once and an uninterrupted wait
+  costs one timer however long it lasts. Polling was affordable only while
+  every wait was short; a wait that spans the hours until a delayed helper
+  share is due would otherwise wake tens of times a second for its whole
+  duration.
+
 - `VotingDb::open_wallet_sidecar` serializes concurrent opens per sidecar
   path only. A slow open of one sidecar (busy timeout, migrations, busy
   retries) no longer delays opening a different sidecar.

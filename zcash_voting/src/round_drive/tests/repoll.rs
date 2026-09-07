@@ -13,10 +13,39 @@ async fn the_repoll_wait_runs_to_completion_when_nothing_interrupts() {
 #[tokio::test(start_paused = true)]
 async fn a_cancelled_host_does_not_pay_the_rest_of_the_repoll_wait() {
     // A host that closes the session mid-wait must not be held for the
-    // remainder of it: the wait is polled, not slept through.
+    // remainder of it: the wait is woken by the control, not slept through.
     let control = ChainSubmissionControl::new(1);
     control.cancel();
     assert!(!sleep_until_interrupted(Duration::from_secs(3600), &control, 1).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_wait_ends_without_advancing_the_clock() {
+    // The mechanism, not just the outcome. A wait that re-read the control on
+    // a tick would need the clock to reach that tick before it noticed, and
+    // under paused time the runtime supplies exactly that by auto-advancing
+    // whenever every task is idle. Being woken by the control instead costs no
+    // clock movement at all, which is what makes an hours-long wait free.
+    let control = ChainSubmissionControl::new(1);
+    let waiting = tokio::spawn({
+        let control = control.clone();
+        async move { sleep_until_interrupted(Duration::from_secs(86_400), &control, 1).await }
+    });
+    // Let it register its interest and settle into the wait. Deliberately not
+    // a multiple of any poll tick: landing on one would leave a polling
+    // implementation already runnable at `at_cancel` and let it pass too.
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    assert!(!waiting.is_finished());
+
+    let at_cancel = tokio::time::Instant::now();
+    control.cancel();
+
+    assert!(!waiting.await.unwrap(), "the wait reports the interruption");
+    assert_eq!(
+        tokio::time::Instant::now(),
+        at_cancel,
+        "the wait is woken by the control, not by the clock reaching a poll tick",
+    );
 }
 
 #[tokio::test(start_paused = true)]
