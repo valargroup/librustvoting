@@ -99,15 +99,29 @@ pub struct RoundRunReport {
     /// [`FailureIsolation::StopRound`], which stops the run instead of
     /// suppressing anything.
     pub skipped_bundles: Vec<u32>,
-    /// Terminal chain outcomes observed, in order.
+    /// Every chain outcome the run observed, in the order it saw them, each
+    /// bound to the step that produced it.
+    ///
+    /// Not only terminal ones: a submission still tracking is recorded here
+    /// too, as is one a failing step saw before it failed. Match on the
+    /// [`ChainSubmissionResult`] rather than treating an entry's presence as
+    /// an ending.
     pub chain_outcomes: Vec<(NextStep, ChainSubmissionResult)>,
     pub share_deliveries: Vec<VoteShareDeliveryReport>,
     /// Delegation bundles the run signed, in the order it produced them.
     ///
     /// Signed, not necessarily submitted: a step cancelled between signing and
     /// building its chain request returns the bundle it produced, and so does
-    /// one that failed at dispatch. Read the bundle's own submission state
-    /// rather than treating presence here as a broadcast.
+    /// one that failed at dispatch. `SignedDelegationBundle` carries no
+    /// submission state of its own, so do not try to read one off it — every
+    /// bundle presents as ready to submit.
+    ///
+    /// To learn what actually happened to bundle `n`, read `plan`: its
+    /// `delegation_statuses` entry for that bundle carries the durable phase,
+    /// the transaction hash, and whether the submission is terminal. That plan
+    /// is re-read after the wave, so it describes the round this run left.
+    /// `chain_outcomes` names what each step saw on the chain, keyed by the
+    /// step, which names the bundle.
     pub delegations: Vec<SignedDelegationBundle>,
 }
 

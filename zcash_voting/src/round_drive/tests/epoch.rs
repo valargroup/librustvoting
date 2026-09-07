@@ -169,3 +169,61 @@ async fn an_epoch_switch_while_gathering_contexts_is_not_a_signature_handoff() {
         report.quiescence
     );
 }
+
+/// Cancels the run the first time a step reports that it finished.
+struct CancellingOnStepFinished {
+    control: ChainSubmissionControl,
+}
+
+impl crate::RoundDriveReporter for CancellingOnStepFinished {
+    fn report(&self, event: crate::RoundDriveEvent) {
+        if matches!(event, crate::RoundDriveEvent::StepFinished { .. }) {
+            self.control.cancel();
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_run_cancelled_after_a_wave_still_reports_what_the_wave_did() {
+    // The wave confirmed the delegation on chain, and the cancellation is only
+    // observed at the next pass's first check. Returning there without
+    // re-planning left the report describing the round as it was before the
+    // confirmation: the bundle still non-terminal and its step still listed.
+    let database = database_with_imported_delegation();
+    let chain = Arc::new(ScriptedChain::default());
+    chain.queue_confirmed();
+    let executor = executor_over_chain(Arc::clone(&database), chain);
+    let control = ChainSubmissionControl::new(1);
+
+    let before = executor.plan().unwrap();
+    assert!(
+        !before.next_steps.is_empty(),
+        "the round owes the imported delegation before the wave"
+    );
+
+    let report = crate::RoundDriver::new(&executor)
+        .run(
+            &SinglePassHost,
+            &control,
+            &CancellingOnStepFinished {
+                control: control.clone(),
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(report.quiescence, crate::RoundQuiescence::Cancelled),
+        "{:?}",
+        report.quiescence
+    );
+    let after = executor.plan().unwrap();
+    assert_ne!(
+        before.next_steps, after.next_steps,
+        "the wave must change durable state, or this test proves nothing"
+    );
+    assert_eq!(
+        report.plan.as_ref().map(|plan| plan.next_steps.clone()),
+        Some(after.next_steps),
+        "the report describes the round the wave left"
+    );
+}

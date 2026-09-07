@@ -68,6 +68,13 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
 
         loop {
             if interrupted() {
+                // A wave that already ran left durable effects the pre-dispatch
+                // plan does not describe, so this return owes the same refresh
+                // a wave-ending one does. A run cancelled before it dispatched
+                // anything has nothing to refresh and reads nothing.
+                if run.dispatches > 0 {
+                    self.refresh_progress(&mut run);
+                }
                 return run.finish(RoundQuiescence::Cancelled);
             }
 

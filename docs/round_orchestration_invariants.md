@@ -413,10 +413,22 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   before it no longer describe the round: a rejection the wave persisted would
   still be listed as a step to run, and a proposal whose vote confirmed would
   still count as incomplete. Both are refreshed from durable state before a
-  wave-ending quiescence is reported. The refresh is best effort — a run stops
-  for a reason the wave produced, and a failed re-read is not that reason, so
-  the pre-wave values stand rather than replacing it
-  (`a_rejected_submission_stops_the_run_carrying_its_diagnostic`).
+  wave-ending quiescence is reported, and before a cancellation observed on the
+  pass after a wave — that return owes the refresh for the same reason, and a
+  run cancelled before it dispatched anything has nothing to refresh and reads
+  nothing. The refresh is best effort: a run stops for a reason the wave
+  produced, and a failed re-read is not that reason, so the pre-wave values
+  stand rather than replacing it
+  (`a_rejected_submission_stops_the_run_carrying_its_diagnostic`,
+  `a_run_cancelled_after_a_wave_still_reports_what_the_wave_did`).
+- **A report's fields say what they hold.** `chain_outcomes` is every chain
+  outcome the run observed, tracking results included, not only terminal ones.
+  `delegations` is what the run *signed*, which is not what it submitted: a
+  step cancelled between signing and building its chain request produces a
+  bundle, and `SignedDelegationBundle` carries no submission state — its wire
+  `status` is always `ready_for_submission`. The durable answer for a bundle is
+  in the report's plan, whose `delegation_statuses` entry carries the phase,
+  the transaction hash and whether the submission is terminal.
 - **A dispatch belongs to the epoch its run captured.** The driver decides to
   dispatch, then plans, builds each host context and reads stored signing
   material before the step begins. A step that captured its own epoch on entry

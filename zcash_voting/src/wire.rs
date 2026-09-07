@@ -900,6 +900,7 @@ pub struct RoundRunReportView {
     /// `StopRound`, which stops instead of suppressing.
     #[serde(default)]
     pub skipped_bundles: Vec<u32>,
+    /// Every chain outcome the run observed, terminal or not.
     #[serde(default)]
     pub chain_outcomes: Vec<RoundChainOutcomeView>,
     #[serde(default)]
@@ -908,16 +909,21 @@ pub struct RoundRunReportView {
     ///
     /// Signed, not necessarily submitted: a step cancelled between signing and
     /// building its chain request returns the bundle it produced, and a step
-    /// that failed at dispatch carries one too. Read the bundle's own
-    /// submission state rather than treating presence here as a broadcast, or
-    /// a host will suppress a resume the round still needs. They are projected
-    /// so a host reading only the report sees the artifacts a host watching
-    /// every step would.
+    /// that failed at dispatch carries one too. The payload's own `status` is
+    /// always `ready_for_submission` and is not a submission state, so a host
+    /// that reads it as one will resubmit a bundle already on the chain.
+    ///
+    /// What happened to bundle `n` is in `plan`: its `delegation_statuses`
+    /// entry carries the durable phase, the transaction hash, and whether the
+    /// submission is terminal. These are projected so a host reading only the
+    /// report sees the artifacts a host watching every step would.
     #[serde(default)]
     pub delegations: Vec<SignedDelegationPayloadView>,
 }
 
-/// A terminal chain outcome bound to the step that produced it.
+/// One chain outcome the run observed, bound to the step that produced it.
+///
+/// Not only terminal ones: a submission still tracking appears here too.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundChainOutcomeView {
     pub step: NextStepView,
