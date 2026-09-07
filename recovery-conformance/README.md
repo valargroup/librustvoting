@@ -70,10 +70,10 @@ infisical secrets get VOTE_MANAGER_VOTE_SDK --env=staging -o json \
   | grep -q '"secretValue":"\*not found\*"' && echo absent || echo present
 ```
 
-`~/agent-global.env` may hold a namespaced `VOTE_DEV__*` copy from an earlier
-sync. That file is a point-in-time snapshot and goes stale as soon as a key is
-added or rotated — it does not currently contain `VOTE_MANAGER_VOTE_SDK`. The
-suite reads live values rather than that cache.
+The suite reads these live from Infisical on every run. Do not point it at a
+local snapshot of exported secrets: such a file goes stale the moment a key is
+added or rotated, and a stale value fails as a rejected authorization, which
+reads like a permissions problem rather than a wrong key.
 
 ## Running it
 
