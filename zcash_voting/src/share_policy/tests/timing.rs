@@ -153,8 +153,40 @@ fn next_tracking_delay_applies_minimum_and_future_cap() {
     let shares = vec![share(0, 100), share(200, 100)];
     let policy = ShareTimingPolicy::default();
 
+    // One second short of the first check, floored to the minimum delay.
     assert_eq!(next_tracking_delay_seconds(&shares, 109, policy), Some(3));
-    assert_eq!(next_tracking_delay_seconds(&shares, 111, policy), Some(30));
+
+    // Nothing ready yet and the only check is 99s out, so the cap applies.
+    let far_future = vec![share(500, 500)];
+    assert_eq!(
+        next_tracking_delay_seconds(&far_future, 111, policy),
+        Some(30)
+    );
+}
+
+#[test]
+fn a_ready_share_is_not_left_waiting_behind_a_later_one() {
+    // The first share's check passed at 110; the second's is at 210. Waiting
+    // for the second would leave the first unpolled for 99 seconds, so the
+    // ready cadence wins.
+    let shares = vec![share(0, 100), share(200, 100)];
+    let policy = ShareTimingPolicy::default();
+
+    assert_eq!(
+        next_tracking_delay_seconds(&shares, 111, policy),
+        Some(policy.ready_poll_interval_seconds)
+    );
+}
+
+#[test]
+fn a_check_sooner_than_the_ready_cadence_still_wins() {
+    // Symmetry: the delay is whichever clock comes first, so a check a few
+    // seconds out is not delayed to the ready interval.
+    let shares = vec![share(0, 100), share(0, 106)];
+    let policy = ShareTimingPolicy::default();
+
+    // Share one is ready (110 <= 111); share two's check is at 116.
+    assert_eq!(next_tracking_delay_seconds(&shares, 111, policy), Some(5));
 }
 
 #[test]

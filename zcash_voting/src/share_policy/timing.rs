@@ -141,12 +141,18 @@ pub(crate) fn is_share_resubmission_window_open(
 
 /// Return the next delay after a share-status polling pass completes.
 ///
-/// This mirrors the current wallet polling cadence. If any unconfirmed share is
-/// still before its status-check grace time, the delay is the soonest future
-/// check time capped by `future_check_max_delay_seconds`. If every unconfirmed
-/// share is already ready, the delay is `ready_poll_interval_seconds` so callers
-/// do not tight-loop on past check times. The returned delay is always at least
-/// `min_tracking_delay_seconds`.
+/// Two clocks compete, and the delay is whichever comes first:
+///
+/// - a share already past its status-check grace time is polled again after
+///   `ready_poll_interval_seconds`, so callers neither tight-loop on it nor
+///   leave it unpolled;
+/// - a share still before its grace time is waited for until it arrives,
+///   capped by `future_check_max_delay_seconds`.
+///
+/// Taking the sooner of the two matters when the two kinds coexist: a ready
+/// share must not queue behind an unrelated share whose check is further out.
+/// The returned delay is always at least `min_tracking_delay_seconds`, and
+/// `None` means no unconfirmed share remains — the signal to stop tracking.
 pub fn next_tracking_delay_seconds(
     shares: &[ShareDelegationRecord],
     now_seconds: u64,
@@ -154,6 +160,7 @@ pub fn next_tracking_delay_seconds(
 ) -> Option<u64> {
     let mut next_second: Option<u64> = None;
     let mut has_unconfirmed = false;
+    let mut has_ready = false;
 
     for share in shares.iter().filter(|share| !share.confirmed) {
         has_unconfirmed = true;
@@ -161,6 +168,8 @@ pub fn next_tracking_delay_seconds(
         let check_at = base_time.saturating_add(policy.status_check_grace_seconds);
         if check_at > now_seconds {
             next_second = min_second(next_second, check_at);
+        } else {
+            has_ready = true;
         }
     }
 
@@ -168,11 +177,18 @@ pub fn next_tracking_delay_seconds(
         return None;
     }
 
-    let delay_seconds = match next_second {
-        Some(next) => next
-            .saturating_sub(now_seconds)
-            .min(policy.future_check_max_delay_seconds),
-        None => policy.ready_poll_interval_seconds,
+    let future_delay = next_second.map(|next| {
+        next.saturating_sub(now_seconds)
+            .min(policy.future_check_max_delay_seconds)
+    });
+    let ready_delay = has_ready.then_some(policy.ready_poll_interval_seconds);
+    let delay_seconds = match (ready_delay, future_delay) {
+        (Some(ready), Some(future)) => ready.min(future),
+        (Some(ready), None) => ready,
+        (None, Some(future)) => future,
+        // Every unconfirmed share was counted as ready or future, so one of
+        // the two is always set once `has_unconfirmed` holds.
+        (None, None) => policy.ready_poll_interval_seconds,
     };
 
     Some(delay_seconds.max(policy.min_tracking_delay_seconds))
