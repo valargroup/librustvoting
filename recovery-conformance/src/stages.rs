@@ -70,9 +70,9 @@ pub enum CrashStage {
     /// stream jumps from `VoteCommit(Signing)` straight to
     /// `HelperPlansPrepared`, which is already the *next* boundary
     /// ([`AfterHelperPlans`](Self::AfterHelperPlans)). Reaching it would need a
-    /// seam inside vote completion that does not exist today; until then this
-    /// stage reports as never reached rather than silently passing against a
-    /// round that finished.
+    /// The seam is the fleet preflight: vote completion probes every helper
+    /// after the vote is durably committed and before its helper plans are
+    /// written, so a crash on that request lands between the two commits.
     AfterVoteCommit,
     /// Helper delivery plans and the round's immediate-share designation are
     /// durable. This is the commit that makes a confirmed-vote-without-a-plan

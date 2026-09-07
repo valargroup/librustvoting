@@ -295,6 +295,27 @@ pub fn assert_stage_state(
                 )),
                 "{stage}: a committed vote is not planned for reconciliation"
             );
+            // What separates the two boundaries. Without this the stage asserts
+            // nothing `after-helper-plans` does not already cover, and a crash
+            // that landed on the wrong side of the plan write would pass.
+            if stage == S::AfterVoteCommit {
+                anyhow::ensure!(
+                    snapshot.helper_share_plans == 0,
+                    "{stage}: helper plans are already durable, so the crash landed \
+                     after the plan write rather than between it and the commit"
+                );
+                // The ordering rule read from the earlier side: plans precede
+                // the broadcast, so a vote with no plan yet must have no chain
+                // row either.
+                anyhow::ensure!(
+                    snapshot
+                        .submissions
+                        .iter()
+                        .all(|(kind, ..)| kind == "delegation"),
+                    "{stage}: a vote reached the chain before its helper plans were \
+                     durable, which the ordering rule forbids"
+                );
+            }
         }
         S::BeforeVoteBroadcast | S::AfterVoteBroadcast | S::AfterVoteConfirmed => {
             anyhow::ensure!(

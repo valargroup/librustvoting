@@ -514,17 +514,17 @@ fn refresh_warm_pir(
 
 /// Stages whose crash seam cannot fire, with the reason.
 ///
-/// `AfterVoteCommit` sits between persisting the committed vote and preparing
-/// helper plans, and vote completion has no seam there: the run goes from
-/// `VoteCommit(Signing)` straight to `HelperPlansPrepared`, which is already
-/// the next stage's boundary. Covering it would mean adding a seam to
-/// production vote completion for the sole benefit of this test, which the
-/// repository's standards rule out.
+/// Empty, and it should stay that way. `AfterVoteCommit` was listed here on the
+/// belief that vote completion offered no seam between persisting the committed
+/// vote and writing helper plans. It does: the step probes the helper fleet
+/// between those two commits, and that probe is a real network round trip this
+/// suite already wraps. Believing a boundary untestable is cheaper than
+/// checking, and it cost this stage every run it was ever skipped in.
 ///
-/// Membership is deliberately narrow. Everything not listed here must actually
-/// crash where it claims to, or the matrix fails rather than skipping.
-fn is_known_unreachable(stage: CrashStage) -> bool {
-    matches!(stage, CrashStage::AfterVoteCommit)
+/// Everything must crash where it claims to, or the matrix fails rather than
+/// skipping.
+fn is_known_unreachable(_stage: CrashStage) -> bool {
+    false
 }
 
 async fn provision(fixture: &Fixture) -> anyhow::Result<ProvisionedRound> {

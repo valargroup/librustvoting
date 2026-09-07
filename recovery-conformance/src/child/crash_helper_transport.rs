@@ -21,6 +21,14 @@ use crate::stages::CrashStage;
 /// Path a share submission is POSTed to.
 const SHARES_ENDPOINT: &str = "/shielded-vote/v1/shares";
 
+/// Path the fleet preflight probes.
+///
+/// Vote completion probes the fleet *after* the vote is durably committed and
+/// *before* helper plans are written, so this request is the seam between those
+/// two commits. It is a real network round trip to every helper, which makes
+/// the window wide rather than theoretical.
+const STATUS_ENDPOINT: &str = "/status";
+
 /// Wraps a real helper transport and kills the process around a share POST.
 ///
 /// GETs pass through: helper status polling changes nothing durable.
@@ -36,7 +44,9 @@ impl<T> CrashHelperTransport<T> {
         let armed = stage.filter(|stage| {
             matches!(
                 stage,
-                CrashStage::BeforeSharePost | CrashStage::AfterSharePost
+                CrashStage::BeforeSharePost
+                    | CrashStage::AfterSharePost
+                    | CrashStage::AfterVoteCommit
             )
         });
         Self { inner, armed, log }
@@ -45,6 +55,12 @@ impl<T> CrashHelperTransport<T> {
 
 impl<T: HelperTransport> HelperTransport for CrashHelperTransport<T> {
     fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> HelperFuture<'a> {
+        // Helper status polling changes nothing durable and passes through. The
+        // exception is the fleet preflight, which is the one observable point
+        // between a committed vote and its durable helper plans.
+        if self.armed == Some(CrashStage::AfterVoteCommit) && url.ends_with(STATUS_ENDPOINT) {
+            crash_now(&self.log, CrashStage::AfterVoteCommit);
+        }
         self.inner.get(url, timeout)
     }
 
