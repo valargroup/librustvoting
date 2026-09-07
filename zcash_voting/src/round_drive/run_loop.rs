@@ -249,6 +249,13 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                 // a failed courtesy read must not replace the reason the run
                 // stopped.
                 self.refresh_progress(&mut run);
+                // That refresh blocks on the database, so it is the last
+                // boundary before this return and owes its own check.
+                // `finish` touches nothing further, so this closes the window
+                // rather than moving it.
+                if interrupted() {
+                    return run.finish(RoundQuiescence::Cancelled);
+                }
                 return run.finish(quiescence);
             }
 
@@ -293,21 +300,33 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
 ///
 /// The wait is polled rather than slept through so a host that closes the
 /// session does not pay the rest of it.
+///
+/// `pending_repoll` is host-configured and unbounded, so an absolute deadline
+/// that far out may not be representable. `None` means "wait until
+/// interrupted" rather than panicking on the overflow — a policy value must
+/// not be able to bring down the host process. This mirrors what the chain
+/// client's own re-poll wait does with the same input.
 pub(crate) async fn sleep_until_interrupted(
     delay: std::time::Duration,
     control: &ChainSubmissionControl,
     entry_epoch: u64,
 ) -> bool {
     const CHECK: std::time::Duration = std::time::Duration::from_millis(50);
-    let deadline = tokio::time::Instant::now() + delay;
+    let deadline = tokio::time::Instant::now().checked_add(delay);
     loop {
         if control.is_cancelled() || control.operation_epoch() != entry_epoch {
             return false;
         }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return true;
-        }
-        tokio::time::sleep(CHECK.min(deadline - now)).await;
+        let remaining = match deadline {
+            Some(deadline) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return true;
+                }
+                deadline - now
+            }
+            None => CHECK,
+        };
+        tokio::time::sleep(remaining.min(CHECK)).await;
     }
 }

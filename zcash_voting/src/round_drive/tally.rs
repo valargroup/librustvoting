@@ -24,9 +24,14 @@ use crate::round_planning::{Obligation, RoundObligations};
 pub struct RoundWorkTally {
     pub completed_proposals: u32,
     pub total_proposals: u32,
-    /// Obligations the round still owes. `Blocked` is excluded: it is never
-    /// dispatched, and the plan reports it through `open_proposals` and
-    /// `unrostered_intents` instead.
+    /// Obligations the round still owes and this layer can execute.
+    ///
+    /// `Blocked` and `Retire` are excluded: neither is ever dispatched on its
+    /// own. `Blocked` is reported through the plan's `open_proposals` and
+    /// `unrostered_intents`, and a `Retire` is carried out by the `Cast` that
+    /// replaces the unit — counting it separately would both double count that
+    /// work and, for a round whose retire has no surviving cast, report work
+    /// owed beside a `NoWorkLeft` quiescence.
     pub remaining_obligations: u32,
 }
 
@@ -63,7 +68,12 @@ impl BallotBaseline {
             remaining_obligations: obligations
                 .obligations
                 .iter()
-                .filter(|obligation| !matches!(obligation, Obligation::Blocked { .. }))
+                .filter(|obligation| {
+                    !matches!(
+                        obligation,
+                        Obligation::Blocked { .. } | Obligation::Retire { .. }
+                    )
+                })
                 .count() as u32,
         }
     }

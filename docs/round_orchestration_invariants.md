@@ -428,12 +428,20 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   so leaving them selectable let a background poll starve the delivery the
   round actually owed — indefinitely, until the dispatch budget ran out
   (`an_accepted_share_never_outranks_the_delivery_the_round_owes`).
+- **A host-configured value cannot crash the host.** `pending_repoll` is
+  unbounded, so an absolute deadline built from it may not be representable;
+  the wait treats that as "until interrupted" rather than panicking on the
+  addition, as the chain client's own re-poll wait already did
+  (`an_unbounded_repoll_waits_instead_of_overflowing`).
 - **A step callback is a boundary too.** `StepFinished` and `StepFailed` run
   host code, so a cancellation or an epoch switch can arrive during the fold. A
   wave that also produced a terminal or stalled outcome reports `Cancelled`
   rather than that outcome, which is what `RoundDriver::run` promises; the
   diagnostic is not lost, since `chain_outcomes` and `failures` carry it either
   way (`a_cancellation_raised_by_a_step_callback_outranks_the_wave_s_own_stop`).
+  The post-wave refresh blocks on the database, so it is itself the last
+  boundary before that return and is followed by its own check; `finish`
+  touches nothing further, so the window closes rather than moving.
 - **A report's fields say what they hold.** `chain_outcomes` is every chain
   outcome the run observed, tracking results included, not only terminal ones.
   `RoundDrivePolicy::pending_repoll` paces every unfinished obligation, not
@@ -572,7 +580,11 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   is dispatched; malformed stored material remains an executor failure.
 - **Progress is run-relative and exact.** A proposal is complete when no `Cast`
   and no `ReconcileChain` obligation covers it, measured against the vote work
-  the run's first plan owed. Obligation membership names every member of an
+  the run's first plan owed. `remaining_obligations` counts only what this
+  layer can execute: `Blocked` and `Retire` are both excluded, because neither
+  is ever dispatched on its own and a `Retire` without a surviving `Cast` would
+  otherwise report work owed beside a `NoWorkLeft` quiescence
+  (`a_retire_is_not_work_the_tally_reports_as_owed`). Obligation membership names every member of an
   atomic batch, which a host counting `NextStep`s cannot see: a batch projects
   to one `AdvanceVoteBatch` carrying only its first member's id.
 - **Every event names the step it came from.** `RoundStepProgress::ChainOutcome`

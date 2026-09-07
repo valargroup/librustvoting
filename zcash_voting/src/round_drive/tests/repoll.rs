@@ -410,3 +410,28 @@ async fn an_exhausted_budget_does_not_pay_a_wait_that_leads_nowhere() {
         "the run waited out an interval it could never use: {elapsed:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_unbounded_repoll_waits_instead_of_overflowing() {
+    // `pending_repoll` is host-configured and unbounded. An absolute deadline
+    // that far out is not representable, and panicking on the addition would
+    // let a policy value bring down the host process; the wait stays
+    // cancellable instead.
+    let control = ChainSubmissionControl::new(1);
+    let waiting = tokio::spawn({
+        let control = control.clone();
+        async move { sleep_until_interrupted(Duration::MAX, &control, 1).await }
+    });
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !waiting.is_finished(),
+        "an unbounded wait does not end early"
+    );
+    control.cancel();
+
+    assert!(
+        !waiting.await.unwrap(),
+        "the wait reports that it was interrupted"
+    );
+}

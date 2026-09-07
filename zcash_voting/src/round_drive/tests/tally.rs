@@ -125,3 +125,32 @@ fn progress_is_measured_against_what_the_run_started_owing() {
     let done = baseline.tally(&batch_obligations(&[1, 2, 3], &[]));
     assert_eq!((done.completed_proposals, done.total_proposals), (1, 1));
 }
+
+#[test]
+fn a_retire_is_not_work_the_tally_reports_as_owed() {
+    // A retire is carried out by the `Cast` that replaces its unit, so it is
+    // never dispatched on its own. Counting it would double count that work,
+    // and for a round whose retire has no surviving cast it would report work
+    // owed beside a `NoWorkLeft` quiescence — a state no host can act on.
+    let obligations = crate::round_planning::RoundObligations {
+        obligations: vec![crate::round_planning::Obligation::Retire {
+            unit: crate::round_planning::VoteUnitId::Singleton {
+                bundle_index: 0,
+                proposal_id: 1,
+            },
+            members: vec![1],
+        }],
+        choice_proposals: Vec::new(),
+        open_proposals: Vec::new(),
+        unrostered_intents: Vec::new(),
+        stale_vote_keys: Default::default(),
+        needs_bundle_setup: false,
+    };
+
+    let tally = BallotBaseline::capture(&obligations).tally(&obligations);
+    assert_eq!(
+        tally.remaining_obligations, 0,
+        "the driver has no entry point that executes a retire alone"
+    );
+    assert_eq!(tally.total_proposals, 0, "a retire owes no vote of its own");
+}
