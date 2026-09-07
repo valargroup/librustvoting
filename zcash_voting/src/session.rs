@@ -761,6 +761,22 @@ pub struct RoundPlan {
     /// `needs_delegation_signing` to learn whether its next pass also needs
     /// signing material.
     pub has_in_flight_delegation: bool,
+    /// Bundles this plan owes any delegation step for, ascending.
+    ///
+    /// The per-bundle form of `needs_delegation_signing` and
+    /// `has_in_flight_delegation`. A host that shows delegation progress per
+    /// bundle would otherwise rebuild this by filtering `delegation_statuses`
+    /// against rules the planner already applied, and would drift from them.
+    pub delegation_bundles_needing_work: Vec<u32>,
+    /// Bundles whose delegation still needs the voter's signing material,
+    /// ascending.
+    ///
+    /// The per-bundle form of `needs_delegation_signing`, and a subset of
+    /// `delegation_bundles_needing_work`. A delegation in flight is not signed
+    /// and done — advancing one re-signs its locked generation — so it belongs
+    /// here too. The exclusion is `AdvanceImportedDelegation`: an imported
+    /// capability is already broadcast and never asks the voter for a signer.
+    pub delegation_bundles_needing_signing: Vec<u32>,
     /// True when vote or helper-share work remains that the host should keep
     /// driving: casting, advancing a chain submission, or submitting shares.
     ///

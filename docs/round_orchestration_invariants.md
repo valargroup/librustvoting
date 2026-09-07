@@ -263,7 +263,25 @@ source of truth:
 - the derived flags (`has_unconfirmed_shares`, `blocking_share_work`,
   `has_recoverable_vote_or_share_work`, `immediate_share_key`,
   `immediate_share_confirmed`, `recovered_*_work`, `primary_action`) are
-  computed from the obligations and the snapshot only.
+  computed from the obligations and the snapshot only;
+- `delegation_bundles_needing_work` and `delegation_bundles_needing_signing`
+  are the per-bundle form of `needs_delegation_signing` and
+  `has_in_flight_delegation`, ascending and deduplicated. Any delegation step
+  puts its bundle in the first. `Delegate` and `AdvanceDelegation` put it in
+  the second — a delegation in flight is not signed and done, because advancing
+  one re-signs its locked generation — so the second is exactly the per-bundle
+  form of `needs_delegation_signing` and cannot disagree with it.
+  `AdvanceImportedDelegation` is the one exclusion: an imported capability is
+  already broadcast and never asks the voter for a signer. A host showing
+  per-bundle delegation progress reads these rather than filtering
+  `delegation_statuses` against these rules itself, which is how a host drifts
+  from the planner.
+
+Regression tests: `delegation_bundles_are_reported_per_bundle_ascending`,
+`an_imported_delegation_owes_work_but_never_the_voter_s_key`,
+`a_bundle_with_several_delegation_steps_is_named_once`, and
+`a_plan_with_no_delegation_work_names_no_bundles` in
+[`round_planning/tests/resume_plan.rs`](../zcash_voting/src/round_planning/tests/resume_plan.rs).
 
 A round holding a ballot choice with no bundle rows owes bundle setup, not
 vote work. Eligibility does not persist a bundle plan, so a host that records

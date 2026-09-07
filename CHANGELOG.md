@@ -64,6 +64,17 @@ This release is `zcash_voting` 4.0.0.
   `Delegate` primary action and no steps; persist the bundle plan and plan
   again.
 
+- `RoundPlan::delegation_bundles_needing_work` and
+  `RoundPlan::delegation_bundles_needing_signing` are the per-bundle form of
+  `needs_delegation_signing` and `has_in_flight_delegation`, ascending and
+  deduplicated. Any delegation step puts its bundle in the first; `Delegate`
+  and `AdvanceDelegation` put it in the second, because advancing a delegation
+  in flight re-signs its locked generation, while an imported delegation is
+  already broadcast and never asks the voter for a signer. A host showing
+  delegation progress per bundle reads these rather than filtering
+  `delegation_statuses` against rules the planner already applied, which is how
+  a host drifts from the planner.
+
 - `RoundExecutor` executes any planner `NextStep` for a bound round: it
   proves and signs delegations through a `DelegationDriver`, re-signs and
   advances in-flight delegations, casts every draft of a bundle (tree sync,

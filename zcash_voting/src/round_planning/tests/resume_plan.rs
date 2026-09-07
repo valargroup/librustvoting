@@ -1152,6 +1152,82 @@ fn a_second_network_generation_makes_the_reported_hash_ambiguous() {
 }
 
 #[test]
+fn delegation_bundles_are_reported_per_bundle_ascending() {
+    // The per-bundle form of the two delegation flags. A host showing progress
+    // per bundle reads these instead of re-deriving them from statuses.
+    let summary = summarize_plan_work(
+        &[
+            NextStep::AdvanceDelegation { bundle_index: 2 },
+            NextStep::Delegate { bundle_index: 1 },
+            NextStep::AdvanceImportedDelegation { bundle_index: 0 },
+        ],
+        false,
+    );
+
+    assert_eq!(
+        summary.delegation_bundles_needing_work,
+        vec![0, 1, 2],
+        "every bundle owing a delegation step, ascending"
+    );
+    assert_eq!(
+        summary.delegation_bundles_needing_signing,
+        vec![1, 2],
+        "both a bundle with nothing on the chain yet and one in flight need \
+         the voter's key; only an imported delegation never asks for it"
+    );
+    assert_eq!(
+        summary.needs_delegation_signing,
+        !summary.delegation_bundles_needing_signing.is_empty(),
+        "the vector is the per-bundle form of the flag, so the two agree"
+    );
+}
+
+#[test]
+fn an_imported_delegation_owes_work_but_never_the_voter_s_key() {
+    // The one delegation step that is already broadcast: it adopts the package
+    // hash and polls, and never asks for a signer. A host that restored
+    // signing material for it would prompt the voter for nothing.
+    let summary = summarize_plan_work(
+        &[NextStep::AdvanceImportedDelegation { bundle_index: 4 }],
+        false,
+    );
+
+    assert_eq!(summary.delegation_bundles_needing_work, vec![4]);
+    assert!(summary.delegation_bundles_needing_signing.is_empty());
+    assert!(!summary.needs_delegation_signing);
+    assert!(summary.has_in_flight_delegation);
+}
+
+#[test]
+fn a_bundle_with_several_delegation_steps_is_named_once() {
+    let summary = summarize_plan_work(
+        &[
+            NextStep::Delegate { bundle_index: 3 },
+            NextStep::AdvanceDelegation { bundle_index: 3 },
+        ],
+        false,
+    );
+
+    assert_eq!(summary.delegation_bundles_needing_work, vec![3]);
+    assert_eq!(summary.delegation_bundles_needing_signing, vec![3]);
+}
+
+#[test]
+fn a_plan_with_no_delegation_work_names_no_bundles() {
+    let summary = summarize_plan_work(
+        &[NextStep::CastVote {
+            bundle_index: 0,
+            proposal_id: 1,
+            choice: 0,
+        }],
+        false,
+    );
+
+    assert!(summary.delegation_bundles_needing_work.is_empty());
+    assert!(summary.delegation_bundles_needing_signing.is_empty());
+}
+
+#[test]
 fn plan_work_summary_classifies_every_step_kind() {
     // Locally prepared delegations need the signing key on both their
     // first and later advancement passes.
