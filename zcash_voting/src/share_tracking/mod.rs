@@ -35,8 +35,8 @@ use crate::{
     share,
     share_policy::{
         effective_share_submission_target_count, is_share_ready_for_status_check,
-        is_share_resubmission_window_open, last_open_resubmission_second,
-        next_tracking_delay_seconds, should_resubmit_share, ShareSubmissionPlan, ShareTimingPolicy,
+        next_tracking_delay_seconds, should_resubmit_share, RoundWindow, ShareSubmissionPlan,
+        ShareTimingPolicy,
     },
     types::{ShareDelegationRecord, VotingError},
 };
@@ -700,6 +700,9 @@ async fn track_pending_shares_with_elapsed(
     let configured_urls = configured_fleet.urls();
     let mut report = ShareTrackingReport::default();
     let mut unrecoverable_generations = Vec::new();
+    // One reading of what this round still permits, for every question below
+    // that depends on it.
+    let window = RoundWindow::new(params.vote_end_time_seconds, params.policy);
 
     for loaded_share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
         if cancel() {
@@ -828,9 +831,7 @@ async fn track_pending_shares_with_elapsed(
         let recovery_can_produce_a_submission =
             matches!(recovery_material, RecoveryMaterialState::Rebuilt(_));
 
-        let resubmission_window_open = params.vote_end_time_seconds.is_none_or(|vote_end| {
-            is_share_resubmission_window_open(current_time, vote_end, params.policy)
-        });
+        let resubmission_window_open = window.can_resubmit_at(current_time);
         let under_placed = delivery_state.accepted_urls().len() < target_count;
         let reconcile_interrupted_only = !flags.overdue_for_retry
             && !under_placed
@@ -932,42 +933,43 @@ async fn track_pending_shares_with_elapsed(
         })
         .map(ShareKey::of)
         .collect();
+    // A share nothing holds is terminal for either of two reasons, and both
+    // have to be counted or the equality stop signal never fires. Its material
+    // may be beyond rebuilding — or the material may be fine and the round may
+    // simply be past the point where anything can be posted, which no amount
+    // of further tracking undoes.
+    let recovery_shut = window.resubmission_permanently_shut_at(current_time);
     report.terminal_unconfirmed = still_unconfirmed
         .iter()
         .filter(|share| {
-            share.sent_to_urls.is_empty()
+            let reached_no_helper = share.sent_to_urls.is_empty()
                 && share.ambiguous_urls.is_empty()
-                && share.attempting_urls.is_empty()
-                && unrecoverable_generations
-                    .iter()
-                    .any(|generation| generation.matches(share))
+                && share.attempting_urls.is_empty();
+            let beyond_rebuilding = unrecoverable_generations
+                .iter()
+                .any(|generation| generation.matches(share));
+            reached_no_helper && (beyond_rebuilding || recovery_shut)
         })
         .map(ShareKey::of)
         .collect();
     report.next_delay_seconds =
-        next_tracking_delay_seconds(&still_unconfirmed, current_time, params.policy).map(|delay| {
-            cap_delay_at_next_round_boundary(
-                delay,
-                current_time,
-                params.vote_end_time_seconds,
-                params.policy,
-            )
-        });
+        next_tracking_delay_seconds(&still_unconfirmed, current_time, params.policy)
+            .map(|delay| cap_delay_at_next_round_boundary(delay, current_time, window));
     Ok(report)
 }
 
-/// Shortens a next-pass delay so it never steps over a round boundary that
-/// closes what a pass can still do.
+/// Shortens a next-pass delay so it never steps over a boundary that closes
+/// what the pass could have done.
 ///
-/// Two boundaries close those options, not one. Recovery shuts a
-/// `resubmit_cutoff_seconds` before the vote end, and confirmation shuts at the
-/// vote end itself, so the delay is bounded by whichever is still ahead: the
-/// last second a resubmission is permitted while that is in the future, and the
-/// vote end once the cutoff is already behind. Stepping over either would skip
-/// the last pass that could act on it. Without a vote-end time there is no
-/// boundary to respect and the delay stands. A round already at or past its end
-/// yields `0`: whether to run a final pass at all is the caller's decision, not
-/// something to encode as a wait.
+/// [`RoundWindow`] owns which boundary that is; this only takes the sooner of
+/// it and the delay the shares asked for. The reserve handed to the window is
+/// one share's status budget, because a pass walks helper status before it
+/// decides anything about recovery and re-reads the clock in between — waking
+/// at the last open second spends it on the walk and suppresses every POST.
+///
+/// A round with no boundary keeps its delay. A round already at or past its
+/// end yields `0`: whether to run a final pass at all is the caller's
+/// decision, not something to encode as a wait.
 ///
 /// A `0` is safe to act on only because a caller re-reads the boundary before
 /// its next pass. A caller that waits `0` against a clock that never advances
@@ -975,16 +977,21 @@ async fn track_pending_shares_with_elapsed(
 fn cap_delay_at_next_round_boundary(
     delay_seconds: u64,
     now_seconds: u64,
-    vote_end_time_seconds: Option<u64>,
-    policy: ShareTimingPolicy,
+    window: RoundWindow,
 ) -> u64 {
-    let Some(vote_end) = vote_end_time_seconds else {
+    let Some(boundary) = window.next_boundary_after(now_seconds, status_poll_budget_seconds())
+    else {
         return delay_seconds;
     };
-    let boundary = last_open_resubmission_second(vote_end, policy)
-        .filter(|second| *second > now_seconds)
-        .unwrap_or(vote_end);
     delay_seconds.min(boundary.saturating_sub(now_seconds))
+}
+
+/// One share's status budget in whole seconds, rounded up.
+///
+/// Rounded up because a partial second of walking still spends the boundary
+/// second it lands in.
+fn status_poll_budget_seconds() -> u64 {
+    SHARE_STATUS_POLL_BUDGET_MILLISECONDS.div_ceil(1_000)
 }
 
 fn dedupe_preserving_order(urls: impl Iterator<Item = String>) -> Vec<String> {

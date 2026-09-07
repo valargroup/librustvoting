@@ -1991,7 +1991,7 @@ async fn missing_recovery_after_the_resubmission_cutoff_is_still_terminal() {
     // change because the window happens to be shut.
     let now = overdue();
     let vote_end = now + ShareTimingPolicy::default().resubmit_cutoff_seconds;
-    assert!(!is_share_resubmission_window_open(
+    assert!(!crate::share_policy::is_share_resubmission_window_open(
         now,
         vote_end,
         ShareTimingPolicy::default()
@@ -2182,5 +2182,97 @@ async fn resubmission_waits_for_the_confirmed_vc_position() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(body).unwrap()["tree_position"],
         789
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_share_no_helper_holds_is_terminal_once_recovery_is_shut_for_good() {
+    // The material is intact, so this share is not beyond rebuilding — and
+    // that was the only thing terminality asked about. But no helper was ever
+    // reached, and past the cutoff no POST can give one this share, so nothing
+    // can confirm what nobody holds. Reporting it as merely unconfirmed left
+    // the equality stop signal permanently unreachable and a caller polling a
+    // share that no further pass could ever change.
+    let configured = helpers(2);
+    let db = db_with_share(&[]);
+    let share_id = share_id_of(&db);
+
+    let transport = Arc::new(MockTransport::default());
+    for server_url in &configured {
+        transport.queue_get(
+            &format!("{server_url}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}"),
+            json_status("pending"),
+        );
+    }
+    let client = client_with(Arc::clone(&transport));
+    let random = zero_bytes;
+
+    let now = overdue();
+    let vote_end = now + ShareTimingPolicy::default().resubmit_cutoff_seconds;
+    assert!(!crate::share_policy::is_share_resubmission_window_open(
+        now,
+        vote_end,
+        ShareTimingPolicy::default()
+    ));
+
+    let report = track_pending_shares(
+        &db,
+        &params_ending_at(&configured, now, Some(vote_end), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.remaining_unconfirmed, 1);
+    assert!(
+        report.unrecoverable.is_empty(),
+        "the material rebuilds; it is the round that is over"
+    );
+    assert_eq!(
+        report.terminal_unconfirmed.len(),
+        1,
+        "no POST can place it and no helper can confirm it",
+    );
+    assert_eq!(transport.call_count("/shielded-vote/v1/shares"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_share_no_helper_holds_is_not_terminal_while_recovery_is_open() {
+    // The same share before the cutoff is ordinary work, not a dead end: a
+    // resubmission can still place it.
+    let configured = helpers(2);
+    let db = db_with_share(&[]);
+    let share_id = share_id_of(&db);
+
+    let transport = Arc::new(MockTransport::default());
+    for server_url in &configured {
+        transport.queue_get(
+            &format!("{server_url}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}"),
+            json_status("pending"),
+        );
+        transport.queue_post(
+            &format!("{server_url}/shielded-vote/v1/shares"),
+            json_status("queued"),
+        );
+    }
+    let client = client_with(Arc::clone(&transport));
+    let random = zero_bytes;
+
+    let now = overdue();
+    let vote_end = now + 3_600;
+
+    let report = track_pending_shares(
+        &db,
+        &params_ending_at(&configured, now, Some(vote_end), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        report.terminal_unconfirmed.is_empty(),
+        "recovery is open, so this share is not beyond help"
     );
 }

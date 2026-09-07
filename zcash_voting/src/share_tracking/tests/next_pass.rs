@@ -70,13 +70,13 @@ fn queue_pending_statuses(transport: &MockTransport, configured: &[String], shar
 
 // ---- The round-boundary cap ------------------------------------------
 
-/// The cap under the default policy: a ten-second resubmission cutoff.
+/// The cap under the default policy: a ten-second resubmission cutoff, and a
+/// ten-second status budget reserved for the walk that precedes recovery.
 fn capped(delay_seconds: u64, now_seconds: u64, vote_end_time_seconds: Option<u64>) -> u64 {
     cap_delay_at_next_round_boundary(
         delay_seconds,
         now_seconds,
-        vote_end_time_seconds,
-        ShareTimingPolicy::default(),
+        crate::share_policy::RoundWindow::new(vote_end_time_seconds, ShareTimingPolicy::default()),
     )
 }
 
@@ -87,11 +87,27 @@ fn a_delay_landing_before_every_boundary_is_left_alone() {
 }
 
 #[test]
-fn a_delay_stepping_over_the_last_recovery_second_is_shortened_to_it() {
-    // Recovery closes ten seconds before the vote end, so the last second a
-    // resubmission is permitted is 1_009 — not the 1_020 vote end. Waiting the
-    // full 15 would wake past the cutoff and lose the final retry.
-    assert_eq!(capped(15, 1_000, Some(1_020)), 9);
+fn a_delay_stepping_over_the_last_usable_start_is_shortened_to_it() {
+    // Recovery closes ten seconds before the vote end, so the last permitted
+    // second is 1_039. A pass must *begin* early enough to still reach its
+    // recovery phase, and it walks helper status first with a ten-second
+    // budget, so the last usable start is 1_029 rather than 1_039. Waking at
+    // 1_039 would spend the window on the walk and suppress every POST.
+    assert_eq!(capped(60, 1_000, Some(1_050)), 29);
+}
+
+#[test]
+fn a_round_too_close_to_fit_a_status_walk_wakes_for_the_vote_end() {
+    // The window is open right now — 1_000 is before the 1_009 cutoff — but no
+    // *future* start leaves room for the walk that precedes recovery. There is
+    // no recovery wake worth scheduling, so the vote end is the boundary and
+    // only the pass already running can still resubmit.
+    assert_eq!(capped(15, 1_000, Some(1_020)), 15);
+    assert!(crate::share_policy::is_share_resubmission_window_open(
+        1_000,
+        1_020,
+        ShareTimingPolicy::default()
+    ));
 }
 
 #[test]
@@ -101,12 +117,12 @@ fn a_pass_on_the_last_open_second_waits_for_the_vote_end_not_for_itself() {
     // left. Treating the current second as the boundary would cap the delay to
     // zero and spend a pass re-waking on the second it is already inside.
     assert_eq!(capped(15, 1_000, Some(1_011)), 11);
-    assert!(is_share_resubmission_window_open(
+    assert!(crate::share_policy::is_share_resubmission_window_open(
         1_000,
         1_011,
         ShareTimingPolicy::default()
     ));
-    assert!(!is_share_resubmission_window_open(
+    assert!(!crate::share_policy::is_share_resubmission_window_open(
         1_001,
         1_011,
         ShareTimingPolicy::default()
@@ -295,17 +311,20 @@ async fn the_next_delay_a_pass_reports_never_steps_over_the_vote_end() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_next_delay_a_pass_reports_never_steps_over_the_last_recovery_second() {
+async fn the_next_delay_a_pass_reports_leaves_room_for_the_status_walk() {
     let configured = helpers(5);
     let db = db_with_share(&configured);
     let share_id = share_id_of(&db);
     let now = ready_not_overdue();
-    // The round has twenty seconds left, so the vote end alone would leave the
-    // fifteen-second poll interval untouched. Recovery shuts ten seconds
-    // earlier, and a pass waking at `now + 15` would find it already closed.
+    // Thirty seconds left. Recovery shuts ten before the vote end, so the last
+    // permitted second is `now + 19` — but a pass walks helper status before it
+    // decides anything about recovery, with a ten-second budget, so the last
+    // second it can *begin* and still get there is `now + 9`. Waking at
+    // `now + 19` would spend the window on the walk and suppress every POST,
+    // and the plain fifteen-second interval steps over both.
     let policy = ShareTimingPolicy::default();
-    let vote_end = now + 20;
-    assert!(vote_end - policy.resubmit_cutoff_seconds < now + policy.ready_poll_interval_seconds);
+    let vote_end = now + 30;
+    assert_eq!(policy.resubmit_cutoff_seconds, 10);
     let client = client_with(all_helpers_answer(&configured, &share_id, "pending"));
     let random = zero_bytes;
 
@@ -322,8 +341,33 @@ async fn the_next_delay_a_pass_reports_never_steps_over_the_last_recovery_second
     assert_eq!(
         report.next_delay_seconds,
         Some(9),
-        "the pass must wake while a resubmission is still permitted",
+        "the pass must wake early enough to still reach its recovery phase",
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pass_too_close_to_fit_a_status_walk_wakes_for_the_vote_end() {
+    let configured = helpers(5);
+    let db = db_with_share(&configured);
+    let share_id = share_id_of(&db);
+    let now = ready_not_overdue();
+    // Twenty seconds left. Recovery is open right now, but no future start
+    // leaves room for the walk that precedes it, so there is no recovery wake
+    // worth scheduling and the vote end is the only boundary left.
+    let vote_end = now + 20;
+    let client = client_with(all_helpers_answer(&configured, &share_id, "pending"));
+    let random = zero_bytes;
+
+    let report = track_pending_shares(
+        &db,
+        &params_ending_at(&configured, now, Some(vote_end), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.next_delay_seconds, Some(15));
 }
 
 #[tokio::test(start_paused = true)]

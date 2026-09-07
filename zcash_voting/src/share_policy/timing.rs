@@ -153,6 +153,92 @@ pub(crate) fn last_open_resubmission_second(
         .checked_sub(1)
 }
 
+/// What a tracking pass can still accomplish for one round, and until when.
+///
+/// A pass does two different things and they stop being possible at two
+/// different times: recovery POSTs shut a `resubmit_cutoff_seconds` before the
+/// vote end, and a confirmation is only worth seeking until the vote end
+/// itself. Four separate questions used to be derived from those two facts at
+/// four call sites — whether this share may be resubmitted, whether it is
+/// beyond help, when to wake next, and whether a pass has reached its cutoff —
+/// each from its own reading of the clock. They must agree, so they are
+/// answered here.
+///
+/// A round with no vote-end time has no boundary: nothing ever shuts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RoundWindow {
+    vote_end_time_seconds: Option<u64>,
+    policy: ShareTimingPolicy,
+}
+
+impl RoundWindow {
+    pub(crate) fn new(vote_end_time_seconds: Option<u64>, policy: ShareTimingPolicy) -> Self {
+        Self {
+            vote_end_time_seconds,
+            policy,
+        }
+    }
+
+    /// Whether a recovery POST issued at `now_seconds` is permitted.
+    pub(crate) fn can_resubmit_at(&self, now_seconds: u64) -> bool {
+        self.vote_end_time_seconds.is_none_or(|vote_end| {
+            is_share_resubmission_window_open(now_seconds, vote_end, self.policy)
+        })
+    }
+
+    /// Whether recovery is shut for the rest of this round.
+    ///
+    /// The window only ever closes, so this is the same question as
+    /// [`Self::can_resubmit_at`] asked about every future second at once. A
+    /// share nothing holds is beyond help once this is true: no POST can place
+    /// it and no helper can confirm what it was never given.
+    pub(crate) fn resubmission_permanently_shut_at(&self, now_seconds: u64) -> bool {
+        self.vote_end_time_seconds.is_some() && !self.can_resubmit_at(now_seconds)
+    }
+
+    /// The latest second a pass may **begin** and still reach its recovery
+    /// phase with the window open.
+    ///
+    /// A pass walks helper status before it decides anything about recovery,
+    /// and re-reads the clock in between, so waking at the last open second
+    /// loses the retry: the walk spends it. `reserve_seconds` is what the
+    /// caller spends before that decision, and it is subtracted here.
+    ///
+    /// `None` when no second is open at all, or when the reserve does not fit
+    /// inside the open window — a pass cannot then be scheduled to recover,
+    /// however early it starts.
+    ///
+    /// The reserve is one share's status budget. A pass over many shares
+    /// spends that budget per share, so a later share can still find the
+    /// window shut by the time its own recovery is considered. No wake time
+    /// prevents that; it is bounded by how many shares one pass carries, and
+    /// each share's own window check still refuses the POST rather than making
+    /// a late one.
+    pub(crate) fn latest_start_that_can_resubmit(&self, reserve_seconds: u64) -> Option<u64> {
+        last_open_resubmission_second(self.vote_end_time_seconds?, self.policy)?
+            .checked_sub(reserve_seconds)
+    }
+
+    /// The next second after `now_seconds` at which what a pass can do
+    /// changes, given a `reserve_seconds` status budget.
+    ///
+    /// The recovery boundary while it is still ahead, and the vote end once it
+    /// is behind. `None` when the round has no vote-end time and so no
+    /// boundary to respect.
+    pub(crate) fn next_boundary_after(
+        &self,
+        now_seconds: u64,
+        reserve_seconds: u64,
+    ) -> Option<u64> {
+        let vote_end = self.vote_end_time_seconds?;
+        Some(
+            self.latest_start_that_can_resubmit(reserve_seconds)
+                .filter(|second| *second > now_seconds)
+                .unwrap_or(vote_end),
+        )
+    }
+}
+
 /// Return the next delay after a share-status polling pass completes.
 ///
 /// Two clocks compete, and the delay is whichever comes first:

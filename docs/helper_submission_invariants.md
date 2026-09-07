@@ -591,17 +591,35 @@ and a share still before its boundary is waited for until it arrives, capped at
 queueing behind an unrelated share whose check is further out. Every nonempty
 delay is at least three seconds. No unconfirmed shares yields no next delay.
 
-That delay is then shortened so it never steps over a boundary that closes what
-a pass can still do. Two boundaries do: recovery shuts a
-`resubmit_cutoff_seconds` before the vote end, and confirmation shuts at the
-vote end itself. The delay is bounded by whichever is still ahead — the last
-second a resubmission is permitted while that is in the future, the vote end
-once the cutoff is already behind. A round with no vote-end time has no
-boundary to respect and keeps the delay unchanged. A round already at or past
-its end yields `0` rather than the three-second floor: whether to run a final
-pass at all is the caller's decision, not something to encode as a wait. Acting
-on a `0` is safe only for a caller that re-reads the boundary before its next
-pass.
+**One place answers what the round still permits.** Recovery shuts a
+`resubmit_cutoff_seconds` before the vote end and confirmation shuts at the
+vote end itself, and four separate questions depend on those two facts: whether
+this share may be resubmitted now, whether it is beyond help, when to wake
+next, and whether the pass has reached its cutoff. They must agree, so
+`RoundWindow` owns them and every caller asks it rather than re-deriving the
+algebra from `(now, vote_end, policy)` at its own call site. Deriving them
+independently is what let a wake boundary be computed for one moment while the
+permission it was protecting was evaluated at another.
+
+The delay is then shortened so it never steps over a boundary that closes what
+a pass can still do, bounded by whichever is still ahead. That boundary is not
+the last second a resubmission is permitted: it is the last second a pass can
+still **begin** and reach its recovery phase. A pass walks helper status first,
+with a per-share budget, and re-reads the clock before deciding anything about
+recovery — so waking on the last permitted second spends it on the walk and
+suppresses every POST. The window subtracts one status budget for that reason.
+Once no such start remains, the vote end is the only boundary left, and only a
+pass already running can still resubmit.
+
+The reserve is one share's budget. A pass over many shares spends it per share,
+so a later share can still find the window shut when its own recovery is
+considered; no wake time prevents that, and each share's own window check
+refuses the late POST rather than making one. A round with no vote-end time has
+no boundary to respect and keeps the delay unchanged. A round already at or
+past its end yields `0` rather than the three-second floor: whether to run a
+final pass at all is the caller's decision, not something to encode as a wait.
+Acting on a `0` is safe only for a caller that re-reads the boundary before its
+next pass.
 
 `ShareTrackingReport::next_delay_seconds` carries the result, and
 `ShareTrackingReport::remaining_unconfirmed` carries how many shares the pass
@@ -609,9 +627,14 @@ left behind. `unrecoverable` identifies shares that cannot be rebuilt for
 resubmission, but an accepted or outcome-unknown helper may still possess and
 eventually confirm one. It is therefore diagnostic, not a polling stop signal.
 `terminal_unconfirmed` narrows that set to shares with no accepted, ambiguous,
-or interrupted helper evidence. Equal `remaining_unconfirmed` and
-`terminal_unconfirmed.len()` counts mean no remaining share can make progress
-through recovery or confirmation.
+or interrupted helper evidence **that also cannot be given to a helper**, for
+either of two reasons: the material is beyond rebuilding, or the round is past
+the point where any POST is permitted. Both have to count. A share whose
+material rebuilds perfectly well but which no helper holds, tracked after the
+cutoff, can never be placed and can never be confirmed — leaving it out made
+the equality rule below unreachable for the rest of the round. Equal
+`remaining_unconfirmed` and `terminal_unconfirmed.len()` counts mean no
+remaining share can make progress through recovery or confirmation.
 
 Whether a share's recovery material can still produce a submission is a
 property of durable state, not of the clock, and the pass decides it before
@@ -653,7 +676,7 @@ The boundary the cap inverts is covered by
 
 What a pass reports to the next one is covered by
 `a_delay_landing_before_every_boundary_is_left_alone`,
-`a_delay_stepping_over_the_last_recovery_second_is_shortened_to_it`,
+`a_delay_stepping_over_the_last_usable_start_is_shortened_to_it`,
 `a_pass_on_the_last_open_second_waits_for_the_vote_end_not_for_itself`,
 `a_round_past_its_recovery_cutoff_still_wakes_by_the_vote_end`,
 `a_round_at_or_past_its_vote_end_yields_no_wait`,
@@ -663,9 +686,13 @@ What a pass reports to the next one is covered by
 `concurrent_confirmation_removes_an_unrecoverable_observation_from_the_final_snapshot`,
 `replacement_generation_does_not_inherit_an_unrecoverable_observation`,
 `the_next_delay_a_pass_reports_never_steps_over_the_vote_end`,
-`the_next_delay_a_pass_reports_never_steps_over_the_last_recovery_second`, and
+`the_next_delay_a_pass_reports_leaves_room_for_the_status_walk`,
+`a_pass_too_close_to_fit_a_status_walk_wakes_for_the_vote_end`,
 `a_round_with_no_vote_end_keeps_the_delay_the_shares_asked_for` in
-[`share_tracking/tests/next_pass.rs`](../zcash_voting/src/share_tracking/tests/next_pass.rs).
+[`share_tracking/tests/next_pass.rs`](../zcash_voting/src/share_tracking/tests/next_pass.rs),
+and `a_share_no_helper_holds_is_terminal_once_recovery_is_shut_for_good` with
+`a_share_no_helper_holds_is_not_terminal_while_recovery_is_open` in
+[`share_tracking/tests/recovery.rs`](../zcash_voting/src/share_tracking/tests/recovery.rs).
 
 ## Transport and timeout invariants
 

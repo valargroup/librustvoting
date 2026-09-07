@@ -604,6 +604,26 @@ This release is `zcash_voting` 4.0.0.
   floor, leaving the decision to run a final pass to the caller. A round with
   no vote-end time has no boundary to respect and is unchanged.
 
+  The boundary is the last second a pass can still *begin* and reach its
+  recovery phase, not the last second a resubmission is permitted. A pass walks
+  helper status first and re-reads the clock before deciding anything about
+  recovery, so waking on the last permitted second spent it on the walk and
+  suppressed every POST; one status budget is reserved for it.
+
+- `RoundWindow` is the single answer to what a round still permits. Whether a
+  share may be resubmitted now, whether it is beyond help, when to wake next,
+  and whether a pass has reached its cutoff all follow from two facts — when
+  recovery shuts and when confirmation does — and each was derived
+  independently at its own call site, from its own reading of the clock. They
+  could and did disagree.
+
+- A share no helper holds is reported in `terminal_unconfirmed` once recovery
+  is shut for the round, not only when its material is beyond rebuilding. Its
+  material may rebuild perfectly well; past the cutoff no POST can place it and
+  no helper can confirm what it was never given. Leaving it out made the
+  documented equality stop signal unreachable for the rest of the round, so a
+  caller kept polling shares no further pass could change.
+
 - A tracking pass now decides whether a share's recovery material can still
   produce a submission before it consults the resubmission window, so a share
   first tracked at or after the cutoff is reported in `unrecoverable` and
