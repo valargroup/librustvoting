@@ -142,6 +142,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             message: bounded_message(message.as_ref()),
             plan: self.plan().ok().map(Box::new),
             share_deliveries: ledger.share_deliveries.clone(),
+            delegation: ledger.delegation.clone(),
         }
     }
 }

@@ -40,6 +40,21 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
         }
     }
 
+    /// Re-reads the plan and tally so a report describes the round after the
+    /// wave's durable effects rather than before them.
+    ///
+    /// Best effort: a run stops for a reason the wave produced, and a failed
+    /// re-read is not that reason. The pre-wave values stand if it fails.
+    fn refresh_progress(&self, run: &mut Run) {
+        let Ok(classified) = self.plan_off_the_worker() else {
+            return;
+        };
+        if let Some(baseline) = run.baseline.as_ref() {
+            run.tally = baseline.tally(&classified.obligations);
+        }
+        run.plan = Some(classified.plan);
+    }
+
     /// Runs the bound round until it is quiescent. See [`RoundDriver::run`].
     pub(super) async fn drive(
         &self,
@@ -115,13 +130,21 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                 .into_iter()
                 .map(|step| (step, host.host_context()))
                 .collect();
-            match signing::missing_signer_bundles(
+            let signer_handoff = signing::missing_signer_bundles(
                 self.executor,
                 &dispatches,
                 &classified.plan.round_id,
                 &classified.obligations.obligations,
                 &run.skipped,
-            ) {
+            );
+            // Building each host context ran host code and the signature check
+            // read the database, so both can span an interruption too. The two
+            // returns below are the last that describe the round without a
+            // dispatch after them to correct the answer.
+            if interrupted() {
+                return run.finish(RoundQuiescence::Cancelled);
+            }
+            match signer_handoff {
                 Ok(bundles) if !bundles.is_empty() => {
                     return run.finish(RoundQuiescence::NeedsDelegationSignatures { bundles });
                 }
@@ -173,6 +196,15 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                 }
             }
             if let Some(quiescence) = wave_quiescence {
+                // The wave made durable progress before it stopped, so the
+                // pre-dispatch plan and tally no longer describe the round: a
+                // vote that confirmed and then failed on helper delivery would
+                // still be listed as owing reconciliation, and its proposal
+                // counted incomplete. Refresh both from durable state before
+                // reporting, keeping the pre-wave read if the refresh fails —
+                // a failed courtesy read must not replace the reason the run
+                // stopped.
+                self.refresh_progress(&mut run);
                 return run.finish(quiescence);
             }
 
@@ -190,6 +222,7 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                     });
                 }
                 if !sleep_until_interrupted(delay, control, entry_epoch).await {
+                    self.refresh_progress(&mut run);
                     return run.finish(RoundQuiescence::Cancelled);
                 }
                 // The next pass re-plans, but it dispatches this step again if

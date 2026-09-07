@@ -750,6 +750,9 @@ pub struct RoundStepFailureView {
     /// payloads from SDKs that predate the field.
     #[serde(default)]
     pub share_deliveries: Vec<ShareBatchDeliveryReportView>,
+    /// The delegation signed before the failure, for the same reason as
+    /// `share_deliveries`: the bundle is durable and the step produced it.
+    pub delegation: Option<SignedDelegationPayloadView>,
 }
 
 /// Delegation proving and signing stages.

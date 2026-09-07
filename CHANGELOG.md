@@ -37,8 +37,11 @@ This release is `zcash_voting` 4.0.0.
   time and nothing is dispatched before the first of them, and every admitted
   admitted bundle is judged by its own signer context rather than one mode
   standing for the wave. A
-  failure keeps the chain outcome its step observed before it, so a step that
-  confirmed and then failed on helper work still reports that confirmation.
+  failure keeps the durable effects its step already made — the chain outcome
+  it observed, and, through the new `RoundStepFailure::delegation`, a bundle it
+  signed before losing the chain. A wave-ending report refreshes its plan and
+  tally from durable state, so it describes the round the run left rather than
+  the one it found.
   Driver dispatches
   inherit the run's operation epoch, so a host that switches session or account
   while the driver is planning interrupts the step instead of having it adopt

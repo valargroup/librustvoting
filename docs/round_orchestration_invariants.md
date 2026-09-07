@@ -388,13 +388,24 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   same bundle the executor locks, so no two admitted steps can contend
   (`the_driver_schedules_by_the_executors_own_lock_scope`,
   `only_delegation_proving_is_bundle_scoped`).
-- **An abandoned run reports only that it was abandoned.** The plan read blocks
-  on the database and the plan callback runs host code, so a cancellation or an
-  epoch switch can span either. Every pre-dispatch early return describes a
-  state of the round, and a run the host has left must not describe one — there
-  is no dispatch after it whose epoch binding could correct the answer — so the
-  loop re-checks for an interruption after planning and reporting
-  (`an_epoch_switch_during_planning_is_not_reported_as_a_round_state`).
+- **An abandoned run reports only that it was abandoned.** Every pre-dispatch
+  early return describes a state of the round, and a run the host has left must
+  not describe one — there is no dispatch after it whose epoch binding could
+  correct the answer. Each blocking or host-facing operation before such a
+  return is therefore followed by an interruption check: the plan read and the
+  `PlanRefreshed` callback, then building the per-dispatch host contexts and
+  reading stored signing material
+  (`an_epoch_switch_during_planning_is_not_reported_as_a_round_state`,
+  `an_epoch_switch_while_gathering_contexts_is_not_a_signature_handoff`).
+- **A report describes the round the run left, not the one it found.** A wave
+  makes durable progress and can then stop the run, so the plan and tally read
+  before it no longer describe the round: a rejection the wave persisted would
+  still be listed as a step to run, and a proposal whose vote confirmed would
+  still count as incomplete. Both are refreshed from durable state before a
+  wave-ending quiescence is reported. The refresh is best effort — a run stops
+  for a reason the wave produced, and a failed re-read is not that reason, so
+  the pre-wave values stand rather than replacing it
+  (`a_rejected_submission_stops_the_run_carrying_its_diagnostic`).
 - **A dispatch belongs to the epoch its run captured.** The driver decides to
   dispatch, then plans, builds each host context and reads stored signing
   material before the step begins. A step that captured its own epoch on entry
@@ -424,8 +435,12 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   not starved by a step that sorts earlier, and the run cannot poll forever:
   every dispatch, re-polls included, counts against `max_dispatches`.
 - **A failure keeps everything its step already did.** Durable effects survive
-  the failure that followed them: share deliveries that reached helpers, and
-  the chain outcome a step observed before failing on the helper work after it.
+  the failure that followed them: share deliveries that reached helpers, the
+  chain outcome a step observed before failing on the helper work after it, and
+  the delegation a `Delegate` step signed before it lost the chain
+  (`a_signed_delegation_survives_the_failure_that_followed_it`).
+  `RoundStepFailure::delegation` carries the last of those for the same reason
+  `share_deliveries` carries the first.
   A step that confirms and then fails is reported in `chain_outcomes` exactly
   as a successful one is, because the run did observe it
   (`a_chain_outcome_survives_a_failure_that_followed_it`). The
@@ -487,8 +502,12 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   either way is wrong: taking the first context would broadcast a bundle under
   a signer the host had stopped offering, and applying one bundle's stored
   requirement to all would demand a durable row for a bundle that signs itself
-  — a handoff the host can never satisfy, because there is nothing to store
-  (`each_bundle_is_judged_by_its_own_signer_context`).
+  — a handoff the host can never satisfy, because there is nothing to store.
+  A step with no `DelegationStepInputs` at all is owed whatever is stored,
+  since a durable row cannot make a step run that has no driver, and it does
+  not condemn a bundle whose row already exists
+  (`each_bundle_is_judged_by_its_own_signer_context`,
+  `a_bundle_that_cannot_sign_does_not_condemn_one_that_already_has`).
 - **Missing stored Keystone signatures are a host handoff.** Before admitting
   signer-requiring bundle work, the driver verifies that **every bundle the
   round still owes a delegation for** has a durable signature row — not only

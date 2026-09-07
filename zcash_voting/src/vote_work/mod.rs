@@ -276,6 +276,10 @@ pub struct RoundStepFailure {
     /// pending shares), so a `HelperDeliveryIncomplete` failure or a later
     /// error does not lose what earlier shares reached the helpers.
     pub share_deliveries: Vec<VoteShareDeliveryReport>,
+    /// The delegation the step signed before it failed, for the same reason as
+    /// `share_deliveries`: a `Delegate` step that proved and signed and then
+    /// lost the chain still produced the bundle, and it is durable.
+    pub delegation: Option<SignedDelegationBundle>,
 }
 
 impl RoundStepFailure {

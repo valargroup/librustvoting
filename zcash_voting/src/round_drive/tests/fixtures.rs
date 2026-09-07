@@ -175,6 +175,32 @@ pub(super) fn step_failure(message: &str) -> crate::RoundStepFailure {
         message: message.to_string(),
         plan: None,
         share_deliveries: Vec::new(),
+        delegation: None,
+    }
+}
+
+/// A signed delegation bundle, for tests about what a run keeps rather than
+/// what produced it.
+pub(super) fn signed_delegation() -> crate::delegate::SignedDelegationBundle {
+    crate::delegate::SignedDelegationBundle {
+        submission: crate::delegate::DelegationSubmission {
+            proof: vec![0x61; 96],
+            rk: [0x62; 32],
+            nf_signed: [0x63; 32],
+            cmx_new: [0x64; 32],
+            gov_comm: [0x65; 32],
+            gov_nullifiers: [[0x66; 32]; crate::governance::BUNDLE_NOTE_SLOTS],
+            alpha: [0x67; 32],
+            vote_round_id: ROUND_ID.to_string(),
+            spend_auth_sig: [0x68; 64],
+            sighash: [0x69; 32],
+            tx1_effects: Vec::new(),
+        },
+        pczt_bytes: Vec::new(),
+        eligible_weight_zatoshi: crate::governance::BALLOT_DIVISOR,
+        delegated_weight_zatoshi: crate::governance::BALLOT_DIVISOR,
+        bundle_count: 1,
+        bundle_index: 0,
     }
 }
 
@@ -326,6 +352,14 @@ impl RoundHostSource for DriftingSigningHost {
         };
         signing_host_context(&self.database, signer)
     }
+}
+
+/// The context `StoredSigningHost` returns, for tests that mix it with others.
+pub(super) fn stored_signing_context(database: &Arc<crate::round::VotingDb>) -> RoundHostContext {
+    signing_host_context(
+        database,
+        crate::DelegationSigner::Keystone(crate::KeystoneSignatureSource::Stored),
+    )
 }
 
 fn signing_host_context(

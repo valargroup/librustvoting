@@ -52,19 +52,20 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
         return Ok(Vec::new());
     }
 
-    // A bundle whose own context produces its signature during the step is
-    // owed nothing, whatever the rest of the wave uses.
+    // Sort the admitted bundles by what their own context can do.
     let mut signs_itself = Vec::new();
-    let mut cannot_sign = false;
+    let mut no_signing_inputs = Vec::new();
     let mut reads_stored_material = false;
     for (bundle_index, context) in &admitted {
         match context.delegation.as_ref().map(|inputs| &inputs.signer) {
-            // No delegation inputs at all: this step cannot sign, and the
-            // round-wide rule below then applies to what it owes.
-            None => cannot_sign = true,
+            // No `DelegationStepInputs` at all: this step has no driver to run
+            // with, so it is owed whatever the database holds.
+            None => no_signing_inputs.push(*bundle_index),
             Some(DelegationSigner::Keystone(KeystoneSignatureSource::Stored)) => {
                 reads_stored_material = true;
             }
+            // A bundle whose own context produces its signature during the
+            // step is owed nothing, whatever the rest of the wave uses.
             Some(_) => signs_itself.push(*bundle_index),
         }
     }
@@ -75,22 +76,26 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
     if owed.is_empty() {
         return Ok(Vec::new());
     }
-    if cannot_sign {
-        return Ok(owed);
-    }
     if !reads_stored_material {
-        return Ok(Vec::new());
+        // Nothing admitted depends on material that must already exist, so the
+        // round-wide rule has no subject: only the bundles this wave has shown
+        // cannot sign are owed. Reporting the rest would demand signatures for
+        // bundles whose contexts nothing here has seen.
+        return Ok(no_signing_inputs);
     }
 
     // The round-wide part: bundles this wave has not reached are owed a
     // durable row too, so the voter signs once rather than a wave at a time.
+    // A bundle with no signing inputs stays owed whatever is stored for it —
+    // a durable row cannot make a step run that has no driver.
     let stored = executor.database().get_keystone_signatures(round_id)?;
     Ok(owed
         .into_iter()
         .filter(|bundle_index| {
-            !stored
-                .iter()
-                .any(|record| record.bundle_index == *bundle_index)
+            no_signing_inputs.contains(bundle_index)
+                || !stored
+                    .iter()
+                    .any(|record| record.bundle_index == *bundle_index)
         })
         .collect())
 }

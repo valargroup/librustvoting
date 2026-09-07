@@ -62,3 +62,22 @@ fn a_plan_failure_names_no_step_and_no_chain_outcome() {
     assert!(report.chain_outcomes.is_empty());
     assert!(report.failures[0].bundle_index.is_none());
 }
+
+#[test]
+fn a_signed_delegation_survives_the_failure_that_followed_it() {
+    // A `Delegate` step can prove and sign and then lose the chain. The bundle
+    // is durable and the run produced it, so keeping it only inside the
+    // failure left `delegations` and its wire projection describing less than
+    // the run had done — the same contract `share_deliveries` already meets.
+    let step = NextStep::Delegate { bundle_index: 0 };
+    let mut failure = step_failure("the chain refused the signed bundle");
+    failure.delegation = Some(signed_delegation());
+
+    let mut run = Run::default();
+    run.record_failure(Some(step), Some(0), failure);
+    let report = run.finish(RoundQuiescence::Failures);
+
+    assert_eq!(report.delegations.len(), 1);
+    assert_eq!(report.delegations[0].bundle_index, 0);
+    assert_eq!(report.failures.len(), 1, "the failure is still reported");
+}

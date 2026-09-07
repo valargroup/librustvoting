@@ -1149,6 +1149,10 @@ impl TryFrom<crate::RoundStepFailure> for RoundStepFailureView {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            delegation: failure
+                .delegation
+                .map(SignedDelegationPayloadView::try_from)
+                .transpose()?,
         })
     }
 }

@@ -42,6 +42,7 @@ fn a_failed_step_keeps_its_partial_delivery_reports_on_the_wire() {
         message: "helper delivery ended with pending shares".to_string(),
         plan: None,
         share_deliveries: Vec::new(),
+        delegation: None,
     }
     .with_share_deliveries(vec![partial_delivery()]);
 

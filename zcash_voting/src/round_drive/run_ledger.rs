@@ -59,6 +59,12 @@ impl Run {
     ) {
         self.share_deliveries
             .extend(failure.share_deliveries.iter().cloned());
+        // A `Delegate` step can prove and sign and then lose the chain. The
+        // signed bundle is durable and the run produced it, so it belongs in
+        // the aggregate exactly as a successful step's does.
+        if let Some(delegation) = failure.delegation.as_ref() {
+            self.delegations.push(delegation.clone());
+        }
         // A step can confirm on the chain and then fail on the helper work
         // that follows. The confirmation is a durable effect the run observed,
         // so it belongs in the aggregate exactly as a successful step's does;
@@ -122,6 +128,7 @@ impl Run {
                             ),
                             plan: None,
                             share_deliveries: Vec::new(),
+                            delegation: None,
                         },
                     );
                     Some(RoundQuiescence::Failures)
@@ -164,6 +171,7 @@ impl Run {
                 message: error.to_string(),
                 plan: None,
                 share_deliveries: Vec::new(),
+                delegation: None,
             },
         );
     }

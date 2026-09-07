@@ -207,6 +207,18 @@ async fn a_rejected_submission_stops_the_run_carrying_its_diagnostic() {
         1,
         "the terminal outcome is also kept in the report"
     );
+    // The wave persisted the rejection and then ended the run. A report whose
+    // plan was read before the wave would still list the step that produced
+    // the rejection and show the bundle as non-terminal, describing the round
+    // as it was rather than as this run left it.
+    let stopped_plan = report.plan.as_ref().expect("a run always reports a plan");
+    assert!(
+        stopped_plan.next_steps.is_empty(),
+        "the rejected submission plans no retry: {:?}",
+        stopped_plan.next_steps
+    );
+    assert!(stopped_plan.blocking_recovery);
+    assert!(stopped_plan.delegation_statuses[0].terminal);
 
     let restarted = RoundDriver::new(&executor)
         .with_policy(RoundDrivePolicy {

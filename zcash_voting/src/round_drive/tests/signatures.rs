@@ -216,3 +216,63 @@ async fn each_bundle_is_judged_by_its_own_signer_context() {
         "nothing is dispatched before the host is asked"
     );
 }
+
+/// A host whose first sample has no delegation inputs at all and whose later
+/// samples read stored material.
+pub(super) struct MixedSigningHost {
+    database: Arc<crate::round::VotingDb>,
+    samples: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::RoundHostSource for MixedSigningHost {
+    fn host_context(&self) -> RoundHostContext {
+        if self
+            .samples
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            return host();
+        }
+        stored_signing_context(&self.database)
+    }
+}
+
+#[tokio::test]
+async fn a_bundle_that_cannot_sign_does_not_condemn_one_that_already_has() {
+    // A wave holding both a step with no signing inputs and a step that reads
+    // stored material must answer for each on its own terms. Returning the
+    // whole owed set as soon as one context cannot sign reported the
+    // stored-signed bundle as missing too, sending the host to collect a
+    // signature it had already stored.
+    let database = database_with_bundles(2);
+    database
+        .store_keystone_signature(ROUND_ID, 1, &[0x68; 64], &[0x69; 32], &[0x62; 32])
+        .unwrap();
+    let executor = executor_over(Arc::clone(&database));
+    decide_ballot(&executor);
+    let control = ChainSubmissionControl::new(1);
+
+    let report = RoundDriver::new(&executor)
+        .with_policy(RoundDrivePolicy {
+            max_bundle_concurrency: std::num::NonZeroUsize::new(2).unwrap(),
+            ..RoundDrivePolicy::default()
+        })
+        .run(
+            &MixedSigningHost {
+                database: Arc::clone(&database),
+                samples: std::sync::atomic::AtomicUsize::new(0),
+            },
+            &control,
+            &RecordingReporter::default(),
+        )
+        .await;
+
+    let RoundQuiescence::NeedsDelegationSignatures { bundles } = report.quiescence else {
+        panic!("bundle 0 has no signing inputs: {:?}", report.quiescence);
+    };
+    assert_eq!(
+        bundles,
+        vec![0],
+        "bundle 1's stored signature is already there"
+    );
+}

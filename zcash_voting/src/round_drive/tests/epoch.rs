@@ -116,3 +116,56 @@ async fn an_epoch_switch_during_planning_is_not_reported_as_a_round_state() {
         report.quiescence
     );
 }
+
+/// A host that switches the epoch the first time a dispatch samples it.
+struct EpochSwitchingHost {
+    inner: StoredSigningHost,
+    control: ChainSubmissionControl,
+    switched: std::sync::atomic::AtomicBool,
+}
+
+impl crate::RoundHostSource for EpochSwitchingHost {
+    fn host_context(&self) -> crate::RoundHostContext {
+        let context = self.inner.host_context();
+        if !self
+            .switched
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.control.set_operation_epoch(2);
+        }
+        context
+    }
+}
+
+#[tokio::test]
+async fn an_epoch_switch_while_gathering_contexts_is_not_a_signature_handoff() {
+    // Building each host context runs host code and the signature check reads
+    // the database, so both can span a switch. `NeedsDelegationSignatures` is
+    // the last pre-dispatch return, with no dispatch after it whose epoch
+    // binding could correct the answer, so it must not describe a round the
+    // host has abandoned.
+    let database = database();
+    let executor = executor_over(Arc::clone(&database));
+    decide_ballot(&executor);
+    let control = ChainSubmissionControl::new(1);
+
+    let report = crate::RoundDriver::new(&executor)
+        .run(
+            &EpochSwitchingHost {
+                inner: StoredSigningHost {
+                    database: Arc::clone(&database),
+                },
+                control: control.clone(),
+                switched: std::sync::atomic::AtomicBool::new(false),
+            },
+            &control,
+            &RecordingReporter::default(),
+        )
+        .await;
+
+    assert!(
+        matches!(report.quiescence, crate::RoundQuiescence::Cancelled),
+        "the run was abandoned before the handoff: {:?}",
+        report.quiescence
+    );
+}
