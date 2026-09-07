@@ -715,14 +715,16 @@ pub struct RoundPlan {
     pub delegation_statuses: Vec<DelegationStatus>,
     /// True when the plan contains work that should keep the foreground vote flow open.
     ///
-    /// Unconfirmed helper shares that were already accepted by at least one helper
-    /// remain in `next_steps` as `ConfirmShare`, but they are non-blocking because
-    /// background polling can complete them later.
+    /// Unconfirmed helper shares with an acceptance or an outcome-unknown
+    /// attempt remain in `next_steps` as `ConfirmShare`, but they are
+    /// non-blocking because background tracking can confirm, reconcile, or
+    /// replenish them later.
     pub blocking_recovery: bool,
-    /// True when an unconfirmed helper-share row has no accepted helper URL yet.
+    /// True when an unconfirmed helper-share row has no accepted, ambiguous,
+    /// or in-flight helper and therefore still needs foreground delivery.
     pub blocking_share_work: bool,
     /// True when any helper-share row is still unconfirmed, whether or not a
-    /// helper has already accepted it.
+    /// helper has accepted it or may hold it after an outcome-unknown attempt.
     ///
     /// Hosts schedule background share tracking from this rather than holding
     /// share rows themselves; `blocking_share_work` is the stricter subset

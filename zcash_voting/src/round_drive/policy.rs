@@ -16,8 +16,8 @@ pub struct RoundDrivePolicy {
     /// tracking. All three of these are paced by it:
     ///
     /// - a chain submission still `Tracking`;
-    /// - a share confirmation the helpers have not answered yet, which carries
-    ///   no chain outcome at all;
+    /// - a share confirmation that became tracking-owned between selection
+    ///   and the executor's locked plan, which carries no chain outcome;
     /// - a vote already `Confirmed` on chain whose helper delivery is waiting
     ///   on ambiguous attempts.
     ///

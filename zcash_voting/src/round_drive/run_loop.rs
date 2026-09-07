@@ -15,7 +15,7 @@ use super::{
     dispatch,
     policy::FailureIsolation,
     progress::{RoundDriveEvent, RoundDriveReporter},
-    quiescence::{is_background_share, quiesce_before_dispatch, RoundQuiescence},
+    quiescence::{quiesce_before_dispatch, requires_background_tracking, RoundQuiescence},
     run_ledger::Run,
     selection, signing,
     tally::BallotBaseline,
@@ -130,17 +130,18 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                 let remaining = classified.plan.next_steps.clone();
                 return run.finish(RoundQuiescence::PassBudgetExhausted { remaining });
             }
-            // Shares a helper already accepted are never dispatched by the
-            // foreground, even when other work makes this plan dispatchable.
-            // Plan order can put one ahead of a share no helper has reached,
-            // and a re-poll promotes the step it named, so leaving them in the
-            // stream let a background poll starve the delivery the round
-            // actually owed.
+            // Shares that require polling or recovery stay with the background
+            // tracker, even when other work makes this plan dispatchable. Plan
+            // order can put one ahead of a share no helper reached, and a
+            // pending poll is promoted again, so leaving it in the stream can
+            // starve the delivery the round actually owes.
             let dispatchable: Vec<NextStep> = classified
                 .plan
                 .next_steps
                 .iter()
-                .filter(|step| !is_background_share(step, &classified.obligations.obligations))
+                .filter(|step| {
+                    !requires_background_tracking(step, &classified.obligations.obligations)
+                })
                 .cloned()
                 .collect();
             run.awaiting_repoll.retain(|step| {

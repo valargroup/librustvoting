@@ -388,3 +388,104 @@ async fn an_accepted_share_never_outranks_the_delivery_the_round_owes() {
         "the accepted share is the timer's, not this run's: {selected:?}"
     );
 }
+
+#[tokio::test]
+async fn an_outcome_unknown_share_never_outranks_the_delivery_the_round_owes() {
+    // Share 0 may already be held by a helper, so only duplicate-safe
+    // background tracking may reconcile or replenish it. If the foreground
+    // polls it, the Pending result promotes it ahead of plan order forever and
+    // share 1 never gets the delivery attempt it can safely make.
+    let helpers = vec!["http://helper.invalid".to_string()];
+    let database = crate::share_tracking::tests::db_with_share(&[]);
+    database
+        .conn()
+        .execute(
+            "UPDATE share_delegations
+             SET ambiguous_urls = '[\"http://helper.invalid\"]'
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": database.wallet_id(),
+            },
+        )
+        .unwrap();
+    crate::share::record_delivery(
+        &database,
+        &crate::share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 1,
+            submission: &crate::share_tracking::ShareSubmissionReport {
+                accepted_urls: Vec::new(),
+                ambiguous_urls: Vec::new(),
+                target_count: helpers.len(),
+            },
+            submit_at: 1_700_000_000,
+        },
+    )
+    .unwrap();
+    database
+        .conn()
+        .execute(
+            "UPDATE votes SET tx_hash = 'aa' WHERE round_id = :round_id
+               AND wallet_id = :wallet_id AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": database.wallet_id(),
+            },
+        )
+        .unwrap();
+
+    let helper = Arc::new(AcceptingHelper::default());
+    let executor = executor_over_accepting_helper(Arc::new(database), Arc::clone(&helper));
+    let outcome_unknown = NextStep::ConfirmShare {
+        bundle_index: 0,
+        proposal_id: 1,
+        share_index: 0,
+    };
+    let undelivered = NextStep::ConfirmShare {
+        bundle_index: 0,
+        proposal_id: 1,
+        share_index: 1,
+    };
+    assert_eq!(
+        executor.plan().unwrap().next_steps,
+        vec![outcome_unknown.clone(), undelivered.clone()],
+        "the tracking-owned share sorts ahead of the deliverable one"
+    );
+
+    let control = ChainSubmissionControl::new(1);
+    let (report, events) = drive(&executor, &control).await;
+    let selected: Vec<_> = events
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            RoundDriveEvent::StepSelected { step } => Some(step.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        selected,
+        vec![undelivered],
+        "only the share that can make foreground progress is dispatched"
+    );
+    assert_eq!(*helper.posts.lock().unwrap(), 1);
+
+    let RoundQuiescence::BackgroundShareWorkOnly { shares } = report.quiescence else {
+        panic!(
+            "the outcome-unknown share is handed to tracking: {:?}",
+            report.quiescence
+        );
+    };
+    assert!(
+        shares.iter().any(|share| share.share_index == 0),
+        "the handoff names the unresolved outcome-unknown share: {shares:?}"
+    );
+    let plan = report.plan.expect("the handoff retains its plan");
+    assert!(!plan.blocking_recovery);
+    assert!(!plan.blocking_share_work);
+}

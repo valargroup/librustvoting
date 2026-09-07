@@ -56,6 +56,7 @@ pub(crate) fn project(
                 proposal_id,
                 share_index,
                 accepted: false,
+                outcome_unknown: false,
                 ..
             } => Some((*bundle_index, *proposal_id, *share_index)),
             _ => None,

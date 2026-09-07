@@ -58,9 +58,12 @@ pub enum RoundQuiescence {
     /// nothing stored for the bundle. Nothing was dispatched, so the host can
     /// collect signatures and run again.
     NeedsDelegationSignatures { bundles: Vec<u32> },
-    /// Only helper shares a helper has already accepted remain, and nothing
-    /// above ranks higher. Background tracking finishes them by polling, so
-    /// the foreground vote flow may close.
+    /// Only helper shares that require background tracking remain, and nothing
+    /// above ranks higher.
+    ///
+    /// This includes shares a helper accepted and outcome-unknown attempts:
+    /// polling or recovery can resolve them, while foreground delivery cannot
+    /// safely repeat their POSTs.
     BackgroundShareWorkOnly { shares: Vec<ShareKey> },
     /// The host cancelled, or moved to another operation epoch.
     ///
@@ -147,12 +150,13 @@ pub(super) fn quiesce_before_dispatch(
 /// The shares this plan leaves to background tracking, or `None` when it still
 /// lists a step this run would dispatch.
 ///
-/// A `ConfirmShare` for a share some helper already accepted is finished by
-/// polling, which the host's background tracking timer owns; a foreground run
-/// that polled it would hold the vote flow open for work that does not block
-/// it. A share no helper has reached is delivered rather than polled, so it is
-/// foreground work. An empty plan yields an empty handoff, since it too has
-/// nothing the foreground can dispatch.
+/// A `ConfirmShare` for a share some helper accepted or may hold is finished by
+/// polling or recovery, which the host's background tracking timer owns. A
+/// foreground run that polled it would hold the vote flow open and could
+/// repeatedly outrank a later share that still needs delivery. A share no
+/// helper reached is delivered rather than polled, so it is foreground work.
+/// An empty plan yields an empty handoff, since it too has nothing the
+/// foreground can dispatch.
 ///
 /// Both questions are asked per share, of the obligation the classifier
 /// produced for it, and only of steps this run would admit. Every round-wide
@@ -176,7 +180,7 @@ fn background_share_handoff(
                 bundle_index,
                 proposal_id,
                 share_index,
-            } if is_background_share(step, obligations) => Some(ShareKey {
+            } if requires_background_tracking(step, obligations) => Some(ShareKey {
                 bundle_index: *bundle_index,
                 proposal_id: *proposal_id,
                 share_index: *share_index,
@@ -186,20 +190,20 @@ fn background_share_handoff(
         .collect()
 }
 
-/// Whether this step is a share the host's background timer owns.
+/// Whether this step is a share the host's background tracker owns.
 ///
-/// The foreground never dispatches one, whatever else the plan lists. It is
-/// finished by polling, and a run that polled it would not only hold the vote
-/// flow open for work that does not block it — plan order could put it ahead of
-/// a share no helper has reached, and a re-poll promotes the step it named, so
-/// the undelivered share would never be submitted at all.
-pub(super) fn is_background_share(step: &NextStep, obligations: &[Obligation]) -> bool {
+/// Accepted and outcome-unknown shares both require tracking: the former needs
+/// confirmation polling, while the latter may need duplicate-safe
+/// reconciliation or replenishment. The foreground never dispatches either.
+/// A pending foreground poll would be promoted ahead of plan order and could
+/// starve a later share that no helper reached and that still needs delivery.
+pub(super) fn requires_background_tracking(step: &NextStep, obligations: &[Obligation]) -> bool {
     match step {
         NextStep::ConfirmShare {
             bundle_index,
             proposal_id,
             share_index,
-        } => accepted_by_a_helper(
+        } => share_requires_tracking(
             obligations,
             &ShareKey {
                 bundle_index: *bundle_index,
@@ -211,10 +215,11 @@ pub(super) fn is_background_share(step: &NextStep, obligations: &[Obligation]) -
     }
 }
 
-/// Whether the classifier says some helper already holds `share`.
+/// Whether the classifier says `share` needs polling or recovery.
 ///
-/// A share nothing accepted cannot be finished by polling: no helper has it.
-fn accepted_by_a_helper(obligations: &[Obligation], share: &ShareKey) -> bool {
+/// A share with neither acceptance nor outcome-unknown evidence can be
+/// delivered safely from its durable plan and remains foreground work.
+fn share_requires_tracking(obligations: &[Obligation], share: &ShareKey) -> bool {
     obligations.iter().any(|obligation| {
         matches!(
             obligation,
@@ -222,11 +227,13 @@ fn accepted_by_a_helper(obligations: &[Obligation], share: &ShareKey) -> bool {
                 bundle_index,
                 proposal_id,
                 share_index,
-                accepted: true,
+                accepted,
+                outcome_unknown,
                 ..
             } if *bundle_index == share.bundle_index
                 && *proposal_id == share.proposal_id
                 && *share_index == share.share_index
+                && (*accepted || *outcome_unknown)
         )
     })
 }

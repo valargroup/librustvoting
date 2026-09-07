@@ -47,8 +47,8 @@ pub enum RoundDriveEvent {
     /// The step did not finish; the driver waits `delay` and dispatches it
     /// again.
     ///
-    /// Not only chain tracking: a share confirmation the helpers have not
-    /// answered, and a confirmed vote whose delivery waits on ambiguous
+    /// Not only chain tracking: a share that became tracking-owned after
+    /// selection, and a confirmed vote whose delivery waits on ambiguous
     /// attempts, are paced by the same
     /// [`pending_repoll`](super::RoundDrivePolicy::pending_repoll). Read the
     /// step to tell them apart rather than labelling every one of these as

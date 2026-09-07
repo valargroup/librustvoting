@@ -853,7 +853,7 @@ pub struct RoundQuiescenceView {
     /// `NeedsDelegationSignatures`: every bundle still awaiting a signature.
     #[serde(default)]
     pub bundles: Vec<u32>,
-    /// `BackgroundShareWorkOnly`: the shares the host's timer finishes.
+    /// `BackgroundShareWorkOnly`: shares requiring the host's tracking timer.
     #[serde(default)]
     pub shares: Vec<ShareKeyView>,
     /// `ChainTerminal` and `ChainRecoveryStalled`: the step and its outcome.

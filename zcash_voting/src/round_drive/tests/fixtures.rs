@@ -16,8 +16,8 @@ pub(super) use crate::{
     },
     session::{Decision, NextStep},
     BallotIntent, ChainAdvancePolicy, ChainSubmissionClientConfig, ChainSubmissionControl,
-    HelperClient, HelperHealth, HyperTransport, Network, ProposalRosterEntry, RoundBinding,
-    RoundExecutor, RoundHostContext,
+    HelperClient, HelperFuture, HelperHealth, HelperResponse, HelperTransport, HyperTransport,
+    Network, ProposalRosterEntry, RoundBinding, RoundExecutor, RoundHostContext,
 };
 
 pub(super) const WALLET_ID: &str = "wallet";
@@ -636,6 +636,71 @@ pub(super) fn executor_over_share_round(
     database: Arc<crate::round::VotingDb>,
 ) -> RoundExecutor<HyperTransport> {
     let helper_client = HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
+    RoundExecutor::new(
+        database,
+        ChainSubmissionClientConfig::for_network(
+            Network::Testnet,
+            vec!["http://chain.invalid".to_string()],
+        ),
+        helper_client,
+    )
+    .unwrap()
+    .with_binding(RoundBinding {
+        round_id: ROUND_ID.to_string(),
+        network: Network::Testnet,
+        proposals: vec![ProposalRosterEntry {
+            proposal_id: 1,
+            num_options: 3,
+        }],
+        hotkey_secret: None,
+    })
+    .unwrap()
+}
+
+/// A helper transport that accepts every share POST and refuses unexpected
+/// status polling.
+///
+/// Round-driver tests use it to prove that tracking-owned shares stay out of
+/// the foreground while a later deliverable share can complete.
+#[derive(Default)]
+pub(super) struct AcceptingHelper {
+    pub(super) posts: Mutex<usize>,
+}
+
+impl HelperTransport for AcceptingHelper {
+    fn get<'a>(&'a self, url: &'a str, _timeout: Duration) -> HelperFuture<'a> {
+        let is_share_poll = url.contains("/share-status/");
+        Box::pin(async move {
+            assert!(
+                !is_share_poll,
+                "the foreground must not poll tracking-owned shares"
+            );
+            Ok(HelperResponse::json(200, br#"{"status":"ok"}"#.to_vec()))
+        })
+    }
+
+    fn post_json<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: Vec<u8>,
+        _timeout: Duration,
+    ) -> HelperFuture<'a> {
+        *self.posts.lock().unwrap() += 1;
+        Box::pin(async {
+            Ok(HelperResponse::json(
+                200,
+                br#"{"status":"queued"}"#.to_vec(),
+            ))
+        })
+    }
+}
+
+/// The single-proposal share-round executor over an accepting helper.
+pub(super) fn executor_over_accepting_helper(
+    database: Arc<crate::round::VotingDb>,
+    helper: Arc<AcceptingHelper>,
+) -> RoundExecutor<HyperTransport> {
+    let helper_client = HelperClient::new(helper, HelperHealth::default());
     RoundExecutor::new(
         database,
         ChainSubmissionClientConfig::for_network(

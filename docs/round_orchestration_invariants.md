@@ -152,7 +152,7 @@ It has no clock and no network. The per-unit rule is one exhaustive match:
 | OnWire | any | Conflicts | invariant violation |
 | Terminal | any | Agrees, Unrecorded | none |
 | Terminal | any | Conflicts | invariant violation |
-| Confirmed | any | Agrees, Unrecorded | per member: `Deliver` for missing or not-yet-accepted shares, `Confirm` for accepted `Submitted` shares |
+| Confirmed | any | Agrees, Unrecorded | per member: `Deliver` for missing shares, `Confirm` for every unconfirmed submitted share, carrying whether it was accepted or has an outcome-unknown attempt |
 | Confirmed | any | Conflicts | invariant violation |
 
 The consequences that follow, and that tests pin:
@@ -227,13 +227,12 @@ persisted recovery bundles rather than from the constant.
 
 - A confirmed vote's expected share indexes come from its recovery bundle.
   Indexes with no share row are `Deliver` work.
-- A `Submitted` share row is `Confirm` work. It blocks the foreground while
-  no helper has accepted it (`sent_to_urls` empty). Dispatch delivers such a
-  row again from its durable plan only when no helper has reached it at all
-  (no accepted, ambiguous, or in-flight helper): no helper holds it, so
-  polling cannot confirm it. A row with an ambiguous or in-flight attempt is
-  polled: redelivery excludes those helpers and only tracking can classify
-  them
+- A `Submitted` share row is `Confirm` work. Dispatch delivers such a row
+  again from its durable plan only when no helper has reached it at all (no
+  accepted, ambiguous, or in-flight helper): no helper holds it, so polling
+  cannot confirm it. A row with an acceptance or an ambiguous or in-flight
+  attempt belongs to background tracking: redelivery excludes those helpers,
+  and only tracking can confirm, reconcile, or replenish it
   (`a_confirm_share_step_for_an_accepted_share_polls_instead_of_delivering`,
   `a_share_with_only_ambiguous_evidence_is_polled_not_redelivered`,
   `a_blocking_confirm_share_step_delivers_before_polling`).
@@ -421,13 +420,16 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   stand rather than replacing it
   (`a_rejected_submission_stops_the_run_carrying_its_diagnostic`,
   `a_run_cancelled_after_a_wave_still_reports_what_the_wave_did`).
-- **The foreground never dispatches a share a helper already accepted.** Not
-  only when such shares are all that is left: they are filtered out of the
-  candidate stream whatever else the plan lists. Plan order can put one ahead
-  of a share no helper has reached, and a re-poll promotes the step it named,
-  so leaving them selectable let a background poll starve the delivery the
-  round actually owed — indefinitely, until the dispatch budget ran out
-  (`an_accepted_share_never_outranks_the_delivery_the_round_owes`).
+- **The foreground never dispatches a share that requires background
+  tracking.** A share a helper accepted needs confirmation polling; an
+  ambiguous or in-flight attempt needs duplicate-safe reconciliation and
+  possibly replenishment. Both are filtered out of the candidate stream
+  whatever else the plan lists. Plan order can put one ahead of a share no
+  helper has reached, and a pending poll promotes the step it named, so leaving
+  either selectable lets background work starve the delivery the round
+  actually owes — indefinitely, until the dispatch budget runs out
+  (`an_accepted_share_never_outranks_the_delivery_the_round_owes`,
+  `an_outcome_unknown_share_never_outranks_the_delivery_the_round_owes`).
 - **A host-configured value cannot crash the host.** `pending_repoll` is
   unbounded, so an absolute deadline built from it may not be representable;
   the wait treats that as "until interrupted" rather than panicking on the
@@ -445,7 +447,7 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
 - **A report's fields say what they hold.** `chain_outcomes` is every chain
   outcome the run observed, tracking results included, not only terminal ones.
   `RoundDrivePolicy::pending_repoll` paces every unfinished obligation, not
-  only chain tracking: a share confirmation the helpers have not answered and a
+  only chain tracking: a share that became tracking-owned after selection and a
   confirmed vote whose delivery waits on ambiguous attempts use the same delay,
   so it is helper retry latency as well. `delegations` is what the run
   *signed*, which is not what it submitted: a
@@ -504,8 +506,8 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   the outcome is the only place the rejection survives.
 - **The stop reason is decided from what the run can still dispatch, never
   from a round-wide flag.** A run stops when the plan lists no step it would
-  admit: no step at all, or only `ConfirmShare` steps for shares a helper has
-  already accepted, or only steps on bundles a failure isolated. It reports, in
+  admit: no step at all, or only `ConfirmShare` steps that require background
+  tracking, or only steps on bundles a failure isolated. It reports, in
   this precedence: a recorded failure, then a persisted submission it cannot
   advance, then missing bundle setup, then an unfinished ballot, then the
   background share handoff, and only then `NoWorkLeft`. Anything the host must
@@ -531,10 +533,10 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   Both halves of that question are asked **per share, of its own obligation**,
   and only of steps this run would admit. `blocking_share_work` is round-wide
   too, so it stayed true for an undelivered share on a bundle a failure had
-  isolated, and polled the healthy bundles' accepted shares for the same
+  isolated, and polled the healthy bundles' tracking-owned shares for the same
   budget. A share no helper has reached is delivered rather than polled and is
-  foreground work; a share some helper accepted can only be finished by the
-  host's background tracking
+  foreground work; a share some helper accepted or may hold can only be
+  finished safely by the host's background tracking
   (`an_undelivered_share_is_foreground_work`,
   `an_undelivered_share_on_a_skipped_bundle_does_not_hold_the_run_open`).
 - **The dispatch budget is evaluated against a fresh plan.** After the final
@@ -623,8 +625,8 @@ Conformance is demonstrated by behavior. Tests cover:
 - mixed-phase batches, a vote claimed by two batches, a missing batch member,
   and conflicting batch hashes are invariant violations with the existing
   messages;
-- `Deliver` is owed for missing and unaccepted shares, `Confirm` only for
-  accepted ones.
+- `Deliver` is owed for missing shares; every submitted, unconfirmed share is
+  `Confirm`, carrying whether it has an acceptance or outcome-unknown attempt.
 
 ### Snapshot
 
@@ -640,8 +642,8 @@ Conformance is demonstrated by behavior. Tests cover:
   for byte what they were;
 - each `NextStep` resolves to its obligation; a `CastVote` for one proposal
   executes the bundle's full draft set without rescanning; a `ConfirmShare`
-  for an unaccepted share resolves to delivery; a stale step resolves to
-  no work.
+  with neither acceptance nor outcome-unknown evidence resolves to delivery;
+  a stale step resolves to no work.
 
 ### Designation
 
@@ -733,9 +735,12 @@ Conformance is demonstrated by behavior. Tests cover:
   progress is measured against what the run started owing
   (`a_batch_counts_every_ordered_member_not_just_its_anchor`,
   `progress_is_measured_against_what_the_run_started_owing`);
-- a share a helper already holds is left to the host's background tracking
-  (`a_share_a_helper_already_holds_is_left_to_background_tracking`), and the
-  default policy is pinned
+- a share a helper accepted or may hold is left to the host's background
+  tracking, and neither can outrank a later share the foreground can deliver
+  (`a_share_a_helper_already_holds_is_left_to_background_tracking`,
+  `an_accepted_share_never_outranks_the_delivery_the_round_owes`,
+  `an_outcome_unknown_share_never_outranks_the_delivery_the_round_owes`), and
+  the default policy is pinned
   (`the_default_policy_is_the_cadence_hosts_were_driving_by_hand`).
 
 ### Executor
