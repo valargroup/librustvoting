@@ -591,13 +591,17 @@ and a share still before its boundary is waited for until it arrives, capped at
 queueing behind an unrelated share whose check is further out. Every nonempty
 delay is at least three seconds. No unconfirmed shares yields no next delay.
 
-That delay is then shortened so it never lands past the round's vote end,
-because recovery closes there and a delay stepping over it would skip the last
-pass that could still act. A round with no vote-end time has no boundary to
-respect and keeps the delay unchanged. A round already at or past its end
-yields `0` rather than the three-second floor: whether to run a final pass at
-all is the caller's decision, not something to encode as a wait. Acting on a
-`0` is safe only for a caller that re-reads the boundary before its next pass.
+That delay is then shortened so it never steps over a boundary that closes what
+a pass can still do. Two boundaries do: recovery shuts a
+`resubmit_cutoff_seconds` before the vote end, and confirmation shuts at the
+vote end itself. The delay is bounded by whichever is still ahead — the last
+second a resubmission is permitted while that is in the future, the vote end
+once the cutoff is already behind. A round with no vote-end time has no
+boundary to respect and keeps the delay unchanged. A round already at or past
+its end yields `0` rather than the three-second floor: whether to run a final
+pass at all is the caller's decision, not something to encode as a wait. Acting
+on a `0` is safe only for a caller that re-reads the boundary before its next
+pass.
 
 `ShareTrackingReport::next_delay_seconds` carries the result, and
 `ShareTrackingReport::remaining_unconfirmed` carries how many shares the pass
@@ -609,15 +613,22 @@ or interrupted helper evidence. Equal `remaining_unconfirmed` and
 `terminal_unconfirmed.len()` counts mean no remaining share can make progress
 through recovery or confirmation.
 
+Whether a share's recovery material can still produce a submission is a
+property of durable state, not of the clock, and the pass decides it before
+consulting the resubmission window. A share first tracked at or after the
+cutoff is therefore classified on the same evidence as one tracked earlier,
+which is what makes the equality rule usable in a round's final seconds.
+
 All three values come from the same final durable snapshot. An unrecoverable
 observation is retained only while that exact share key and nullifier
 generation remains unconfirmed, so a concurrent confirmation or replacement
 cannot make either classification describe a stale share.
 
 Enforcement: `share_recovery_base_time`, `should_resubmit_share`,
-`is_share_resubmission_window_open`, and `next_tracking_delay_seconds` in
+`is_share_resubmission_window_open`, `last_open_resubmission_second`, and
+`next_tracking_delay_seconds` in
 [`share_policy/timing.rs`](../zcash_voting/src/share_policy/timing.rs), and
-`cap_delay_at_vote_end` in
+`cap_delay_at_next_round_boundary` in
 [`share_tracking/mod.rs`](../zcash_voting/src/share_tracking/mod.rs).
 
 Regression tests: `immediate_shares_use_created_at_for_status_and_retry`,
@@ -635,16 +646,23 @@ Facade-level timing behavior is covered by
 `young_share_is_idle_until_the_status_grace_passes` in
 [`share_tracking/tests/timing_policy.rs`](../zcash_voting/src/share_tracking/tests/timing_policy.rs).
 
+The boundary the cap inverts is covered by
+`the_last_open_resubmission_second_is_open_and_the_next_is_not` and
+`a_round_shorter_than_the_cutoff_has_no_open_resubmission_second` in
+[`share_policy/tests/timing.rs`](../zcash_voting/src/share_policy/tests/timing.rs).
+
 What a pass reports to the next one is covered by
-`a_delay_landing_before_the_vote_end_is_left_alone`,
-`a_delay_stepping_over_the_vote_end_is_shortened_to_it`,
+`a_delay_landing_before_every_boundary_is_left_alone`,
+`a_delay_stepping_over_the_last_recovery_second_is_shortened_to_it`,
+`a_round_past_its_recovery_cutoff_still_wakes_by_the_vote_end`,
 `a_round_at_or_past_its_vote_end_yields_no_wait`,
 `a_round_without_a_vote_end_keeps_its_delay`,
 `a_pass_that_confirms_nothing_reports_the_share_still_unconfirmed`,
 `a_confirmed_share_leaves_nothing_unconfirmed_and_no_next_delay`,
 `concurrent_confirmation_removes_an_unrecoverable_observation_from_the_final_snapshot`,
 `replacement_generation_does_not_inherit_an_unrecoverable_observation`,
-`the_next_delay_a_pass_reports_never_steps_over_the_vote_end`, and
+`the_next_delay_a_pass_reports_never_steps_over_the_vote_end`,
+`the_next_delay_a_pass_reports_never_steps_over_the_last_recovery_second`, and
 `a_round_with_no_vote_end_keeps_the_delay_the_shares_asked_for` in
 [`share_tracking/tests/next_pass.rs`](../zcash_voting/src/share_tracking/tests/next_pass.rs).
 
@@ -1238,13 +1256,19 @@ re-reads the exact row generation: the same generation makes the mismatch
 persistently unrecoverable, while a deleted or different generation is a
 concurrent stale replacement and is silently left to its owning operation.
 
+That verdict is reached from durable state alone, before any randomness, helper
+ordering, health lookup, or network call, so a tracking pass can also reach it
+for a share it is not permitted to POST for.
+
 Enforcement:
 [`helper_recovery_material`](../zcash_voting/src/recovery.rs) and
-`resubmit_to_next_helper` in
+`rebuild_share_recovery`, called both by `resubmit_to_next_helper` and directly
+by the tracking pass, in
 [`share_tracking/recovery.rs`](../zcash_voting/src/share_tracking/recovery.rs).
 
 Regression tests: `missing_recovery_material_is_reported_not_retried`,
 `missing_recovery_without_possible_helper_possession_is_terminal`,
+`missing_recovery_after_the_resubmission_cutoff_is_still_terminal`,
 `persistent_recovery_nullifier_mismatch_is_reported_unrecoverable`,
 `recovery_nullifier_mismatch_from_replacement_remains_stale`, and
 `resubmission_waits_for_the_confirmed_vc_position`.

@@ -139,6 +139,20 @@ pub(crate) fn is_share_resubmission_window_open(
     vote_end_time_seconds > now_seconds.saturating_add(policy.resubmit_cutoff_seconds)
 }
 
+/// Return the last Unix second at which recovery POSTs are still permitted.
+///
+/// This is the inverse of [`is_share_resubmission_window_open`]: the returned
+/// second is open and the one after it is not. `None` when the cutoff already
+/// covers the whole round, so no second in it is open at all.
+pub(crate) fn last_open_resubmission_second(
+    vote_end_time_seconds: u64,
+    policy: ShareTimingPolicy,
+) -> Option<u64> {
+    vote_end_time_seconds
+        .checked_sub(policy.resubmit_cutoff_seconds)?
+        .checked_sub(1)
+}
+
 /// Return the next delay after a share-status polling pass completes.
 ///
 /// Two clocks compete, and the delay is whichever comes first:

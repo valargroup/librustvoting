@@ -593,14 +593,24 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
-- A helper-share tracking pass no longer reports a next delay that lands past
-  the round's vote end. Recovery closes there, so a delay stepping over it
-  skipped the last pass that could still resubmit or confirm a share — with
-  the default cadence, a round entering its final seconds asked to be polled
-  again fifteen seconds after it had closed. The delay is now shortened to the
-  boundary, and a round already at or past its end yields `0` rather than the
-  three-second floor, leaving the decision to run a final pass to the caller.
-  A round with no vote-end time has no boundary to respect and is unchanged.
+- A helper-share tracking pass no longer reports a next delay that steps over
+  a boundary closing what the next pass could do. Two boundaries close them:
+  recovery shuts a `resubmit_cutoff_seconds` before the vote end, confirmation
+  at the vote end itself. With the default cadence, a round twenty seconds from
+  its end asked to be polled again fifteen seconds later — five seconds past
+  the recovery cutoff — losing the last retry for a share whose helpers had all
+  failed. The delay is now bounded by whichever boundary is still ahead, and a
+  round already at or past its end yields `0` rather than the three-second
+  floor, leaving the decision to run a final pass to the caller. A round with
+  no vote-end time has no boundary to respect and is unchanged.
+
+- A tracking pass now decides whether a share's recovery material can still
+  produce a submission before it consults the resubmission window, so a share
+  first tracked at or after the cutoff is reported in `unrecoverable` and
+  `terminal_unconfirmed` on the same evidence as one tracked earlier. It was
+  previously classified only as a side effect of an attempted resubmission,
+  which left a share whose material was plainly gone looking merely pending for
+  the rest of the round.
 
 - Three guards that must refuse an action on a vote already on chain now
   recognise one confirmed by an exact-tree scan. `ensure_vote_rebuild_allowed`,

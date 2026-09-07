@@ -1961,6 +1961,58 @@ async fn missing_recovery_without_possible_helper_possession_is_terminal() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn missing_recovery_after_the_resubmission_cutoff_is_still_terminal() {
+    let configured = helpers(2);
+    let db = db_with_share(&[]);
+    let share_id = share_id_of(&db);
+    db.conn()
+        .execute(
+            "UPDATE votes SET commitment_bundle_json = NULL, vc_tree_position = NULL
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    for server_url in &configured {
+        transport.queue_get(
+            &format!("{server_url}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}"),
+            json_status("pending"),
+        );
+    }
+    let client = client_with(Arc::clone(&transport));
+    let random = zero_bytes;
+
+    // Inside the cutoff, so no further POST is permitted. Whether the share can
+    // be rebuilt is a question about durable state, and the answer does not
+    // change because the window happens to be shut.
+    let now = overdue();
+    let vote_end = now + ShareTimingPolicy::default().resubmit_cutoff_seconds;
+    assert!(!is_share_resubmission_window_open(
+        now,
+        vote_end,
+        ShareTimingPolicy::default()
+    ));
+
+    let report = track_pending_shares(
+        &db,
+        &params_ending_at(&configured, now, Some(vote_end), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.remaining_unconfirmed, 1);
+    assert_eq!(report.unrecoverable.len(), 1);
+    assert_eq!(report.unrecoverable, report.terminal_unconfirmed);
+    assert_eq!(transport.call_count("/shielded-vote/v1/shares"), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn persistent_recovery_nullifier_mismatch_is_reported_unrecoverable() {
     let configured = helpers(2);
     let db = db_with_delivery(&[helper(1)], &[], 2);

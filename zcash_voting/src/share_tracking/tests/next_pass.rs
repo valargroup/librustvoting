@@ -3,23 +3,6 @@
 
 use super::*;
 
-/// `params`, but for a round whose vote end is a caller-chosen boundary.
-fn params_ending_at<'a>(
-    configured: &'a [String],
-    now_seconds: u64,
-    vote_end_time_seconds: Option<u64>,
-    random_bytes: &'a (dyn Fn(usize) -> Vec<u8> + Send + Sync),
-) -> ShareTrackingParams<'a> {
-    ShareTrackingParams {
-        round_id: ROUND_ID,
-        configured_server_urls: configured,
-        now_seconds,
-        vote_end_time_seconds,
-        policy: ShareTimingPolicy::default(),
-        random_bytes,
-    }
-}
-
 /// Answers every configured helper's status poll for the round's only share.
 fn all_helpers_answer(configured: &[String], share_id: &str, status: &str) -> Arc<MockTransport> {
     let transport = Arc::new(MockTransport::default());
@@ -85,31 +68,50 @@ fn queue_pending_statuses(transport: &MockTransport, configured: &[String], shar
     }
 }
 
-// ---- The vote-end cap ------------------------------------------------
+// ---- The round-boundary cap ------------------------------------------
 
-#[test]
-fn a_delay_landing_before_the_vote_end_is_left_alone() {
-    assert_eq!(cap_delay_at_vote_end(15, 1_000, Some(1_100)), 15);
+/// The cap under the default policy: a ten-second resubmission cutoff.
+fn capped(delay_seconds: u64, now_seconds: u64, vote_end_time_seconds: Option<u64>) -> u64 {
+    cap_delay_at_next_round_boundary(
+        delay_seconds,
+        now_seconds,
+        vote_end_time_seconds,
+        ShareTimingPolicy::default(),
+    )
 }
 
 #[test]
-fn a_delay_stepping_over_the_vote_end_is_shortened_to_it() {
-    // Recovery closes at the vote end, so waiting the full 15 would skip the
-    // last pass that could still resubmit or confirm.
-    assert_eq!(cap_delay_at_vote_end(15, 1_000, Some(1_005)), 5);
+fn a_delay_landing_before_every_boundary_is_left_alone() {
+    // Recovery stays open until 1_089, which the 15 does not reach.
+    assert_eq!(capped(15, 1_000, Some(1_100)), 15);
+}
+
+#[test]
+fn a_delay_stepping_over_the_last_recovery_second_is_shortened_to_it() {
+    // Recovery closes ten seconds before the vote end, so the last second a
+    // resubmission is permitted is 1_009 — not the 1_020 vote end. Waiting the
+    // full 15 would wake past the cutoff and lose the final retry.
+    assert_eq!(capped(15, 1_000, Some(1_020)), 9);
+}
+
+#[test]
+fn a_round_past_its_recovery_cutoff_still_wakes_by_the_vote_end() {
+    // No open recovery second is left, so the vote end is the only boundary
+    // still ahead and confirmation is all a final pass could do.
+    assert_eq!(capped(15, 1_000, Some(1_005)), 5);
 }
 
 #[test]
 fn a_round_at_or_past_its_vote_end_yields_no_wait() {
     // Not a floor of `min_tracking_delay_seconds`: whether to run a final pass
     // at all is the caller's decision, not something to encode as a wait.
-    assert_eq!(cap_delay_at_vote_end(15, 1_000, Some(1_000)), 0);
-    assert_eq!(cap_delay_at_vote_end(15, 1_000, Some(900)), 0);
+    assert_eq!(capped(15, 1_000, Some(1_000)), 0);
+    assert_eq!(capped(15, 1_000, Some(900)), 0);
 }
 
 #[test]
 fn a_round_without_a_vote_end_keeps_its_delay() {
-    assert_eq!(cap_delay_at_vote_end(15, 1_000, None), 15);
+    assert_eq!(capped(15, 1_000, None), 15);
 }
 
 // ---- What a whole pass reports ---------------------------------------
@@ -271,6 +273,38 @@ async fn the_next_delay_a_pass_reports_never_steps_over_the_vote_end() {
 
     assert_eq!(report.remaining_unconfirmed, 1);
     assert_eq!(report.next_delay_seconds, Some(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_next_delay_a_pass_reports_never_steps_over_the_last_recovery_second() {
+    let configured = helpers(5);
+    let db = db_with_share(&configured);
+    let share_id = share_id_of(&db);
+    let now = ready_not_overdue();
+    // The round has twenty seconds left, so the vote end alone would leave the
+    // fifteen-second poll interval untouched. Recovery shuts ten seconds
+    // earlier, and a pass waking at `now + 15` would find it already closed.
+    let policy = ShareTimingPolicy::default();
+    let vote_end = now + 20;
+    assert!(vote_end - policy.resubmit_cutoff_seconds < now + policy.ready_poll_interval_seconds);
+    let client = client_with(all_helpers_answer(&configured, &share_id, "pending"));
+    let random = zero_bytes;
+
+    let report = track_pending_shares(
+        &db,
+        &params_ending_at(&configured, now, Some(vote_end), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.remaining_unconfirmed, 1);
+    assert_eq!(
+        report.next_delay_seconds,
+        Some(9),
+        "the pass must wake while a resubmission is still permitted",
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -73,6 +73,103 @@ impl ResubmissionSchedule {
     }
 }
 
+/// A wire payload rebuilt from a share's durable recovery material.
+pub(super) struct RebuiltShareRecovery {
+    pub(super) share_wire_json: String,
+}
+
+/// What a share's durable recovery material can still produce.
+pub(super) enum RecoveryMaterialState {
+    /// A wire payload was rebuilt and its nullifier matches the share row.
+    Rebuilt(RebuiltShareRecovery),
+    /// Recovery exists but confirmation has not recorded the real VC position.
+    /// A later pass can still find it.
+    AwaitingVcPosition,
+    /// Missing, corrupt, or nullifier-mismatched material for this generation.
+    /// No retry, no other helper, and no later pass can change it.
+    Unusable,
+    /// The loaded share was deleted or replaced, so this material describes a
+    /// generation that no longer exists.
+    StaleGeneration,
+}
+
+/// Rebuilds the wire payload a resubmission would carry, without sending one.
+///
+/// This is the whole of the usability question and none of the delivery
+/// question: it reads only durable state and reaches a verdict before any
+/// randomness, helper ordering, health lookup, or network call. Callers use it
+/// both to prepare a POST and to classify a share they are not permitted to
+/// POST for, so a share whose material is gone is recognized as beyond repair
+/// whether or not the resubmission window is still open.
+///
+/// A nullifier that does not match the share row is [`Self::Unusable`] only
+/// while the loaded generation is still the current one; otherwise the mismatch
+/// is simply a share that was replaced underneath the caller.
+pub(super) fn rebuild_share_recovery(
+    db: &VotingDb,
+    scope: &share::ShareOperationScope,
+    round_id: &str,
+    share: &ShareDelegationRecord,
+    schedule: ResubmissionSchedule,
+) -> Result<RecoveryMaterialState, VotingError> {
+    let bundle = match vote_recovery::helper_recovery_material_for_wallet(
+        db,
+        scope.wallet_id(),
+        round_id,
+        share.bundle_index,
+        share.proposal_id,
+    )? {
+        vote_recovery::HelperRecoveryMaterial::Ready(bundle) => bundle,
+        vote_recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
+            return Ok(RecoveryMaterialState::AwaitingVcPosition);
+        }
+        vote_recovery::HelperRecoveryMaterial::Missing => {
+            return Ok(RecoveryMaterialState::Unusable);
+        }
+    };
+
+    let share_wire_json = match share::recover_wire_json(
+        &bundle.commitment_bundle_json,
+        share.proposal_id,
+        share.share_index,
+        bundle.vc_tree_position,
+        schedule.submit_at(),
+    ) {
+        Ok(share_wire_json) => share_wire_json,
+        // Corrupt recovery material cannot be fixed by trying another helper.
+        Err(_) => return Ok(RecoveryMaterialState::Unusable),
+    };
+    let recovered_nullifier = match share::nullifier_from_recovery_json(
+        &bundle.commitment_bundle_json,
+        share.proposal_id,
+        share.share_index,
+    ) {
+        Ok(recovered_nullifier) => recovered_nullifier,
+        Err(_) => return Ok(RecoveryMaterialState::Unusable),
+    };
+    if recovered_nullifier.as_slice() != share.nullifier {
+        let generation = share::ShareGeneration::new(scope, &share.nullifier);
+        return Ok(
+            if share::is_current_generation(
+                db,
+                round_id,
+                share.bundle_index,
+                share.proposal_id,
+                share.share_index,
+                generation,
+            )? {
+                RecoveryMaterialState::Unusable
+            } else {
+                RecoveryMaterialState::StaleGeneration
+            },
+        );
+    }
+
+    Ok(RecoveryMaterialState::Rebuilt(RebuiltShareRecovery {
+        share_wire_json,
+    }))
+}
+
 /// Walks the randomized resubmission order until one helper accepts.
 ///
 /// Untried helpers come first. An interrupted attempt follows them even during
@@ -100,74 +197,28 @@ pub(super) async fn resubmit_to_next_helper(
 ) -> Result<ResubmitReport, VotingError> {
     let share = request.share;
     let generation = share::ShareGeneration::new(scope, &share.nullifier);
-    let bundle = match vote_recovery::helper_recovery_material_for_wallet(
-        db,
-        scope.wallet_id(),
-        params.round_id,
-        share.bundle_index,
-        share.proposal_id,
-    )? {
-        vote_recovery::HelperRecoveryMaterial::Ready(bundle) => bundle,
-        vote_recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
-            return Ok(ResubmitReport {
-                outcome: ResubmitOutcome::AwaitingVcPosition,
-                outcome_unknown_urls: Vec::new(),
-            });
-        }
-        vote_recovery::HelperRecoveryMaterial::Missing => {
-            return Ok(ResubmitReport {
-                outcome: ResubmitOutcome::Unrecoverable,
-                outcome_unknown_urls: Vec::new(),
-            });
-        }
-    };
-
-    let recovered_share_wire_json = match share::recover_wire_json(
-        &bundle.commitment_bundle_json,
-        share.proposal_id,
-        share.share_index,
-        bundle.vc_tree_position,
-        request.schedule.submit_at(),
-    ) {
-        Ok(recovered_share_wire_json) => recovered_share_wire_json,
-        // Corrupt recovery material cannot be fixed by trying another helper.
-        Err(_) => {
-            return Ok(ResubmitReport {
-                outcome: ResubmitOutcome::Unrecoverable,
-                outcome_unknown_urls: Vec::new(),
-            });
-        }
-    };
-    let recovered_nullifier = match share::nullifier_from_recovery_json(
-        &bundle.commitment_bundle_json,
-        share.proposal_id,
-        share.share_index,
-    ) {
-        Ok(nullifier) => nullifier,
-        Err(_) => {
-            return Ok(ResubmitReport {
-                outcome: ResubmitOutcome::Unrecoverable,
-                outcome_unknown_urls: Vec::new(),
-            });
-        }
-    };
-    if recovered_nullifier.as_slice() != share.nullifier {
-        return Ok(ResubmitReport {
-            outcome: if share::is_current_generation(
-                db,
-                params.round_id,
-                share.bundle_index,
-                share.proposal_id,
-                share.share_index,
-                generation,
-            )? {
-                ResubmitOutcome::Unrecoverable
-            } else {
-                ResubmitOutcome::StaleGeneration
-            },
-            outcome_unknown_urls: Vec::new(),
-        });
-    }
+    let recovered_share_wire_json =
+        match rebuild_share_recovery(db, scope, params.round_id, share, request.schedule)? {
+            RecoveryMaterialState::Rebuilt(rebuilt) => rebuilt.share_wire_json,
+            RecoveryMaterialState::AwaitingVcPosition => {
+                return Ok(ResubmitReport {
+                    outcome: ResubmitOutcome::AwaitingVcPosition,
+                    outcome_unknown_urls: Vec::new(),
+                });
+            }
+            RecoveryMaterialState::Unusable => {
+                return Ok(ResubmitReport {
+                    outcome: ResubmitOutcome::Unrecoverable,
+                    outcome_unknown_urls: Vec::new(),
+                });
+            }
+            RecoveryMaterialState::StaleGeneration => {
+                return Ok(ResubmitReport {
+                    outcome: ResubmitOutcome::StaleGeneration,
+                    outcome_unknown_urls: Vec::new(),
+                });
+            }
+        };
 
     let ambiguous_helpers: HashSet<&str> =
         request.ambiguous_urls.iter().map(String::as_str).collect();

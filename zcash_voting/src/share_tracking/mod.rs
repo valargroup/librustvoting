@@ -35,8 +35,8 @@ use crate::{
     share,
     share_policy::{
         effective_share_submission_target_count, is_share_ready_for_status_check,
-        is_share_resubmission_window_open, next_tracking_delay_seconds, should_resubmit_share,
-        ShareSubmissionPlan, ShareTimingPolicy,
+        is_share_resubmission_window_open, last_open_resubmission_second,
+        next_tracking_delay_seconds, should_resubmit_share, ShareSubmissionPlan, ShareTimingPolicy,
     },
     types::{ShareDelegationRecord, VotingError},
 };
@@ -502,8 +502,8 @@ pub(crate) use initial_delivery::submit_committed_share_to_helpers;
 #[cfg(test)]
 use initial_delivery::submit_share_to_helpers;
 use recovery::{
-    resubmit_to_next_helper, ResubmissionCandidates, ResubmissionSchedule, ResubmitOutcome,
-    ResubmitRequest,
+    rebuild_share_recovery, resubmit_to_next_helper, RecoveryMaterialState, ResubmissionCandidates,
+    ResubmissionSchedule, ResubmitOutcome, ResubmitRequest,
 };
 
 /// Polls and, on quorum, confirms exactly one durable helper share.
@@ -811,6 +811,23 @@ async fn track_pending_shares_with_elapsed(
             params.policy,
         );
 
+        let schedule = if flags.overdue_for_retry {
+            ResubmissionSchedule::Immediate
+        } else {
+            ResubmissionSchedule::PreserveScheduledSubmitAt(share.submit_at)
+        };
+        // Whether the material can still produce a submission is a property of
+        // durable state, not of the clock. Answer it before consulting the
+        // resubmission window, so a share tracked at or after the cutoff is
+        // still recognized as beyond repair.
+        let recovery_material =
+            rebuild_share_recovery(db, &scope, params.round_id, &share, schedule)?;
+        if matches!(recovery_material, RecoveryMaterialState::Unusable) {
+            unrecoverable_generations.push(UnrecoverableShareGeneration::of(&share));
+        }
+        let recovery_can_produce_a_submission =
+            matches!(recovery_material, RecoveryMaterialState::Rebuilt(_));
+
         let resubmission_window_open = params.vote_end_time_seconds.is_none_or(|vote_end| {
             is_share_resubmission_window_open(current_time, vote_end, params.policy)
         });
@@ -818,16 +835,12 @@ async fn track_pending_shares_with_elapsed(
         let reconcile_interrupted_only = !flags.overdue_for_retry
             && !under_placed
             && !configured_interrupted_attempt_urls.is_empty();
-        if resubmission_window_open
+        if recovery_can_produce_a_submission
+            && resubmission_window_open
             && (flags.overdue_for_retry
                 || under_placed
                 || !configured_interrupted_attempt_urls.is_empty())
         {
-            let schedule = if flags.overdue_for_retry {
-                ResubmissionSchedule::Immediate
-            } else {
-                ResubmissionSchedule::PreserveScheduledSubmitAt(share.submit_at)
-            };
             loop {
                 let resubmission = resubmit_to_next_helper(
                     db,
@@ -885,11 +898,11 @@ async fn track_pending_shares_with_elapsed(
                             break;
                         }
                     }
-                    ResubmitOutcome::Unrecoverable => {
-                        unrecoverable_generations.push(UnrecoverableShareGeneration::of(&share));
-                        break;
-                    }
-                    ResubmitOutcome::AwaitingVcPosition
+                    // The pass already classified this share's recovery
+                    // material before entering the block, so these are the
+                    // outcomes of the helper walk itself.
+                    ResubmitOutcome::Unrecoverable
+                    | ResubmitOutcome::AwaitingVcPosition
                     | ResubmitOutcome::StaleGeneration
                     | ResubmitOutcome::NoDefiniteAcceptanceObserved
                     | ResubmitOutcome::CutoffReached => break,
@@ -932,31 +945,46 @@ async fn track_pending_shares_with_elapsed(
         .map(ShareKey::of)
         .collect();
     report.next_delay_seconds =
-        next_tracking_delay_seconds(&still_unconfirmed, current_time, params.policy)
-            .map(|delay| cap_delay_at_vote_end(delay, current_time, params.vote_end_time_seconds));
+        next_tracking_delay_seconds(&still_unconfirmed, current_time, params.policy).map(|delay| {
+            cap_delay_at_next_round_boundary(
+                delay,
+                current_time,
+                params.vote_end_time_seconds,
+                params.policy,
+            )
+        });
     Ok(report)
 }
 
-/// Shortens a next-pass delay so it never lands past the round's vote end.
+/// Shortens a next-pass delay so it never steps over a round boundary that
+/// closes what a pass can still do.
 ///
-/// Recovery closes at vote end, so a delay that steps over it would skip the
-/// last pass that could still resubmit or confirm a share. Without a vote-end
-/// time there is no boundary to respect and the delay stands. A round already
-/// at or past its end yields `0`: whether to run a final pass at all is the
-/// caller's decision, not something to encode as a wait.
+/// Two boundaries close those options, not one. Recovery shuts a
+/// `resubmit_cutoff_seconds` before the vote end, and confirmation shuts at the
+/// vote end itself, so the delay is bounded by whichever is still ahead: the
+/// last second a resubmission is permitted while that is in the future, and the
+/// vote end once the cutoff is already behind. Stepping over either would skip
+/// the last pass that could act on it. Without a vote-end time there is no
+/// boundary to respect and the delay stands. A round already at or past its end
+/// yields `0`: whether to run a final pass at all is the caller's decision, not
+/// something to encode as a wait.
 ///
 /// A `0` is safe to act on only because a caller re-reads the boundary before
 /// its next pass. A caller that waits `0` against a clock that never advances
 /// gets a pass loop with no delay in it.
-fn cap_delay_at_vote_end(
+fn cap_delay_at_next_round_boundary(
     delay_seconds: u64,
     now_seconds: u64,
     vote_end_time_seconds: Option<u64>,
+    policy: ShareTimingPolicy,
 ) -> u64 {
     let Some(vote_end) = vote_end_time_seconds else {
         return delay_seconds;
     };
-    delay_seconds.min(vote_end.saturating_sub(now_seconds))
+    let boundary = last_open_resubmission_second(vote_end, policy)
+        .filter(|second| *second > now_seconds)
+        .unwrap_or(vote_end);
+    delay_seconds.min(boundary.saturating_sub(now_seconds))
 }
 
 fn dedupe_preserving_order(urls: impl Iterator<Item = String>) -> Vec<String> {

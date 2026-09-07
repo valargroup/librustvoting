@@ -535,6 +535,23 @@ fn params<'a>(
     }
 }
 
+/// `params`, but for a round whose vote end is a caller-chosen boundary.
+fn params_ending_at<'a>(
+    configured: &'a [String],
+    now_seconds: u64,
+    vote_end_time_seconds: Option<u64>,
+    random_bytes: &'a (dyn Fn(usize) -> Vec<u8> + Send + Sync),
+) -> ShareTrackingParams<'a> {
+    ShareTrackingParams {
+        round_id: ROUND_ID,
+        configured_server_urls: configured,
+        now_seconds,
+        vote_end_time_seconds,
+        policy: ShareTimingPolicy::default(),
+        random_bytes,
+    }
+}
+
 /// Ready for a status check but not yet overdue.
 fn ready_not_overdue() -> u64 {
     SUBMIT_AT + ShareTimingPolicy::default().status_check_grace_seconds + 1
