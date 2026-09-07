@@ -35,6 +35,56 @@ fn all_helpers_answer(configured: &[String], share_id: &str, status: &str) -> Ar
     transport
 }
 
+/// Builds two pending shares where only the first generation has corrupt
+/// recovery material and therefore reaches an unrecoverable observation.
+fn db_with_unrecoverable_first_share(configured: &[String]) -> VotingDb {
+    let db = db_with_delivery(&configured[..1], &[], 2);
+    let second_submission = ShareSubmissionReport {
+        accepted_urls: configured[..1].to_vec(),
+        ambiguous_urls: Vec::new(),
+        target_count: 1,
+    };
+    share::record_delivery(
+        &db,
+        &share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 1,
+            submission: &second_submission,
+            submit_at: SUBMIT_AT,
+        },
+    )
+    .unwrap();
+
+    let mut corrupt_recovery = recovery_bundle_fixture();
+    corrupt_recovery.share_blinds[0] = field_bytes(9);
+    db.conn()
+        .execute(
+            "UPDATE votes SET commitment_bundle_json = :json
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! {
+                ":json": serialize_recovery(&corrupt_recovery).unwrap(),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+    db
+}
+
+fn queue_pending_statuses(transport: &MockTransport, configured: &[String], share_ids: &[String]) {
+    for share_id in share_ids {
+        for server_url in configured {
+            transport.queue_get(
+                &format!("{server_url}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}"),
+                json_status("pending"),
+            );
+        }
+    }
+}
+
 // ---- The vote-end cap ------------------------------------------------
 
 #[test]
@@ -112,6 +162,88 @@ async fn a_confirmed_share_leaves_nothing_unconfirmed_and_no_next_delay() {
     assert_eq!(report.confirmed.len(), 1);
     assert_eq!(report.remaining_unconfirmed, 0);
     assert_eq!(report.next_delay_seconds, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_confirmation_removes_an_unrecoverable_observation_from_the_final_snapshot() {
+    let configured = helpers(2);
+    let db = Arc::new(db_with_unrecoverable_first_share(&configured));
+    let first_share_id = share_id_at(&db, 0);
+    let second_share_id = share_id_at(&db, 1);
+    let transport = Arc::new(MockTransport::default());
+    queue_pending_statuses(
+        &transport,
+        &configured,
+        &[first_share_id, second_share_id.clone()],
+    );
+    let confirming_db = Arc::clone(&db);
+    transport.observe_gets(move |url| {
+        if url.contains(&second_share_id) {
+            share::confirm(&confirming_db, ROUND_ID, 0, 1, 0).unwrap();
+        }
+    });
+    let client = client_with(transport);
+    let random = zero_bytes;
+
+    let report = track_pending_shares(
+        &db,
+        &params(&configured, ready_not_overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.remaining_unconfirmed, 1);
+    assert!(report.unrecoverable.is_empty());
+    assert!(report.terminal_unconfirmed.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn replacement_generation_does_not_inherit_an_unrecoverable_observation() {
+    let configured = helpers(2);
+    let db = Arc::new(db_with_unrecoverable_first_share(&configured));
+    let first_share_id = share_id_at(&db, 0);
+    let second_share_id = share_id_at(&db, 1);
+    let transport = Arc::new(MockTransport::default());
+    queue_pending_statuses(
+        &transport,
+        &configured,
+        &[first_share_id, second_share_id.clone()],
+    );
+    let replacing_db = Arc::clone(&db);
+    transport.observe_gets(move |url| {
+        if url.contains(&second_share_id) {
+            replacing_db
+                .conn()
+                .execute(
+                    "UPDATE share_delegations SET nullifier = :nullifier
+                     WHERE round_id = :round_id AND wallet_id = :wallet_id
+                       AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+                    rusqlite::named_params! {
+                        ":nullifier": vec![0xEEu8; 32],
+                        ":round_id": ROUND_ID,
+                        ":wallet_id": WALLET_ID,
+                    },
+                )
+                .unwrap();
+        }
+    });
+    let client = client_with(transport);
+    let random = zero_bytes;
+
+    let report = track_pending_shares(
+        &db,
+        &params(&configured, ready_not_overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.remaining_unconfirmed, 2);
+    assert!(report.unrecoverable.is_empty());
+    assert!(report.terminal_unconfirmed.is_empty());
 }
 
 #[tokio::test(start_paused = true)]

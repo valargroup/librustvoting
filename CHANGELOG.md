@@ -96,10 +96,11 @@ This release is `zcash_voting` 4.0.0.
   tracking without holding durable share rows: the plan says whether any share
   is still unconfirmed, and the delay is computed from the round's own records.
 - `ShareTrackingReport::remaining_unconfirmed` counts the shares a tracking
-  pass left behind. Read against `unrecoverable`, equal counts mean every
-  share left is beyond repair and polling again cannot change anything; a
-  caller could not otherwise tell that from shares merely waiting, because
-  both keep producing a next delay.
+  pass left behind. `unrecoverable` identifies shares that cannot be rebuilt
+  for resubmission but may still be confirmed by a helper that possesses them.
+  Read `remaining_unconfirmed` against `terminal_unconfirmed`: equal counts
+  mean every share left lacks both usable recovery material and evidence that
+  a helper may possess it, so polling again cannot change anything.
 - `PirFleet`, `PirSession`, and `PirProofSource`: ordered PIR endpoints with
   failover on typed retryable failures, serviced from a dedicated thread so
   proving can run inside another runtime's blocking pool.

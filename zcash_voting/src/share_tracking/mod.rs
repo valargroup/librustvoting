@@ -384,20 +384,46 @@ pub struct ShareTrackingReport {
     pub ambiguous: Vec<ResubmittedShare>,
     /// Shares skipped because their recovery material is missing.
     ///
-    /// These cannot be repaired by retrying; a wallet should surface them
-    /// rather than spin on them.
+    /// These cannot be repaired by resubmitting, but an accepted or
+    /// outcome-unknown helper may still confirm one. A wallet should surface
+    /// them while continuing to poll unless they also appear in
+    /// [`Self::terminal_unconfirmed`].
     pub unrecoverable: Vec<ShareKey>,
+    /// Unconfirmed shares for which neither recovery nor future confirmation
+    /// can make progress.
+    ///
+    /// Each entry is generation-matched against the final durable snapshot:
+    /// recovery material is unusable and no accepted, ambiguous, or
+    /// interrupted helper may possess the share.
+    pub terminal_unconfirmed: Vec<ShareKey>,
     /// True when the pass stopped early because `cancel` fired.
     pub cancelled: bool,
     /// Seconds to wait before the next pass, or `None` when nothing is pending.
     pub next_delay_seconds: Option<u64>,
     /// Shares still unconfirmed when the pass finished.
     ///
-    /// Read against `unrecoverable`: equal counts mean every share left is
-    /// beyond repair, so polling again cannot change anything. Without it a
-    /// caller cannot tell that state from shares that are merely waiting,
-    /// because both keep producing a next delay.
+    /// Read against `terminal_unconfirmed`: equal counts mean no remaining
+    /// share can make progress through either recovery or confirmation.
     pub remaining_unconfirmed: usize,
+}
+
+/// An unrecoverable observation bound to the exact durable share generation.
+struct UnrecoverableShareGeneration {
+    key: ShareKey,
+    nullifier: Vec<u8>,
+}
+
+impl UnrecoverableShareGeneration {
+    fn of(share: &ShareDelegationRecord) -> Self {
+        Self {
+            key: ShareKey::of(share),
+            nullifier: share.nullifier.clone(),
+        }
+    }
+
+    fn matches(&self, share: &ShareDelegationRecord) -> bool {
+        self.key == ShareKey::of(share) && self.nullifier == share.nullifier
+    }
 }
 
 /// Inputs for a focused confirmation check over one durable helper share.
@@ -673,6 +699,7 @@ async fn track_pending_shares_with_elapsed(
     let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
     let configured_urls = configured_fleet.urls();
     let mut report = ShareTrackingReport::default();
+    let mut unrecoverable_generations = Vec::new();
 
     for loaded_share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
         if cancel() {
@@ -859,7 +886,7 @@ async fn track_pending_shares_with_elapsed(
                         }
                     }
                     ResubmitOutcome::Unrecoverable => {
-                        report.unrecoverable.push(ShareKey::of(&share));
+                        unrecoverable_generations.push(UnrecoverableShareGeneration::of(&share));
                         break;
                     }
                     ResubmitOutcome::AwaitingVcPosition
@@ -883,6 +910,27 @@ async fn track_pending_shares_with_elapsed(
     let current_time = params.now_seconds.saturating_add(elapsed_seconds());
     let still_unconfirmed = share::unconfirmed_for_scope(db, &scope, params.round_id)?;
     report.remaining_unconfirmed = still_unconfirmed.len();
+    report.unrecoverable = still_unconfirmed
+        .iter()
+        .filter(|share| {
+            unrecoverable_generations
+                .iter()
+                .any(|generation| generation.matches(share))
+        })
+        .map(ShareKey::of)
+        .collect();
+    report.terminal_unconfirmed = still_unconfirmed
+        .iter()
+        .filter(|share| {
+            share.sent_to_urls.is_empty()
+                && share.ambiguous_urls.is_empty()
+                && share.attempting_urls.is_empty()
+                && unrecoverable_generations
+                    .iter()
+                    .any(|generation| generation.matches(share))
+        })
+        .map(ShareKey::of)
+        .collect();
     report.next_delay_seconds =
         next_tracking_delay_seconds(&still_unconfirmed, current_time, params.policy)
             .map(|delay| cap_delay_at_vote_end(delay, current_time, params.vote_end_time_seconds));

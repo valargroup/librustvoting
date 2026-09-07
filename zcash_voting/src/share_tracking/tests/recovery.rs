@@ -1895,8 +1895,69 @@ async fn missing_recovery_material_is_reported_not_retried() {
     .unwrap();
 
     assert_eq!(report.unrecoverable.len(), 1);
+    assert!(
+        report.terminal_unconfirmed.is_empty(),
+        "an accepted helper may still confirm the share"
+    );
     assert!(report.resubmitted.is_empty());
     assert_eq!(transport.call_count("/shielded-vote/v1/shares"), 0);
+
+    for server_url in &configured {
+        transport.queue_get(
+            &format!("{server_url}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}"),
+            json_status("confirmed"),
+        );
+    }
+    let confirmed = track_pending_shares(
+        &db,
+        &params(&configured, overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(confirmed.confirmed.len(), 1);
+    assert_eq!(confirmed.remaining_unconfirmed, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_recovery_without_possible_helper_possession_is_terminal() {
+    let configured = helpers(2);
+    let db = db_with_share(&[]);
+    let share_id = share_id_of(&db);
+    db.conn()
+        .execute(
+            "UPDATE votes SET commitment_bundle_json = NULL, vc_tree_position = NULL
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    for server_url in &configured {
+        transport.queue_get(
+            &format!("{server_url}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}"),
+            json_status("pending"),
+        );
+    }
+    let client = client_with(transport);
+    let random = zero_bytes;
+
+    let report = track_pending_shares(
+        &db,
+        &params(&configured, overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.remaining_unconfirmed, 1);
+    assert_eq!(report.unrecoverable, report.terminal_unconfirmed);
 }
 
 #[tokio::test(start_paused = true)]

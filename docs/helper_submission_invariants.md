@@ -601,10 +601,18 @@ all is the caller's decision, not something to encode as a wait. Acting on a
 
 `ShareTrackingReport::next_delay_seconds` carries the result, and
 `ShareTrackingReport::remaining_unconfirmed` carries how many shares the pass
-left behind. The second is read against `unrecoverable`: equal counts mean
-every share left is beyond repair, so polling again cannot change anything,
-and a next delay alone cannot distinguish that from shares merely waiting,
-because both keep producing one.
+left behind. `unrecoverable` identifies shares that cannot be rebuilt for
+resubmission, but an accepted or outcome-unknown helper may still possess and
+eventually confirm one. It is therefore diagnostic, not a polling stop signal.
+`terminal_unconfirmed` narrows that set to shares with no accepted, ambiguous,
+or interrupted helper evidence. Equal `remaining_unconfirmed` and
+`terminal_unconfirmed.len()` counts mean no remaining share can make progress
+through recovery or confirmation.
+
+All three values come from the same final durable snapshot. An unrecoverable
+observation is retained only while that exact share key and nullifier
+generation remains unconfirmed, so a concurrent confirmation or replacement
+cannot make either classification describe a stale share.
 
 Enforcement: `share_recovery_base_time`, `should_resubmit_share`,
 `is_share_resubmission_window_open`, and `next_tracking_delay_seconds` in
@@ -634,6 +642,8 @@ What a pass reports to the next one is covered by
 `a_round_without_a_vote_end_keeps_its_delay`,
 `a_pass_that_confirms_nothing_reports_the_share_still_unconfirmed`,
 `a_confirmed_share_leaves_nothing_unconfirmed_and_no_next_delay`,
+`concurrent_confirmation_removes_an_unrecoverable_observation_from_the_final_snapshot`,
+`replacement_generation_does_not_inherit_an_unrecoverable_observation`,
 `the_next_delay_a_pass_reports_never_steps_over_the_vote_end`, and
 `a_round_with_no_vote_end_keeps_the_delay_the_shares_asked_for` in
 [`share_tracking/tests/next_pass.rs`](../zcash_voting/src/share_tracking/tests/next_pass.rs).
@@ -1234,6 +1244,7 @@ Enforcement:
 [`share_tracking/recovery.rs`](../zcash_voting/src/share_tracking/recovery.rs).
 
 Regression tests: `missing_recovery_material_is_reported_not_retried`,
+`missing_recovery_without_possible_helper_possession_is_terminal`,
 `persistent_recovery_nullifier_mismatch_is_reported_unrecoverable`,
 `recovery_nullifier_mismatch_from_replacement_remains_stale`, and
 `resubmission_waits_for_the_confirmed_vc_position`.
