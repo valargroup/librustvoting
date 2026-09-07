@@ -1903,11 +1903,23 @@ pub fn load_zkp2_inputs(
         message: format!("failed to load ZKP2 inputs for round={}, bundle={} ({})", round_id, bundle_index, e),
     })?;
 
-    // Compute current proposal_authority by clearing bits for votes with a
-    // durable tx hash for THIS bundle specifically.
+    // Clear a bit for every vote of THIS bundle that has reached the chain,
+    // by either of the two facts that can witness it.
+    //
+    // A transaction hash marks a submitted vote, and the VAN is spent as soon
+    // as that transaction lands, so the bit must clear then. But a hash is
+    // route-specific: the schema requires `confirmation_source = 'tree'` to
+    // carry none, so a vote confirmed by an exact-tree scan has none and never
+    // will. Testing the hash alone left such a vote's bit set, the next vote on
+    // the bundle rebuilt its VAN as though that proposal had never voted, and
+    // the chain rejected the stale nullifier as already spent — permanently,
+    // since no later pass could supply a hash that does not exist.
+    //
+    // Either fact is sufficient and neither is redundant: the hash covers a
+    // vote still in flight, the position covers one confirmed without a hash.
     let mut authority = MAX_PROPOSAL_AUTHORITY;
     let mut stmt = conn
-        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND tx_hash IS NOT NULL")
+        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND (tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL)")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare proposal_authority query: {}", e),
         })?;
@@ -2159,14 +2171,60 @@ pub(crate) fn load_van_tree_entries(
 ) -> Result<Vec<VanTreeEntry>, VotingError> {
     let mut stmt = conn
         .prepare(
+            // A bundle whose vote may already be on chain no longer holds its
+            // delegation VAN at that leaf: casting spends it. `tx_hash` alone
+            // is too weak a signal for that — a vote whose POST was dispatched
+            // but never classified has none, yet may have spent the VAN. The
+            // reservation is the authoritative fact: a committed
+            // `chain_submissions` row means a POST was released, which the
+            // submission lifecycle treats as possibly dispatched.
+            //
+            // Reading only `tx_hash` deadlocked recovery. The stale expectation
+            // failed tree sync, tree sync failing aborted the cast that would
+            // have classified the vote, and so `tx_hash` stayed null and the
+            // next pass failed identically.
+            //
+            // A terminally `rejected` row is the one exception, and it is
+            // excluded for the same reason the rest are counted: what retires
+            // the expectation is a POST that may have spent the VAN, and a
+            // definite rejection spent nothing. `Rejected` is safe to read
+            // that way because it is terminal — no observation transitions out
+            // of it, and `reserve_recovery_retry` accepts only `Recovering` —
+            // so the row can never acquire an outstanding POST after the fact.
+            // Its own row is never deleted, so without this it would retire
+            // the expectation for the rest of the round and silently skip both
+            // the leaf-content and the leaf-presence check.
+            //
+            // A `recovering` row carrying `chain_rejected` is deliberately NOT
+            // excluded, even though its last classified outcome also spent
+            // nothing. Exact-tree recovery reaches any `Recovering` row
+            // regardless of diagnostic, and on a no-match it reserves a retry
+            // and releases a POST while leaving both `state` and
+            // `diagnostic_kind` untouched. Between that reservation and the
+            // response being classified, the row is indistinguishable from a
+            // quiescent rejection, so excluding it would restore a delegation
+            // VAN the retry may already have spent — failing tree sync against
+            // the successor leaf, which aborts the cast that would classify
+            // the retry, which is the self-sustaining deadlock this predicate
+            // exists to break. Distinguishing the two needs the retry dispatch
+            // journaled against the reservation counter, which the row does
+            // not record today.
             "SELECT b.bundle_index, b.van_leaf_position, b.gov_comm,
-                    EXISTS (
+                    (EXISTS (
                         SELECT 1 FROM votes v
                         WHERE v.round_id = b.round_id
                           AND v.wallet_id = b.wallet_id
                           AND v.bundle_index = b.bundle_index
                           AND v.tx_hash IS NOT NULL
                     )
+                    OR EXISTS (
+                        SELECT 1 FROM chain_submissions cs
+                        WHERE cs.round_id = b.round_id
+                          AND cs.wallet_id = b.wallet_id
+                          AND cs.bundle_index = b.bundle_index
+                          AND cs.kind IN ('vote', 'vote_batch')
+                          AND cs.state != 'rejected'
+                    ))
              FROM bundles b
              WHERE b.round_id = :round_id
                AND b.wallet_id = :wallet_id
@@ -2967,9 +3025,17 @@ pub fn store_vote(
         })?;
 
     let result: Result<(), VotingError> = (|| {
+        // Either witness of the vote having reached the chain forbids a
+        // replacement. A hash exists only for hash-confirmed submissions — the
+        // schema requires `confirmation_source = 'tree'` to carry none — so
+        // asking for it alone let a vote confirmed by an exact-tree scan have
+        // its choice and commitment silently overwritten, describing a vote
+        // whose proposal authority had already moved.
         let existing_vote: Option<(i64, Option<Vec<u8>>, bool)> = conn
             .query_row(
-                "SELECT choice, commitment, tx_hash IS NOT NULL FROM votes
+                "SELECT choice, commitment,
+                        tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL
+                 FROM votes
                  WHERE round_id = :round_id
                    AND wallet_id = :wallet_id
                    AND bundle_index = :bundle_index
@@ -3052,6 +3118,12 @@ pub fn store_vote(
     }
 }
 
+/// Refuses a ballot intent that disagrees with a vote already on chain.
+///
+/// A vote counts as on chain by either witness. The transaction hash exists
+/// only for hash-confirmed submissions, so reading it alone missed every vote
+/// confirmed by an exact-tree scan and accepted an intent that could no longer
+/// be honoured — the proposal's authority had already moved.
 pub fn ensure_no_submitted_vote_conflict_for_intent(
     conn: &Connection,
     round_id: &str,
@@ -3067,7 +3139,7 @@ pub fn ensure_no_submitted_vote_conflict_for_intent(
              WHERE round_id = :round_id
                AND wallet_id = :wallet_id
                AND proposal_id = :proposal_id
-               AND tx_hash IS NOT NULL
+               AND (tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL)
                AND (:skipped != 0 OR choice != :choice)
              ORDER BY bundle_index
              LIMIT 1",

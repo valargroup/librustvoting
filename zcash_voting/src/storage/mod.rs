@@ -412,6 +412,8 @@ impl VotingDb {
 
 #[cfg(test)]
 mod tests {
+    mod tree_confirmed_completion;
+
     use super::*;
     use crate::types::VotingRoundParams;
 

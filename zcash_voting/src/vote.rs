@@ -3680,9 +3680,14 @@ fn ensure_vote_rebuild_allowed(
 ) -> Result<(), VotingError> {
     let conn = db.conn();
     let wallet_id = db.wallet_id();
-    let has_tx_hash = conn
+    // Either witness of the vote having reached the chain refuses a rebuild.
+    // A hash exists only for hash-confirmed submissions — the schema requires
+    // `confirmation_source = 'tree'` to carry none — so asking for it alone let
+    // a vote confirmed by an exact-tree scan be rebuilt, producing a competing
+    // generation for a proposal whose authority had already moved.
+    let has_reached_chain = conn
         .query_row(
-            "SELECT tx_hash IS NOT NULL FROM votes
+            "SELECT tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL FROM votes
              WHERE round_id = :round_id
                AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index
@@ -3701,7 +3706,7 @@ fn ensure_vote_rebuild_allowed(
         })?
         .unwrap_or(false);
 
-    if has_tx_hash {
+    if has_reached_chain {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote that conflicts with requested draft"
@@ -3711,7 +3716,18 @@ fn ensure_vote_rebuild_allowed(
     Ok(())
 }
 
-/// Rejects another pending commitment that would spend the bundle's same current VAN.
+/// Refuses a new vote chain while an earlier one on the same bundle is still
+/// unconfirmed, because both would spend the bundle's same current VAN.
+///
+/// Completion is the commitment-tree position, not the transaction hash.
+/// Confirmation writes the position on both routes, and clears it when a
+/// generation is invalidated, so it is the fact that tracks the vote. A hash
+/// exists only for hash confirmation: the schema requires
+/// `confirmation_source = 'tree'` to carry none, so a vote confirmed by an
+/// exact-tree scan has no hash and never will. Treating a missing hash as
+/// "pending" left such a vote blocking its bundle permanently — every later
+/// proposal on it refused, with a message asking the caller to confirm a vote
+/// that was already confirmed.
 fn ensure_no_competing_pending_vote_chain_with_conn(
     conn: &rusqlite::Connection,
     wallet_id: &str,
@@ -3726,7 +3742,7 @@ fn ensure_no_competing_pending_vote_chain_with_conn(
                AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index
                AND commitment_bundle_json IS NOT NULL
-               AND (tx_hash IS NULL OR vc_tree_position IS NULL)
+               AND vc_tree_position IS NULL
              ORDER BY proposal_id",
         )
         .map_err(|e| VotingError::Internal {
@@ -4048,6 +4064,8 @@ pub(crate) fn record_vc_position(
 }
 #[cfg(test)]
 mod tests {
+    mod tree_confirmed_completion;
+
     use super::*;
     use crate::{
         round::RoundParams,

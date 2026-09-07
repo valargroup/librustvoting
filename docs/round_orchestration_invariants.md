@@ -304,6 +304,37 @@ own write transaction or lock:
 | `Confirm` | per-share operation lock | the helper specification's quorum rules |
 | `Delegate`, `AdvanceDelegation` | bundle lock | the delegation pipeline and coordinator |
 
+A vote has reached the chain when **either** witness of its confirmation is
+present: `tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL`. Hash
+confirmation writes the first and tree confirmation the second, and the schema
+forbids a tree confirmation from carrying a hash, so no query may treat the
+hash alone as the answer — see "Authoritative durable record" in
+[`chain_submission_invariants.md`](chain_submission_invariants.md) for why. The
+`Retire` row above states the negation of that rule. Two kinds of check depend
+on it, and they break in opposite directions.
+
+A check asking whether the vote is *finished* fails closed and stalls the
+round. A tree-confirmed vote must clear its proposal's authority bit, or the
+next vote on the bundle rebuilds a stale vote-authority note and the chain
+rejects its nullifier as already spent
+(`a_tree_confirmed_vote_clears_its_proposal_authority_bit`); it must not count
+as a competing pending vote chain, or it locks its bundle out of every later
+proposal (`a_tree_confirmed_vote_is_not_a_competing_pending_chain`). Vote-tree
+sync goes further still: a POST that was released spends the delegation VAN
+whether or not its response was ever classified, so the durable
+`chain_submissions` row retires the bundle's `gov_comm` expectation rather than
+waiting for a hash (`a_dispatched_vote_retires_its_bundles_van_expectation`).
+
+A check *refusing* an act on a vote already on chain fails open and permits
+what it exists to prevent: rebuilding the vote into a competing generation
+(`a_tree_confirmed_vote_cannot_be_rebuilt`), accepting a ballot intent that
+disagrees with it
+(`an_intent_conflicting_with_a_tree_confirmed_vote_is_refused`), or replacing
+its choice and commitment (`a_tree_confirmed_vote_cannot_be_replaced`). This
+class is the more dangerous, because a stalled round announces itself and a
+permitted rebuild does not, which is why all three are tested rather than
+assumed.
+
 Delegation setup uses the chain coordinator's matching hierarchy: shared
 account access, shared round access, and exclusive access to its bundle.
 Distinct bundles can therefore build setup concurrently, while wallet or

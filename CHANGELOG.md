@@ -451,6 +451,68 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Three guards that must refuse an action on a vote already on chain now
+  recognise one confirmed by an exact-tree scan. `ensure_vote_rebuild_allowed`,
+  `ensure_no_submitted_vote_conflict_for_intent` and `store_vote` each asked
+  whether `votes.tx_hash` was set — a hash that exists only for a hash-confirmed
+  submission, because the schema requires `confirmation_source = 'tree'` to
+  carry none. So a tree-confirmed vote could be rebuilt into a competing
+  generation, a ballot intent disagreeing with it was accepted, and its choice
+  and commitment could be overwritten outright, all silently: unlike the
+  completion checks above, these failed open, permitting what they exist to
+  refuse rather than blocking what should proceed. Each now accepts either
+  witness. A test scanning for the shape all of these shared guards against the
+  next one.
+
+- A vote chain is judged complete by its commitment-tree position rather than
+  its transaction hash, and a proposal-authority bit clears on either witness.
+  Both checks read `votes.tx_hash`, which exists only for hash-confirmed
+  submissions: the schema requires `confirmation_source = 'tree'` to carry none.
+  A vote confirmed by an exact-tree scan therefore looked unfinished forever —
+  it blocked every later proposal on its bundle with a message asking the caller
+  to confirm a vote already confirmed, and its authority bit stayed set so the
+  next vote rebuilt a stale vote-authority note and the chain rejected the
+  nullifier as already spent. Neither could be recovered from, because the
+  missing hash does not exist. The tree position is written by confirmation on
+  both routes and cleared when a generation is invalidated, so it tracks
+  completion; the hash still counts a submitted vote whose transaction has
+  landed but is not yet confirmed locally.
+
+- A vote whose POST was dispatched but never classified is now treated as
+  having spent its delegation VAN. `load_van_tree_entries` skips the VAN-leaf
+  expectation once a bundle has voted, because casting spends that VAN, but it
+  read only `votes.tx_hash`. A dispatched-and-unclassified vote has no hash yet
+  may already be on chain, so the bundle was still expected to hold its original
+  `gov_comm`, the witness failed to verify, and tree sync failed with "confirmed
+  delegation bundle N does not match its synced vote-tree leaf". The failure was
+  self-sustaining: tree sync failing aborted the cast that would have recorded
+  the hash, so the next pass failed identically, and one bundle's stale
+  expectation aborted the sync for every other bundle too. A committed
+  `chain_submissions` reservation is now consulted as well — the same evidence
+  the submission lifecycle uses to refuse a second POST, so the tree expectation
+  and the lifecycle no longer disagree about whether a transaction may exist.
+  A terminally `rejected` row is excluded, because it spent nothing and, being
+  terminal, can never acquire an outstanding POST afterwards; counting it would
+  retire the expectation for the rest of the round and silently skip the
+  delegation-leaf check. A `recovering` row carrying the same rejection is not
+  excluded: exact-tree recovery can reserve a retry and release a POST from it
+  without changing either column, so it cannot be told apart from a quiescent
+  rejection and must be read as possibly-spent.
+
+- The helper-attempt marker is now recorded in release builds. The reservation
+  performed its only state mutation inside `debug_assert!(state.begin(&url)?)`,
+  and `debug_assert!` compiles its argument out of a release build — so release
+  wrote `attempting_urls = []`, still saw its compare-and-swap succeed, and
+  returned `Started` for a reservation it had not made. A POST must be durably
+  journaled before dispatch so an interrupted attempt stays recoverable: on
+  restart the helper is known to have been tried with an unknown outcome, and is
+  polled rather than re-sent blindly or written off as never contacted. Release
+  builds wrote no such evidence, so a crash mid-POST left an attempt
+  indistinguishable from one never made. Tests never caught it because they run
+  with debug assertions enabled and therefore execute the call release drops;
+  it surfaced only by crashing a release binary mid-POST and reopening the
+  sidecar in another process.
+
 - Schema version 21 rebuilds `chain_submissions` onto the 50-proposal bound.
   A sidecar migrated by a build that carried the 15-proposal bound kept that
   CHECK at version 20; nothing rewrote it, and the version-20 fingerprint
