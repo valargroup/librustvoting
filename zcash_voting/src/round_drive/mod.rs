@@ -48,6 +48,7 @@ pub use progress::{
     NoopRoundDriveReporter, RoundDriveEvent, RoundDriveReporter, RoundDriveReporterBridge,
 };
 pub use quiescence::RoundQuiescence;
+pub(crate) use run_loop::sleep_until_interrupted;
 pub use tally::RoundWorkTally;
 
 use crate::{

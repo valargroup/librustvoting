@@ -31,16 +31,18 @@ use crate::{
         CompletedVoteDisplayView, DelegationPirPrecomputeResultView, DelegationProgressKind,
         DelegationRecoveryView, DelegationRecoveryWorkView, DelegationSetupFieldView,
         DelegationStatusView, DelegationSubmissionWire, NextStepView, PendingShareRoundView,
-        PirSnapshotEndpointDiagnosticView, PirSnapshotEndpointStatusView, RoundChainOutcomeView,
-        RoundDriveEventKind, RoundDriveEventView, RoundPlanView, RoundQuiescenceKind,
-        RoundQuiescenceView, RoundRecoveryStateView, RoundRunReportView, RoundStepDispositionView,
-        RoundStepFailureKindView, RoundStepFailureRecordView, RoundStepFailureView,
-        RoundStepOutcomeView, RoundStepProgressKind, RoundStepProgressView, RoundWorkTallyView,
-        ShareBatchDeliveryReportView, ShareDelegationRecordView, ShareDeliveryOutcomeView,
-        ShareKeyView, ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteBatchView,
-        SignedVoteCommitmentView, SignedVoteCommitmentsView, SubmissionDiagnosticView,
-        VoteCommitStageKind, VoteCommitmentBatchWire, VoteCommitmentWire, VoteKeyView,
-        VoteRecoveryView, VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView,
+        PirSnapshotEndpointDiagnosticView, PirSnapshotEndpointStatusView, ResubmittedShareView,
+        RoundChainOutcomeView, RoundDriveEventKind, RoundDriveEventView, RoundPlanView,
+        RoundQuiescenceKind, RoundQuiescenceView, RoundRecoveryStateView, RoundRunReportView,
+        RoundStepDispositionView, RoundStepFailureKindView, RoundStepFailureRecordView,
+        RoundStepFailureView, RoundStepOutcomeView, RoundStepProgressKind, RoundStepProgressView,
+        RoundWorkTallyView, ShareBatchDeliveryReportView, ShareDelegationRecordView,
+        ShareDeliveryOutcomeView, ShareKeyView, ShareTrackingEventKind, ShareTrackingEventView,
+        ShareTrackingPassReportView, ShareTrackingQuiescenceKind, ShareTrackingQuiescenceView,
+        ShareTrackingRunReportView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
+        SignedVoteBatchView, SignedVoteCommitmentView, SignedVoteCommitmentsView,
+        SubmissionDiagnosticView, VoteCommitStageKind, VoteCommitmentBatchWire, VoteCommitmentWire,
+        VoteKeyView, VoteRecoveryView, VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView,
         VotingErrorView, VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView,
         VotingRoundParams,
     },
@@ -1081,6 +1083,133 @@ impl From<crate::pir_snapshot::PirSnapshotEndpointDiagnostic>
     }
 }
 
+impl From<crate::share_tracking::ResubmittedShare> for ResubmittedShareView {
+    fn from(resubmitted: crate::share_tracking::ResubmittedShare) -> Self {
+        Self {
+            share: resubmitted.share.into(),
+            server_url: resubmitted.server_url,
+        }
+    }
+}
+
+impl From<crate::share_tracking::ShareTrackingReport> for ShareTrackingPassReportView {
+    fn from(report: crate::share_tracking::ShareTrackingReport) -> Self {
+        Self {
+            confirmed: report
+                .confirmed
+                .into_iter()
+                .map(ShareKeyView::from)
+                .collect(),
+            resubmitted: report
+                .resubmitted
+                .into_iter()
+                .map(ResubmittedShareView::from)
+                .collect(),
+            ambiguous: report
+                .ambiguous
+                .into_iter()
+                .map(ResubmittedShareView::from)
+                .collect(),
+            unrecoverable: report
+                .unrecoverable
+                .into_iter()
+                .map(ShareKeyView::from)
+                .collect(),
+            cancelled: report.cancelled,
+            next_delay_seconds: report.next_delay_seconds,
+        }
+    }
+}
+
+impl From<crate::share_tracking_drive::ShareTrackingQuiescence> for ShareTrackingQuiescenceView {
+    fn from(quiescence: crate::share_tracking_drive::ShareTrackingQuiescence) -> Self {
+        use crate::share_tracking_drive::ShareTrackingQuiescence as Q;
+
+        let mut view = Self {
+            kind: ShareTrackingQuiescenceKind::NothingToTrack,
+            messages: Vec::new(),
+            unrecoverable: Vec::new(),
+        };
+        match quiescence {
+            Q::NothingToTrack => {}
+            Q::AllConfirmed => view.kind = ShareTrackingQuiescenceKind::AllConfirmed,
+            Q::VoteEndReached => view.kind = ShareTrackingQuiescenceKind::VoteEndReached,
+            Q::Cancelled => view.kind = ShareTrackingQuiescenceKind::Cancelled,
+            Q::Failing { messages } => {
+                view.kind = ShareTrackingQuiescenceKind::Failing;
+                view.messages = messages;
+            }
+            Q::PassBudgetExhausted { unrecoverable } => {
+                view.kind = ShareTrackingQuiescenceKind::PassBudgetExhausted;
+                view.unrecoverable = unrecoverable.into_iter().map(ShareKeyView::from).collect();
+            }
+        }
+        view
+    }
+}
+
+impl From<crate::share_tracking_drive::ShareTrackingEvent> for ShareTrackingEventView {
+    fn from(event: crate::share_tracking_drive::ShareTrackingEvent) -> Self {
+        use crate::share_tracking_drive::ShareTrackingEvent as E;
+
+        let mut view = Self {
+            kind: ShareTrackingEventKind::PassStarted,
+            pass: None,
+            report: None,
+            message: None,
+            delay_seconds: None,
+        };
+        match event {
+            E::PassStarted { pass } => view.pass = Some(pass),
+            E::PassFinished { pass, report } => {
+                view.kind = ShareTrackingEventKind::PassFinished;
+                view.pass = Some(pass);
+                view.report = Some(ShareTrackingPassReportView::from(*report));
+            }
+            E::PassFailed { pass, message } => {
+                view.kind = ShareTrackingEventKind::PassFailed;
+                view.pass = Some(pass);
+                view.message = Some(message);
+            }
+            E::AwaitingNextPass { delay } => {
+                view.kind = ShareTrackingEventKind::AwaitingNextPass;
+                view.delay_seconds = Some(delay.as_secs());
+            }
+        }
+        view
+    }
+}
+
+impl From<crate::share_tracking_drive::ShareTrackingRunReport> for ShareTrackingRunReportView {
+    fn from(report: crate::share_tracking_drive::ShareTrackingRunReport) -> Self {
+        Self {
+            quiescence: ShareTrackingQuiescenceView::from(report.quiescence),
+            passes: report.passes,
+            confirmed: report
+                .confirmed
+                .into_iter()
+                .map(ShareKeyView::from)
+                .collect(),
+            resubmitted: report
+                .resubmitted
+                .into_iter()
+                .map(ResubmittedShareView::from)
+                .collect(),
+            ambiguous: report
+                .ambiguous
+                .into_iter()
+                .map(ResubmittedShareView::from)
+                .collect(),
+            unrecoverable: report
+                .unrecoverable
+                .into_iter()
+                .map(ShareKeyView::from)
+                .collect(),
+            failures: report.failures,
+        }
+    }
+}
+
 impl From<crate::VoteShareDeliveryReport> for ShareBatchDeliveryReportView {
     fn from(report: crate::VoteShareDeliveryReport) -> Self {
         let delivery = report.delivery;
@@ -1626,6 +1755,7 @@ mod tests {
     mod error_view;
     mod pir_snapshot_view;
     mod round_drive_view;
+    mod share_tracking_drive_view;
     mod step_failure_view;
 
     use super::*;

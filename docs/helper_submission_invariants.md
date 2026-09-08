@@ -610,6 +610,67 @@ Facade-level timing behavior is covered by
 `young_share_is_idle_until_the_status_grace_passes` in
 [`share_tracking/tests/timing_policy.rs`](../zcash_voting/src/share_tracking/tests/timing_policy.rs).
 
+### Driving passes to quiescence
+
+`ShareTrackingDriver` repeats one pass until a round's shares are quiescent. It
+adds no facts about a share: every decision about what a share needs stays in
+the pass and the timing policy.
+
+- **The cadence is the pass's, not the driver's.** Between two successful
+  passes the driver waits exactly `next_delay_seconds`. It supplies a wait of
+  its own only after a failed pass, which computed none.
+- **The host context is read once per pass.** A run can span hours, so a
+  refreshed helper fleet or round timing reaches the next pass. A pass already
+  running completes against the inputs it was given.
+- **Vote end is checked before a pass, never after.** Recovery is closed past
+  it, so a pass there could only re-poll shares it cannot act on.
+- **Passes are strictly sequential.** Each plans from the rows the previous one
+  wrote, so overlapping two would contend for the same share locks and re-poll
+  helpers that were just answered.
+- **A run always reports why it stopped.** `ShareTrackingQuiescence` is
+  exhaustive over the reasons, so a host acts on it rather than re-reading
+  share rows: `NothingToTrack`, `AllConfirmed`, `VoteEndReached`, `Cancelled`,
+  `Failing`, and `PassBudgetExhausted`.
+- **A failing pass is retried, then surfaced.** `max_consecutive_failures`
+  consecutive failures end the run with the messages, rather than retrying
+  silently for the rest of the round. A successful pass resets the count.
+- **The pass budget bounds the cases that never settle.** A share that never
+  becomes pollable, and a share nothing can still repair, both stay unconfirmed
+  however long the run lasts, so both keep producing a next delay and keep
+  looking pollable. `max_passes` stops the run and names the shares recovery
+  could not repair. The run never waits for a pass the budget will not allow.
+
+  Stopping *as soon as* nothing can make progress, rather than at the budget,
+  needs a terminality classification the pass does not yet report: a share
+  whose recovery material is beyond rebuilding may still be confirmed by a
+  helper that already accepted it, so `unrecoverable` alone would end a run
+  that could still finish. Until the pass reports that, the budget is the only
+  bound on this case.
+- **Cancellation is observed in three places** — between passes, during the
+  wait, and inside a pass through its cancel callback — so a host draining a
+  run does not wait out a delay. The wait is woken by the control rather than
+  polled, because a wait spans the time until a share is actually due. An
+  operation-epoch change is the same signal; the epoch is captured at entry, so
+  a change made before a run is simply the epoch that run belongs to.
+
+Enforcement: [`share_tracking_drive`](../zcash_voting/src/share_tracking_drive/).
+
+Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
+`a_cancelled_run_stops_before_it_polls_anything`,
+`moving_to_another_operation_epoch_stops_the_run`,
+`a_round_past_its_vote_end_is_not_polled`,
+`vote_end_reached_between_passes_stops_the_run`,
+`a_share_that_never_becomes_pollable_stops_at_the_pass_budget`,
+`a_zero_budget_stops_without_polling`, and
+`repeated_pass_failures_stop_the_run_and_are_reported` in
+[`share_tracking_drive/tests/stopping.rs`](../zcash_voting/src/share_tracking_drive/tests/stopping.rs);
+`the_wait_between_passes_is_the_one_the_pass_computed`,
+`a_pass_close_to_its_check_waits_only_until_then`,
+`the_host_context_is_read_once_per_pass`,
+`a_long_wait_is_cancelled_at_once_rather_than_slept_out`, and
+`the_default_policy_is_the_cadence_the_host_was_driving_by_hand` in
+[`share_tracking_drive/tests/pacing.rs`](../zcash_voting/src/share_tracking_drive/tests/pacing.rs).
+
 ## Transport and timeout invariants
 
 ### Readiness

@@ -119,6 +119,27 @@ This release is `zcash_voting` 4.0.0.
   `share::next_tracking_delay_for_round` let a host schedule background share
   tracking without holding durable share rows: the plan says whether any share
   is still unconfirmed, and the delay is computed from the round's own records.
+- `share_tracking_drive` composes `track_pending_shares` passes into one run:
+  `ShareTrackingDriver::run` repeats a pass until a round's helper shares are
+  quiescent, waiting exactly the delay each pass computed and supplying a
+  cadence of its own only after a failed pass, which computed none. It is the
+  share-side counterpart of `round_drive` and mirrors its shape: a
+  `ShareTrackingDrivePolicy`, a `ShareTrackingHostSource` read once per pass so
+  a refreshed helper fleet or clock reaches the next one, a synchronous
+  `ShareTrackingReporter` over `ShareTrackingEvent`, and one
+  `ShareTrackingRunReport`. Passes are strictly sequential, because each plans
+  from the share rows the previous one wrote. `ShareTrackingQuiescence` is
+  exhaustive over why a run stopped, so a host acts on it rather than
+  re-reading share rows: `NothingToTrack`, `AllConfirmed`, `VoteEndReached`,
+  `Cancelled`, `Failing`, and `PassBudgetExhausted`. Cancellation and an
+  operation-epoch change are observed between passes, during the wait, and
+  inside a pass through its cancel callback, and the wait is woken by the
+  control rather than polled, so a wait that spans the hours until a delayed
+  share is due costs one timer and a host draining a run does not wait it out.
+  Wire views — `ShareTrackingRunReportView`, `ShareTrackingQuiescenceView`,
+  `ShareTrackingEventView`, `ShareTrackingPassReportView`, and
+  `ResubmittedShareView` — follow the same flat, serde-stable shape as the
+  round-drive views.
 - `PirFleet`, `PirSession`, and `PirProofSource`: ordered PIR endpoints with
   failover on typed retryable failures, serviced from a dedicated thread so
   proving can run inside another runtime's blocking pool.

@@ -5,9 +5,12 @@
 //! module is the part in between: it asks helpers what they know, decides what
 //! their answers mean, and drives the durable state forward.
 //!
-//! Wallets should call [`track_pending_shares`] on a timer and keep only the
-//! lifecycle concerns — the timer itself, app lock, and round expiry — on their
-//! side, surfaced through the `cancel` callback.
+//! [`track_pending_shares`] performs one pass.
+//! [`share_tracking_drive`](crate::share_tracking_drive) repeats it on the
+//! cadence each pass computes, so a wallet keeps only what it alone can
+//! observe — app lock and account or round identity — surfaced through the
+//! `cancel` callback. Calling this directly is still supported for a single
+//! pass, and makes the caller responsible for the cadence again.
 //!
 //! # Trust model
 //!

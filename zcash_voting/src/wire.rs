@@ -727,6 +727,101 @@ pub struct PirSnapshotEndpointDiagnosticView {
     pub message: Option<String>,
 }
 
+/// One share that reached a new helper during recovery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResubmittedShareView {
+    pub share: ShareKeyView,
+    pub server_url: String,
+}
+
+/// What one helper-share tracking pass did.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareTrackingPassReportView {
+    #[serde(default)]
+    pub confirmed: Vec<ShareKeyView>,
+    #[serde(default)]
+    pub resubmitted: Vec<ResubmittedShareView>,
+    #[serde(default)]
+    pub ambiguous: Vec<ResubmittedShareView>,
+    /// Shares skipped because their recovery material is missing. Retrying
+    /// cannot repair these, but a helper that already accepted one may still
+    /// confirm it, so a host keeps polling.
+    #[serde(default)]
+    pub unrecoverable: Vec<ShareKeyView>,
+    pub cancelled: bool,
+    /// Seconds until the next pass, absent when nothing is pending.
+    pub next_delay_seconds: Option<u64>,
+}
+
+/// Discriminator of a [`ShareTrackingQuiescenceView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareTrackingQuiescenceKind {
+    NothingToTrack,
+    AllConfirmed,
+    VoteEndReached,
+    Cancelled,
+    Failing,
+    PassBudgetExhausted,
+}
+
+/// Why a tracking run stopped, flattened for host bindings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareTrackingQuiescenceView {
+    pub kind: ShareTrackingQuiescenceKind,
+    /// `Failing`: the consecutive failures that ended the run.
+    #[serde(default)]
+    pub messages: Vec<String>,
+    /// `PassBudgetExhausted`: shares the last pass could
+    /// not repair.
+    #[serde(default)]
+    pub unrecoverable: Vec<ShareKeyView>,
+}
+
+/// Discriminator of a [`ShareTrackingEventView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareTrackingEventKind {
+    PassStarted,
+    PassFinished,
+    PassFailed,
+    AwaitingNextPass,
+}
+
+/// One observation from a tracking run, flattened for host bindings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareTrackingEventView {
+    pub kind: ShareTrackingEventKind,
+    /// The pass this belongs to, counting from 1. Absent on
+    /// `AwaitingNextPass`, which sits between two passes.
+    pub pass: Option<u32>,
+    /// `PassFinished`: what that pass did.
+    pub report: Option<ShareTrackingPassReportView>,
+    /// `PassFailed`: why.
+    pub message: Option<String>,
+    /// `AwaitingNextPass`: how long the driver waits before the next one.
+    pub delay_seconds: Option<u64>,
+}
+
+/// Everything one tracking run did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareTrackingRunReportView {
+    pub quiescence: ShareTrackingQuiescenceView,
+    pub passes: u32,
+    #[serde(default)]
+    pub confirmed: Vec<ShareKeyView>,
+    #[serde(default)]
+    pub resubmitted: Vec<ResubmittedShareView>,
+    #[serde(default)]
+    pub ambiguous: Vec<ResubmittedShareView>,
+    /// From the most recent pass, not accumulated: a share can stop being
+    /// unrecoverable once its material is restored.
+    #[serde(default)]
+    pub unrecoverable: Vec<ShareKeyView>,
+    #[serde(default)]
+    pub failures: Vec<String>,
+}
+
 /// Delivery result for one share of a batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareDeliveryOutcomeView {
