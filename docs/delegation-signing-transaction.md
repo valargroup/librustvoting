@@ -542,3 +542,20 @@ The complete caller-oriented flows are implemented in
 
 [prepared]: ../zcash_voting/src/delegate.rs
 [example]: ../wallet-example/src/example_delegation.rs
+
+## Durable Keystone requests
+
+Setup stores the exact finalized PCZT atomically with its signing fields.
+Keystone request creation reloads those bytes, including after background ZKP1
+or restart, and validates the selected notes, hotkey target, sighash, and unique
+matching randomized key. It never substitutes newly randomized bytes for an
+existing setup. Schema 22 adds this nullable field; legacy rows without the
+original transaction fail with `DelegationPcztUnavailable`.
+
+Concurrent initial setup can return `Busy` while another caller holds the
+bundle setup lease. A retry loads that caller's persisted transaction without
+waiting for its full proof generation.
+
+Regression coverage lives in `delegate/tests/keystone.rs`: request reuse after
+setup and restart, concurrent request creation, legacy rejection without
+rebuilding, and changed-note, changed-target, and corrupt-PCZT rejection.

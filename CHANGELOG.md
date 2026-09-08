@@ -10,6 +10,10 @@ This release is `zcash_voting` 4.0.0.
 
 ### Added
 
+- Keystone signing requests retain the exact transaction across background ZKP1
+  warmup and wallet restart. Setup persists and validates the signing transaction
+  in the SDK; schema 22 adds its storage without repairing legacy round state.
+
 - `round_drive` composes `RoundExecutor` calls into one run: `RoundDriver::run`
   re-plans from durable state, dispatches the obligations the plan lists, paces
   a still-tracking submission by `RoundDrivePolicy::pending_repoll`, isolates

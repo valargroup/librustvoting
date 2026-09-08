@@ -1281,6 +1281,7 @@ impl VotingDb {
                 &result.padded_note_secrets,
                 &result.pczt_sighash,
                 &result.tx1_effects,
+                &result.pczt_bytes,
                 &result.rk,
                 &result.gov_nullifiers,
             )?;
@@ -1305,11 +1306,23 @@ impl VotingDb {
                 &result.padded_note_secrets,
                 &result.pczt_sighash,
                 &result.tx1_effects,
+                &result.pczt_bytes,
                 &result.rk,
                 &result.gov_nullifiers,
             )?;
         }
         Ok(result)
+    }
+
+    /// Load the exact delegation PCZT and signing fields persisted by setup.
+    pub(crate) fn get_delegation_pczt_fields(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::load_delegation_pczt_fields(&conn, round_id, &wallet_id, bundle_index)
     }
 
     /// Cache tree state fetched from lightwalletd by SDK.
@@ -5883,6 +5896,7 @@ mod tests {
                 &[],
                 &[0x09; 32],
                 tx1_effects,
+                &[],
                 &[0x0A; 32],
                 &gov_nullifiers,
             )
@@ -5998,6 +6012,7 @@ mod tests {
             &[],
             &[0x06; 32],
             &crate::tx1::placeholder_tx1_effects(),
+            &[],
             &rk,
             &gov_nullifiers,
         )
@@ -7059,6 +7074,7 @@ mod tests {
                 &[],
                 &stored_sighash,
                 &crate::tx1::placeholder_tx1_effects(),
+                &[],
                 &rk,
                 &[vec![0x89; 32]],
             )

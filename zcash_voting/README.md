@@ -500,3 +500,18 @@ boundary, so production builds should not enable this feature.
 ## License
 
 Dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](../LICENSE-MIT) and [LICENSE-APACHE](../LICENSE-APACHE).
+
+### Keystone proof warmup
+
+`DelegationPipeline::ensure_proof` can warm a Keystone bundle before the device
+signs. The SDK stores the exact finalized PCZT with its signing context;
+`DelegationPipeline::keystone_request` reloads it after warmup or a process
+restart. Concurrent request creation and proof setup converge on one durable
+transaction. Proof generation retains its existing single-flight coordination.
+The host owns scheduling, cancellation, hotkey custody, and device signing.
+
+Schema 22 adds nullable PCZT storage and preserves existing rounds. A legacy
+bundle whose original PCZT is unavailable returns
+`DelegationPcztUnavailable` when asked for a Keystone request. Do not
+reset or rebuild such a bundle automatically. Existing validated software
+proof reuse and authoritative chain submissions do not require PCZT bytes.

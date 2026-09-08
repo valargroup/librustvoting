@@ -40,6 +40,7 @@ fn a_late_bundle_proof_preserves_vote_ready_round_phase() {
             &[],
             &[0x06; 32],
             &crate::tx1::placeholder_tx1_effects(),
+            &[],
             &delegation_proof.rk,
             &delegation_proof.gov_nullifiers,
         )
