@@ -149,6 +149,7 @@ pub(crate) fn voting_error_kind(error: &crate::VotingError) -> &'static str {
         crate::VotingErrorKind::InsufficientEligibility => "InsufficientEligibility",
         crate::VotingErrorKind::NoSpendableNotes => "NoSpendableNotes",
         crate::VotingErrorKind::SetupAlreadyPersisted => "SetupAlreadyPersisted",
+        crate::VotingErrorKind::DelegationPcztUnavailable => "DelegationPcztUnavailable",
         crate::VotingErrorKind::DbBusy => "DbBusy",
         crate::VotingErrorKind::PirUnavailable => "PirUnavailable",
         crate::VotingErrorKind::DelegationTargetMismatch => "DelegationTargetMismatch",

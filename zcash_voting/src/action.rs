@@ -806,6 +806,37 @@ pub fn extract_pczt_sighash(pczt_bytes: &[u8]) -> Result<[u8; 32], VotingError> 
     Ok(signer.shielded_sighash())
 }
 
+/// Locate the persisted governance action bound to `expected_rk`.
+pub(crate) fn delegation_pczt_action_index(
+    pczt_bytes: &[u8],
+    expected_rk: &[u8; 32],
+) -> Result<usize, VotingError> {
+    let pczt = pczt::Pczt::parse(pczt_bytes).map_err(|e| VotingError::Internal {
+        message: format!("failed to parse persisted delegation PCZT: {e:?}"),
+    })?;
+    let (actions, protocol) = signed_pczt_actions(&pczt)?;
+    let matches = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            let rk = *action.spend().rk();
+            (rk == *expected_rk).then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(VotingError::Internal {
+            message: format!("persisted delegation PCZT has no matching {protocol} rk"),
+        }),
+        _ => Err(VotingError::Internal {
+            message: format!(
+                "persisted delegation PCZT has multiple matching {protocol} rk values"
+            ),
+        }),
+    }
+}
+
 /// Extract the spend_auth_sig from a signed PCZT.
 ///
 /// Keystone redacts sensitive fields (alpha, rseed, zip32_derivation, etc.) after signing,

@@ -168,9 +168,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
 /// way a step would so a host reads one taxonomy.
 pub(crate) fn failure_kind_for(error: &VotingError) -> RoundStepFailureKind {
     match error.kind() {
-        VotingErrorKind::InvalidInput | VotingErrorKind::SetupAlreadyPersisted => {
-            RoundStepFailureKind::InvalidInput
-        }
+        VotingErrorKind::InvalidInput
+        | VotingErrorKind::SetupAlreadyPersisted
+        | VotingErrorKind::DelegationPcztUnavailable => RoundStepFailureKind::InvalidInput,
         VotingErrorKind::InsufficientEligibility => RoundStepFailureKind::InsufficientEligibility,
         VotingErrorKind::NoSpendableNotes => RoundStepFailureKind::NoSpendableNotes,
         VotingErrorKind::Busy | VotingErrorKind::DbBusy => RoundStepFailureKind::Busy,

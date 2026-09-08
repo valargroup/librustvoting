@@ -41,6 +41,8 @@ pub enum DelegationSetupField {
     PaddedNoteSecrets,
     PcztSighash,
     Tx1Effects,
+    /// Exact serialized PCZT for a later external signing request.
+    DelegationPczt,
 }
 
 impl DelegationSetupField {
@@ -50,6 +52,7 @@ impl DelegationSetupField {
             Self::PaddedNoteSecrets => "padded_note_secrets",
             Self::PcztSighash => "pczt_sighash",
             Self::Tx1Effects => "tx1_effects",
+            Self::DelegationPczt => "delegation_pczt",
         }
     }
 }
@@ -77,6 +80,7 @@ pub enum VotingErrorKind {
     InsufficientEligibility,
     NoSpendableNotes,
     SetupAlreadyPersisted,
+    DelegationPcztUnavailable,
     DbBusy,
     PirUnavailable,
     /// A bundle's stored delegation setup does not reproduce from the voting
@@ -119,6 +123,9 @@ fn pir_endpoint_suffix(endpoint: &Option<String>) -> String {
 
 #[derive(Debug, Error)]
 pub enum VotingError {
+    /// Stored setup is missing the exact transaction needed for Keystone signing.
+    #[error("delegation for round={round_id}, bundle={bundle_index} has no persisted PCZT for a Keystone signing request")]
+    DelegationPcztUnavailable { round_id: String, bundle_index: u32 },
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
     #[error("Keystone signature conflict for bundle {bundle_index}")]
@@ -230,6 +237,7 @@ impl VotingError {
             Self::InsufficientEligibility { .. } => VotingErrorKind::InsufficientEligibility,
             Self::NoSpendableNotes { .. } => VotingErrorKind::NoSpendableNotes,
             Self::SetupAlreadyPersisted { .. } => VotingErrorKind::SetupAlreadyPersisted,
+            Self::DelegationPcztUnavailable { .. } => VotingErrorKind::DelegationPcztUnavailable,
             Self::DbBusy { .. } => VotingErrorKind::DbBusy,
             Self::PirUnavailable { .. } => VotingErrorKind::PirUnavailable,
             Self::DelegationTargetMismatch { .. } => VotingErrorKind::DelegationTargetMismatch,
