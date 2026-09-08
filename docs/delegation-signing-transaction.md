@@ -347,13 +347,16 @@ After the bundle is built, the wallet MUST:
 4. serialize the full PCZT;
 5. compute `Signer::shielded_sighash()` from the finalized PCZT;
 6. encode the finalized Ironwood action's effecting data; and
-7. persist the effecting data, sighash, `rk`, `alpha`, `nf_signed`, `cmx_new`,
-   both rseeds, and proof inputs before requesting a signature, while retaining
-   the action index with the active signing request.
+7. atomically persist the full finalized PCZT with the effecting data, sighash,
+   `rk`, `alpha`, `nf_signed`, `cmx_new`, both rseeds, and proof inputs before
+   requesting a signature, while retaining the action index with the active
+   signing request.
 
 The caller MUST retain the exact full PCZT for the active signing session.
-The current voting database persists the binding fields, but not the full PCZT
-bytes.
+The current voting database stores those bytes in `bundles.delegation_pczt`
+alongside the binding fields. `PreparedDelegationBundle::keystone_request`
+reloads and validates the request from that durable setup, including after
+restart; callers do not need a separate persistent copy of the request.
 
 The sighash is the 32-byte ZIP-244 shielded signature digest. It is not a
 custom voting hash.
@@ -453,16 +456,20 @@ controller retains its account keys. The delivery receipt and validation
 contract is documented in
 [delegation capability handoff](exporting-to-external-software.md).
 
-Signing state is one-shot. After a restart, the wallet MAY resume only if it
-retained the exact signing request, including the full PCZT. Otherwise it MUST
-clear the unsigned setup and build a fresh one. It MUST NOT combine `alpha`,
-`rk`, action fields, rseeds, a sighash, or a signature from different setup
-attempts.
+Signing state is bound to one setup. To resume a Keystone signing session after
+a restart, the wallet MUST reload and validate the exact persisted signing
+request. Losing the in-memory request MUST NOT trigger a setup reset or a newly
+randomized PCZT.
+If the original PCZT is absent from legacy setup, request creation fails with
+`DelegationPcztUnavailable`; automatic legacy repair is outside this contract.
+The wallet MUST NOT combine `alpha`, `rk`, action fields, rseeds, a sighash, or
+a signature from different setup attempts. See [Durable Keystone
+requests](#durable-keystone-requests) for reuse and concurrency behavior.
 
 ## Rust example
 
 The caller first prepares a [`PreparedDelegationBundle`][prepared] using the
-wallet and round state. TX1 construction itself is then:
+wallet and round state. TX1 construction or recovery is then:
 
 ```rust
 use anyhow::{ensure, Context, Result};
@@ -478,7 +485,7 @@ fn build_tx1(
     let progress = NoopProgressReporter;
     let request = prepared
         .keystone_request(voting_db, &progress)
-        .context("build TX1 and persist its binding fields")?;
+        .context("build or reload TX1 signing request")?;
 
     let recomputed = pczt_sighash(&request.pczt_bytes)?;
     ensure!(
