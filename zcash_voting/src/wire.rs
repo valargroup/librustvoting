@@ -693,6 +693,40 @@ pub struct ShareKeyView {
     pub share_index: u32,
 }
 
+/// How one PIR endpoint answered a snapshot-height probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PirSnapshotEndpointStatusView {
+    /// Serving exactly the round's snapshot height.
+    Matched,
+    /// Serving an older height; it has not caught up yet.
+    Behind,
+    /// Serving a newer height; the round's snapshot is gone from it.
+    Ahead,
+    /// Answered without a height field.
+    MissingHeight,
+    /// Answered with a body that is not the expected JSON.
+    MalformedJson,
+    /// Answered with a non-success HTTP status.
+    NonSuccessStatus,
+    /// Did not answer within the probe deadline.
+    TimeoutOrNetworkError,
+}
+
+/// One endpoint's probe result.
+///
+/// The full set is part of a resolution, not debug output: a caller builds its
+/// failover list from the endpoints that matched, and explains a failed
+/// resolution from the heights the others reported.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PirSnapshotEndpointDiagnosticView {
+    pub endpoint: String,
+    pub status: PirSnapshotEndpointStatusView,
+    pub reported_height: Option<u64>,
+    pub http_status_code: Option<u16>,
+    pub message: Option<String>,
+}
+
 /// Delivery result for one share of a batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareDeliveryOutcomeView {

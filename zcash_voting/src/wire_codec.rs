@@ -31,17 +31,18 @@ use crate::{
         CompletedVoteDisplayView, DelegationPirPrecomputeResultView, DelegationProgressKind,
         DelegationRecoveryView, DelegationRecoveryWorkView, DelegationSetupFieldView,
         DelegationStatusView, DelegationSubmissionWire, NextStepView, PendingShareRoundView,
-        RoundChainOutcomeView, RoundDriveEventKind, RoundDriveEventView, RoundPlanView,
-        RoundQuiescenceKind, RoundQuiescenceView, RoundRecoveryStateView, RoundRunReportView,
-        RoundStepDispositionView, RoundStepFailureKindView, RoundStepFailureRecordView,
-        RoundStepFailureView, RoundStepOutcomeView, RoundStepProgressKind, RoundStepProgressView,
-        RoundWorkTallyView, ShareBatchDeliveryReportView, ShareDelegationRecordView,
-        ShareDeliveryOutcomeView, ShareKeyView, ShareWorkflowRecoveryView,
-        SignedDelegationPayloadView, SignedVoteBatchView, SignedVoteCommitmentView,
-        SignedVoteCommitmentsView, SubmissionDiagnosticView, VoteCommitStageKind,
-        VoteCommitmentBatchWire, VoteCommitmentWire, VoteKeyView, VoteRecoveryView,
-        VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView, VotingErrorView,
-        VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView, VotingRoundParams,
+        PirSnapshotEndpointDiagnosticView, PirSnapshotEndpointStatusView, RoundChainOutcomeView,
+        RoundDriveEventKind, RoundDriveEventView, RoundPlanView, RoundQuiescenceKind,
+        RoundQuiescenceView, RoundRecoveryStateView, RoundRunReportView, RoundStepDispositionView,
+        RoundStepFailureKindView, RoundStepFailureRecordView, RoundStepFailureView,
+        RoundStepOutcomeView, RoundStepProgressKind, RoundStepProgressView, RoundWorkTallyView,
+        ShareBatchDeliveryReportView, ShareDelegationRecordView, ShareDeliveryOutcomeView,
+        ShareKeyView, ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteBatchView,
+        SignedVoteCommitmentView, SignedVoteCommitmentsView, SubmissionDiagnosticView,
+        VoteCommitStageKind, VoteCommitmentBatchWire, VoteCommitmentWire, VoteKeyView,
+        VoteRecoveryView, VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView,
+        VotingErrorView, VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView,
+        VotingRoundParams,
     },
     BundlePolicy,
 };
@@ -1050,6 +1051,36 @@ impl From<crate::share_tracking::ShareKey> for ShareKeyView {
     }
 }
 
+impl From<crate::pir_snapshot::PirSnapshotEndpointStatus> for PirSnapshotEndpointStatusView {
+    fn from(status: crate::pir_snapshot::PirSnapshotEndpointStatus) -> Self {
+        use crate::pir_snapshot::PirSnapshotEndpointStatus as Status;
+
+        match status {
+            Status::Matched => Self::Matched,
+            Status::Behind => Self::Behind,
+            Status::Ahead => Self::Ahead,
+            Status::MissingHeight => Self::MissingHeight,
+            Status::MalformedJson => Self::MalformedJson,
+            Status::NonSuccessStatus => Self::NonSuccessStatus,
+            Status::TimeoutOrNetworkError => Self::TimeoutOrNetworkError,
+        }
+    }
+}
+
+impl From<crate::pir_snapshot::PirSnapshotEndpointDiagnostic>
+    for PirSnapshotEndpointDiagnosticView
+{
+    fn from(diagnostic: crate::pir_snapshot::PirSnapshotEndpointDiagnostic) -> Self {
+        Self {
+            endpoint: diagnostic.endpoint,
+            status: diagnostic.status.into(),
+            reported_height: diagnostic.reported_height,
+            http_status_code: diagnostic.http_status_code,
+            message: diagnostic.message,
+        }
+    }
+}
+
 impl From<crate::VoteShareDeliveryReport> for ShareBatchDeliveryReportView {
     fn from(report: crate::VoteShareDeliveryReport) -> Self {
         let delivery = report.delivery;
@@ -1593,6 +1624,7 @@ impl TryFrom<crate::round_drive::RoundDriveEvent> for RoundDriveEventView {
 #[cfg(test)]
 mod tests {
     mod error_view;
+    mod pir_snapshot_view;
     mod round_drive_view;
     mod step_failure_view;
 
