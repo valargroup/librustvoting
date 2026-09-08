@@ -614,8 +614,19 @@ suppresses every POST. The window subtracts one status budget for that reason.
 Once no such start remains, the vote end is the only boundary left, and only a
 pass already running can still resubmit.
 
-The reserve is one share's budget. A pass over many shares spends it per share,
-so a later share can still find the window shut when its own recovery is
+The reserve is one share's budget plus a second of quantization. A pass
+measures itself as `now_seconds + elapsed().as_secs()`, a second-granular model
+of the wall clock that can sit up to a second behind it, so waking exactly one
+budget early risks arriving with the model reading a second the real clock has
+left. That residual is not eliminated, deliberately: the cutoff check is
+second-granular too, so a POST may be issued within a second of the cutoff.
+`resubmit_cutoff_seconds` is a margin before the vote end rather than a hard
+deadline, and a second inside a ten-second margin still serves what the margin
+is for; making the model pessimistic enough to close the gap would cost real
+retries to buy a property the cutoff does not need.
+
+The reserve covers one share. A pass over many shares spends the budget per
+share, so a later share can still find the window shut when its own recovery is
 considered; no wake time prevents that, and each share's own window check
 refuses the late POST rather than making one. A round with no vote-end time has
 no boundary to respect and keeps the delay unchanged. A round already at or
@@ -631,12 +642,20 @@ resubmission, but an accepted or outcome-unknown helper may still possess and
 eventually confirm one. It is therefore diagnostic, not a polling stop signal.
 `terminal_unconfirmed` narrows that set to shares with no accepted, ambiguous,
 or interrupted helper evidence **that also cannot be given to a helper**, for
-either of two reasons: the material is beyond rebuilding, or the round is past
-the point where any POST is permitted. Both have to count. A share whose
-material rebuilds perfectly well but which no helper holds, tracked after the
-cutoff, can never be placed and can never be confirmed — leaving it out made
-the equality rule below unreachable for the rest of the round. Equal
-`remaining_unconfirmed` and `terminal_unconfirmed.len()` counts mean no
+either of two reasons: the material is beyond rebuilding, or the round is over.
+Both have to count. A share whose material rebuilds perfectly well but which no
+helper holds can never be placed and can never be confirmed once the round has
+ended — leaving it out made the equality rule below unreachable.
+
+The second test is the **vote end**, not the resubmission cutoff. The cutoff
+governs recovery alone: initial delivery does not consult it, so between the
+cutoff and the vote end a share nothing holds may still be placed by an
+outstanding initial fan-out that resumes. Reading the cutoff as the end of all
+hope would tell a caller to stop tracking a share that was about to be
+delivered. That initial delivery is ungoverned by the cutoff at all is worth a
+separate look; this rule is written to be correct either way.
+
+Equal `remaining_unconfirmed` and `terminal_unconfirmed.len()` counts mean no
 remaining share can make progress through recovery or confirmation.
 
 Whether a share's recovery material can still produce a submission is a
@@ -693,7 +712,8 @@ What a pass reports to the next one is covered by
 `a_pass_too_close_to_fit_a_status_walk_wakes_for_the_vote_end`,
 `a_round_with_no_vote_end_keeps_the_delay_the_shares_asked_for` in
 [`share_tracking/tests/next_pass.rs`](../zcash_voting/src/share_tracking/tests/next_pass.rs),
-and `a_share_no_helper_holds_is_terminal_once_recovery_is_shut_for_good` with
+and `a_share_no_helper_holds_is_terminal_once_the_round_is_over`,
+`a_share_no_helper_holds_is_not_terminal_between_the_cutoff_and_the_vote_end`, and
 `a_share_no_helper_holds_is_not_terminal_while_recovery_is_open` in
 [`share_tracking/tests/recovery.rs`](../zcash_voting/src/share_tracking/tests/recovery.rs).
 

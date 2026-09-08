@@ -617,12 +617,15 @@ This release is `zcash_voting` 4.0.0.
   confirmation does — and each was derived independently at its own call site,
   from its own reading of the clock. They could and did disagree.
 
-- A share no helper holds is reported in `terminal_unconfirmed` once recovery
-  is shut for the round, not only when its material is beyond rebuilding. Its
-  material may rebuild perfectly well; past the cutoff no POST can place it and
-  no helper can confirm what it was never given. Leaving it out made the
-  documented equality stop signal unreachable for the rest of the round, so a
-  caller kept polling shares no further pass could change.
+- A share no helper holds is reported in `terminal_unconfirmed` once the round
+  is over, not only when its material is beyond rebuilding. Its material may
+  rebuild perfectly well; once the round has ended no POST can place it and no
+  helper can confirm what it was never given. Leaving it out made the
+  documented equality stop signal unreachable, so a caller kept polling shares
+  no further pass could change. The boundary is the vote end rather than the
+  resubmission cutoff because initial delivery does not consult the cutoff: a
+  share nothing holds can still be placed between the two by an initial fan-out
+  that resumes.
 
 - A tracking pass now decides whether a share's recovery material can still
   produce a submission before it consults the resubmission window, so a share

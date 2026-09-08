@@ -186,14 +186,18 @@ impl RoundWindow {
         })
     }
 
-    /// Whether recovery is shut for the rest of this round.
+    /// Whether the round is over, so no POST on any path can still produce a
+    /// confirmation that counts.
     ///
-    /// The window only ever closes, so this is the same question as
-    /// [`Self::can_resubmit_at`] asked about every future second at once. A
-    /// share nothing holds is beyond help once this is true: no POST can place
-    /// it and no helper can confirm what it was never given.
-    pub(crate) fn resubmission_permanently_shut_at(&self, now_seconds: u64) -> bool {
-        self.vote_end_time_seconds.is_some() && !self.can_resubmit_at(now_seconds)
+    /// Deliberately the vote end and not the resubmission cutoff. The cutoff
+    /// governs recovery only: initial delivery does not consult it, so between
+    /// the cutoff and the vote end a share nothing holds may still be placed by
+    /// an outstanding initial fan-out that resumes. Treating the cutoff as the
+    /// end of all hope would tell a caller to stop tracking a share that was
+    /// about to be delivered.
+    pub(crate) fn closed_at(&self, now_seconds: u64) -> bool {
+        self.vote_end_time_seconds
+            .is_some_and(|vote_end| now_seconds >= vote_end)
     }
 
     /// The latest second a pass may **begin** and still reach its recovery

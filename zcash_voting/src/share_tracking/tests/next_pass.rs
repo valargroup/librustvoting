@@ -70,8 +70,10 @@ fn queue_pending_statuses(transport: &MockTransport, configured: &[String], shar
 
 // ---- The round-boundary cap ------------------------------------------
 
-/// The cap under the default policy: a ten-second resubmission cutoff, and a
-/// ten-second status budget reserved for the walk that precedes recovery.
+/// The cap under the default policy: a ten-second resubmission cutoff, and an
+/// eleven-second reserve for the walk that precedes recovery — one share's
+/// ten-second status budget plus the second of clock quantization the reserve
+/// may add on top of it.
 fn capped(delay_seconds: u64, now_seconds: u64, vote_end_time_seconds: Option<u64>) -> u64 {
     cap_delay_at_next_round_boundary(
         delay_seconds,
@@ -90,10 +92,10 @@ fn a_delay_landing_before_every_boundary_is_left_alone() {
 fn a_delay_stepping_over_the_last_usable_start_is_shortened_to_it() {
     // Recovery closes ten seconds before the vote end, so the last permitted
     // second is 1_039. A pass must *begin* early enough to still reach its
-    // recovery phase, and it walks helper status first with a ten-second
-    // budget, so the last usable start is 1_029 rather than 1_039. Waking at
+    // recovery phase, and it walks helper status first against a conservative
+    // clock, so the last usable start is 1_028 rather than 1_039. Waking at
     // 1_039 would spend the window on the walk and suppress every POST.
-    assert_eq!(capped(60, 1_000, Some(1_050)), 29);
+    assert_eq!(capped(60, 1_000, Some(1_050)), 28);
 }
 
 #[test]
@@ -315,10 +317,11 @@ async fn the_next_delay_a_pass_reports_leaves_room_for_the_status_walk() {
     let now = ready_not_overdue();
     // Thirty seconds left. Recovery shuts ten before the vote end, so the last
     // permitted second is `now + 19` — but a pass walks helper status before it
-    // decides anything about recovery, with a ten-second budget, so the last
-    // second it can *begin* and still get there is `now + 9`. Waking at
-    // `now + 19` would spend the window on the walk and suppress every POST,
-    // and the plain fifteen-second interval steps over both.
+    // decides anything about recovery, with a ten-second budget and a second
+    // of clock conservatism, so the last second it can *begin* and still get
+    // there is `now + 8`. Waking at `now + 19` would spend the window on the
+    // walk and suppress every POST, and the plain fifteen-second interval steps
+    // over both.
     let policy = ShareTimingPolicy::default();
     let vote_end = now + 30;
     assert_eq!(policy.resubmit_cutoff_seconds, 10);
@@ -337,7 +340,7 @@ async fn the_next_delay_a_pass_reports_leaves_room_for_the_status_walk() {
     assert_eq!(report.remaining_unconfirmed, 1);
     assert_eq!(
         report.next_delay_seconds,
-        Some(9),
+        Some(8),
         "the pass must wake early enough to still reach its recovery phase",
     );
 }

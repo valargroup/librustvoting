@@ -2185,13 +2185,13 @@ async fn resubmission_waits_for_the_confirmed_vc_position() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_share_no_helper_holds_is_terminal_once_recovery_is_shut_for_good() {
+async fn a_share_no_helper_holds_is_terminal_once_the_round_is_over() {
     // The material is intact, so this share is not beyond rebuilding — and
     // that was the only thing terminality asked about. But no helper was ever
-    // reached, and past the cutoff no POST can give one this share, so nothing
-    // can confirm what nobody holds. Reporting it as merely unconfirmed left
-    // the equality stop signal permanently unreachable and a caller polling a
-    // share that no further pass could ever change.
+    // reached, and the round is over, so nothing can place it and nothing can
+    // confirm what nobody holds. Reporting it as merely unconfirmed left the
+    // equality stop signal permanently unreachable and a caller polling a share
+    // no further pass could change.
     let configured = helpers(2);
     let db = db_with_share(&[]);
     let share_id = share_id_of(&db);
@@ -2207,11 +2207,7 @@ async fn a_share_no_helper_holds_is_terminal_once_recovery_is_shut_for_good() {
     let random = zero_bytes;
 
     let now = overdue();
-    let vote_end = now + ShareTimingPolicy::default().resubmit_cutoff_seconds;
-    assert!(
-        !crate::share_policy::RoundWindow::new(Some(vote_end), ShareTimingPolicy::default())
-            .can_resubmit_at(now)
-    );
+    let vote_end = now;
 
     let report = track_pending_shares(
         &db,
@@ -2230,9 +2226,53 @@ async fn a_share_no_helper_holds_is_terminal_once_recovery_is_shut_for_good() {
     assert_eq!(
         report.terminal_unconfirmed.len(),
         1,
-        "no POST can place it and no helper can confirm it",
+        "nothing can place it and no helper can confirm it",
     );
     assert_eq!(transport.call_count("/shielded-vote/v1/shares"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_share_no_helper_holds_is_not_terminal_between_the_cutoff_and_the_vote_end() {
+    // Recovery is shut, so no resubmission can place this share — but initial
+    // delivery does not consult the recovery cutoff, so an outstanding initial
+    // fan-out that resumes still can. Calling it terminal here would stop a
+    // caller's tracking just before that delivery succeeded.
+    let configured = helpers(2);
+    let db = db_with_share(&[]);
+    let share_id = share_id_of(&db);
+
+    let transport = Arc::new(MockTransport::default());
+    for server_url in &configured {
+        transport.queue_get(
+            &format!("{server_url}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}"),
+            json_status("pending"),
+        );
+    }
+    let client = client_with(Arc::clone(&transport));
+    let random = zero_bytes;
+
+    let now = overdue();
+    let vote_end = now + ShareTimingPolicy::default().resubmit_cutoff_seconds;
+    assert!(
+        !crate::share_policy::RoundWindow::new(Some(vote_end), ShareTimingPolicy::default())
+            .can_resubmit_at(now),
+        "recovery is shut"
+    );
+
+    let report = track_pending_shares(
+        &db,
+        &params_ending_at(&configured, now, Some(vote_end), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.remaining_unconfirmed, 1);
+    assert!(
+        report.terminal_unconfirmed.is_empty(),
+        "an initial delivery can still place this share before the vote end"
+    );
 }
 
 #[tokio::test(start_paused = true)]

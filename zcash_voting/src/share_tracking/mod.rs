@@ -947,9 +947,14 @@ async fn track_pending_shares_with_elapsed(
     // A share nothing holds is terminal for either of two reasons, and both
     // have to be counted or the equality stop signal never fires. Its material
     // may be beyond rebuilding — or the material may be fine and the round may
-    // simply be past the point where anything can be posted, which no amount
-    // of further tracking undoes.
-    let recovery_shut = window.resubmission_permanently_shut_at(current_time);
+    // be over, which no amount of further tracking undoes.
+    //
+    // The second test is the vote end, not the resubmission cutoff. The cutoff
+    // governs recovery alone; initial delivery does not consult it, so a share
+    // nothing holds can still be placed between the two by an initial fan-out
+    // that resumes. Reading the cutoff as the end of all hope would stop a
+    // caller's tracking just before that delivery succeeded.
+    let round_over = window.closed_at(current_time);
     report.terminal_unconfirmed = still_unconfirmed
         .iter()
         .filter(|share| {
@@ -959,7 +964,7 @@ async fn track_pending_shares_with_elapsed(
             let beyond_rebuilding = unrecoverable_generations
                 .iter()
                 .any(|generation| generation.matches(share));
-            reached_no_helper && (beyond_rebuilding || recovery_shut)
+            reached_no_helper && (beyond_rebuilding || round_over)
         })
         .map(ShareKey::of)
         .collect();
@@ -990,19 +995,32 @@ fn cap_delay_at_next_round_boundary(
     now_seconds: u64,
     window: RoundWindow,
 ) -> u64 {
-    let Some(boundary) = window.next_boundary_after(now_seconds, status_poll_budget_seconds())
-    else {
+    let Some(boundary) = window.next_boundary_after(now_seconds, recovery_reserve_seconds()) else {
         return delay_seconds;
     };
     delay_seconds.min(boundary.saturating_sub(now_seconds))
 }
 
-/// One share's status budget in whole seconds, rounded up.
+/// What a pass spends before it can decide anything about recovery, in whole
+/// seconds, as the pass's own clock model will measure it.
 ///
-/// Rounded up because a partial second of walking still spends the boundary
-/// second it lands in.
-fn status_poll_budget_seconds() -> u64 {
-    SHARE_STATUS_POLL_BUDGET_MILLISECONDS.div_ceil(1_000)
+/// One share's status budget, rounded up because a partial second of walking
+/// still spends the second it lands in, plus one second of quantization.
+///
+/// The pass measures itself as `now_seconds + elapsed().as_secs()`, which is a
+/// second-granular model of the wall clock and can sit up to a second behind
+/// it. Waking exactly one budget before the last permitted second therefore
+/// risks arriving with the model reading a second the real clock has left. The
+/// extra second buys that back.
+///
+/// It does not make the model exact, and it is not meant to: the cutoff check
+/// itself is second-granular, so a POST may still be issued within a second of
+/// the cutoff. `resubmit_cutoff_seconds` is a margin before the vote end rather
+/// than a hard deadline, and a second inside a ten-second margin still serves
+/// what the margin is for. Pessimising the model instead would cost real
+/// retries to buy a property the cutoff does not need.
+fn recovery_reserve_seconds() -> u64 {
+    SHARE_STATUS_POLL_BUDGET_MILLISECONDS.div_ceil(1_000) + 1
 }
 
 fn dedupe_preserving_order(urls: impl Iterator<Item = String>) -> Vec<String> {
