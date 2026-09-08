@@ -18,7 +18,7 @@ use super::{
     quiescence::{quiesce_before_dispatch, requires_background_tracking, RoundQuiescence},
     run_ledger::Run,
     selection, signing,
-    tally::BallotBaseline,
+    tally::VoteProgressBaseline,
     RoundDriver, RoundHostSource, RoundRunReport,
 };
 
@@ -106,9 +106,11 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
             let baseline =
                 run.baseline
                     .get_or_insert_with(|| match self.policy.progress_baseline {
-                        ProgressBaseline::Run => BallotBaseline::capture(&classified.obligations),
-                        ProgressBaseline::Ballot => {
-                            BallotBaseline::for_ballot(&classified.obligations)
+                        ProgressBaseline::Run => {
+                            VoteProgressBaseline::for_run(&classified.obligations)
+                        }
+                        ProgressBaseline::SelectedChoices => {
+                            VoteProgressBaseline::for_selected_choices(&classified.obligations)
                         }
                     });
             run.tally = baseline.tally(&classified.obligations);

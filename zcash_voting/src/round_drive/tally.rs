@@ -1,4 +1,4 @@
-//! Exact ballot progress for one run, derived from obligations.
+//! Exact selected-choice submission progress, derived from obligations.
 
 use std::collections::BTreeSet;
 
@@ -15,9 +15,9 @@ use crate::round_planning::{Obligation, RoundObligations};
 /// - `Run` (the default) is **run-relative**: the total is the vote work the
 ///   run's first plan owed, so a round resumed with two questions left reports
 ///   two.
-/// - `Ballot` is **ballot-relative**: the total is every proposal the durable
-///   ballot recorded a choice for, so the same resume still reports the whole
-///   ballot and "question N of M" does not renumber across a restart.
+/// - `SelectedChoices` counts every durable choice whose vote belongs to the
+///   current roster or chain lifecycle. Skips and clearable stale choices are
+///   excluded because they owe no vote submission.
 ///
 /// The counts are exact for atomic batches. Obligation membership names every
 /// ordered member, where a host counting `NextStep`s sees one
@@ -45,52 +45,50 @@ pub struct RoundWorkTally {
 /// The vote work the run's first plan owed, held so later plans can be
 /// measured against it.
 #[derive(Clone, Debug, Default)]
-pub(super) struct BallotBaseline {
+pub(super) struct VoteProgressBaseline {
     proposals: BTreeSet<u32>,
 }
 
-impl BallotBaseline {
+impl VoteProgressBaseline {
     /// Captures the proposals the run starts out owing a vote for.
     ///
     /// A withheld cast contributes nothing: a `Blocked` obligation names no
     /// proposals, and while one stands the host is resolving the ballot rather
     /// than watching a progress bar.
-    pub(super) fn capture(obligations: &RoundObligations) -> Self {
+    pub(super) fn for_run(obligations: &RoundObligations) -> Self {
         Self {
             proposals: covered_proposals(obligations),
         }
     }
 
-    /// Captures every proposal the durable ballot recorded a choice for.
+    /// Captures every durable selected choice that still belongs to this round.
     ///
     /// The measure is the same; only the total differs. A run baseline asks
     /// "how much of what this run picked up is done", which renumbers when a
-    /// resume picks up less than the whole ballot. This asks "how much of the
-    /// ballot is done", which is what a host showing "question N of M" across a
-    /// quit and reopen wants: the denominator is the voter's ballot, so it does
-    /// not move between runs.
+    /// resume picks up less than all selected choices. This asks "how many of
+    /// the selected choices have finished vote submission", preserving that
+    /// denominator across a restart when the selections and roster are
+    /// unchanged.
     ///
     /// Skipped proposals are excluded, because `choice_proposals` holds only
-    /// roster proposals with a durable `Choice`. A skip is terminal and owes no
-    /// vote work, so counting one would leave the label permanently short of
-    /// its total on a ballot that is in fact complete.
+    /// roster proposals with a durable `Choice`. A skip owes no vote
+    /// submission.
     ///
     /// `lifecycle_owned_choices` is added back, because a choice whose vote the
     /// chain lifecycle owns is one the host cannot clear and whose work
     /// deliberately outlives its roster seat. Dropping it when the roster drops
     /// it would move the very total this baseline exists to hold still, and
-    /// would report a finished ballot while the vote is on the wire. A
-    /// clearable unrostered intent is not added back: the host resolves it, and
-    /// the recast that follows is planned fresh. Nor is a vote with no durable
-    /// choice at all, which the wallet drives to resolution but the voter never
-    /// saw as a question.
+    /// would hide a selected vote still on the wire. A clearable unrostered
+    /// intent is not added back: the host resolves it, and the recast that
+    /// follows is planned fresh. Nor is a vote with no durable choice at all,
+    /// which the wallet drives to resolution but the voter did not select.
     ///
-    /// Unlike a run baseline, this total holds choices no obligation names:
+    /// Unlike a run baseline, this total holds selected choices no obligation names:
     /// a ballot the host recorded before bundle setup, a cast withheld while
     /// the ballot is open, and a member of an undispatched batch the ballot has
     /// not finished deciding own nothing in the plan. `tally` reads
     /// `withheld_casts` so those count as owed rather than as done.
-    pub(super) fn for_ballot(obligations: &RoundObligations) -> Self {
+    pub(super) fn for_selected_choices(obligations: &RoundObligations) -> Self {
         Self {
             proposals: obligations
                 .choice_proposals

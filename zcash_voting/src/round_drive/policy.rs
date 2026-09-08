@@ -83,10 +83,10 @@ pub enum ProgressBaseline {
     /// remaining questions reports a total of two.
     #[default]
     Run,
-    /// Every proposal the durable ballot recorded a choice for, skips
-    /// excluded. A resume reports the whole ballot, so a host label like
-    /// "question N of M" keeps the same M across a quit and reopen.
-    Ballot,
+    /// Every durable selected choice whose vote belongs to the current roster
+    /// or chain lifecycle. Skips and clearable stale choices are excluded
+    /// because they owe no vote submission.
+    SelectedChoices,
 }
 
 /// What the driver does with the rest of the round after one failure.

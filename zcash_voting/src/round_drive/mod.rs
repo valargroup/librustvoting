@@ -27,7 +27,7 @@
 //! the host still owes a delegation signature), `dispatch` (running one
 //! admitted wave concurrently), `run_ledger` (what the run has accumulated and
 //! whether an outcome ends it), `quiescence` (why a plan with nothing
-//! dispatchable stops), `tally` (run-relative ballot progress), `policy`
+//! dispatchable stops), `tally` (selected-vote submission progress), `policy`
 //! (pacing and failure isolation) and `progress` (driver-level events).
 
 mod dispatch;

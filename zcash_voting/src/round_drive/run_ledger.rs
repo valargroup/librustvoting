@@ -15,7 +15,7 @@ use super::{
     progress::{RoundDriveEvent, RoundDriveReporter},
     quiescence::RoundQuiescence,
     selection,
-    tally::{BallotBaseline, RoundWorkTally},
+    tally::{RoundWorkTally, VoteProgressBaseline},
     RoundRunReport, RoundStepFailureRecord,
 };
 
@@ -25,7 +25,7 @@ pub(super) struct Run {
     pub(super) dispatches: usize,
     pub(super) plan: Option<RoundPlan>,
     pub(super) tally: RoundWorkTally,
-    pub(super) baseline: Option<BallotBaseline>,
+    pub(super) baseline: Option<VoteProgressBaseline>,
     pub(super) failures: Vec<RoundStepFailureRecord>,
     pub(super) skipped: Vec<u32>,
     pub(super) chain_outcomes: Vec<(NextStep, ChainSubmissionResult)>,

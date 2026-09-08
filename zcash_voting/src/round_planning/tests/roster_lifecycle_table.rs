@@ -227,7 +227,7 @@ fn a_held_batch_withholds_the_members_the_ballot_already_decided() {
 }
 
 #[test]
-fn a_lifecycle_owned_unrostered_choice_stays_a_ballot_question() {
+fn a_lifecycle_owned_unrostered_choice_stays_selected() {
     // The roster dropped proposal 1 after its vote reached the chain. The
     // intent cannot be cleared and the vote is still driven to resolution, so
     // the choice is neither reported to the host nor forgotten: it is in
@@ -262,7 +262,7 @@ fn a_lifecycle_owned_unrostered_choice_stays_a_ballot_question() {
 }
 
 #[test]
-fn a_clearable_unrostered_intent_is_not_a_ballot_question() {
+fn a_clearable_unrostered_intent_is_not_a_selected_choice() {
     // The same roster change over an undispatched vote. Nothing reached the
     // chain, so the unit is retired and the intent is the host's to clear;
     // the durable ballot does not keep it, because the recast that may follow

@@ -52,7 +52,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// The obligations name every member of an atomic batch, which the
     /// projected steps do not: a batch projects to one `AdvanceVoteBatch`
     /// carrying only its first member's id. The round driver reads them to
-    /// report exact ballot progress.
+    /// report exact selected-vote submission progress.
     pub(crate) fn plan_classified(&self) -> Result<ClassifiedPlan, VotingError> {
         self.wallet_scope()?;
         let binding = self.binding()?;

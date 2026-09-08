@@ -8,7 +8,7 @@
 pub(super) use std::sync::{Arc, Mutex};
 pub(super) use std::time::Duration;
 
-pub(super) use crate::round_drive::tally::BallotBaseline;
+pub(super) use crate::round_drive::tally::VoteProgressBaseline;
 pub(super) use crate::{
     round_drive::{
         FailureIsolation, ProgressBaseline, RoundDriveEvent, RoundDrivePolicy, RoundDriveReporter,

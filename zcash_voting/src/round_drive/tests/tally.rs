@@ -1,5 +1,5 @@
-//! Ballot progress is exact for batches, and counted against whichever
-//! baseline the host's policy selected.
+//! Vote-submission progress is exact for batches and counted against the
+//! baseline selected by the host.
 
 use super::fixtures::*;
 
@@ -23,7 +23,7 @@ async fn the_tally_counts_every_chosen_proposal_the_run_starts_owing() {
 
     // The run stops for signing material without casting anything, so both
     // chosen proposals are still owed. A host counting steps would see one
-    // `Delegate` and read the ballot as one question.
+    // `Delegate` and read two selected votes as one.
     assert_eq!(report.tally.total_proposals, 2);
     assert_eq!(report.tally.completed_proposals, 0);
 }
@@ -123,9 +123,9 @@ impl BatchObligations<'_> {
 #[test]
 fn a_batch_counts_every_ordered_member_not_just_its_anchor() {
     // The batch projects to one `AdvanceVoteBatch` carrying proposal 1, so a
-    // host counting steps reads a three-proposal ballot as one question. The
+    // host counting steps reads three selected votes as one. The
     // tally reads the obligation's membership instead.
-    let baseline = BallotBaseline::capture(&batch_obligations(&[1, 2, 3], &[1, 2, 3]));
+    let baseline = VoteProgressBaseline::for_run(&batch_obligations(&[1, 2, 3], &[1, 2, 3]));
 
     let owed = baseline.tally(&batch_obligations(&[1, 2, 3], &[1, 2, 3]));
     assert_eq!(owed.total_proposals, 3);
@@ -143,9 +143,9 @@ fn a_batch_counts_every_ordered_member_not_just_its_anchor() {
 #[test]
 fn progress_is_measured_against_what_the_run_started_owing() {
     // A resumed round owes one of three proposals. Reporting "1 of 3" would
-    // describe the ballot rather than this run, and would never reach its
-    // total.
-    let baseline = BallotBaseline::capture(&batch_obligations(&[1, 2, 3], &[3]));
+    // describe all selected votes rather than this run, and would never reach
+    // its total.
+    let baseline = VoteProgressBaseline::for_run(&batch_obligations(&[1, 2, 3], &[3]));
     assert_eq!(
         baseline
             .tally(&batch_obligations(&[1, 2, 3], &[3]))
@@ -180,7 +180,7 @@ fn a_retire_is_not_work_the_tally_reports_as_owed() {
         lifecycle_owned_choices: Default::default(),
     };
 
-    let tally = BallotBaseline::capture(&obligations).tally(&obligations);
+    let tally = VoteProgressBaseline::for_run(&obligations).tally(&obligations);
     assert_eq!(
         tally.remaining_obligations, 0,
         "the driver has no entry point that executes a retire alone"
@@ -189,13 +189,12 @@ fn a_retire_is_not_work_the_tally_reports_as_owed() {
 }
 
 #[test]
-fn the_ballot_baseline_keeps_its_total_across_a_resume() {
+fn the_selected_choices_baseline_keeps_its_total_across_a_resume() {
     // The same resumed round as above: one of three proposals still owed. The
-    // run baseline reports "1 of 1" for this run; the ballot baseline reports
-    // the ballot, so a host label keeps the M the voter saw before quitting and
-    // resumes at the right N instead of renumbering.
+    // run baseline reports "1 of 1" for this run; the selected-choices
+    // baseline keeps all three selected votes in view across the restart.
     let resumed = batch_obligations(&[1, 2, 3], &[3]);
-    let baseline = BallotBaseline::for_ballot(&resumed);
+    let baseline = VoteProgressBaseline::for_selected_choices(&resumed);
 
     let owed = baseline.tally(&resumed);
     assert_eq!((owed.completed_proposals, owed.total_proposals), (2, 3));
@@ -205,10 +204,11 @@ fn the_ballot_baseline_keeps_its_total_across_a_resume() {
 }
 
 #[test]
-fn the_ballot_baseline_counts_every_member_of_an_atomic_batch() {
+fn the_selected_choices_baseline_counts_every_member_of_an_atomic_batch() {
     // Same exactness the run baseline has: membership comes from the
     // obligation, not from the single anchor id an `AdvanceVoteBatch` carries.
-    let baseline = BallotBaseline::for_ballot(&batch_obligations(&[1, 2, 3], &[1, 2, 3]));
+    let baseline =
+        VoteProgressBaseline::for_selected_choices(&batch_obligations(&[1, 2, 3], &[1, 2, 3]));
 
     let owed = baseline.tally(&batch_obligations(&[1, 2, 3], &[1, 2, 3]));
     assert_eq!((owed.completed_proposals, owed.total_proposals), (0, 3));
@@ -218,11 +218,11 @@ fn the_ballot_baseline_counts_every_member_of_an_atomic_batch() {
 }
 
 #[test]
-fn a_withheld_cast_is_not_a_completed_ballot_question() {
+fn a_withheld_cast_is_not_a_completed_selected_choice() {
     // Proposal 3 is chosen but its cast is withheld while the ballot is open,
     // so no obligation names it. Reading completion as "no obligation covers
-    // it" would report a finished ballot for a round that has not cast a vote
-    // for that choice; proposal 1 has genuinely landed and still counts.
+    // it" would report completed submission for a choice that has not been
+    // cast; proposal 1 has genuinely landed and still counts.
     let partly_cast = BatchObligations {
         choices: &[1, 2, 3],
         still_owed: &[2],
@@ -230,7 +230,7 @@ fn a_withheld_cast_is_not_a_completed_ballot_question() {
         ..BatchObligations::default()
     }
     .build();
-    let baseline = BallotBaseline::for_ballot(&partly_cast);
+    let baseline = VoteProgressBaseline::for_selected_choices(&partly_cast);
 
     let owed = baseline.tally(&partly_cast);
     assert_eq!((owed.completed_proposals, owed.total_proposals), (1, 3));
@@ -251,8 +251,8 @@ fn a_withheld_cast_is_not_a_completed_ballot_question() {
 #[tokio::test]
 async fn a_ballot_recorded_before_bundle_setup_completes_nothing() {
     // Choices persisted first is the supported ordering, and it plans no vote
-    // work at all: the run stops with `NeedsBundleSetup`. The ballot total is
-    // the choices the voter made, and none of them is complete.
+    // work at all: the run stops with `NeedsBundleSetup`. The selected-choice
+    // total is two, and neither submission is complete.
     let executor = executor_over(database_without_bundles());
     executor
         .set_ballot_intents(&[
@@ -270,7 +270,7 @@ async fn a_ballot_recorded_before_bundle_setup_completes_nothing() {
     let events = RecordingReporter::default();
     let report = RoundDriver::new(&executor)
         .with_policy(RoundDrivePolicy {
-            progress_baseline: ProgressBaseline::Ballot,
+            progress_baseline: ProgressBaseline::SelectedChoices,
             ..RoundDrivePolicy::default()
         })
         .run(&FixedHost, &control, &events)
@@ -288,10 +288,9 @@ async fn a_ballot_recorded_before_bundle_setup_completes_nothing() {
 }
 
 #[tokio::test]
-async fn a_skipped_proposal_is_not_a_ballot_question() {
-    // `choice_proposals` excludes skips, so the ballot total matches the run
-    // total here. A skip owes no vote work, and counting one would leave the
-    // label short of its total on a complete ballot.
+async fn a_skipped_proposal_is_not_a_selected_choice() {
+    // `choice_proposals` excludes skips, so only the selected vote contributes
+    // to the total. A skip owes no vote submission.
     let executor = executor();
     executor
         .set_ballot_intents(&[
@@ -309,7 +308,7 @@ async fn a_skipped_proposal_is_not_a_ballot_question() {
     let events = RecordingReporter::default();
     let report = RoundDriver::new(&executor)
         .with_policy(RoundDrivePolicy {
-            progress_baseline: ProgressBaseline::Ballot,
+            progress_baseline: ProgressBaseline::SelectedChoices,
             ..RoundDrivePolicy::default()
         })
         .run(&FixedHost, &control, &events)
@@ -319,12 +318,12 @@ async fn a_skipped_proposal_is_not_a_ballot_question() {
 }
 
 #[tokio::test]
-async fn selecting_a_baseline_does_not_disturb_a_ballot_both_agree_on() {
+async fn selecting_a_baseline_does_not_disturb_a_round_both_agree_on() {
     // Both baselines are the same set while nothing has completed yet, so the
     // policy is observable only on a resume (see the two tests above). This
-    // pins the wiring: selecting `Ballot` runs the driver to the same tally,
-    // rather than, say, capturing an empty baseline.
-    for baseline in [ProgressBaseline::Run, ProgressBaseline::Ballot] {
+    // pins the wiring: selecting `SelectedChoices` runs the driver to the same
+    // tally rather than, say, capturing an empty baseline.
+    for baseline in [ProgressBaseline::Run, ProgressBaseline::SelectedChoices] {
         let executor = executor();
         executor
             .set_ballot_intents(&[
@@ -362,19 +361,19 @@ fn the_default_baseline_is_the_run_so_existing_hosts_are_unchanged() {
 }
 
 #[test]
-fn a_decided_member_of_a_held_batch_is_not_a_completed_question() {
+fn a_decided_member_of_a_held_batch_is_not_a_completed_selected_choice() {
     // The ballot decided proposal 1; its committed batch also holds proposal
     // 2, which the voter has not reached, so the batch cannot be dispatched
     // and owns no obligation. Reading completion as "no obligation covers it"
-    // would report the ballot finished before anything was sent, then take the
-    // count back when deciding proposal 2 produces the `ReconcileChain`.
+    // would report completed submission before anything was sent, then take
+    // the count back when deciding proposal 2 produces the `ReconcileChain`.
     let held = BatchObligations {
         choices: &[1],
         withheld: &[1],
         ..BatchObligations::default()
     }
     .build();
-    let baseline = BallotBaseline::for_ballot(&held);
+    let baseline = VoteProgressBaseline::for_selected_choices(&held);
 
     let waiting = baseline.tally(&held);
     assert_eq!(
@@ -393,12 +392,12 @@ fn a_decided_member_of_a_held_batch_is_not_a_completed_question() {
 }
 
 #[test]
-fn the_ballot_baseline_holds_a_choice_the_chain_lifecycle_owns() {
+fn the_selected_choices_baseline_holds_a_choice_the_chain_lifecycle_owns() {
     // Proposal 1 left the roster after its vote reached the chain, so it is in
     // neither `choice_proposals` nor the clearable `unrostered_intents`. Its
-    // work is still owed and its intent still stands, so the ballot total must
-    // keep it: dropping it would move the denominator this baseline exists to
-    // hold still, and would report a finished ballot with a vote on the wire.
+    // work is still owed and its intent still stands, so the selected-choice
+    // total must keep it: dropping it would move the denominator this baseline
+    // exists to hold still and hide a vote on the wire.
     let unrostered = BatchObligations {
         choices: &[2, 3],
         still_owed: &[1],
@@ -406,7 +405,7 @@ fn the_ballot_baseline_holds_a_choice_the_chain_lifecycle_owns() {
         ..BatchObligations::default()
     }
     .build();
-    let baseline = BallotBaseline::for_ballot(&unrostered);
+    let baseline = VoteProgressBaseline::for_selected_choices(&unrostered);
 
     let owed = baseline.tally(&unrostered);
     assert_eq!(
@@ -416,7 +415,7 @@ fn the_ballot_baseline_holds_a_choice_the_chain_lifecycle_owns() {
     );
 
     // The vote confirms. Its shares are tracked elsewhere, so no vote
-    // obligation covers it any more and the ballot reads complete.
+    // obligation covers it any more and its vote submission reads complete.
     let confirmed = BatchObligations {
         choices: &[2, 3],
         lifecycle_owned: &[1],
@@ -427,9 +426,9 @@ fn the_ballot_baseline_holds_a_choice_the_chain_lifecycle_owns() {
     assert_eq!((done.completed_proposals, done.total_proposals), (3, 3));
 
     // The same total whichever run captures it: the roster change does not
-    // renumber the ballot a host is labelling.
+    // renumber the selected-vote submissions a host is labelling.
     assert_eq!(
-        BallotBaseline::for_ballot(&confirmed)
+        VoteProgressBaseline::for_selected_choices(&confirmed)
             .tally(&confirmed)
             .total_proposals,
         3
