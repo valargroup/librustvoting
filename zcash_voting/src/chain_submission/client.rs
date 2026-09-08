@@ -939,11 +939,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .clone()
             .unwrap_or_else(crate::ObservationScope::disabled);
         invocation_observations.bind_round_bytes(&request.vote_round_id);
-        let attributed_observations =
-            invocation_observations.attributed(crate::ObservationAttribution {
-                bundle_index: Some(request.bundle_index),
-                ..Default::default()
-            });
+        let attributed_observations = invocation_observations.for_bundle(request.bundle_index);
         let observation_stage = attributed_observations.stage("chain::advance_vote_batch");
         let mut observed_control = control.clone();
         observed_control.observations = Some(observation_stage.scope().clone());
@@ -1020,11 +1016,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .clone()
             .unwrap_or_else(crate::ObservationScope::disabled);
         invocation_observations.bind_round_bytes(&request.vote_round_id);
-        let attributed_observations =
-            invocation_observations.attributed(crate::ObservationAttribution {
-                bundle_index: Some(request.bundle_index),
-                ..Default::default()
-            });
+        let attributed_observations = invocation_observations.for_bundle(request.bundle_index);
         let observation_stage =
             attributed_observations.stage("chain::advance_vote_batch_with_recovery");
         let mut observed_control = control.clone();
@@ -1182,8 +1174,13 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .clone()
             .unwrap_or_else(|| crate::ObservationScope::disabled())
             .invocation();
-        let attributed_observations =
-            invocation_observations.attributed(crate::ObservationAttribution::default());
+        let attributed_observations = match &request {
+            ChainAdvanceRequest::VoteBatch(batch) => {
+                invocation_observations.bind_round_bytes(&batch.vote_round_id);
+                invocation_observations.for_bundle(batch.bundle_index)
+            }
+            _ => invocation_observations.attributed(crate::ObservationAttribution::default()),
+        };
         let observation_stage =
             attributed_observations.stage("chain::advance_until_terminal_in_epoch");
         let mut observed_control = control.clone();

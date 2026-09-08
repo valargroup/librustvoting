@@ -72,6 +72,18 @@ Round-aware boundaries populate `round_id`. Network attempts carry a one-based
 when available. Attempts from different parent operations are separate sequences.
 Reports exclude payloads, URLs, keys, proof bytes, signatures, and free-form errors.
 
+Atomic batch casting uses these existing reports. Batch preparation, persistence,
+recovery and chain advancement carry bundle attribution without a proposal or
+share ID. The enclosing round step may name the proposal that triggered the
+batch; each proof worker and helper operation names its own proposal and share
+when known. Worker records share the invocation's collector and parent linkage.
+Fresh-cast handle recovery is included alongside resumed recovery. A batch route
+failure retains the chain lifecycle's dispatch uncertainty; reports do not
+introduce singleton fallback or change recovery decisions. A rejected batch POST
+can return pending recovery: its attempt is `rejected` while the enclosing
+operation remains `pending`. An ambiguous response likewise retains its
+`possibly_dispatched` attempt alongside the authoritative recovery result.
+
 Outcomes reflect domain results: cancellation is not success, pending helper
 shares are not confirmed, and hashless chain submissions remain
 `possibly_dispatched` through enclosing reports. Always use the authoritative

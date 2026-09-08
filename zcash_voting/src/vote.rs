@@ -1115,10 +1115,15 @@ pub(crate) fn observe_prepare_vote_work(
     request: VoteWorkRequest<'_>,
     observations: &crate::ObservationScope,
 ) -> Result<PreparedVoteWork, VotingError> {
-    let attributed_observations = observations.attributed(crate::ObservationAttribution {
-        bundle_index: Some(request.bundle_index),
-        ..Default::default()
-    });
+    observations.bind_round_id(request.round_id);
+    let attributed_observations = if request.drafts.len() > 1 {
+        observations.for_bundle(request.bundle_index)
+    } else {
+        observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(request.bundle_index),
+            ..Default::default()
+        })
+    };
     let observation_stage = attributed_observations.stage("vote::prepare_vote_work");
     let observations = observation_stage.scope();
     let operation_result: Result<PreparedVoteWork, VotingError> = (|| {
@@ -1182,7 +1187,13 @@ pub(crate) fn observe_persist_prepared_vote_work(
     prepared: PreparedVoteWork,
     observations: &crate::ObservationScope,
 ) -> Result<VoteCommitmentRecovery, VotingError> {
-    let attributed_observations = observations.clone();
+    let attributed_observations = match &prepared {
+        PreparedVoteWork::AtomicBatch(batch) => {
+            observations.bind_round_id(&batch.round_id);
+            observations.for_bundle(batch.bundle_index)
+        }
+        PreparedVoteWork::Singleton(_) => observations.clone(),
+    };
     let observation_stage = attributed_observations.stage("vote::persist_prepared_vote_work");
     let observations = observation_stage.scope();
     let operation_result: Result<VoteCommitmentRecovery, VotingError> = (|| match prepared {
@@ -1435,10 +1446,7 @@ pub(crate) fn observe_commit_atomic_vote_batch(
 ) -> Result<SignedVoteBatch, VotingError> {
     observations.bind_round_id(round_id);
 
-    let attributed_observations = observations.attributed(crate::ObservationAttribution {
-        bundle_index: Some(bundle_index),
-        ..Default::default()
-    });
+    let attributed_observations = observations.for_bundle(bundle_index);
     let observation_stage = attributed_observations.stage("vote::commit_atomic_vote_batch");
     let observations = observation_stage.scope();
     let operation_result: Result<SignedVoteBatch, VotingError> = (|| {
@@ -1525,7 +1533,8 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
     batch: AtomicVoteBatch<'_>,
     observations: &crate::ObservationScope,
 ) -> Result<PreparedAtomicVoteBatch, VotingError> {
-    let attributed_observations = observations.clone();
+    observations.bind_round_id(batch.round_id);
+    let attributed_observations = observations.for_bundle(batch.bundle_index);
     let observation_stage = attributed_observations.stage("vote::prepare_atomic_vote_batch");
     let observations = observation_stage.scope();
     let operation_result: Result<PreparedAtomicVoteBatch, VotingError> = (|| {
@@ -1816,7 +1825,8 @@ pub(crate) fn observe_persist_prepared_atomic_vote_batch(
     prepared: PreparedAtomicVoteBatch,
     observations: &crate::ObservationScope,
 ) -> Result<SignedVoteBatch, VotingError> {
-    let attributed_observations = observations.clone();
+    observations.bind_round_id(&prepared.round_id);
+    let attributed_observations = observations.for_bundle(prepared.bundle_index);
     let observation_stage =
         attributed_observations.stage("vote::persist_prepared_atomic_vote_batch");
     let operation_result: Result<SignedVoteBatch, VotingError> =
@@ -1968,11 +1978,7 @@ pub(crate) fn observe_recover_atomic_vote_batch(
 ) -> Result<SignedVoteBatch, VotingError> {
     observations.bind_round_id(round_id);
 
-    let attributed_observations = observations.attributed(crate::ObservationAttribution {
-        bundle_index: Some(bundle_index),
-        proposal_id: Some(proposal_id),
-        ..Default::default()
-    });
+    let attributed_observations = observations.for_bundle(bundle_index);
     let observation_stage = attributed_observations.stage("vote::recover_atomic_vote_batch");
     let operation_result: Result<SignedVoteBatch, VotingError> = (|| {
         let requested = recovery_bundle(db, round_id, bundle_index, proposal_id)?.ok_or_else(|| {
@@ -4784,6 +4790,8 @@ pub(crate) fn record_vc_position(
 }
 #[cfg(test)]
 mod tests {
+    mod batch_chain_reports;
+    mod batch_observability;
     mod tree_confirmed_completion;
 
     use super::*;
