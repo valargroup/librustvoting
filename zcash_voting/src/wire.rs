@@ -591,6 +591,10 @@ pub enum DelegationSetupFieldView {
     PaddedNoteSecrets,
     PcztSighash,
     Tx1Effects,
+    /// A setup field added after this host was built. It does not establish
+    /// that the persisted setup is reusable.
+    #[serde(other)]
+    Other,
 }
 
 /// One pending helper-share round for one wallet, as returned by

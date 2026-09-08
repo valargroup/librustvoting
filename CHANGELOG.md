@@ -486,7 +486,9 @@ This release is `zcash_voting` 4.0.0.
 - `VotingDb::clear_ballot_intent` evaluates the vote phase inside its write
   transaction.
 - `wire::VotingErrorView` accepts unknown fields so the `Other` category
-  fallback also survives new structured fields.
+  fallback also survives new structured fields. Unknown `setup_field` values
+  decode as `DelegationSetupFieldView::Other`, preserving the error payload
+  without treating an unfamiliar setup conflict as reusable.
 - The in-memory vote-tree cache is keyed by sidecar connection as well as
   wallet id, so two sidecars sharing a wallet id keep separate tree state and
   transports.
