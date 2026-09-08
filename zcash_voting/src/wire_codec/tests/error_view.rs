@@ -130,3 +130,40 @@ fn a_setup_conflict_names_its_field_on_the_wire() {
     let decoded: crate::wire::VotingErrorView = serde_json::from_str(&legacy).unwrap();
     assert_eq!(decoded.setup_field, None);
 }
+
+#[test]
+fn an_unknown_setup_field_preserves_the_error_payload() {
+    use crate::{types::DelegationSetupField, wire::DelegationSetupFieldView};
+
+    let known = VotingError::SetupAlreadyPersisted {
+        round_id: "r".to_string(),
+        bundle_index: 3,
+        field: DelegationSetupField::DelegationPczt,
+    }
+    .to_view();
+    let mut json = serde_json::to_value(&known).unwrap();
+    assert_eq!(json["setup_field"], "delegation_pczt");
+    assert_eq!(
+        serde_json::from_value::<crate::wire::VotingErrorView>(json.clone()).unwrap(),
+        known
+    );
+    json["setup_field"] = "field_added_after_this_host_shipped".into();
+
+    for kind in ["setup_already_persisted", "future_error_kind"] {
+        json["kind"] = kind.into();
+        let decoded: crate::wire::VotingErrorView = serde_json::from_value(json.clone())
+            .expect("an unknown nested setup field must not reject the error");
+        assert_eq!(decoded.setup_field, Some(DelegationSetupFieldView::Other));
+        assert_eq!(decoded.bundle_index, known.bundle_index);
+        assert_eq!(decoded.message, known.message);
+        assert_eq!(decoded.retryable, known.retryable);
+        assert_eq!(
+            decoded.kind,
+            if kind == "setup_already_persisted" {
+                VotingErrorKindView::SetupAlreadyPersisted
+            } else {
+                VotingErrorKindView::Other
+            }
+        );
+    }
+}

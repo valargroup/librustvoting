@@ -9,6 +9,15 @@ use crate::{
 
 use super::fixtures::{pipeline_with_round, ROUND_ID};
 
+fn store_signing_context(db: &crate::round::VotingDb, sighash: &[u8], rk: &[u8]) {
+    db.conn()
+        .execute(
+            "UPDATE bundles SET pczt_sighash = ?1, rk = ?2 WHERE bundle_index = 0",
+            rusqlite::params![sighash, rk],
+        )
+        .unwrap();
+}
+
 fn signed_bundle(sig: [u8; 64], sighash: [u8; 32], rk: [u8; 32]) -> SignedDelegationBundle {
     SignedDelegationBundle {
         submission: DelegationSubmission {
@@ -89,6 +98,7 @@ fn a_valid_provided_keystone_signature_is_resolved() {
 #[test]
 fn a_stored_keystone_signature_is_resolved_only_for_its_bundle() {
     let pipeline = pipeline_with_round();
+    store_signing_context(&pipeline.voting_db(), &[0x44; 32], &[0x55; 32]);
     pipeline
         .voting_db()
         .store_keystone_signature(ROUND_ID, 0, &[0x33; 64], &[0x44; 32], &[0x55; 32])
@@ -115,6 +125,7 @@ fn a_stored_keystone_signature_is_resolved_only_for_its_bundle() {
 #[test]
 fn a_provided_keystone_signature_is_retained_once_verified() {
     let pipeline = pipeline_with_round();
+    store_signing_context(&pipeline.voting_db(), &[0x72; 32], &[0x73; 32]);
     let signed = signed_bundle([0x71; 64], [0x72; 32], [0x73; 32]);
     let provided = DelegationSigner::Keystone(KeystoneSignatureSource::Provided {
         sig: vec![0x71; 64],
@@ -161,6 +172,7 @@ fn software_and_stored_signers_write_no_keystone_row() {
 #[test]
 fn re_scoping_a_handle_from_voting_db_does_not_reach_the_pipeline() {
     let pipeline = pipeline_with_round();
+    store_signing_context(&pipeline.voting_db(), &[0x44; 32], &[0x55; 32]);
     pipeline
         .voting_db()
         .store_keystone_signature(ROUND_ID, 0, &[0x33; 64], &[0x44; 32], &[0x55; 32])

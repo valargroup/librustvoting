@@ -538,6 +538,7 @@ pub enum VotingErrorKindView {
     InsufficientEligibility,
     NoSpendableNotes,
     SetupAlreadyPersisted,
+    DelegationPcztUnavailable,
     DbBusy,
     PirUnavailable,
     DelegationTargetMismatch,
@@ -553,7 +554,8 @@ pub enum VotingErrorKindView {
 ///
 /// `kind`, `retryable`, and `message` are always populated. The remaining
 /// fields carry the structured payload of the kinds that have one:
-/// `bundle_index` for `KeystoneSignatureConflict` and `SetupAlreadyPersisted`;
+/// `bundle_index` for `KeystoneSignatureConflict`, `SetupAlreadyPersisted`,
+/// and `DelegationPcztUnavailable`;
 /// `snapshot_height`, the weight fields, the selected note count, and the
 /// bundle slot capacity for
 /// `InsufficientEligibility` and `NoSpendableNotes`; `http_status` and
@@ -585,9 +587,14 @@ pub struct VotingErrorView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationSetupFieldView {
+    DelegationPczt,
     PaddedNoteSecrets,
     PcztSighash,
     Tx1Effects,
+    /// A setup field added after this host was built. It does not establish
+    /// that the persisted setup is reusable.
+    #[serde(other)]
+    Other,
 }
 
 /// One pending helper-share round for one wallet, as returned by

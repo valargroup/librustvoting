@@ -347,13 +347,16 @@ After the bundle is built, the wallet MUST:
 4. serialize the full PCZT;
 5. compute `Signer::shielded_sighash()` from the finalized PCZT;
 6. encode the finalized Ironwood action's effecting data; and
-7. persist the effecting data, sighash, `rk`, `alpha`, `nf_signed`, `cmx_new`,
-   both rseeds, and proof inputs before requesting a signature, while retaining
-   the action index with the active signing request.
+7. atomically persist the full finalized PCZT with the effecting data, sighash,
+   `rk`, `alpha`, `nf_signed`, `cmx_new`, both rseeds, and proof inputs before
+   requesting a signature, while retaining the action index with the active
+   signing request.
 
 The caller MUST retain the exact full PCZT for the active signing session.
-The current voting database persists the binding fields, but not the full PCZT
-bytes.
+The current voting database stores those bytes in `bundles.delegation_pczt`
+alongside the binding fields. `PreparedDelegationBundle::keystone_request`
+reloads and validates the request from that durable setup, including after
+restart; callers do not need a separate persistent copy of the request.
 
 The sighash is the 32-byte ZIP-244 shielded signature digest. It is not a
 custom voting hash.
@@ -453,16 +456,20 @@ controller retains its account keys. The delivery receipt and validation
 contract is documented in
 [delegation capability handoff](exporting-to-external-software.md).
 
-Signing state is one-shot. After a restart, the wallet MAY resume only if it
-retained the exact signing request, including the full PCZT. Otherwise it MUST
-clear the unsigned setup and build a fresh one. It MUST NOT combine `alpha`,
-`rk`, action fields, rseeds, a sighash, or a signature from different setup
-attempts.
+Signing state is bound to one setup. To resume a Keystone signing session after
+a restart, the wallet MUST reload and validate the exact persisted signing
+request. Losing the in-memory request MUST NOT trigger a setup reset or a newly
+randomized PCZT.
+If the original PCZT is absent from legacy setup, request creation fails with
+`DelegationPcztUnavailable`; automatic legacy repair is outside this contract.
+The wallet MUST NOT combine `alpha`, `rk`, action fields, rseeds, a sighash, or
+a signature from different setup attempts. See [Durable Keystone
+requests](#durable-keystone-requests) for reuse and concurrency behavior.
 
 ## Rust example
 
 The caller first prepares a [`PreparedDelegationBundle`][prepared] using the
-wallet and round state. TX1 construction itself is then:
+wallet and round state. TX1 construction or recovery is then:
 
 ```rust
 use anyhow::{ensure, Context, Result};
@@ -478,7 +485,7 @@ fn build_tx1(
     let progress = NoopProgressReporter;
     let request = prepared
         .keystone_request(voting_db, &progress)
-        .context("build TX1 and persist its binding fields")?;
+        .context("build or reload TX1 signing request")?;
 
     let recomputed = pczt_sighash(&request.pczt_bytes)?;
     ensure!(
@@ -542,3 +549,52 @@ The complete caller-oriented flows are implemented in
 
 [prepared]: ../zcash_voting/src/delegate.rs
 [example]: ../wallet-example/src/example_delegation.rs
+
+## Durable Keystone requests
+
+Setup stores the exact finalized PCZT atomically with its signing fields.
+Keystone request creation reloads those bytes, including after background ZKP1
+or restart, and validates the selected notes, hotkey target, sighash, and unique
+matching randomized key. It never substitutes newly randomized bytes for an
+existing setup. Schema 22 adds this nullable field; legacy rows without the
+original transaction fail with `DelegationPcztUnavailable`.
+
+The display memo is recovered from the stored governance output. If the host
+supplies a different round name after restart, the request still displays the
+original signed memo. Missing recovery metadata or a non-text memo fails request
+creation instead of substituting caller-provided text.
+
+Note and target validation and transaction loading share one database read
+snapshot. A concurrent setup replacement cannot substitute a different target's
+transaction between validation and loading. The returned request belongs to
+that snapshot; later signing and submission still check the current setup.
+
+Proof generation captures the setup's transaction hash before starting. The
+proof persistence transaction requires that same hash to still be present, so
+a reset or replacement cannot leave a late proof attached to missing or different
+setup. If persistence wins before cleanup, cleanup preserves the proved bundle.
+Hosts should use the cache-only `reset_vote_tree` for normal navigation so
+background proofs and later signing can reuse the durable transaction.
+
+Signature retention rechecks the bundle's current sighash and randomized key
+inside the same immediate write transaction as insertion or idempotent replay.
+A missing or replaced signing context returns `KeystoneSignatureConflict` and
+rolls back the entire batch. This prevents a signature validated before a
+replacement from being stored against the replacement and blocking its signer.
+
+Concurrent initial setup can return `Busy` while another caller holds the
+bundle setup lease. A retry loads that caller's persisted transaction without
+waiting for its full proof generation.
+
+Regression coverage lives in `delegate/tests/keystone.rs`: request reuse after
+setup and restart with a changed title, Unicode memo recovery, concurrent request
+creation, legacy rejection without rebuilding, and changed-note, changed-target,
+corrupt-PCZT, and unrecoverable-memo rejection.
+`storage/operations/tests/keystone_snapshot.rs` covers another connection
+committing a target replacement while the request snapshot remains open.
+`storage/operations/tests/proof_persistence.rs` covers reset and replacement
+from a second connection before proof completion, retry after reset, and cleanup
+after successful proof persistence.
+`storage/operations/tests/keystone_signatures.rs` covers replacement from a
+second connection after signature validation, rejection of missing or changed
+signing context, and atomic rollback including stale idempotent replays.

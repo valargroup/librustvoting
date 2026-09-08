@@ -40,6 +40,7 @@ fn a_late_bundle_proof_preserves_vote_ready_round_phase() {
             &[],
             &[0x06; 32],
             &crate::tx1::placeholder_tx1_effects(),
+            &[],
             &delegation_proof.rk,
             &delegation_proof.gov_nullifiers,
         )
@@ -50,7 +51,8 @@ fn a_late_bundle_proof_preserves_vote_ready_round_phase() {
 
     {
         let mut conn = db.conn();
-        persist_delegation_proof_result(&mut conn, ROUND_ID, W, 0, &delegation_proof).unwrap();
+        persist_delegation_proof_result(&mut conn, ROUND_ID, W, 0, &[0x06; 32], &delegation_proof)
+            .unwrap();
         let stored: (Vec<u8>, i64) = conn
             .query_row(
                 "SELECT proof, success FROM proofs

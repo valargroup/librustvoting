@@ -1480,7 +1480,8 @@ impl From<&VotingError> for VotingErrorView {
             endpoint: None,
         };
         match error {
-            VotingError::KeystoneSignatureConflict { bundle_index } => {
+            VotingError::KeystoneSignatureConflict { bundle_index }
+            | VotingError::DelegationPcztUnavailable { bundle_index, .. } => {
                 view.bundle_index = Some(*bundle_index);
             }
             VotingError::InsufficientEligibility {
@@ -1532,6 +1533,7 @@ impl From<crate::types::DelegationSetupField> for DelegationSetupFieldView {
             F::PaddedNoteSecrets => Self::PaddedNoteSecrets,
             F::PcztSighash => Self::PcztSighash,
             F::Tx1Effects => Self::Tx1Effects,
+            F::DelegationPczt => Self::DelegationPczt,
         }
     }
 }
@@ -1554,6 +1556,7 @@ impl From<VotingErrorKind> for VotingErrorKindView {
             VotingErrorKind::InsufficientEligibility => Self::InsufficientEligibility,
             VotingErrorKind::NoSpendableNotes => Self::NoSpendableNotes,
             VotingErrorKind::SetupAlreadyPersisted => Self::SetupAlreadyPersisted,
+            VotingErrorKind::DelegationPcztUnavailable => Self::DelegationPcztUnavailable,
             VotingErrorKind::DbBusy => Self::DbBusy,
             VotingErrorKind::PirUnavailable => Self::PirUnavailable,
             VotingErrorKind::DelegationTargetMismatch => Self::DelegationTargetMismatch,

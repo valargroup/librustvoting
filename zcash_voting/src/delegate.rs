@@ -13,6 +13,11 @@
 //! let _ = zcash_voting::round::VotingDb::build_and_prove_delegation;
 //! ```
 
+mod keystone;
+#[cfg(test)]
+#[path = "delegate/tests/keystone.rs"]
+mod keystone_tests;
+
 #[allow(unused_imports)]
 pub(crate) use crate::backend::{
     orchard, pasta_curves, pczt, zcash_client_backend, zcash_client_sqlite, zcash_primitives,
@@ -832,7 +837,8 @@ pub struct KeystoneSigningRequest {
     pub rk: Vec<u8>,
     /// Governance action index within the selected shielded protocol bundle.
     pub action_index: u32,
-    /// Human-readable memo shown to the signer.
+    /// Human-readable memo recovered from the persisted transaction, retaining
+    /// the round name used at setup even if the caller supplies a new name.
     pub display_memo: String,
     /// Total eligible round weight after bundle quantization.
     pub eligible_weight_zatoshi: u64,
@@ -1091,34 +1097,19 @@ impl PreparedDelegationBundle {
         )
     }
 
-    /// Builds the redacted Keystone signing request for this prepared bundle.
+    /// Builds or reloads the exact Keystone signing request, including after
+    /// background proof generation or restart. Legacy setup without its original
+    /// PCZT returns [`VotingError::DelegationPcztUnavailable`]. Concurrent setup
+    /// can return [`VotingError::Busy`]; retry after the setup lease is released.
+    /// A stored setup for another hotkey returns
+    /// [`VotingError::DelegationTargetMismatch`]. Request creation preserves it;
+    /// call [`Self::setup`] to explicitly replace an unusable unbroadcast setup.
     pub fn keystone_request(
         &self,
         voting_db: &VotingDb,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<KeystoneSigningRequest, VotingError> {
-        let setup = self.setup(voting_db, stages)?;
-        let redacted_pczt_bytes = redact_delegation_pczt_for_signer(&setup.pczt_bytes)?;
-        let display_weight_zatoshi = crate::round::raw_bundle_weight(&self.bundle_note_infos)?;
-        let display_memo = display_memo(&self.round_name, display_weight_zatoshi);
-        let action_index = crate::wire::BoundedU32::try_from(setup.action_index).map_err(|_| {
-            VotingError::InvalidInput {
-                message: format!("action_index {} does not fit u32", setup.action_index),
-            }
-        })?;
-
-        Ok(KeystoneSigningRequest {
-            pczt_bytes: setup.pczt_bytes,
-            redacted_pczt_bytes,
-            pczt_sighash: setup.pczt_sighash.to_vec(),
-            rk: setup.rk.to_vec(),
-            action_index: action_index.0,
-            display_memo,
-            eligible_weight_zatoshi: self.eligible_weight_zatoshi(),
-            delegated_weight_zatoshi: self.delegated_weight_zatoshi()?,
-            bundle_count: self.layout.bundle_count,
-            bundle_index: self.bundle_index,
-        })
+        keystone::request(self, voting_db, stages)
     }
 }
 
@@ -1256,6 +1247,8 @@ pub fn prove(
 /// waiting notification, is delivered live from a dedicated delivery thread
 /// that the producer never waits on; a reporter that reenters proof
 /// coordination waits at most until the current operation releases its lock.
+/// If the original setup is cleared or replaced while proving, persistence
+/// fails without saving the proof or advancing the round phase.
 pub fn ensure_proof(
     db: &VotingDb,
     round_id: &str,
@@ -1990,7 +1983,7 @@ mod tests {
         }
     }
 
-    fn prepared_wallet_delegation_fixture() -> (
+    pub(super) fn prepared_wallet_delegation_fixture() -> (
         VotingDb,
         crate::VotingRoundParams,
         VotingHotkey,
