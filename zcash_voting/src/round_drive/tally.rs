@@ -75,13 +75,29 @@ impl BallotBaseline {
     /// vote work, so counting one would leave the label permanently short of
     /// its total on a ballot that is in fact complete.
     ///
+    /// `lifecycle_owned_choices` is added back, because a choice whose vote the
+    /// chain lifecycle owns is one the host cannot clear and whose work
+    /// deliberately outlives its roster seat. Dropping it when the roster drops
+    /// it would move the very total this baseline exists to hold still, and
+    /// would report a finished ballot while the vote is on the wire. A
+    /// clearable unrostered intent is not added back: the host resolves it, and
+    /// the recast that follows is planned fresh. Nor is a vote with no durable
+    /// choice at all, which the wallet drives to resolution but the voter never
+    /// saw as a question.
+    ///
     /// Unlike a run baseline, this total holds choices no obligation names:
-    /// a ballot the host recorded before bundle setup, and a cast withheld
-    /// while the ballot is open, own nothing in the plan. `tally` reads
+    /// a ballot the host recorded before bundle setup, a cast withheld while
+    /// the ballot is open, and a member of an undispatched batch the ballot has
+    /// not finished deciding own nothing in the plan. `tally` reads
     /// `withheld_casts` so those count as owed rather than as done.
     pub(super) fn for_ballot(obligations: &RoundObligations) -> Self {
         Self {
-            proposals: obligations.choice_proposals.iter().copied().collect(),
+            proposals: obligations
+                .choice_proposals
+                .iter()
+                .chain(&obligations.lifecycle_owned_choices)
+                .copied()
+                .collect(),
         }
     }
 

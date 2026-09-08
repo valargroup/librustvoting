@@ -105,6 +105,9 @@ pub(crate) fn classify_round(
             stale_vote_keys: Default::default(),
             needs_bundle_setup: true,
             withheld_casts,
+            // No bundle rows means no votes, so no intent's vote can be
+            // lifecycle-owned yet.
+            lifecycle_owned_choices: Default::default(),
         });
     }
     let units = group_vote_units(snapshot, &snapshot.intents)?;

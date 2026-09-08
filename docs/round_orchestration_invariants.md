@@ -145,7 +145,7 @@ It has no clock and no network. The per-unit rule is one exhaustive match:
 | Lifecycle | Roster | Ballot | Obligation |
 |---|---|---|---|
 | Undispatched | Rostered | Agrees | `ReconcileChain` |
-| Undispatched | Rostered | Unrecorded | none; the unit holds its bundle. For a batch, `Agrees` means every member agrees: one undecided member holds the whole batch (`an_undispatched_batch_holds_until_the_ballot_agrees_with_every_member`) |
+| Undispatched | Rostered | Unrecorded | none; the unit holds its bundle. For a batch, `Agrees` means every member agrees: one undecided member holds the whole batch (`an_undispatched_batch_holds_until_the_ballot_agrees_with_every_member`), and its already-decided members are `withheld_casts` because nothing has been dispatched for them either (`a_held_batch_withholds_the_members_the_ballot_already_decided`) |
 | Undispatched | Rostered | Conflicts | singleton: none, and it holds nothing; the cast pass recasts and the persisted cast replaces the row. Batch: invariant violation, since the intent write path clears an unsubmitted batch whole |
 | Undispatched | LeftRoster | any | `Retire` for the whole unit; the cast pass recasts the rostered members |
 | OnWire | any | Agrees, Unrecorded | `ReconcileChain` |
@@ -624,13 +624,17 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   proposal is complete when no `Cast` and no `ReconcileChain` obligation covers
   it **and it is not one of the plan's `withheld_casts`** — the rostered choices
   that still owe a cast this pass could not draw up, because the ballot is not
-  yet terminal, the bundle is held by a vote already on the wire, or the round
-  has no bundle rows at all. Those choices own no obligation, so absence alone
-  does not mean done: a ballot recorded before bundle setup — the supported
-  ordering — would otherwise read as fully complete beside a `NeedsBundleSetup`
-  quiescence and no vote at all
+  yet terminal, the bundle is held by a vote already on the wire, the round has
+  no bundle rows at all, or the choice's undispatched batch is still waiting on
+  a member the ballot has not decided. Those choices own no obligation, so
+  absence alone does not mean done: a ballot recorded before bundle setup — the
+  supported ordering — would otherwise read as fully complete beside a
+  `NeedsBundleSetup` quiescence and no vote at all, and a decided member of a
+  held batch would read as complete before the batch was sent and then regress
+  once deciding the rest of it produced the `ReconcileChain`
   (`a_ballot_recorded_before_bundle_setup_completes_nothing`,
-  `a_withheld_cast_is_not_a_completed_ballot_question`). Obligation membership
+  `a_withheld_cast_is_not_a_completed_ballot_question`,
+  `a_decided_member_of_a_held_batch_is_not_a_completed_question`). Obligation membership
   names every member of an atomic batch, which a host
   counting `NextStep`s cannot see: a batch projects to one `AdvanceVoteBatch`
   carrying only its first member's id, so a host counting steps reads a
@@ -650,13 +654,23 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
     the vote work that first plan owed. A round resumed with two questions left
     reports a total of two.
   - `ProgressBaseline::Ballot` counts every proposal the durable ballot recorded
-    a `Decision::Choice` for, read from `RoundObligations::choice_proposals`.
+    a `Decision::Choice` for, read from `RoundObligations::choice_proposals`
+    together with `lifecycle_owned_choices`.
     It is the baseline that can hold a choice no obligation names, which is why
     completion reads `withheld_casts`; a run baseline holds only what its first
     plan already owed.
     Skipped proposals are excluded: a skip is terminal and owes no vote work, so
     counting one would leave a host label permanently short of its total on a
-    ballot that is in fact complete. The same resume reports the whole ballot,
+    ballot that is in fact complete.
+    A choice whose proposal left the roster after its vote reached the chain is
+    **kept**: the host cannot clear that intent and its work deliberately
+    outlives the roster change, so it is in neither `choice_proposals` nor the
+    clearable `unrostered_intents` and has to be named separately. Dropping it
+    would move the very total this baseline exists to hold still, and would
+    report a finished ballot with a vote still on the wire. A clearable
+    unrostered intent is not kept — the host resolves it and any recast is
+    planned fresh — and neither is a vote with no durable choice at all, which
+    the wallet drives to resolution but the voter never saw as a question. The same resume reports the whole ballot,
     which is what a host showing "question N of M" across a quit and reopen
     needs — the denominator does not move between runs.
 
@@ -817,10 +831,18 @@ Conformance is demonstrated by behavior. Tests cover:
   `selecting_a_baseline_does_not_disturb_a_ballot_both_agree_on`,
   `the_default_baseline_is_the_run_so_existing_hosts_are_unchanged`);
 - a choice whose cast the plan could not draw up counts as owed, not as done,
-  both for a ballot recorded before bundle setup and for a cast withheld while
-  the ballot is open
+  for a ballot recorded before bundle setup, for a cast withheld while the
+  ballot is open, and for a decided member of a batch still waiting on the rest
+  of itself
   (`a_ballot_recorded_before_bundle_setup_completes_nothing`,
-  `a_withheld_cast_is_not_a_completed_ballot_question`);
+  `a_withheld_cast_is_not_a_completed_ballot_question`,
+  `a_held_batch_withholds_the_members_the_ballot_already_decided`,
+  `a_decided_member_of_a_held_batch_is_not_a_completed_question`);
+- the ballot baseline keeps a choice whose vote the chain lifecycle owns after
+  its proposal left the roster, and drops one the host can still clear
+  (`a_lifecycle_owned_unrostered_choice_stays_a_ballot_question`,
+  `a_clearable_unrostered_intent_is_not_a_ballot_question`,
+  `the_ballot_baseline_holds_a_choice_the_chain_lifecycle_owns`);
 - a share a helper accepted or may hold is left to the host's background
   tracking, and neither can outrank a later share the foreground can deliver
   (`a_share_a_helper_already_holds_is_left_to_background_tracking`,

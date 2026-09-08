@@ -60,10 +60,13 @@ This release is `zcash_voting` 4.0.0.
   measured against. `ProgressBaseline::Run`, the default, keeps the historical
   run-relative total: a round resumed with two questions left reports two.
   `ProgressBaseline::Ballot` counts every proposal the durable ballot recorded
-  a choice for, skips excluded, so a host label like "question N of M" keeps
-  the same M across a quit and reopen. Both are captured from the run's first
-  plan and share one completion measure — a proposal is done once no `Cast` and
-  no `ReconcileChain` obligation covers it — so only the denominator differs.
+  a choice for, skips excluded and choices whose vote the chain lifecycle owns
+  kept even after their proposal leaves the roster, so a host label like
+  "question N of M" keeps the same M across a quit and reopen. Both are
+  captured from the run's first plan and share one completion measure — a
+  proposal is done once no `Cast` and no `ReconcileChain` obligation covers it
+  and the plan did not have to withhold its cast — so only the denominator
+  differs.
   The choice belongs to the host because it depends on what the host's label
   claims to be counting, which the driver cannot know.
 - `RoundPlan::needs_bundle_setup` reports a round that holds a ballot choice
