@@ -73,8 +73,9 @@ durable state, chooses what to run, overlaps independent bundles, paces a
 still-tracking submission, and isolates a failure to its bundle — and stops
 with a `RoundQuiescence` naming the state only a host can resolve: an open
 ballot, delegation signatures it has not collected, a terminal submission, or
-nothing left to do. Hosts that need one obligation at a time, rather than a
-run, call `advance_step` with a step they selected from a plan they read.
+nothing left to do. Running the round's steps is the driver's: it carries the
+epoch it dispatched under into each step, so a host switching session or
+account interrupts work already in flight instead of having it adopted.
 The executor owns the ordering between helper-plan persistence, chain
 advancement, confirmation, and share delivery, proves off the async runtime,
 and reports typed progress.
@@ -234,18 +235,18 @@ upgrading the crate.
 - Replace per-stage delegation orchestration with `DelegationPipeline` and
   `DelegationSigner`; keep only the seed-owning `SpendAuthSigner`.
 - Replace host sequencing of plan steps, and the removed
-  `VoteRecoveryExecutor::advance` driver, with `RoundDriver::run`. A host loop
-  around `RoundExecutor::advance_step` is no longer needed and
-  `RoundExecutor::advance_next` is removed: a second way to advance a round
-  from its plan head is a second driver. Helper shares are submitted through
-  `ConfirmedVote`.
+  `VoteRecoveryExecutor::advance` driver, with `RoundDriver::run`.
+  `RoundExecutor::advance_next` and `RoundExecutor::advance_step` are both
+  removed: a second way to advance a round from its plan is a second driver.
+  Helper shares are submitted through `ConfirmedVote`.
 - Replace a host loop over share-tracking passes with
   `ShareTrackingDriver::run`. It repeats a pass on the delay each pass
   computes, keeps every wait inside the round's voting window, and reports why
   it stopped; a host keeps only what it alone can see, such as app lock and
   account identity.
-- Start chain submissions with `ChainSubmissionClientConfig::for_network` and
-  drive them with `advance_until_terminal` instead of a host polling loop.
+- Configure chain submissions with `ChainSubmissionClientConfig::for_network`.
+  Episodes are driven by `RoundExecutor` under a `ChainAdvancePolicy`, not by a
+  host polling loop.
 
 The workspace uses the published `voting-circuits 0.12.0-rc.1` release.
 

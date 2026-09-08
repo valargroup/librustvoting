@@ -772,31 +772,21 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// `Tracking` result waits `pending_repoll` and passes again; a
     /// `Recovering` result escalates to `ExactTree` at most once per episode
     /// and otherwise ends the episode as `StillPending`; terminal results are
-    /// never retried. Cancellation, or an operation-epoch change since the
-    /// episode began, is observed between passes and during the repoll wait
-    /// and ends the episode as `Cancelled`.
-    pub async fn advance_until_terminal(
-        &self,
-        request: ChainAdvanceRequest,
-        policy: &ChainAdvancePolicy,
-        control: &ChainSubmissionControl,
-    ) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure> {
-        self.advance_until_terminal_in_epoch(request, policy, control, control.operation_epoch())
-            .await
-    }
-
-    /// [`Self::advance_until_terminal`] for an episode that belongs to work
-    /// begun earlier under `entry_epoch`.
+    /// never retried.
     ///
     /// A caller that proved or signed before reaching the chain passes the
     /// epoch it captured at its own entry, so a host epoch change during that
     /// work is observed here instead of being recaptured as the episode's
-    /// own. The episode ends as `Cancelled` if the control's epoch differs
-    /// from `entry_epoch` at any pass boundary or during the repoll wait, and
-    /// every bounded pass captures its operation under `entry_epoch`, so a
-    /// change between the boundary check and the pass is caught by the
-    /// coordinator rather than adopted.
-    pub async fn advance_until_terminal_in_epoch(
+    /// own. The episode ends as `Cancelled` if the control is cancelled, or if
+    /// its epoch differs from `entry_epoch`, at any pass boundary or during
+    /// the repoll wait; every bounded pass captures its operation under
+    /// `entry_epoch`, so a change between the boundary check and the pass is
+    /// caught by the coordinator rather than adopted.
+    ///
+    /// Driving an episode is [`RoundExecutor`](crate::RoundExecutor) work, not
+    /// a host's: a host that ran one directly would own the round lock, step
+    /// ordering, and durable outcome recording that the executor already has.
+    pub(crate) async fn advance_until_terminal_in_epoch(
         &self,
         request: ChainAdvanceRequest,
         policy: &ChainAdvancePolicy,

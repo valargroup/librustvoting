@@ -172,9 +172,10 @@ This release is `zcash_voting` 4.0.0.
   `HyperTransport` is generic over it; `DirectRoute` is the SDK default.
   Classification of definite versus ambiguous failures is derived from the
   executor's dispatch hook in one place.
-- `ChainSubmissionClient::advance_until_terminal` runs bounded passes as one
-  episode under a `ChainAdvancePolicy`; `ChainSubmissionClientConfig::for_network`
-  and `Network::default_vote_chain_id` replace host-side literals.
+- `ChainSubmissionClient` composes bounded passes into one episode under a
+  `ChainAdvancePolicy`, driven by `RoundExecutor` rather than by a host;
+  `ChainSubmissionClientConfig::for_network` and
+  `Network::default_vote_chain_id` replace host-side literals.
 - `VotingError::kind`, `VotingError::retryable`, and the new variants
   `InsufficientEligibility`, `NoSpendableNotes`, `SetupAlreadyPersisted`,
   `DbBusy`, and `PirUnavailable`, with `wire::VotingErrorView` for hosts.
@@ -785,6 +786,12 @@ This release is `zcash_voting` 4.0.0.
   driver's policy is built from. Per-share readiness is still readable through
   `share_tracking_flags`, whose `ready_for_status_check` is exactly the retired
   predicate.
+- **Breaking:** removed `RoundExecutor::advance_step` and
+  `ChainSubmissionClient::advance_until_terminal`. `RoundDriver` is the
+  supported way to run a round's steps: it re-plans, orders bundle-locked work,
+  and carries the operation epoch it dispatched under into each step, which a
+  host selecting one step at a time cannot do. A host that ran steps itself
+  should call `RoundDriver::run`.
 
 - **Breaking:** removed the persisted-vote recovery driver
   `VoteRecoveryExecutor::advance` with `VoteRecoveryRequest`,

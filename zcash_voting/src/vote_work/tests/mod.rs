@@ -25,7 +25,7 @@ fn step_control_treats_an_epoch_change_like_cancellation() {
     use crate::ChainSubmissionControl;
 
     let control = ChainSubmissionControl::new(3);
-    let captured = StepControl::capture(&control);
+    let captured = StepControl::in_epoch(&control, control.operation_epoch());
     assert!(!captured.interrupted());
 
     control.set_operation_epoch(4);
@@ -33,7 +33,7 @@ fn step_control_treats_an_epoch_change_like_cancellation() {
     assert!(!control.is_cancelled());
 
     // A pass captured under the new epoch is live until cancelled.
-    let recaptured = StepControl::capture(&control);
+    let recaptured = StepControl::in_epoch(&control, control.operation_epoch());
     assert!(!recaptured.interrupted());
     control.cancel();
     assert!(recaptured.interrupted());

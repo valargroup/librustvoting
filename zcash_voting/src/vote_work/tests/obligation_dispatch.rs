@@ -54,7 +54,13 @@ async fn a_confirm_share_step_for_an_accepted_share_polls_instead_of_delivering(
     let progress = RecordingProgress::default();
     let control = ChainSubmissionControl::new(1);
     let _ = executor
-        .advance_step(step, &host(), &control, &progress)
+        .advance_step_in_epoch(
+            step,
+            &host(),
+            &control,
+            control.operation_epoch(),
+            &progress,
+        )
         .await;
 
     let events = progress.events.lock().unwrap();
@@ -131,7 +137,13 @@ async fn a_share_with_only_ambiguous_evidence_is_polled_not_redelivered() {
     let progress = RecordingProgress::default();
     let control = ChainSubmissionControl::new(1);
     let _ = executor
-        .advance_step(step, &host(), &control, &progress)
+        .advance_step_in_epoch(
+            step,
+            &host(),
+            &control,
+            control.operation_epoch(),
+            &progress,
+        )
         .await;
 
     let events = progress.events.lock().unwrap();

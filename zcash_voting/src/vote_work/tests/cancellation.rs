@@ -45,10 +45,11 @@ async fn a_delegate_step_cancelled_after_signing_returns_the_signed_bundle() {
     assert!(executor.plan().unwrap().next_steps.contains(&step));
 
     let outcome = executor
-        .advance_step(
+        .advance_step_in_epoch(
             step.clone(),
             &host_with_delegation(&control, "wallet", &executor.database()),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await
@@ -71,7 +72,7 @@ async fn a_delegate_step_stops_when_the_host_moves_to_a_new_operation_epoch() {
     let step = NextStep::Delegate { bundle_index: 0 };
 
     let outcome = executor
-        .advance_step(
+        .advance_step_in_epoch(
             step.clone(),
             &host_with_interrupting_delegation(
                 &control,
@@ -80,6 +81,7 @@ async fn a_delegate_step_stops_when_the_host_moves_to_a_new_operation_epoch() {
                 &executor.database(),
             ),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await
@@ -112,10 +114,11 @@ async fn a_sync_that_fails_after_cancellation_reports_cancelled_not_a_transport_
     };
 
     let outcome = executor
-        .advance_step(
+        .advance_step_in_epoch(
             cast.clone(),
             &host,
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await
@@ -148,7 +151,7 @@ async fn an_epoch_change_during_resigning_stops_delegation_advancement() {
     let control = ChainSubmissionControl::new(7);
 
     let outcome = executor
-        .advance_step(
+        .advance_step_in_epoch(
             step.clone(),
             &host_with_interrupting_delegation(
                 &control,
@@ -157,6 +160,7 @@ async fn an_epoch_change_during_resigning_stops_delegation_advancement() {
                 &executor.database(),
             ),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await

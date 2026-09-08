@@ -1072,8 +1072,11 @@ transition.
 
 ### Episodes
 
-`ChainSubmissionClient::advance_until_terminal` composes bounded passes into
-one finite episode under a `ChainAdvancePolicy`. Every iteration is one
+`ChainSubmissionClient::advance_until_terminal_in_epoch` composes bounded
+passes into one finite episode under a `ChainAdvancePolicy`. It is
+crate-internal: `RoundExecutor` runs episodes as part of a step, so a host
+never drives one and cannot start one that the round lock does not cover.
+Every iteration is one
 `advance_*_with_recovery` pass, so every public result above still describes
 exactly one pass. An episode re-polls after `Tracking`, escalates to
 `ExactTree` at most once after `Recovering` and otherwise ends as

@@ -515,7 +515,13 @@ pub(super) async fn cast_against_unreachable_nodes(
     };
     let control = ChainSubmissionControl::new(1);
     let failure = executor
-        .advance_step(cast, &host, &control, &NoopRoundStepProgressReporter {})
+        .advance_step_in_epoch(
+            cast,
+            &host,
+            &control,
+            control.operation_epoch(),
+            &NoopRoundStepProgressReporter {},
+        )
         .await
         .expect_err("no node is reachable");
     assert!(
@@ -627,5 +633,9 @@ pub(super) async fn advance_plan_head<T: crate::ChainTransport>(
     progress: &dyn crate::RoundStepProgressReporter,
 ) -> Option<Result<crate::RoundStepOutcome, crate::RoundStepFailure>> {
     let step = executor.plan().ok()?.next_steps.first().cloned()?;
-    Some(executor.advance_step(step, host, control, progress).await)
+    Some(
+        executor
+            .advance_step_in_epoch(step, host, control, control.operation_epoch(), progress)
+            .await,
+    )
 }

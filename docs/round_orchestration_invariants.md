@@ -522,8 +522,9 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   the run's `entry_epoch` through `advance_step_in_epoch`, and stop at the
   step's first boundary instead
   (`a_dispatch_decided_in_an_earlier_epoch_is_cancelled_not_adopted`,
-  `a_dispatch_in_the_run_s_own_epoch_still_runs`). `advance_step` still
-  captures on entry, which is the right answer for a host calling it directly.
+  `a_dispatch_in_the_run_s_own_epoch_still_runs`). `advance_step_in_epoch` is
+  the only way to run a step, so there is no entry point that could capture a
+  newer epoch as its own.
 - **Stop-round failure isolation is strictly serial.** When
   `FailureIsolation::StopRound` is selected, the driver admits one step at a
   time so no later obligation can already be running when the first failure

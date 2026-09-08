@@ -106,30 +106,19 @@ impl<T: ChainTransport> RoundExecutor<T> {
     /// round. A `ConfirmShare` whose share no
     /// helper has accepted yet (the plan's `blocking_share_work`) runs the
     /// share's delivery from its durable plan instead of polling for a
-    /// confirmation no helper can give. The operation epoch is captured on
-    /// entry: cancellation or an epoch change is observed at every boundary
-    /// where the step decides to continue, and either ends the step as
-    /// `Cancelled`.
-    pub async fn advance_step(
-        &self,
-        step: NextStep,
-        host: &RoundHostContext,
-        control: &ChainSubmissionControl,
-        progress: &dyn RoundStepProgressReporter,
-    ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        self.advance_step_under(step, host, StepControl::capture(control), progress)
-            .await
-    }
-
-    /// Runs one step as part of a longer run that captured `entry_epoch`.
+    /// confirmation no helper can give. Cancellation, or a move away from
+    /// `entry_epoch`, is observed at every boundary where the step decides to
+    /// continue, and either ends the step as `Cancelled`.
     ///
-    /// [`Self::advance_step`] captures the epoch when the step begins, which
-    /// is the right answer for a host calling it directly. A driver decides to
-    /// dispatch earlier than that — before planning, building the host
-    /// context, and reading stored signing material — and an epoch switch
-    /// across that gap must interrupt the step rather than be adopted by it.
-    /// The step then stops at its first boundary, before any proving, durable
-    /// write or broadcast.
+    /// `entry_epoch` is the epoch the caller captured when it decided to run
+    /// this step. A driver decides to dispatch before planning, building the
+    /// host context, and reading stored signing material; capturing the epoch
+    /// here instead would adopt a switch that happened across that gap rather
+    /// than be interrupted by it. The step then stops at its first boundary,
+    /// before any proving, durable write or broadcast.
+    ///
+    /// Crate-internal: [`RoundDriver`](crate::RoundDriver) is the supported
+    /// way to run a round's steps.
     pub(crate) async fn advance_step_in_epoch(
         &self,
         step: NextStep,
