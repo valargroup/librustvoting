@@ -153,6 +153,7 @@ pub(crate) fn voting_error_kind(error: &crate::VotingError) -> &'static str {
         crate::VotingErrorKind::PirUnavailable => "PirUnavailable",
         crate::VotingErrorKind::DelegationTargetMismatch => "DelegationTargetMismatch",
         crate::VotingErrorKind::DelegationAlreadyBroadcast => "DelegationAlreadyBroadcast",
+        crate::VotingErrorKind::DelegationPcztUnavailable => "DelegationPcztUnavailable",
     }
 }
 

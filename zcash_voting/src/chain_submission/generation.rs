@@ -1239,6 +1239,7 @@ mod tests {
                 &[],
                 &sighash,
                 &crate::tx1::placeholder_tx1_effects(),
+                &[],
                 &rk,
                 &gov_nullifiers,
             )

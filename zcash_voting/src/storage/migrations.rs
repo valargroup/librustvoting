@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 21;
+const CURRENT_VERSION: u32 = 22;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -143,6 +143,7 @@ END;",
         20,
         include_str!("migrations/005_chain_submissions_proposal_range.sql"),
     ),
+    (21, "ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;"),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
@@ -200,6 +201,14 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
         let mut upgraded = version;
         for (from, sql) in INCREMENTAL_MIGRATIONS {
             if *from < upgraded {
+                continue;
+            }
+            // Preview builds already stored PCZTs at version 21. Preserve them.
+            if *from == 21 && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bundles') WHERE name = 'delegation_pczt')",
+                [], |row| row.get::<_, bool>(0),
+            ).map_err(|e| VotingError::from_sqlite("failed to inspect delegation PCZT storage", &e))? {
+                upgraded = from + 1;
                 continue;
             }
             tx.execute_batch(sql).map_err(|e| {

@@ -1,3 +1,5 @@
+mod delegation_pczt;
+
 #[allow(unused_imports)]
 pub(crate) use crate::backend::{orchard, pasta_curves, zcash_keys};
 use std::collections::{HashMap, HashSet};
@@ -80,16 +82,26 @@ fn validate_delegation_keys_for_round(
 /// Bundles progress independently, so another bundle may already have moved
 /// the round to `VoteReady`. In that case this proof still commits and the
 /// later round phase is preserved.
+/// The original setup must still exist and match when the proof commits.
 fn persist_delegation_proof_result(
     conn: &mut rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
+    expected_pczt_sighash: &[u8],
     delegation_proof: &DelegationProofResult,
 ) -> Result<(), VotingError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::from_sqlite("failed to begin proof result transaction", &e))?;
+    let stored_sighash = queries::load_pczt_sighash(&tx, round_id, wallet_id, bundle_index)?;
+    if stored_sighash != expected_pczt_sighash {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "delegation setup changed during proof generation for round={round_id}, bundle={bundle_index}"
+            ),
+        });
+    }
     queries::store_proof(
         &tx,
         round_id,
@@ -1281,6 +1293,7 @@ impl VotingDb {
                 &result.padded_note_secrets,
                 &result.pczt_sighash,
                 &result.tx1_effects,
+                &result.pczt_bytes,
                 &result.rk,
                 &result.gov_nullifiers,
             )?;
@@ -1305,11 +1318,25 @@ impl VotingDb {
                 &result.padded_note_secrets,
                 &result.pczt_sighash,
                 &result.tx1_effects,
+                &result.pczt_bytes,
                 &result.rk,
                 &result.gov_nullifiers,
             )?;
         }
         Ok(result)
+    }
+
+    /// Validate the notes and target and load their exact signing transaction
+    /// from one database snapshot, including against other connections' writes.
+    pub(crate) fn validated_delegation_pczt(
+        &self,
+        identity: &DelegationProofIdentity,
+        notes: &[NoteInfo],
+        keys: &DelegationKeys,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), VotingError> {
+        self.read_transaction("read validated delegation PCZT", |tx| {
+            delegation_pczt::load(tx, identity, notes, keys)
+        })
     }
 
     /// Cache tree state fetched from lightwalletd by SDK.
@@ -1850,6 +1877,7 @@ impl VotingDb {
             queries::load_round_params_with_network(&conn, round_id, wallet_id)?;
         validate_delegation_keys_for_round(&params, stored_network, keys)?;
         queries::require_bundle_notes(&conn, round_id, wallet_id, bundle_index, notes)?;
+        let pczt_sighash = queries::load_pczt_sighash(&conn, round_id, wallet_id, bundle_index)?;
         let alpha = queries::load_alpha(&conn, round_id, wallet_id, bundle_index)?;
         let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, wallet_id, bundle_index)?;
         let witnesses = queries::load_witnesses(&conn, round_id, wallet_id, bundle_index)?;
@@ -2019,6 +2047,7 @@ impl VotingDb {
             identity.round_id(),
             identity.wallet_id(),
             identity.bundle_index(),
+            &pczt_sighash,
             &result,
         )?;
 
@@ -2574,10 +2603,11 @@ impl VotingDb {
 
     /// Atomically store a batch of Keystone delegation signatures.
     ///
-    /// Replaying a tuple with the same sighash and randomized key is
-    /// idempotent even if the signature bytes differ. Reusing a bundle index
-    /// for a different signing context returns a typed conflict and rolls the
-    /// complete batch back.
+    /// Every tuple must match the bundle's current PCZT sighash and randomized
+    /// key inside the storage transaction, including on an idempotent replay.
+    /// Missing or different setup returns `KeystoneSignatureConflict` and rolls
+    /// the complete batch back. Replaying a matching stored context remains
+    /// idempotent even if the signature bytes differ.
     pub fn store_keystone_signatures_batch(
         &self,
         round_id: &str,
@@ -2621,6 +2651,37 @@ impl VotingDb {
         let mut already_present = 0u32;
 
         for signature in signatures {
+            // Validation may have preceded a setup replacement on another
+            // connection. Hold the write transaction across this check and save.
+            let matches_bundle: bool = tx
+                .query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM bundles
+                        WHERE round_id = :round_id AND wallet_id = :wallet_id
+                          AND bundle_index = :bundle_index
+                          AND pczt_sighash = :sighash AND rk = :rk
+                     )",
+                    rusqlite::named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": &wallet_id,
+                        ":bundle_index": signature.bundle_index as i64,
+                        ":sighash": &signature.sighash,
+                        ":rk": &signature.rk,
+                    },
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    VotingError::from_sqlite(
+                        "failed to read Keystone bundle signing context",
+                        &error,
+                    )
+                })?;
+            if !matches_bundle {
+                return Err(VotingError::KeystoneSignatureConflict {
+                    bundle_index: signature.bundle_index,
+                });
+            }
+
             let existing = tx
                 .query_row(
                     "SELECT sighash, rk FROM keystone_signatures
@@ -3254,6 +3315,9 @@ mod pir_wallet_scope_tests;
 mod tests {
     mod broadcast_protection;
     mod fixtures;
+    mod keystone_signatures;
+    mod keystone_snapshot;
+    mod proof_persistence;
     mod proof_phase;
     mod setup_target_rebuild;
 
@@ -3947,6 +4011,12 @@ mod tests {
             &[identity_note_with_position(8)],
         )
         .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET pczt_sighash = ?1, rk = ?2",
+                rusqlite::params![vec![0x22u8; 32], vec![0x33u8; 32]],
+            )
+            .unwrap();
         let signature = KeystoneSignatureInput {
             bundle_index: 0,
             sig: vec![0x11; 64],
@@ -5888,6 +5958,7 @@ mod tests {
                 &[],
                 &[0x09; 32],
                 tx1_effects,
+                &[],
                 &[0x0A; 32],
                 &gov_nullifiers,
             )
@@ -6003,6 +6074,7 @@ mod tests {
             &[],
             &[0x06; 32],
             &crate::tx1::placeholder_tx1_effects(),
+            &[],
             &rk,
             &gov_nullifiers,
         )
@@ -7064,6 +7136,7 @@ mod tests {
                 &[],
                 &stored_sighash,
                 &crate::tx1::placeholder_tx1_effects(),
+                &[],
                 &rk,
                 &[vec![0x89; 32]],
             )

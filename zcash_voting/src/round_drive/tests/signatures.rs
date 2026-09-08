@@ -2,6 +2,25 @@
 
 use super::fixtures::*;
 
+fn store_signature(database: &crate::round::VotingDb, bundle_index: u32) {
+    database
+        .conn()
+        .execute(
+            "UPDATE bundles SET pczt_sighash = ?1, rk = ?2 WHERE bundle_index = ?3",
+            rusqlite::params![vec![0x69u8; 32], vec![0x62u8; 32], bundle_index],
+        )
+        .unwrap();
+    database
+        .store_keystone_signature(
+            ROUND_ID,
+            bundle_index,
+            &[0x68; 64],
+            &[0x69; 32],
+            &[0x62; 32],
+        )
+        .unwrap();
+}
+
 #[tokio::test]
 async fn a_missing_stored_keystone_signature_stops_for_the_host() {
     let database = database();
@@ -39,9 +58,7 @@ async fn a_missing_stored_keystone_signature_stops_for_the_host() {
 #[tokio::test]
 async fn stored_keystone_handoff_names_only_unsigned_bundles() {
     let database = database_with_bundles(2);
-    database
-        .store_keystone_signature(ROUND_ID, 0, &[0x68; 64], &[0x69; 32], &[0x62; 32])
-        .unwrap();
+    store_signature(&database, 0);
     let executor = executor_over(Arc::clone(&database));
     decide_ballot(&executor);
     let control = ChainSubmissionControl::new(1);
@@ -68,9 +85,7 @@ async fn stored_keystone_handoff_names_only_unsigned_bundles() {
 #[tokio::test]
 async fn a_present_stored_keystone_signature_is_dispatched() {
     let database = database();
-    database
-        .store_keystone_signature(ROUND_ID, 0, &[0x68; 64], &[0x69; 32], &[0x62; 32])
-        .unwrap();
+    store_signature(&database, 0);
     let executor = executor_over(Arc::clone(&database));
     decide_ballot(&executor);
     let control = ChainSubmissionControl::new(1);
@@ -110,9 +125,7 @@ async fn every_unsigned_bundle_is_named_before_anything_is_dispatched() {
     // delegations would already be on the wire before the first of them.
     let database = database_with_bundles(4);
     for bundle in 0..3u32 {
-        database
-            .store_keystone_signature(ROUND_ID, bundle, &[0x68; 64], &[0x69; 32], &[0x62; 32])
-            .unwrap();
+        store_signature(&database, bundle);
     }
     let executor = executor_over(Arc::clone(&database));
     decide_ballot(&executor);
@@ -245,9 +258,7 @@ async fn a_bundle_that_cannot_sign_does_not_condemn_one_that_already_has() {
     // stored-signed bundle as missing too, sending the host to collect a
     // signature it had already stored.
     let database = database_with_bundles(2);
-    database
-        .store_keystone_signature(ROUND_ID, 1, &[0x68; 64], &[0x69; 32], &[0x62; 32])
-        .unwrap();
+    store_signature(&database, 1);
     let executor = executor_over(Arc::clone(&database));
     decide_ballot(&executor);
     let control = ChainSubmissionControl::new(1);

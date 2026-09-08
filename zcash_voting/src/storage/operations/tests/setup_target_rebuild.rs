@@ -425,6 +425,7 @@ fn replace_setup(db: &VotingDb, van_comm_rand: &[u8; 32]) -> Result<(), VotingEr
         &[(vec![0xBB; 32], vec![0xCC; 32])],
         &[0xDD; 32],
         &crate::tx1::placeholder_tx1_effects(),
+        &[],
         &[0xEE; 32],
         &[vec![0xFF; 32]],
     )

@@ -55,27 +55,31 @@ fn without_round_immediate_share(schema: &str) -> String {
     schema[..start].to_string()
 }
 
+fn v21_schema() -> String {
+    include_str!("001_init.sql").replace("    delegation_pczt     BLOB,\n", "")
+}
+
 /// The complete version-19 schema: everything but the designation row.
 fn v19_schema() -> String {
-    without_round_immediate_share(include_str!("001_init.sql"))
+    without_round_immediate_share(&v21_schema())
 }
 
 /// The complete version-20 schema as a build carrying the 15-proposal bound
 /// left it: everything `001_init.sql` creates, with `chain_submissions` still
 /// refusing proposal ids above 15.
 fn v20_legacy_proposal_bound_schema() -> String {
-    include_str!("001_init.sql").replace(
+    v21_schema().replace(
         "proposal_id BETWEEN 1 AND 50",
         "proposal_id BETWEEN 1 AND 15",
     )
 }
 
 fn v16_schema() -> String {
-    without_helper_share_plans(&without_chain_submissions(include_str!("001_init.sql")))
+    without_helper_share_plans(&without_chain_submissions(&v21_schema()))
 }
 
 fn v17_schema() -> String {
-    without_chain_submissions(include_str!("001_init.sql"))
+    without_chain_submissions(&v21_schema())
 }
 
 /// The `chain_submissions` DDL exactly as shipped at version 18: no
@@ -175,6 +179,50 @@ fn test_migrate_idempotent() {
     assert_eq!(version, CURRENT_VERSION);
 }
 
+#[test]
+fn v21_adds_pczt_storage_without_rewriting_delegation_state() {
+    for preview_has_pczt in [false, true] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v21_schema()).unwrap();
+        if preview_has_pczt {
+            conn.execute_batch("ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;")
+                .unwrap();
+        }
+        queries::insert_round(
+            &conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        insert_v17_delegation_with_complete_setup(&conn, ROUND, "wallet", 0, None);
+        if preview_has_pczt {
+            conn.execute("UPDATE bundles SET delegation_pczt = X'010203'", [])
+                .unwrap();
+        }
+        let mut bundles = dump_table(&conn, "bundles");
+        if !preview_has_pczt {
+            for bundle in &mut bundles {
+                bundle.push("Null".to_string());
+            }
+        }
+        let proofs = dump_table(&conn, "proofs");
+        let signatures = dump_table(&conn, "keystone_signatures");
+        conn.pragma_update(None, "user_version", 21).unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(dump_table(&conn, "bundles"), bundles);
+        assert_eq!(dump_table(&conn, "proofs"), proofs);
+        assert_eq!(dump_table(&conn, "keystone_signatures"), signatures);
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            22
+        );
+    }
+}
+
 /// Version 18 adds the lifecycle table by DDL only.
 ///
 /// Every version-17 domain column stays byte-identical, and no
@@ -257,7 +305,11 @@ fn v17_domain_evidence_is_preserved_and_creates_no_submission_rows() {
     .unwrap();
     conn.pragma_update(None, "user_version", 17).unwrap();
     let votes_before = dump_table(&conn, "votes");
-    let bundles_before = dump_table(&conn, "bundles");
+    let mut bundles_before = dump_table(&conn, "bundles");
+    // The new nullable PCZT column is appended without changing older fields.
+    for bundle in &mut bundles_before {
+        bundle.push("Null".to_string());
+    }
 
     migrate(&mut conn).unwrap();
 
@@ -778,32 +830,34 @@ fn insert_v17_delegation_with_complete_setup(
     )
     .unwrap();
 
-    let padded_values = vec![vec![0x02; 32]; crate::governance::BUNDLE_NOTE_SLOTS - 1];
-    let padded_secrets =
-        vec![(vec![0x03; 32], vec![0x04; 32]); crate::governance::BUNDLE_NOTE_SLOTS - 1];
-    let gov_nullifiers = vec![vec![0x05; 32]; crate::governance::BUNDLE_NOTE_SLOTS];
-    queries::store_delegation_data_with_pczt_fields(
-        conn,
-        round_id,
-        wallet_id,
-        bundle_index,
-        &[0x06; 32],
-        &padded_values,
-        &[0x07; 32],
-        &padded_values,
-        &[0x08; 32],
-        &[0x09; 32],
-        &[0x0a; 32],
-        &[0x0b; 32],
-        &[0x0c; 32],
-        &[0x0d; 32],
-        1,
-        0,
-        &padded_secrets,
-        &[0x0e; 32],
-        &crate::tx1::placeholder_tx1_effects(),
-        &[0x0f; 32],
-        &gov_nullifiers,
+    let padded = vec![0x02u8; 32 * (crate::governance::BUNDLE_NOTE_SLOTS - 1)];
+    let secrets = vec![0x03u8; 64 * (crate::governance::BUNDLE_NOTE_SLOTS - 1)];
+    conn.execute(
+        "UPDATE bundles SET van_comm_rand=?1, dummy_nullifiers=?2,
+         rho_signed=?3, padded_note_data=?2, nf_signed=?4, cmx_new=?5,
+         alpha=?6, rseed_signed=?7, rseed_output=?8, gov_comm=?9,
+         total_note_value=1, address_index=0, padded_note_secrets=?10,
+         pczt_sighash=?11, tx1_effects=?12, rk=?13, gov_nullifiers_blob=?14
+         WHERE round_id=?15 AND wallet_id=?16 AND bundle_index=?17",
+        rusqlite::params![
+            vec![6u8; 32],
+            padded,
+            vec![7u8; 32],
+            vec![8u8; 32],
+            vec![9u8; 32],
+            vec![10u8; 32],
+            vec![11u8; 32],
+            vec![12u8; 32],
+            vec![13u8; 32],
+            secrets,
+            vec![14u8; 32],
+            crate::tx1::placeholder_tx1_effects(),
+            vec![15u8; 32],
+            vec![5u8; 32 * crate::governance::BUNDLE_NOTE_SLOTS],
+            round_id,
+            wallet_id,
+            bundle_index
+        ],
     )
     .unwrap();
     queries::store_proof(conn, round_id, wallet_id, bundle_index, &[0x10; 96]).unwrap();

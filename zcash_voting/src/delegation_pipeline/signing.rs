@@ -113,7 +113,8 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     /// (signature, sighash, randomized key) is stored under the bundle so a
     /// pass cancelled before chain dispatch, or a restart, resumes through
     /// [`KeystoneSignatureSource::Stored`]. Replaying the same tuple is
-    /// idempotent; a different signing context for the bundle fails with
+    /// idempotent. Storage atomically rechecks the bundle's current sighash
+    /// and randomized key; missing or replaced signing context fails with
     /// [`VotingError::KeystoneSignatureConflict`].
     pub(super) fn retain_provided_keystone_signature(
         &self,

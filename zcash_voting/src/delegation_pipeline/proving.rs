@@ -154,7 +154,10 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         match prepared.observe_setup(self.scoped_voting_db()?, progress, observations) {
             Ok(setup) => Ok(setup.pczt_bytes),
             Err(VotingError::SetupAlreadyPersisted {
-                field: DelegationSetupField::PcztSighash | DelegationSetupField::Tx1Effects,
+                field:
+                    DelegationSetupField::PcztSighash
+                    | DelegationSetupField::Tx1Effects
+                    | DelegationSetupField::DelegationPczt,
                 ..
             }) => {
                 prepared

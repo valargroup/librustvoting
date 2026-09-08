@@ -327,14 +327,10 @@ pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError>
 /// can be rebuilt safely. Imported delegation capabilities and bundles with a
 /// successful persisted proof are preserved.
 ///
-/// Round-scoped cleanup is mainly for the restart mid-signing case: if the app
-/// dies after `build_governance_pczt` persisted `pczt_sighash` (and related
-/// setup columns) but before the user finishes signing, the next startup tries
-/// to rebuild the Keystone request and `store_delegation_data` refuses to
-/// overwrite those fields. Clearing unsigned setup for that round lets setup
-/// run again without touching bundles that already have a successful proof,
-/// Keystone signatures, or a stored `delegation_tx_hash`. Proved bundles retain
-/// the setup fields that later signing must reproduce.
+/// Use [`reset_vote_tree`] for ordinary navigation or session disposal. The
+/// exact signing transaction is durable and can be reused after restart.
+/// This stronger reset explicitly abandons unfinished setup. It does not stop
+/// a running proof, but that proof cannot persist after its setup is cleared.
 ///
 /// When `round_id` is empty, only the process-local vote tree cache is reset
 /// account-wide; no persisted delegation setup columns are cleared.
@@ -1566,6 +1562,7 @@ mod session_reset_tests {
         conn.execute(
             "UPDATE bundles
              SET pczt_sighash = :sighash,
+                 rk = :rk,
                  tx1_effects = :tx1_effects,
                  padded_note_secrets = :secrets,
                  padded_note_data = :padded
@@ -1577,6 +1574,7 @@ mod session_reset_tests {
                 ":wallet_id": WALLET_ID,
                 ":bundle_index": bundle_index,
                 ":sighash": vec![0xAAu8; 32],
+                ":rk": vec![0x22u8; 32],
                 ":tx1_effects": crate::tx1::placeholder_tx1_effects(),
                 ":secrets": vec![0xBBu8; 64],
                 ":padded": vec![0xCCu8; 32],
