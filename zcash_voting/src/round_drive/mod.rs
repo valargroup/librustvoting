@@ -1,11 +1,13 @@
 //! Driving one round to quiescence over a [`RoundExecutor`].
 //!
 //! [`vote_work`](crate::vote_work) executes **one** obligation per call: it
-//! resolves a host-selected step to an obligation under the right lock, runs
-//! it, and returns. This module is the layer above: it re-plans from durable
-//! state, chooses what to run, paces re-polls, isolates failures, and stops
-//! with a reason the host can act on. It owns no classification — every
-//! decision about what a step *means* stays in the planner and the executor.
+//! resolves a step to an obligation under the right lock, runs it, and
+//! returns. The step is this module's to select — it is the only caller, and
+//! the epoch it dispatched under travels with the step. This module is the
+//! layer above: it re-plans from durable state, chooses what to run, paces
+//! re-polls, isolates failures, and stops with a reason the host can act on.
+//! It owns no classification — every decision about what a step *means* stays
+//! in the planner and the executor.
 //!
 //! Two properties are worth stating outright because they are what a host
 //! loop tends to get wrong:

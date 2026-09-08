@@ -799,8 +799,8 @@ This release is `zcash_voting` 4.0.0.
   `VoteRecoveryFailureKind`, `VoteRecoveryProgress`,
   `VoteRecoveryProgressReporter`, `VoteRecoveryProgressBridge`,
   `NoopVoteRecoveryProgressReporter`, and the `VoteRecoveryExecutor` alias.
-  It duplicated the step path with a second failure ladder; `RoundExecutor`
-  resumes persisted vote work through `advance_next` and `advance_step`.
+  It duplicated the step path with a second failure ladder; `RoundDriver`
+  resumes persisted vote work through the ordinary step path.
   `VoteRecoveryKey` and `VoteShareDeliveryReport` remain as the identity a
   step's progress and delivery reports carry.
 - **Breaking:** removed `VotingDb::build_and_prove_delegation` so durable

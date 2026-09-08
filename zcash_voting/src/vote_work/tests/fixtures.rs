@@ -615,14 +615,15 @@ impl crate::chain_submission::ChainTransport for UnreachableChainTransport {
     }
 }
 
-/// Runs the plan's first step through the public step entry point.
+/// Runs the plan's first step through the step entry point the driver uses.
 ///
 /// Tests that pin what one step does to a round want exactly one obligation,
 /// not a whole run. `RoundDriver` is the shipped way to choose work, so this
-/// selects from a plan the test read and hands the step to `advance_step`,
-/// the same call a host makes — rather than a plan-head entry point compiled
-/// only for tests, which could let selection or cancellation behaviour drift
-/// from both public paths while the suite stayed green.
+/// selects from a plan the test read and hands the step to
+/// `advance_step_in_epoch` under the epoch it captured — the same call the
+/// driver makes — rather than a plan-head entry point compiled only for tests,
+/// which could let selection or cancellation behaviour drift from the shipped
+/// path while the suite stayed green.
 ///
 /// Returns `None` when the plan lists nothing to run, so a test asserting an
 /// idle round says so explicitly.
