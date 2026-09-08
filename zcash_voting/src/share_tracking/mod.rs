@@ -490,6 +490,7 @@ mod delivery_plan;
 mod delivery_progress;
 mod immediate_designation;
 mod initial_delivery;
+mod post_capacity;
 mod recovery;
 
 pub(crate) use delivery_plan::{load_share_delivery_plan, prepare_share_delivery_plan};
