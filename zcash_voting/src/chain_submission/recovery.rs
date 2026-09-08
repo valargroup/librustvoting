@@ -119,6 +119,7 @@ pub(super) async fn scan_exact_layout<'a, T: ChainTransport>(
     operation: &'a CapturedSubmissionOperation,
     lease: &'a SubmissionOperationLease,
     interrupted: impl Fn() -> bool,
+    observations: &crate::ObservationScope,
 ) -> Result<RecoveryScanOutcome<'a>, RecoveryScanFailure> {
     let started = Instant::now();
     let endpoint = protocol.endpoints().first().ok_or_else(|| {
@@ -127,7 +128,7 @@ pub(super) async fn scan_exact_layout<'a, T: ChainTransport>(
     let round = hex::encode(derived.generation().identity().vote_round_id());
     let latest_url = format!("{endpoint}/shielded-vote/v1/commitment-tree/{round}/latest");
     let (latest, latest_bytes): (LatestResponse, usize) =
-        get_json_with_size(protocol.transport(), latest_url, &interrupted).await?;
+        get_json_with_size(protocol.transport(), latest_url, &interrupted, observations).await?;
     let snapshot = latest.tree.ok_or_else(|| {
         RecoveryScanFailure::Invalid(invalid("tree recovery latest response omitted tree state"))
     })?;
@@ -172,7 +173,7 @@ pub(super) async fn scan_exact_layout<'a, T: ChainTransport>(
             snapshot.height
         );
         let (page, bytes): (LeavesResponse, usize) =
-            get_json_with_size(protocol.transport(), url, &interrupted).await?;
+            get_json_with_size(protocol.transport(), url, &interrupted, observations).await?;
         leaf_request_count += 1;
         total_bytes = total_bytes.saturating_add(bytes as u64);
         if total_bytes > MAX_RECOVERY_TOTAL_BYTES {
@@ -280,42 +281,62 @@ async fn get_json_with_size<T: ChainTransport, R: for<'de> Deserialize<'de>>(
     transport: &T,
     url: String,
     interrupted: &impl Fn() -> bool,
+    observations: &crate::ObservationScope,
 ) -> Result<(R, usize), RecoveryScanFailure> {
-    if interrupted() {
-        return Err(RecoveryScanFailure::Interrupted);
+    let timer = observations.stage("chain.recovery_get");
+    let mut http_status = None;
+    let result = async {
+        if interrupted() {
+            return Err(RecoveryScanFailure::Interrupted);
+        }
+        let request = ChainHttpRequest::new(
+            url,
+            vec![("accept".to_string(), "application/json".to_string())],
+            RECOVERY_REQUEST_TIMEOUT,
+            MAX_RECOVERY_RESPONSE_BYTES,
+        );
+        let response = tokio::time::timeout(RECOVERY_REQUEST_TIMEOUT, transport.chain_get(request))
+            .await
+            .map_err(|_| {
+                RecoveryScanFailure::Transport(ChainTransportError::possibly_dispatched(
+                    "tree recovery request timed out",
+                ))
+            })?
+            .map_err(RecoveryScanFailure::Transport)?;
+        http_status = Some(response.status());
+        let has_json_content_type = response.content_type().is_some_and(|content_type| {
+            content_type.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("application/json")
+            })
+        });
+        if response.status() != 200
+            || response.body().len() > MAX_RECOVERY_RESPONSE_BYTES
+            || !has_json_content_type
+        {
+            return Err(RecoveryScanFailure::Invalid(invalid(
+                "tree recovery response has invalid HTTP metadata",
+            )));
+        }
+        let size = response.body().len();
+        serde_json::from_slice(response.body())
+            .map(|value| (value, size))
+            .map_err(|_| {
+                RecoveryScanFailure::Invalid(invalid("tree recovery response is malformed"))
+            })
     }
-    let request = ChainHttpRequest::new(
-        url,
-        vec![("accept".to_string(), "application/json".to_string())],
-        RECOVERY_REQUEST_TIMEOUT,
-        MAX_RECOVERY_RESPONSE_BYTES,
-    );
-    let response = tokio::time::timeout(RECOVERY_REQUEST_TIMEOUT, transport.chain_get(request))
-        .await
-        .map_err(|_| {
-            RecoveryScanFailure::Transport(ChainTransportError::possibly_dispatched(
-                "tree recovery request timed out",
-            ))
-        })?
-        .map_err(RecoveryScanFailure::Transport)?;
-    let has_json_content_type = response.content_type().is_some_and(|content_type| {
-        content_type
-            .split(';')
-            .next()
-            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
-    });
-    if response.status() != 200
-        || response.body().len() > MAX_RECOVERY_RESPONSE_BYTES
-        || !has_json_content_type
-    {
-        return Err(RecoveryScanFailure::Invalid(invalid(
-            "tree recovery response has invalid HTTP metadata",
-        )));
-    }
-    let size = response.body().len();
-    serde_json::from_slice(response.body())
-        .map(|value| (value, size))
-        .map_err(|_| RecoveryScanFailure::Invalid(invalid("tree recovery response is malformed")))
+    .await;
+    let (outcome, error_kind) = match &result {
+        Ok(_) => (crate::ObservationOutcome::Succeeded, None),
+        Err(RecoveryScanFailure::Interrupted) => {
+            (crate::ObservationOutcome::Cancelled, Some("Interrupted"))
+        }
+        Err(RecoveryScanFailure::Transport(_)) => {
+            (crate::ObservationOutcome::Failed, Some("Transport"))
+        }
+        Err(_) => (crate::ObservationOutcome::Failed, Some("Protocol")),
+    };
+    timer.finish_http(outcome, error_kind, http_status, None);
+    result
 }
 
 fn decode_leaf(encoded: &str, label: &str) -> Result<MerkleHashVote, RecoveryScanFailure> {

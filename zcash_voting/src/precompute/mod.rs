@@ -66,14 +66,62 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
-    crate::witness::store_tree_state_and_generate_note_witnesses(
+    observe_note_witnesses(
         db,
         round_id,
         bundle_index,
         tree_state_bytes,
         notes,
         wallet_db,
+        &crate::ObservationScope::disabled(),
     )
+}
+
+pub(crate) fn observe_note_witnesses<C, P, CL, R>(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    tree_state_bytes: &[u8],
+    notes: &[NoteInfo],
+    wallet_db: &WalletDb<C, P, CL, R>,
+    observations: &crate::ObservationScope,
+) -> Result<Vec<WitnessData>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("precompute::mod::note_witnesses");
+    let observations = observation_stage.scope();
+    let operation_result: Result<Vec<WitnessData>, VotingError> = (|| {
+        crate::witness::observe_store_tree_state_and_generate_note_witnesses(
+            db,
+            round_id,
+            bundle_index,
+            tree_state_bytes,
+            notes,
+            wallet_db,
+            observations,
+        )
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Loads a round's cached tree state, generates shielded note witnesses, and caches them.
@@ -92,9 +140,60 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
-    let witnesses = crate::witness::generate_note_witnesses(db, round_id, notes, wallet_db)?;
-    db.replace_bundle_witnesses(round_id, bundle_index, &witnesses)?;
-    Ok(witnesses)
+    observe_stored_note_witnesses(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        wallet_db,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_stored_note_witnesses<C, P, CL, R>(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    wallet_db: &WalletDb<C, P, CL, R>,
+    observations: &crate::ObservationScope,
+) -> Result<Vec<WitnessData>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("precompute::mod::stored_note_witnesses");
+    let observations = observation_stage.scope();
+    let operation_result: Result<Vec<WitnessData>, VotingError> = (|| {
+        let witnesses = crate::witness::observe_generate_note_witnesses(
+            db,
+            round_id,
+            notes,
+            wallet_db,
+            observations,
+        )?;
+        db.replace_bundle_witnesses(round_id, bundle_index, &witnesses)?;
+        Ok(witnesses)
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Verifies a shielded note witness against its stored root.
@@ -165,12 +264,50 @@ pub fn van_witness(
     bundle_index: u32,
     anchor_height: u32,
 ) -> Result<VanWitness, VotingError> {
-    vote_tree_registry::vote_tree_for_round(db, round_id)?.generate_van_witness(
+    observe_van_witness(
         db,
         round_id,
         bundle_index,
         anchor_height,
+        &crate::ObservationScope::disabled(),
     )
+}
+
+pub(crate) fn observe_van_witness(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    anchor_height: u32,
+    observations: &crate::ObservationScope,
+) -> Result<VanWitness, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("precompute::mod::van_witness");
+    let operation_result: Result<VanWitness, VotingError> = (|| {
+        vote_tree_registry::vote_tree_for_round(db, round_id)?.generate_van_witness(
+            db,
+            round_id,
+            bundle_index,
+            anchor_height,
+        )
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Drops cached vote tree state for one round, or all rounds when `round_id` is empty.
@@ -230,12 +367,54 @@ pub fn delegation_pir(
     pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<PirPrecomputeReport, VotingError> {
-    let result =
-        db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network)?;
-    Ok(PirPrecomputeReport {
-        cached: result.cached_count,
-        fetched: result.fetched_count,
-    })
+    observe_delegation_pir(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        pir_client,
+        network,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_delegation_pir(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    pir_client: &dyn crate::pir::PirProofSource,
+    network: Network,
+    observations: &crate::ObservationScope,
+) -> Result<PirPrecomputeReport, VotingError> {
+    observations.bind_round_id(round_id);
+
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("precompute::mod::delegation_pir");
+    let operation_result: Result<PirPrecomputeReport, VotingError> = (|| {
+        let result =
+            db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network)?;
+        Ok(PirPrecomputeReport {
+            cached: result.cached_count,
+            fetched: result.fetched_count,
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Fetches and persists PIR proofs for notes that survive `bundle_policy`.
@@ -264,7 +443,71 @@ pub fn precompute_pir_proofs(
     network: Network,
     pir_client: &dyn crate::pir::PirProofSource,
 ) -> Result<PirCachePrecomputeResult, VotingError> {
-    db.precompute_pir_proof_cache(notes, bundle_policy, network, pir_client)
+    observe_precompute_pir_proofs(
+        db,
+        notes,
+        bundle_policy,
+        network,
+        pir_client,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+/// Warms the round-independent PIR proof cache with optional per-call diagnostics.
+///
+/// Uses the same cache pruning, validation, fetches, and errors as
+/// [`precompute_pir_proofs`]. Diagnostics survive failed fetches. No round or
+/// bundle attribution is assigned because this cache can be warmed before either exists.
+pub fn precompute_pir_proofs_with_report(
+    db: &VotingDb,
+    notes: &[NoteInfo],
+    bundle_policy: crate::note_bundling::BundlePolicy,
+    network: Network,
+    pir_client: &dyn crate::pir::PirProofSource,
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<PirCachePrecomputeResult, VotingError>> {
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let result = observe_precompute_pir_proofs(
+        db,
+        notes,
+        bundle_policy,
+        network,
+        pir_client,
+        invocation.scope(),
+    );
+    let outcome = if result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    invocation.complete("precompute::mod::precompute_pir_proofs", outcome, result)
+}
+
+pub(crate) fn observe_precompute_pir_proofs(
+    db: &VotingDb,
+    notes: &[NoteInfo],
+    bundle_policy: crate::note_bundling::BundlePolicy,
+    network: Network,
+    pir_client: &dyn crate::pir::PirProofSource,
+    observations: &crate::ObservationScope,
+) -> Result<PirCachePrecomputeResult, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("precompute::mod::precompute_pir_proofs");
+    let operation_result: Result<PirCachePrecomputeResult, VotingError> =
+        (|| db.precompute_pir_proof_cache(notes, bundle_policy, network, pir_client))();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Classifies the cached PIR proofs for the given nullifiers against an
@@ -277,7 +520,42 @@ pub fn validate_cached_pir_proofs(
     network: Network,
     expected_root: &[u8],
 ) -> Result<PirCacheValidationReport, VotingError> {
-    db.validate_pir_proof_cache(notes, extra_nullifiers, network, expected_root)
+    observe_validate_cached_pir_proofs(
+        db,
+        notes,
+        extra_nullifiers,
+        network,
+        expected_root,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_validate_cached_pir_proofs(
+    db: &VotingDb,
+    notes: &[NoteInfo],
+    extra_nullifiers: &[Vec<u8>],
+    network: Network,
+    expected_root: &[u8],
+    observations: &crate::ObservationScope,
+) -> Result<PirCacheValidationReport, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage =
+        attributed_observations.stage("precompute::mod::validate_cached_pir_proofs");
+    let operation_result: Result<PirCacheValidationReport, VotingError> =
+        (|| db.validate_pir_proof_cache(notes, extra_nullifiers, network, expected_root))();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Persists the canonical bundle plan for a snapshot-stable note set, samples
@@ -317,44 +595,114 @@ pub fn precompute_snapshot_bundles(
     pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
 ) -> Result<SnapshotBundlePrecomputeReport, VotingError> {
-    db.require_round_network(round_id, network, "snapshot bundle precompute")?;
-    let layout = db.ensure_bundles_with_policy(round_id, notes, bundle_policy)?;
-    if layout.bundle_count == 0 {
-        return Ok(SnapshotBundlePrecomputeReport {
-            layout,
-            bundles: Vec::new(),
-        });
-    }
+    observe_precompute_snapshot_bundles(
+        db,
+        round_id,
+        notes,
+        bundle_policy,
+        pir_client,
+        network,
+        &crate::ObservationScope::disabled(),
+    )
+}
 
-    let policy = db.effective_bundle_policy(round_id, bundle_policy)?;
-    let planned = crate::round::note_bundles_with_policy(notes, policy)?;
-    if planned.len() as u32 != layout.bundle_count {
-        return Err(VotingError::Internal {
-            message: format!(
-                "planned bundle count {} does not match persisted layout {}",
-                planned.len(),
-                layout.bundle_count
-            ),
-        });
-    }
+pub(crate) fn observe_precompute_snapshot_bundles(
+    db: &VotingDb,
+    round_id: &str,
+    notes: &[NoteInfo],
+    bundle_policy: BundlePolicy,
+    pir_client: &dyn crate::pir::PirProofSource,
+    network: Network,
+    observations: &crate::ObservationScope,
+) -> Result<SnapshotBundlePrecomputeReport, VotingError> {
+    observations.bind_round_id(round_id);
 
-    for (bundle_index, bundle_notes) in planned.iter().enumerate() {
-        db.ensure_padded_secrets(round_id, bundle_index as u32, bundle_notes)?;
-    }
+    let attributed_observations = observations.clone();
+    let observation_stage =
+        attributed_observations.stage("precompute::mod::precompute_snapshot_bundles");
+    let observations = observation_stage.scope();
+    let operation_result: Result<SnapshotBundlePrecomputeReport, VotingError> = (|| {
+        db.require_round_network(round_id, network, "snapshot bundle precompute")?;
+        let layout = db.ensure_bundles_with_policy(round_id, notes, bundle_policy)?;
+        if layout.bundle_count == 0 {
+            return Ok(SnapshotBundlePrecomputeReport {
+                layout,
+                bundles: Vec::new(),
+            });
+        }
 
-    let mut bundles = Vec::with_capacity(planned.len());
-    for (bundle_index, bundle_notes) in planned.iter().enumerate() {
-        bundles.push(delegation_pir(
-            db,
-            round_id,
-            bundle_index as u32,
-            bundle_notes,
-            pir_client,
-            network,
-        )?);
-    }
+        let policy = db.effective_bundle_policy(round_id, bundle_policy)?;
+        let planned = crate::round::note_bundles_with_policy(notes, policy)?;
+        if planned.len() as u32 != layout.bundle_count {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "planned bundle count {} does not match persisted layout {}",
+                    planned.len(),
+                    layout.bundle_count
+                ),
+            });
+        }
 
-    Ok(SnapshotBundlePrecomputeReport { layout, bundles })
+        for (bundle_index, bundle_notes) in planned.iter().enumerate() {
+            db.ensure_padded_secrets(round_id, bundle_index as u32, bundle_notes)?;
+        }
+
+        let mut bundles = Vec::with_capacity(planned.len());
+        for (bundle_index, bundle_notes) in planned.iter().enumerate() {
+            bundles.push(observe_delegation_pir(
+                db,
+                round_id,
+                bundle_index as u32,
+                bundle_notes,
+                pir_client,
+                network,
+                observations,
+            )?);
+        }
+
+        Ok(SnapshotBundlePrecomputeReport { layout, bundles })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Runs this workflow with optional per-call diagnostics, including on errors.
+pub fn precompute_snapshot_bundles_with_report(
+    db: &VotingDb,
+    round_id: &str,
+    notes: &[NoteInfo],
+    bundle_policy: BundlePolicy,
+    pir_client: &dyn crate::pir::PirProofSource,
+    network: Network,
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<SnapshotBundlePrecomputeReport, VotingError>> {
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let operation_result = observe_precompute_snapshot_bundles(
+        db,
+        round_id,
+        notes,
+        bundle_policy,
+        pir_client,
+        network,
+        invocation.scope(),
+    );
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    invocation.complete("precompute_snapshot_bundles", outcome, operation_result)
 }
 
 /// Initializes padded-note secrets and runs PIR precompute.
@@ -374,9 +722,18 @@ pub(crate) fn warm_delegation_pir(
     layout: BundleLayout,
     pir_client: &dyn crate::pir::PirProofSource,
     network: Network,
+    observations: &crate::ObservationScope,
 ) -> Result<PreparedDelegationReport, VotingError> {
     db.ensure_padded_secrets(round_id, bundle_index, notes)?;
-    let report = delegation_pir(db, round_id, bundle_index, notes, pir_client, network)?;
+    let report = observe_delegation_pir(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        pir_client,
+        network,
+        observations,
+    )?;
 
     Ok(PreparedDelegationReport {
         report,
@@ -506,6 +863,9 @@ mod pir_tests {
         )
         .unwrap();
 
+        let owner =
+            crate::ObservationScope::new(Some(crate::ObservabilityOptions::default())).invocation();
+        let parent = owner.stage("delegation.precompute");
         let err = warm_delegation_pir(
             &db,
             ROUND_ID,
@@ -514,9 +874,22 @@ mod pir_tests {
             layout,
             &pir_client,
             Network::Testnet,
+            parent.scope(),
         )
         .unwrap_err();
 
+        parent.finish(crate::ObservationOutcome::Failed, None);
+        let diagnostics = owner
+            .finish(
+                "precompute",
+                Some(ROUND_ID),
+                crate::ObservationOutcome::Failed,
+            )
+            .unwrap();
+        assert!(diagnostics
+            .records
+            .iter()
+            .any(|record| record.stage.ends_with("delegation_pir") && record.parent_id == Some(0)));
         let message = err.to_string();
         assert!(
             message.contains("failed to decode UFVK while deriving padded nullifiers")
@@ -1430,3 +1803,7 @@ mod session_reset_tests {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/observability.rs"]
+mod observability_tests;

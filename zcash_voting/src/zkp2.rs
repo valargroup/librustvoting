@@ -128,151 +128,176 @@ pub(crate) fn build_vote_commitment(
     proposal_authority: u64,
     single_share: bool,
     progress: &dyn ProgressReporter,
+    observations: &crate::ObservationScope,
 ) -> Result<VoteCommitmentBundle, VotingError> {
-    validate_vote_decision(choice, num_options)?;
-    if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_id) {
-        return Err(VotingError::InvalidInput {
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        proposal_id: Some(proposal_id),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("zkp2::build_vote_commitment");
+    let observations = observation_stage.scope();
+    let operation_result: Result<VoteCommitmentBundle, VotingError> = (|| {
+        validate_vote_decision(choice, num_options)?;
+        if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_id) {
+            return Err(VotingError::InvalidInput {
             message: format!(
                 "proposal_id must be {}..={} (1-indexed, matching on-chain IDs; 0 is the circuit sentinel), got {}",
                 MIN_PROPOSAL_ID, MAX_PROPOSAL_ID, proposal_id
             ),
         });
-    }
-    if van_auth_path.len() != VOTE_COMM_TREE_DEPTH {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "van_auth_path must have {} siblings, got {}",
-                VOTE_COMM_TREE_DEPTH,
-                van_auth_path.len()
-            ),
-        });
-    }
+        }
+        if van_auth_path.len() != VOTE_COMM_TREE_DEPTH {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "van_auth_path must have {} siblings, got {}",
+                    VOTE_COMM_TREE_DEPTH,
+                    van_auth_path.len()
+                ),
+            });
+        }
 
-    // Derive the Orchard SpendingKey from the hotkey seed via ZIP-32.
-    progress.on_progress(0.05);
-    let sk = crate::hotkey::spending_key_from_hotkey_seed(
-        hotkey_seed,
-        network,
-        VOTING_HOTKEY_ACCOUNT_INDEX,
-    )?;
-
-    // Parse gov_comm_rand → pallas::Base
-    let gcr = parse_base("gov_comm_rand", gov_comm_rand)?;
-
-    // Parse voting_round_id → pallas::Base (canonical Fp).
-    let vri = parse_base("voting_round_id", voting_round_id)?;
-
-    // Parse ea_pk → pallas::Affine (compressed point)
-    let ea_pk_bytes: [u8; 32] = ea_pk.try_into().map_err(|_| VotingError::InvalidInput {
-        message: format!("ea_pk must be 32 bytes, got {}", ea_pk.len()),
-    })?;
-    let ea_pk_point: pallas::Point = Option::from(pallas::Point::from_bytes(&ea_pk_bytes))
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: "ea_pk is not a valid compressed Pallas point".to_string(),
-        })?;
-    // Reject the identity point: with ea_pk = O the El Gamal ciphertexts become
-    // C2 = v*G, exposing every share's plaintext. Pallas has cofactor 1, so the
-    // identity is the only degenerate public key.
-    if bool::from(ea_pk_point.is_identity()) {
-        return Err(VotingError::InvalidInput {
-            message: "ea_pk must not be the identity point".to_string(),
-        });
-    }
-    let ea_pk_affine = ea_pk_point.to_affine();
-
-    // Convert auth path from byte slices to pallas::Base field elements
-    let mut auth_path = [pallas::Base::zero(); VOTE_COMM_TREE_DEPTH];
-    for (i, sibling) in van_auth_path.iter().enumerate() {
-        auth_path[i] = ct_option_to_result(
-            pallas::Base::from_repr(*sibling),
-            &format!("van_auth_path[{}] is not a valid Pallas field element", i),
+        // Derive the Orchard SpendingKey from the hotkey seed via ZIP-32.
+        progress.on_progress(0.05);
+        let sk = crate::hotkey::spending_key_from_hotkey_seed(
+            hotkey_seed,
+            network,
+            VOTING_HOTKEY_ACCOUNT_INDEX,
         )?;
-    }
 
-    // Generate the real proof
-    progress.on_progress(0.10);
-    // Generate spend-auth randomizer for the voting key.
-    // The caller will need alpha_v to sign the TX2 sighash with rsk_v = ask_v.randomize(&alpha_v).
-    let alpha_v = pallas::Scalar::random(&mut voting_crypto_deps::rand::rngs::OsRng);
-    let sk_for_proof = sk.clone();
-    let vote_bundle = std::thread::Builder::new()
-        .name("vote-proof-build".to_string())
-        .stack_size(VOTE_PROOF_STACK_BYTES)
-        .spawn(move || {
-            build_vote_proof_from_delegation(
-                &sk_for_proof,
-                address_index,
-                total_note_value,
-                gcr,
-                vri,
-                auth_path,
-                van_position,
-                anchor_height,
-                proposal_id as u64,
-                choice as u64,
-                ea_pk_affine,
-                alpha_v,
-                proposal_authority,
-                single_share,
-            )
-        })
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to spawn vote proof builder thread: {e}"),
-        })?
-        .join()
-        .map_err(|_| VotingError::Internal {
-            message: "vote proof builder thread panicked".to_string(),
-        })?
-        .map_err(|e| VotingError::ProofFailed {
-            message: format!("vote proof generation failed: {}", e),
+        // Parse gov_comm_rand → pallas::Base
+        let gcr = parse_base("gov_comm_rand", gov_comm_rand)?;
+
+        // Parse voting_round_id → pallas::Base (canonical Fp).
+        let vri = parse_base("voting_round_id", voting_round_id)?;
+
+        // Parse ea_pk → pallas::Affine (compressed point)
+        let ea_pk_bytes: [u8; 32] = ea_pk.try_into().map_err(|_| VotingError::InvalidInput {
+            message: format!("ea_pk must be 32 bytes, got {}", ea_pk.len()),
         })?;
-    progress.on_progress(1.0);
+        let ea_pk_point: pallas::Point = Option::from(pallas::Point::from_bytes(&ea_pk_bytes))
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "ea_pk is not a valid compressed Pallas point".to_string(),
+            })?;
+        // Reject the identity point: with ea_pk = O the El Gamal ciphertexts become
+        // C2 = v*G, exposing every share's plaintext. Pallas has cofactor 1, so the
+        // identity is the only degenerate public key.
+        if bool::from(ea_pk_point.is_identity()) {
+            return Err(VotingError::InvalidInput {
+                message: "ea_pk must not be the identity point".to_string(),
+            });
+        }
+        let ea_pk_affine = ea_pk_point.to_affine();
 
-    // Convert Instance public inputs to byte vectors
-    let van_nullifier = vote_bundle.instance.van_nullifier.to_repr().to_vec();
-    let van_new = vote_bundle
-        .instance
-        .vote_authority_note_new
-        .to_repr()
-        .to_vec();
-    let vote_commitment = vote_bundle.instance.vote_commitment.to_repr().to_vec();
+        // Convert auth path from byte slices to pallas::Base field elements
+        let mut auth_path = [pallas::Base::zero(); VOTE_COMM_TREE_DEPTH];
+        for (i, sibling) in van_auth_path.iter().enumerate() {
+            auth_path[i] = ct_option_to_result(
+                pallas::Base::from_repr(*sibling),
+                &format!("van_auth_path[{}] is not a valid Pallas field element", i),
+            )?;
+        }
 
-    // Convert encrypted shares from builder output to zcash_voting EncryptedShare format
-    let enc_shares: Vec<EncryptedShare> = vote_bundle
-        .encrypted_shares
-        .iter()
-        .map(|es| EncryptedShare {
-            c1: es.c1.to_vec(),
-            c2: es.c2.to_vec(),
-            share_index: es.share_index,
-            plaintext_value: es.plaintext_value,
-            randomness: es.randomness.to_vec(),
+        // Generate the real proof
+        progress.on_progress(0.10);
+        // Generate spend-auth randomizer for the voting key.
+        // The caller will need alpha_v to sign the TX2 sighash with rsk_v = ask_v.randomize(&alpha_v).
+        let alpha_v = pallas::Scalar::random(&mut voting_crypto_deps::rand::rngs::OsRng);
+        let sk_for_proof = sk.clone();
+        let proof_observations = observations.clone();
+        let vote_bundle = std::thread::Builder::new()
+            .name("vote-proof-build".to_string())
+            .stack_size(VOTE_PROOF_STACK_BYTES)
+            .spawn(move || {
+                proof_observations.measure_result("zkp2.prove", || {
+                    build_vote_proof_from_delegation(
+                        &sk_for_proof,
+                        address_index,
+                        total_note_value,
+                        gcr,
+                        vri,
+                        auth_path,
+                        van_position,
+                        anchor_height,
+                        proposal_id as u64,
+                        choice as u64,
+                        ea_pk_affine,
+                        alpha_v,
+                        proposal_authority,
+                        single_share,
+                    )
+                })
+            })
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to spawn vote proof builder thread: {e}"),
+            })?
+            .join()
+            .map_err(|_| VotingError::Internal {
+                message: "vote proof builder thread panicked".to_string(),
+            })?
+            .map_err(|e| VotingError::ProofFailed {
+                message: format!("vote proof generation failed: {}", e),
+            })?;
+        progress.on_progress(1.0);
+
+        // Convert Instance public inputs to byte vectors
+        let van_nullifier = vote_bundle.instance.van_nullifier.to_repr().to_vec();
+        let van_new = vote_bundle
+            .instance
+            .vote_authority_note_new
+            .to_repr()
+            .to_vec();
+        let vote_commitment = vote_bundle.instance.vote_commitment.to_repr().to_vec();
+
+        // Convert encrypted shares from builder output to zcash_voting EncryptedShare format
+        let enc_shares: Vec<EncryptedShare> = vote_bundle
+            .encrypted_shares
+            .iter()
+            .map(|es| EncryptedShare {
+                c1: es.c1.to_vec(),
+                c2: es.c2.to_vec(),
+                share_index: es.share_index,
+                plaintext_value: es.plaintext_value,
+                randomness: es.randomness.to_vec(),
+            })
+            .collect();
+
+        Ok(VoteCommitmentBundle {
+            van_nullifier,
+            vote_authority_note_new: van_new,
+            vote_commitment,
+            proposal_id,
+            proof: vote_bundle.proof,
+            enc_shares,
+            anchor_height,
+            vote_round_id: hex::encode(voting_round_id),
+            shares_hash: vote_bundle.shares_hash.to_repr().to_vec(),
+            share_blinds: vote_bundle
+                .share_blinds
+                .iter()
+                .map(|b| b.to_repr().to_vec())
+                .collect(),
+            share_comms: vote_bundle
+                .share_comms
+                .iter()
+                .map(|c| c.to_repr().to_vec())
+                .collect(),
+            r_vpk_bytes: vote_bundle.r_vpk_bytes.to_vec(),
+            alpha_v: alpha_v.to_repr().to_vec(),
         })
-        .collect();
-
-    Ok(VoteCommitmentBundle {
-        van_nullifier,
-        vote_authority_note_new: van_new,
-        vote_commitment,
-        proposal_id,
-        proof: vote_bundle.proof,
-        enc_shares,
-        anchor_height,
-        vote_round_id: hex::encode(voting_round_id),
-        shares_hash: vote_bundle.shares_hash.to_repr().to_vec(),
-        share_blinds: vote_bundle
-            .share_blinds
-            .iter()
-            .map(|b| b.to_repr().to_vec())
-            .collect(),
-        share_comms: vote_bundle
-            .share_comms
-            .iter()
-            .map(|c| c.to_repr().to_vec())
-            .collect(),
-        r_vpk_bytes: vote_bundle.r_vpk_bytes.to_vec(),
-        alpha_v: alpha_v.to_repr().to_vec(),
-    })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 #[cfg(test)]
@@ -329,6 +354,7 @@ mod tests {
             voting_circuits::MAX_PROPOSAL_AUTHORITY,
             false,
             &TestReporter,
+            &crate::ObservationScope::disabled()
         )
         .is_err());
     }
@@ -352,6 +378,7 @@ mod tests {
             voting_circuits::MAX_PROPOSAL_AUTHORITY,
             false,
             &TestReporter,
+            &crate::ObservationScope::disabled()
         )
         .is_err());
 
@@ -372,6 +399,7 @@ mod tests {
             voting_circuits::MAX_PROPOSAL_AUTHORITY,
             false,
             &TestReporter,
+            &crate::ObservationScope::disabled()
         )
         .is_err());
     }
@@ -395,6 +423,7 @@ mod tests {
             voting_circuits::MAX_PROPOSAL_AUTHORITY,
             false,
             &TestReporter,
+            &crate::ObservationScope::disabled()
         )
         .is_err());
     }
@@ -418,6 +447,7 @@ mod tests {
             voting_circuits::MAX_PROPOSAL_AUTHORITY,
             false,
             &TestReporter,
+            &crate::ObservationScope::disabled()
         )
         .is_err());
     }
@@ -441,6 +471,7 @@ mod tests {
             voting_circuits::MAX_PROPOSAL_AUTHORITY,
             false,
             &TestReporter,
+            &crate::ObservationScope::disabled()
         )
         .is_err());
     }

@@ -200,9 +200,64 @@ impl<'a> ShareTrackingDriver<'a> {
         control: &ChainSubmissionControl,
         events: &dyn ShareTrackingReporter,
     ) -> ShareTrackingRunReport {
-        let started_at = Instant::now();
-        self.run_on_clock(host, control, events, &|| started_at.elapsed().as_secs())
+        self.observe_run(host, control, events, &crate::ObservationScope::disabled())
             .await
+    }
+
+    pub(crate) async fn observe_run(
+        &self,
+        host: &dyn ShareTrackingHostSource,
+        control: &ChainSubmissionControl,
+        events: &dyn ShareTrackingReporter,
+        observations: &crate::ObservationScope,
+    ) -> ShareTrackingRunReport {
+        observations.bind_round_id(self.round_id);
+        let stage = observations.stage("helper::tracking_run");
+        let client = self.client.observing(stage.scope());
+        let driver = ShareTrackingDriver {
+            database: self.database,
+            client: &client,
+            round_id: self.round_id,
+            policy: self.policy.clone(),
+        };
+        let started_at = Instant::now();
+        let result = driver
+            .run_on_clock(host, control, events, &|| started_at.elapsed().as_secs())
+            .await;
+        let outcome = match result.quiescence {
+            ShareTrackingQuiescence::Cancelled => crate::ObservationOutcome::Cancelled,
+            ShareTrackingQuiescence::AllConfirmed | ShareTrackingQuiescence::NothingToTrack => {
+                crate::ObservationOutcome::Succeeded
+            }
+            ShareTrackingQuiescence::Failing { .. } => crate::ObservationOutcome::Failed,
+            _ => crate::ObservationOutcome::Pending,
+        };
+        stage.finish(outcome, None);
+        result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn run_with_report(
+        &self,
+        host: &dyn ShareTrackingHostSource,
+        control: &ChainSubmissionControl,
+        events: &dyn ShareTrackingReporter,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<ShareTrackingRunReport> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+
+        let result = self
+            .observe_run(host, control, events, invocation.scope())
+            .await;
+        let outcome = match result.quiescence {
+            ShareTrackingQuiescence::Cancelled => crate::ObservationOutcome::Cancelled,
+            ShareTrackingQuiescence::AllConfirmed | ShareTrackingQuiescence::NothingToTrack => {
+                crate::ObservationOutcome::Succeeded
+            }
+            ShareTrackingQuiescence::Failing { .. } => crate::ObservationOutcome::Failed,
+            _ => crate::ObservationOutcome::Pending,
+        };
+        invocation.complete("run", outcome, result)
     }
 
     /// [`run`](Self::run), reading elapsed wall time through `monotonic_seconds`.

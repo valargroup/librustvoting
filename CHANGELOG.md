@@ -10,6 +10,23 @@ This release is `zcash_voting` 4.0.0.
 
 ### Added
 
+- Pipeline cached-proof diagnostics consistently report `Reused` at both stage
+  and invocation boundaries. Diagnostic output structs and wire projections are
+  non-exhaustive to allow future fields.
+
+- Reported variants for delegation eligibility, Keystone request preparation, and
+  round-independent PIR cache warm-up, with an explicit observability coverage
+  checklist for future workflow changes.
+
+- Optional per-invocation API observability, including per-bundle proof, chain,
+  and helper measurements. Selective `*_with_report` workflows accept optional
+  per-call settings and return `OperationReport<T>`, including on errors. Existing
+  signatures and plain results are preserved. Reports include outcome-specific
+  summaries, wall-clock anchors, retry indexes, and bounded collection. See
+  [observability and migration](docs/observability.md). Lightwalletd input
+  gathering and `recovery_bundle` remain unchanged; tree sync is timed by its
+  production caller.
+
 - `round_drive` composes `RoundExecutor` calls into one run: `RoundDriver::run`
   re-plans from durable state, dispatches the obligations the plan lists, paces
   a still-tracking submission by `RoundDrivePolicy::pending_repoll`, isolates

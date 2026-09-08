@@ -71,6 +71,12 @@ pub use crate::config::{
 };
 pub use crate::delegate::KeystoneSigningRequest;
 pub use crate::note_bundling::PrivacyTrim;
+pub use crate::observability::wire::{
+    ObservationRecord, ObservationSummary, OperationObservability,
+};
+// Diagnostics are plain serializable DTOs; expose the same representation to
+// wire consumers without making recorder or timer APIs part of the schema.
+pub use crate::observability::{ObservabilityOptions, ObservationAttribution, ObservationOutcome};
 pub use crate::round::BundleLayout;
 pub use crate::share_policy::{ImmediateShareKey, ShareSubmissionPlan};
 pub use crate::types::WireEncryptedShare;

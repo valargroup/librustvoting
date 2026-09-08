@@ -19,6 +19,7 @@ use super::{
 
 /// The captured scope of one step.
 pub(super) struct StepScope<'a> {
+    pub(super) observations: crate::ObservationScope,
     pub(super) step: NextStep,
     pub(super) wallet_id: String,
     /// Canonical lowercase-hex round id, and its bytes.
@@ -53,6 +54,11 @@ impl<'a> StepScope<'a> {
         let round_id_bytes = parse_round_id(&binding.round_id)
             .map_err(|error| executor.step_voting_failure(error, Some(&step), &ledger))?;
         Ok(Self {
+            observations: control
+                .chain()
+                .observations
+                .clone()
+                .unwrap_or_else(crate::ObservationScope::disabled),
             step,
             wallet_id,
             round_id: binding.round_id.clone(),

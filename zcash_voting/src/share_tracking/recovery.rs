@@ -147,12 +147,13 @@ pub(super) async fn resubmit_to_next_helper(
         }
     };
 
-    let recovered_share_wire_json = match share::recover_wire_json(
+    let recovered_share_wire_json = match share::observe_recover_wire_json(
         &bundle.commitment_bundle_json,
         share.proposal_id,
         share.share_index,
         bundle.vc_tree_position,
         request.schedule.submit_at(),
+        &client.observation_scope(),
     ) {
         Ok(recovered_share_wire_json) => recovered_share_wire_json,
         // Corrupt recovery material cannot be fixed by trying another helper.

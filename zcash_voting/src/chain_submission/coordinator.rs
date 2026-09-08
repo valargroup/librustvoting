@@ -87,6 +87,10 @@ impl ChainSubmissionClock for SystemChainSubmissionClock {
 
 /// Host cancellation and operation-epoch authority sampled at every boundary.
 pub(super) trait SubmissionControl: Send + Sync {
+    fn observations(&self) -> crate::ObservationScope {
+        crate::ObservationScope::disabled()
+    }
+
     fn is_cancelled(&self) -> bool;
     fn operation_epoch(&self) -> u64;
 }
@@ -277,8 +281,12 @@ where
         first_attempt_index: usize,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let observations = control.observations();
+
         let mut ambiguity_seen = is_retryable_dispatch_ambiguity(&reserved);
         for attempt_index in first_attempt_index..self.policy.maximum_post_attempts {
+            let observations = observations
+                .attempt(u32::try_from(attempt_index.saturating_add(1)).unwrap_or(u32::MAX));
             if let Some(reason) = interruption(operation, control) {
                 if ambiguity_seen {
                     return reserved.public_result();
@@ -305,7 +313,12 @@ where
             let endpoint_index = ordinal.saturating_sub(1) % self.protocol.endpoint_count();
             let outcome = {
                 let dispatch = ChainPostDispatch::default();
-                let post = self.submit_to_endpoint(endpoint_index, &derived, dispatch.clone());
+                let post = self.submit_to_endpoint(
+                    endpoint_index,
+                    &derived,
+                    dispatch.clone(),
+                    &observations,
+                );
                 tokio::pin!(post);
                 tokio::select! {
                     biased;
@@ -540,11 +553,17 @@ where
         endpoint_index: usize,
         derived: &DerivedChainSubmission,
         dispatch: ChainPostDispatch,
+        observations: &crate::ObservationScope,
     ) -> PostAttemptOutcome {
         match derived.request() {
             ChainSubmissionRequest::Delegation(submission) => {
                 self.protocol
-                    .submit_delegation_with_dispatch(endpoint_index, submission, dispatch)
+                    .submit_delegation_with_dispatch(
+                        endpoint_index,
+                        submission,
+                        dispatch,
+                        observations,
+                    )
                     .await
             }
             ChainSubmissionRequest::ImportedDelegation(_) => {
@@ -555,7 +574,7 @@ where
             }
             ChainSubmissionRequest::Vote(submission) => {
                 self.protocol
-                    .submit_vote_with_dispatch(endpoint_index, submission, dispatch)
+                    .submit_vote_with_dispatch(endpoint_index, submission, dispatch, observations)
                     .await
             }
             ChainSubmissionRequest::VoteBatch(submission) => {
@@ -571,6 +590,7 @@ where
                         submission,
                         ordered_batch_digest,
                         dispatch,
+                        observations,
                     )
                     .await
             }
@@ -1021,9 +1041,17 @@ where
         lease: &'a SubmissionOperationLease,
         control: &dyn SubmissionControl,
     ) -> Result<RecoveryScan<'a>, ChainSubmissionFailure> {
-        match scan_exact_layout(&self.protocol, derived, candidate, operation, lease, || {
-            interruption(operation, control).is_some()
-        })
+        let observations = control.observations();
+
+        match scan_exact_layout(
+            &self.protocol,
+            derived,
+            candidate,
+            operation,
+            lease,
+            || interruption(operation, control).is_some(),
+            &observations,
+        )
         .await
         {
             Ok(RecoveryScanOutcome::Match {
@@ -1156,6 +1184,8 @@ where
         post_attempts_used: usize,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let observations = control.observations();
+
         if interruption(operation, control).is_some() {
             return reserved.public_result();
         }
@@ -1176,7 +1206,8 @@ where
         let endpoint_index = ordinal.saturating_sub(1) % self.protocol.endpoint_count();
         let outcome = {
             let dispatch = ChainPostDispatch::default();
-            let post = self.submit_to_endpoint(endpoint_index, &derived, dispatch.clone());
+            let post =
+                self.submit_to_endpoint(endpoint_index, &derived, dispatch.clone(), &observations);
             tokio::pin!(post);
             tokio::select! {
                 biased;
@@ -1426,7 +1457,9 @@ where
         candidate: super::CandidateTransactionHash,
         control: &dyn SubmissionControl,
     ) -> LookupProgress {
-        let lookup = self.protocol.transaction_status(candidate);
+        let observations = control.observations();
+
+        let lookup = self.protocol.transaction_status(candidate, &observations);
         tokio::pin!(lookup);
         tokio::select! {
             biased;

@@ -443,7 +443,7 @@ async fn focused_confirmation_reports_cancellation_without_mutation() {
     let transport = Arc::new(MockTransport::default());
     let client = client_with(transport.clone());
 
-    let report = confirm_pending_share(
+    let report = confirm_pending_share_with_report(
         &db,
         &ShareConfirmationParams {
             round_id: ROUND_ID,
@@ -457,9 +457,13 @@ async fn focused_confirmation_reports_cancellation_without_mutation() {
         },
         &client,
         &|| true,
+        Some(crate::ObservabilityOptions::default()),
     )
-    .await
-    .unwrap();
+    .await;
+    let diagnostics = report.observability.unwrap();
+    assert_eq!(diagnostics.outcome, crate::ObservationOutcome::Cancelled);
+    assert_eq!(diagnostics.round_id.as_deref(), Some(ROUND_ID));
+    let report = report.result.unwrap();
 
     assert_eq!(
         report,

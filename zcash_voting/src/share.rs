@@ -951,56 +951,111 @@ pub fn recover_payload(
     bundle: &VoteRecoveryBundle,
     share_index: u32,
 ) -> Result<SharePayload, VotingError> {
-    recover_payloads(bundle)?
-        .into_iter()
-        .find(|payload| payload.enc_share.share_index == share_index)
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: format!("share_index {share_index} not found in vote recovery bundle"),
-        })
+    observe_recover_payload(bundle, share_index, &crate::ObservationScope::disabled())
+}
+
+pub(crate) fn observe_recover_payload(
+    bundle: &VoteRecoveryBundle,
+    share_index: u32,
+    observations: &crate::ObservationScope,
+) -> Result<SharePayload, VotingError> {
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        share_index: Some(share_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("share::recover_payload");
+    let observations = observation_stage.scope();
+    let operation_result: Result<SharePayload, VotingError> = (|| {
+        observe_recover_payloads(bundle, observations)?
+            .into_iter()
+            .find(|payload| payload.enc_share.share_index == share_index)
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: format!("share_index {share_index} not found in vote recovery bundle"),
+            })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Reconstructs all helper-server payloads from a persisted vote recovery bundle.
 pub fn recover_payloads(bundle: &VoteRecoveryBundle) -> Result<Vec<SharePayload>, VotingError> {
-    validate_recovery_bundle_vote_fields(bundle)?;
+    observe_recover_payloads(bundle, &crate::ObservationScope::disabled())
+}
 
-    let all_enc_shares = bundle
-        .encrypted_shares
-        .iter()
-        .map(WireEncryptedShare::from)
-        .collect::<Vec<_>>();
-    let iter_shares: &[WireEncryptedShare] = if bundle.single_share {
-        &all_enc_shares[..1.min(all_enc_shares.len())]
-    } else {
-        &all_enc_shares
-    };
-    iter_shares
-        .iter()
-        .enumerate()
-        .map(|(idx, share)| {
-            let primary_blind =
-                bundle
-                    .share_blinds
-                    .get(idx)
-                    .ok_or_else(|| VotingError::InvalidInput {
-                        message: format!("missing primary blind for encrypted share index {idx}"),
-                    })?;
-            Ok(SharePayload {
-                vote_round_id: bundle.vote_round_id.clone(),
-                shares_hash: bundle.shares_hash.to_vec(),
-                proposal_id: bundle.proposal_id,
-                vote_decision: bundle.vote_decision,
-                enc_share: share.clone(),
-                tree_position: bundle.vc_tree_position,
-                all_enc_shares: all_enc_shares.clone(),
-                share_comms: bundle
-                    .share_comms
-                    .iter()
-                    .map(|comm| comm.to_vec())
-                    .collect(),
-                primary_blind: primary_blind.to_vec(),
+pub(crate) fn observe_recover_payloads(
+    bundle: &VoteRecoveryBundle,
+    observations: &crate::ObservationScope,
+) -> Result<Vec<SharePayload>, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("share::recover_payloads");
+    let operation_result: Result<Vec<SharePayload>, VotingError> = (|| {
+        validate_recovery_bundle_vote_fields(bundle)?;
+
+        let all_enc_shares = bundle
+            .encrypted_shares
+            .iter()
+            .map(WireEncryptedShare::from)
+            .collect::<Vec<_>>();
+        let iter_shares: &[WireEncryptedShare] = if bundle.single_share {
+            &all_enc_shares[..1.min(all_enc_shares.len())]
+        } else {
+            &all_enc_shares
+        };
+        iter_shares
+            .iter()
+            .enumerate()
+            .map(|(idx, share)| {
+                let primary_blind =
+                    bundle
+                        .share_blinds
+                        .get(idx)
+                        .ok_or_else(|| VotingError::InvalidInput {
+                            message: format!(
+                                "missing primary blind for encrypted share index {idx}"
+                            ),
+                        })?;
+                Ok(SharePayload {
+                    vote_round_id: bundle.vote_round_id.clone(),
+                    shares_hash: bundle.shares_hash.to_vec(),
+                    proposal_id: bundle.proposal_id,
+                    vote_decision: bundle.vote_decision,
+                    enc_share: share.clone(),
+                    tree_position: bundle.vc_tree_position,
+                    all_enc_shares: all_enc_shares.clone(),
+                    share_comms: bundle
+                        .share_comms
+                        .iter()
+                        .map(|comm| comm.to_vec())
+                        .collect(),
+                    primary_blind: primary_blind.to_vec(),
+                })
             })
-        })
-        .collect()
+            .collect()
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Reconstructs one helper-server payload from persisted recovery JSON and
@@ -1012,10 +1067,50 @@ pub fn recover_wire_json(
     vc_tree_position: u64,
     submit_at: u64,
 ) -> Result<String, VotingError> {
-    let bundle = crate::vote::parse_recovery(commitment_bundle_json)?;
-    ensure_recovery_proposal(&bundle, proposal_id)?;
-    let payload = recover_payload(&bundle, share_index)?;
-    payload.to_wire_json(Some(vc_tree_position), submit_at)
+    observe_recover_wire_json(
+        commitment_bundle_json,
+        proposal_id,
+        share_index,
+        vc_tree_position,
+        submit_at,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_recover_wire_json(
+    commitment_bundle_json: &str,
+    proposal_id: u32,
+    share_index: u32,
+    vc_tree_position: u64,
+    submit_at: u64,
+    observations: &crate::ObservationScope,
+) -> Result<String, VotingError> {
+    let attributed_observations = observations.attributed(crate::ObservationAttribution {
+        proposal_id: Some(proposal_id),
+        share_index: Some(share_index),
+        ..Default::default()
+    });
+    let observation_stage = attributed_observations.stage("share::recover_wire_json");
+    let observations = observation_stage.scope();
+    let operation_result: Result<String, VotingError> = (|| {
+        let bundle = crate::vote::parse_recovery(commitment_bundle_json)?;
+        ensure_recovery_proposal(&bundle, proposal_id)?;
+        let payload = observe_recover_payload(&bundle, share_index, observations)?;
+        payload.to_wire_json(Some(vc_tree_position), submit_at)
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 fn array32(label: &str, value: Vec<u8>) -> Result<[u8; 32], VotingError> {

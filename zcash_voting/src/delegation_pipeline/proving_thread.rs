@@ -29,12 +29,91 @@ impl<W: WalletDbOpener + 'static> DelegationPipeline<W> {
         pir: Arc<PirFleet>,
         progress: Arc<dyn DelegationProgressReporter>,
     ) -> Result<SignedDelegationBundle, VotingError> {
+        self.observe_prove_and_sign(
+            bundle_index,
+            signer,
+            pir,
+            progress,
+            &crate::ObservationScope::disabled(),
+        )
+        .await
+    }
+
+    pub(crate) async fn observe_prove_and_sign(
+        self: Arc<Self>,
+        bundle_index: u32,
+        signer: DelegationSigner,
+        pir: Arc<PirFleet>,
+        progress: Arc<dyn DelegationProgressReporter>,
+        observations: &crate::ObservationScope,
+    ) -> Result<SignedDelegationBundle, VotingError> {
+        observations.bind_round_id(self.round_id());
+        let attributed = observations.attributed(crate::ObservationAttribution {
+            bundle_index: Some(bundle_index),
+            ..Default::default()
+        });
+        let stage = attributed.stage("delegation::prove_and_sign");
+        let result = self
+            .execute_prove_and_sign(bundle_index, signer, pir, progress, stage.scope())
+            .await;
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn prove_and_sign_with_report(
+        self: Arc<Self>,
+        bundle_index: u32,
+        signer: DelegationSigner,
+        pir: Arc<PirFleet>,
+        progress: Arc<dyn DelegationProgressReporter>,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<SignedDelegationBundle, VotingError>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+
+        let result = self
+            .observe_prove_and_sign(bundle_index, signer, pir, progress, invocation.scope())
+            .await;
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        invocation.complete("prove_and_sign", outcome, result)
+    }
+
+    pub(crate) async fn execute_prove_and_sign(
+        self: Arc<Self>,
+        bundle_index: u32,
+        signer: DelegationSigner,
+        pir: Arc<PirFleet>,
+        progress: Arc<dyn DelegationProgressReporter>,
+        observations: &crate::ObservationScope,
+    ) -> Result<SignedDelegationBundle, VotingError> {
+        let observations = observations.clone();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("voting-delegation-prove".to_string())
             .stack_size(PROVING_STACK_BYTES)
             .spawn(move || {
-                let result = self.prove_and_sign_blocking(bundle_index, &signer, &pir, &*progress);
+                let result = self.execute_prove_and_sign_blocking(
+                    bundle_index,
+                    &signer,
+                    &pir,
+                    &*progress,
+                    &observations,
+                );
                 let _ = reply_tx.send(result);
             })
             .map_err(|error| VotingError::Internal {

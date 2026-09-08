@@ -13,3 +13,5 @@ mod selection;
 mod signatures;
 mod stop_precedence;
 mod tally;
+
+mod observability;

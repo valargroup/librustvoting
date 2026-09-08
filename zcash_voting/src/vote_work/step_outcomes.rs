@@ -40,22 +40,37 @@ impl<T: ChainTransport> RoundExecutor<T> {
     pub(super) async fn blocking<R: Send + 'static>(
         &self,
         scope: &StepScope<'_>,
-        label: &str,
+        label: &'static str,
         work: impl FnOnce() -> Result<R, VotingError> + Send + 'static,
     ) -> Result<R, RoundStepFailure> {
         let ledger = StepLedger::default();
-        tokio::task::spawn_blocking(work)
-            .await
-            .map_err(|error| {
-                self.step_failure(
-                    RoundStepFailureKind::InvariantViolation,
-                    Some(&scope.step),
-                    None,
-                    &ledger,
-                    format!("{label} task failed: {error}"),
-                )
-            })?
-            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))
+        let observation_stage = scope.observations.stage(label);
+        tokio::task::spawn_blocking(move || {
+            let result = work();
+            observation_stage.finish(
+                if result.is_ok() {
+                    crate::ObservationOutcome::Succeeded
+                } else {
+                    crate::ObservationOutcome::Failed
+                },
+                result
+                    .as_ref()
+                    .err()
+                    .map(crate::observability::voting_error_kind),
+            );
+            result
+        })
+        .await
+        .map_err(|error| {
+            self.step_failure(
+                RoundStepFailureKind::InvariantViolation,
+                Some(&scope.step),
+                None,
+                &ledger,
+                format!("{label} task failed: {error}"),
+            )
+        })?
+        .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))
     }
 
     pub(super) fn no_work(&self, step: Option<NextStep>, plan: RoundPlan) -> RoundStepOutcome {

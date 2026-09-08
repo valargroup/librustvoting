@@ -148,8 +148,16 @@ async fn scan_responses(
         &["https://chain.example".to_string()],
     )
     .unwrap();
-    let outcome =
-        scan_exact_layout(&protocol, derived, candidate, operation, lease, || false).await?;
+    let outcome = scan_exact_layout(
+        &protocol,
+        derived,
+        candidate,
+        operation,
+        lease,
+        || false,
+        &crate::ObservationScope::disabled(),
+    )
+    .await?;
     let urls = protocol.transport().urls.lock().unwrap().clone();
     Ok((outcome, urls))
 }

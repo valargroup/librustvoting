@@ -500,3 +500,6 @@ boundary, so production builds should not enable this feature.
 ## License
 
 Dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](../LICENSE-MIT) and [LICENSE-APACHE](../LICENSE-APACHE).
+
+API workflow calls support [optional observability](../docs/observability.md),
+including per-bundle proof and submission timings and diagnostics on errors.

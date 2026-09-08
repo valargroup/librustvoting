@@ -60,6 +60,19 @@ pub trait DelegationDriver: Send + Sync {
         progress: &dyn DelegationProgressReporter,
     ) -> Result<SignedDelegationBundle, VotingError>;
 
+    /// SDK observation hook; existing implementations may use the default.
+    #[doc(hidden)]
+    fn prove_and_sign_blocking_observed(
+        &self,
+        bundle_index: u32,
+        signer: &DelegationSigner,
+        pir: &PirFleet,
+        progress: &dyn DelegationProgressReporter,
+        _observations: &crate::observability::ObservationScope,
+    ) -> Result<SignedDelegationBundle, VotingError> {
+        self.prove_and_sign_blocking(bundle_index, signer, pir, progress)
+    }
+
     /// Produces a fresh SpendAuth signature over the bundle's persisted
     /// sighash, for re-dispatching a delegation that is already prepared.
     fn resign_blocking(
@@ -67,6 +80,17 @@ pub trait DelegationDriver: Send + Sync {
         bundle_index: u32,
         signer: &DelegationSigner,
     ) -> Result<[u8; 64], VotingError>;
+
+    /// SDK observation hook; existing implementations may use the default.
+    #[doc(hidden)]
+    fn resign_blocking_observed(
+        &self,
+        bundle_index: u32,
+        signer: &DelegationSigner,
+        _observations: &crate::observability::ObservationScope,
+    ) -> Result<[u8; 64], VotingError> {
+        self.resign_blocking(bundle_index, signer)
+    }
 }
 
 impl<W: WalletDbOpener> DelegationDriver for DelegationPipeline<W> {
@@ -97,7 +121,31 @@ impl<W: WalletDbOpener> DelegationDriver for DelegationPipeline<W> {
         pir: &PirFleet,
         progress: &dyn DelegationProgressReporter,
     ) -> Result<SignedDelegationBundle, VotingError> {
-        DelegationPipeline::prove_and_sign_blocking(self, bundle_index, signer, pir, progress)
+        self.execute_prove_and_sign_blocking(
+            bundle_index,
+            signer,
+            pir,
+            progress,
+            &crate::ObservationScope::disabled(),
+        )
+    }
+
+    fn prove_and_sign_blocking_observed(
+        &self,
+        bundle_index: u32,
+        signer: &DelegationSigner,
+        pir: &PirFleet,
+        progress: &dyn DelegationProgressReporter,
+        observations: &crate::ObservationScope,
+    ) -> Result<SignedDelegationBundle, VotingError> {
+        DelegationPipeline::execute_prove_and_sign_blocking(
+            self,
+            bundle_index,
+            signer,
+            pir,
+            progress,
+            observations,
+        )
     }
 
     fn resign_blocking(
@@ -105,9 +153,18 @@ impl<W: WalletDbOpener> DelegationDriver for DelegationPipeline<W> {
         bundle_index: u32,
         signer: &DelegationSigner,
     ) -> Result<[u8; 64], VotingError> {
-        let prepared = self.prepare(bundle_index)?;
+        self.resign_blocking_observed(bundle_index, signer, &crate::ObservationScope::disabled())
+    }
+
+    fn resign_blocking_observed(
+        &self,
+        bundle_index: u32,
+        signer: &DelegationSigner,
+        observations: &crate::ObservationScope,
+    ) -> Result<[u8; 64], VotingError> {
+        let prepared = self.execute_prepare(bundle_index, observations)?;
         let PreparedSigner::Signature { sig, .. } =
-            self.spend_auth_signature(&prepared, bundle_index, signer)?;
+            self.spend_auth_signature(&prepared, bundle_index, signer, observations)?;
         Ok(sig)
     }
 }

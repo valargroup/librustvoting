@@ -39,6 +39,12 @@ pub mod hotkey;
 mod http_transport;
 pub mod lwd;
 pub mod note_bundling;
+pub mod observability;
+pub(crate) use observability::ObservationScope;
+pub use observability::{
+    ObservabilityOptions, ObservationAttribution, ObservationOutcome, ObservationRecord,
+    ObservationSummary, OperationObservability, OperationReport,
+};
 pub mod phases;
 pub mod pir;
 pub mod pir_snapshot;

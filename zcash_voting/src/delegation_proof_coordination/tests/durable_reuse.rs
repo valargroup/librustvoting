@@ -386,3 +386,35 @@ fn persisted_proof_reuse_validation_rejects_another_hotkey_without_pir() {
             .expect_err("different notes must not reuse the proof");
     assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
 }
+
+#[test]
+fn enabled_report_identifies_reused_proofs_without_claiming_new_proving_work() {
+    let db = db_with_persisted_proofs();
+    let owner =
+        crate::ObservationScope::new(Some(crate::ObservabilityOptions::default())).invocation();
+    let completion = crate::delegate::observe_ensure_proof(
+        &db,
+        ROUND_ID,
+        0,
+        &[note()],
+        &keys(Network::Testnet, 1),
+        &pir_client(),
+        &crate::types::NoopProgressReporter,
+        owner.scope(),
+    );
+    assert_eq!(completion.unwrap().status, DelegationProofStatus::Reused);
+    let diagnostics = owner
+        .finish(
+            "ensure_proof",
+            Some(ROUND_ID),
+            crate::ObservationOutcome::Reused,
+        )
+        .unwrap();
+    assert_eq!(diagnostics.outcome, crate::ObservationOutcome::Reused);
+    assert_eq!(diagnostics.round_id.as_deref(), Some(ROUND_ID));
+    assert_eq!(diagnostics.records[0].attribution.bundle_index, Some(0));
+    assert!(!diagnostics
+        .records
+        .iter()
+        .any(|record| record.stage.as_ref() == "zkp1.prove"));
+}
