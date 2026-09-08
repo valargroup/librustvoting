@@ -1,3 +1,5 @@
+mod delegation_pczt;
+
 #[allow(unused_imports)]
 pub(crate) use crate::backend::{orchard, pasta_curves, zcash_keys};
 use std::collections::{HashMap, HashSet};
@@ -1314,15 +1316,17 @@ impl VotingDb {
         Ok(result)
     }
 
-    /// Load the exact delegation PCZT and signing fields persisted by setup.
-    pub(crate) fn get_delegation_pczt_fields(
+    /// Validate the notes and target and load their exact signing transaction
+    /// from one database snapshot, including against other connections' writes.
+    pub(crate) fn validated_delegation_pczt(
         &self,
-        round_id: &str,
-        bundle_index: u32,
+        identity: &DelegationProofIdentity,
+        notes: &[NoteInfo],
+        keys: &DelegationKeys,
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::load_delegation_pczt_fields(&conn, round_id, &wallet_id, bundle_index)
+        self.read_transaction("read validated delegation PCZT", |tx| {
+            delegation_pczt::load(tx, identity, notes, keys)
+        })
     }
 
     /// Cache tree state fetched from lightwalletd by SDK.
@@ -3263,6 +3267,7 @@ mod pir_wallet_scope_tests;
 mod tests {
     mod broadcast_protection;
     mod fixtures;
+    mod keystone_snapshot;
     mod proof_phase;
     mod setup_target_rebuild;
 

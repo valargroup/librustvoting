@@ -19,10 +19,19 @@ pub(super) fn request(
             Err(error) => return Err(error),
         }
     }
-    // Check the exact notes and target before returning any persisted request.
-    prepared.validate_persisted_proof(voting_db)?;
-    let (pczt_bytes, stored_sighash, stored_rk) =
-        voting_db.get_delegation_pczt_fields(&prepared.round_id, prepared.bundle_index)?;
+    // Validation and loading must observe the same setup if another connection
+    // replaces an unbroadcast bundle for a different hotkey.
+    let identity = DelegationProofIdentity::new(
+        voting_db.sidecar_id(),
+        voting_db.wallet_id(),
+        &prepared.round_id,
+        prepared.bundle_index,
+    );
+    let (pczt_bytes, stored_sighash, stored_rk) = voting_db.validated_delegation_pczt(
+        &identity,
+        &prepared.bundle_note_infos,
+        &prepared.delegation_keys,
+    )?;
     let persisted_sighash = array32("pczt_sighash", stored_sighash)?;
     let recomputed_sighash = pczt_sighash(&pczt_bytes)?;
     if recomputed_sighash != persisted_sighash {
