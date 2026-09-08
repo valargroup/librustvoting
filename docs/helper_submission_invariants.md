@@ -1678,8 +1678,27 @@ host wallet:
    type around every transport implementation.
 3. **Entropy.** The SDK owns production entropy for complete-plan timing and
    helper ordering. Hosts do not supply randomness to the planning lifecycle.
-4. **Lifecycle.** The host owns the timer, app-lock and round-expiry behavior,
-   invokes `track_pending_shares`, and supplies cancellation.
+4. **Share-tracking lifecycle.** Supported wallet integrations drive a round's
+   helper shares with `ShareTrackingDriver::run`, which owns the cadence: it
+   repeats a pass on the delay that pass computed, shortens every wait to what
+   is left before vote end, and stops with a `ShareTrackingQuiescence` the host
+   acts on. Once per pass, through `ShareTrackingHostSource`, the host supplies
+   the complete current configured fleet, its clock, and the round's vote end;
+   it also supplies cancellation and the operation epoch, through which app
+   lock and a change of account or round reach the run. The host no longer owns
+   the timer or the round-expiry boundary for share tracking, and cannot derive
+   that schedule for itself — the values a host-side loop was assembled from
+   are crate-private.
+
+   A host may still run a single pass with `track_pending_shares`, and the pass
+   reports its own `next_delay_seconds`, so a host scheduling by hand follows
+   the schedule the SDK computed rather than one it derived. What it takes back
+   is narrower than the whole vote-end boundary: the pass still enforces the
+   recovery cutoff itself, refusing to resubmit within `resubmit_cutoff_seconds`
+   of vote end. What it does not do is bound its own delay — that is computed
+   from share rows alone — or stop polling once the round closes. So a host
+   driving passes by hand owns not sleeping past vote end, and ending the loop
+   there.
 5. **Initial delivery invocation.** Supported wallet integrations bind a
    `RoundExecutor` to the complete proposal roster from the authenticated round
    configuration and drive it with `RoundDriver::run`, which supplies the

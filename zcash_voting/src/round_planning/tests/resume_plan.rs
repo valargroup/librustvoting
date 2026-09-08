@@ -3168,22 +3168,15 @@ fn confirm_share_emitted_for_unconfirmed_share() {
 }
 
 #[test]
-fn unconfirmed_shares_are_reported_and_schedule_a_tracking_pass() {
+fn unconfirmed_shares_are_reported_without_blocking_the_round() {
+    // `has_unconfirmed_shares` is what tells a host to keep share tracking
+    // running for this round. The pass cadence behind it is the tracking
+    // driver's, so nothing here asserts a delay.
     let db = db_with_bundle();
     assert!(
         !resume_plan(&db, ROUND, &[1, 2, 3])
             .unwrap()
             .has_unconfirmed_shares
-    );
-    assert_eq!(
-        crate::share::next_tracking_delay_for_round(
-            &db,
-            ROUND,
-            1_000,
-            crate::share::ShareTimingPolicy::default()
-        )
-        .unwrap(),
-        None
     );
 
     db.record_share_delegation(
@@ -3202,14 +3195,6 @@ fn unconfirmed_shares_are_reported_and_schedule_a_tracking_pass() {
     let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
     assert!(plan.has_unconfirmed_shares);
     assert!(!plan.blocking_share_work);
-    assert!(crate::share::next_tracking_delay_for_round(
-        &db,
-        ROUND,
-        1_000,
-        crate::share::ShareTimingPolicy::default()
-    )
-    .unwrap()
-    .is_some());
 }
 
 #[test]

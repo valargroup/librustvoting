@@ -50,6 +50,10 @@ enum Outcome {
     /// Connection setup that ran out of time: no request byte left, but the
     /// endpoint never answered either. Not an answer, so it may be repeated.
     ConnectTimedOut,
+    /// The connection was made and the request dispatched, then the transfer
+    /// died before any response header — Hyper's `SendRequest`. What a large
+    /// upload over a degraded link does, while the endpoint itself is idle.
+    SendFailedMidBody,
 }
 
 impl RecordingRoute {
@@ -123,7 +127,10 @@ impl RouteHttp for RecordingRoute {
         drop(outcomes);
         // A refusal and a connect timeout both happen before any byte leaves,
         // so neither marks dispatch. The other two reach the endpoint.
-        if matches!(outcome, Outcome::Stall | Outcome::Status(_)) {
+        if matches!(
+            outcome,
+            Outcome::Stall | Outcome::Status(_) | Outcome::SendFailedMidBody
+        ) {
             on_dispatch();
         }
         Box::pin(async move {
@@ -157,6 +164,11 @@ impl RouteHttp for RecordingRoute {
                         "send HTTP request: connection setup timed out before request dispatch",
                     ))
                 }
+                // Reaches the endpoint, then fails: the request is already on
+                // the wire, so this is after dispatch, not a refusal.
+                Outcome::SendFailedMidBody => Err(RouteError::after_dispatch(
+                    "send HTTP request: client error (SendRequest): connection reset by peer",
+                )),
             }
         })
     }
@@ -249,6 +261,39 @@ async fn a_late_refusal_from_a_route_that_enforces_the_budget_is_a_connect_timeo
 
     assert!(result.is_ok(), "the second attempt answered");
     assert_eq!(route.deadlines().len(), 2, "the expired budget was retried");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_severed_upload_is_retried() {
+    // The regression this guards: a tier-1 query is well over a megabyte, and
+    // a local link that cannot carry it severs the request after dispatch.
+    // That was read as a definite answer about the endpoint and failed the
+    // whole run, while the server sat idle and served the next query in
+    // milliseconds.
+    let (route, transport) = transport(vec![Outcome::SendFailedMidBody, Outcome::Status(200)]);
+
+    let result = pir_client::Transport::get(&transport, "http://pir.invalid/root").await;
+
+    assert!(result.is_ok(), "the second attempt answered");
+    assert_eq!(
+        route.deadlines().len(),
+        2,
+        "a failure after dispatch is not an answer about the endpoint"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_severed_upload_still_stops_at_two_attempts() {
+    let (route, transport) = transport(vec![Outcome::SendFailedMidBody]);
+
+    let result = pir_client::Transport::get(&transport, "http://pir.invalid/root").await;
+
+    assert!(result.is_err(), "every attempt was severed");
+    assert_eq!(
+        route.deadlines().len(),
+        2,
+        "retrying a severed upload does not make the schedule unbounded"
+    );
 }
 
 #[tokio::test(start_paused = true)]

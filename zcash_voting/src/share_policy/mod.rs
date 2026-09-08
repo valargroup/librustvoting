@@ -128,18 +128,24 @@ pub use submission_schedule::{
     SHARE_SUBMIT_AT_RANDOM_BYTES,
 };
 pub use timing::{
-    is_last_moment, is_share_ready_for_status_check, last_moment_buffer_seconds,
-    last_moment_deadline_seconds, next_tracking_delay_seconds, overdue_threshold_seconds,
-    share_recovery_base_time, should_resubmit_share, summarize_share_tracking,
-    LAST_MOMENT_BUFFER_FRACTION_DENOMINATOR, LAST_MOMENT_BUFFER_FRACTION_NUMERATOR,
-    LAST_MOMENT_BUFFER_MAX_SECONDS, SHARE_FUTURE_CHECK_MAX_DELAY_SECONDS,
+    is_last_moment, last_moment_buffer_seconds, last_moment_deadline_seconds,
+    overdue_threshold_seconds, share_recovery_base_time, should_resubmit_share,
+    summarize_share_tracking, LAST_MOMENT_BUFFER_FRACTION_DENOMINATOR,
+    LAST_MOMENT_BUFFER_FRACTION_NUMERATOR, LAST_MOMENT_BUFFER_MAX_SECONDS,
     SHARE_MAX_OVERDUE_THRESHOLD_SECONDS, SHARE_MIN_OVERDUE_THRESHOLD_SECONDS,
-    SHARE_MIN_TRACKING_DELAY_SECONDS, SHARE_READY_POLL_INTERVAL_SECONDS,
-    SHARE_RESUBMIT_CUTOFF_SECONDS, SHARE_STATUS_CHECK_GRACE_SECONDS,
+    SHARE_RESUBMIT_CUTOFF_SECONDS,
 };
 
 pub(crate) use server_order::effective_share_submission_target_count;
-pub(crate) use timing::is_share_resubmission_window_open;
+// The tracking cadence: `ShareTrackingDriver` applies it, and the four
+// constants are the defaults of `ShareTimingPolicy` fields, which a host reads
+// from `ShareTimingPolicy::default()` rather than as loose values.
+pub(crate) use timing::{
+    is_share_ready_for_status_check, is_share_resubmission_window_open,
+    next_tracking_delay_seconds, SHARE_FUTURE_CHECK_MAX_DELAY_SECONDS,
+    SHARE_MIN_TRACKING_DELAY_SECONDS, SHARE_READY_POLL_INTERVAL_SECONDS,
+    SHARE_STATUS_CHECK_GRACE_SECONDS,
+};
 
 #[cfg(test)]
 mod tests;
