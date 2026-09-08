@@ -700,6 +700,11 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Repeated delegation setup reports `Reused` for the already-persisted PCZT
+  sighash, TX1 effects, and delegation PCZT tolerated by the pipeline, while retaining the
+  `SetupAlreadyPersisted` error category. Note-secret conflicts and other setup
+  errors continue to report `Failed`.
+
 - Three guards that must refuse an action on a vote already on chain now
   recognise one confirmed by an exact-tree scan. `ensure_vote_rebuild_allowed`,
   `ensure_no_submitted_vote_conflict_for_intent` and `store_vote` each asked
