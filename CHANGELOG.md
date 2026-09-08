@@ -783,8 +783,8 @@ This release is `zcash_voting` 4.0.0.
   driver and observe its events; one that needs a default value reads it from
   `ShareTimingPolicy::default()`, which is still public and is what the
   driver's policy is built from. Per-share readiness is still readable through
-  `summarize_share_tracking`, which classifies with the same predicate and is
-  now exported from `prelude` alongside the `ShareTrackingSummary` it returns.
+  `share_tracking_flags`, whose `ready_for_status_check` is exactly the retired
+  predicate.
 
 - **Breaking:** removed the persisted-vote recovery driver
   `VoteRecoveryExecutor::advance` with `VoteRecoveryRequest`,
