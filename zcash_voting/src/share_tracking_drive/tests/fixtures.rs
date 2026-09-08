@@ -275,6 +275,29 @@ impl ShareTrackingHostSource for WalletSwitchingHost<'_> {
     }
 }
 
+/// Cancels the run from inside the reporter, the moment a pass fails.
+///
+/// The reporter is called synchronously from the driver, between the failure
+/// and the driver's decision about it, which makes it the one place a test can
+/// interrupt a run at exactly that point.
+pub(super) struct CancellingOnFailureReporter<'a> {
+    control: &'a ChainSubmissionControl,
+}
+
+impl<'a> CancellingOnFailureReporter<'a> {
+    pub(super) fn new(control: &'a ChainSubmissionControl) -> Self {
+        Self { control }
+    }
+}
+
+impl ShareTrackingReporter for CancellingOnFailureReporter<'_> {
+    fn report(&self, event: ShareTrackingEvent) {
+        if matches!(event, ShareTrackingEvent::PassFailed { .. }) {
+            self.control.cancel();
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RecordingReporter {
     pub(super) events: Mutex<Vec<ShareTrackingEvent>>,

@@ -70,19 +70,36 @@ impl Run {
 
     /// The three per-share effects a pass commits as it makes them.
     ///
-    /// Ambiguity is the one that can be *un*made. A pass records an attempt as
-    /// ambiguous when it could not tell whether the helper took the share; a
-    /// later pass retrying that same helper can be told plainly, and reports
-    /// the attempt as a definite resubmission. Keeping both would leave the
-    /// run's `ambiguous` claiming an unknown outcome that is now known, so the
-    /// resolved attempt is withdrawn from it.
+    /// A run accumulates *which* helpers a share reached, not how many times.
+    /// A pass re-sends an overdue share to helpers that already accepted it —
+    /// duplicate-safe, and the point of recovery — so the same
+    /// `(share, helper)` recurs pass after pass, and a run bounded only by
+    /// vote end has many. Appending each recurrence would grow the report
+    /// without bound and present every repetition as a helper newly reached.
+    /// Each pair is therefore recorded once, and the per-pass `PassFinished`
+    /// events keep every attempt for telemetry.
+    ///
+    /// Ambiguity is the one effect that can be *un*made. A pass records an
+    /// attempt as ambiguous when it could not tell whether the helper took the
+    /// share; any later pass told plainly settles it. The pair moves to
+    /// `resubmitted` and does not return to `ambiguous`, because the share is
+    /// known to have reached that helper however an even later attempt reads.
+    ///
+    /// `confirmed` needs no such care: a confirmed share leaves the
+    /// unconfirmed set, so no later pass walks it again.
     fn absorb_durable_effects(&mut self, report: &ShareTrackingReport) {
         self.confirmed.extend(report.confirmed.iter().copied());
         for settled in &report.resubmitted {
             self.ambiguous.retain(|attempt| attempt != settled);
+            if !self.resubmitted.contains(settled) {
+                self.resubmitted.push(settled.clone());
+            }
         }
-        self.resubmitted.extend(report.resubmitted.iter().cloned());
-        self.ambiguous.extend(report.ambiguous.iter().cloned());
+        for unknown in &report.ambiguous {
+            if !self.ambiguous.contains(unknown) && !self.resubmitted.contains(unknown) {
+                self.ambiguous.push(unknown.clone());
+            }
+        }
     }
 
     /// The last `count` failures, oldest first.

@@ -183,3 +183,86 @@ fn a_settled_attempt_at_another_helper_leaves_the_ambiguity_alone() {
         vec![resubmitted_to(1, "https://helper-a.example")],
     );
 }
+
+#[test]
+fn a_helper_reached_again_on_a_later_pass_is_recorded_once() {
+    // Recovery re-sends an overdue share to helpers that already accepted it —
+    // duplicate-safe, and the point of it. A run bounded only by vote end does
+    // that for days, so appending each recurrence would grow the report
+    // without bound and present every repetition as a helper newly reached.
+    let mut run = Run::default();
+
+    for _ in 0..4 {
+        run.absorb(&ShareTrackingReport {
+            resubmitted: vec![resubmitted(1)],
+            ..ShareTrackingReport::default()
+        });
+    }
+    let report = run.finish(ShareTrackingQuiescence::VoteEndReached);
+
+    assert_eq!(report.resubmitted, vec![resubmitted(1)]);
+}
+
+#[test]
+fn a_share_reaching_two_helpers_keeps_both() {
+    // Deduplication is per (share, helper): reaching a second helper is a
+    // distinct fact about the share's placement, not a repetition.
+    let mut run = Run::default();
+
+    run.absorb(&ShareTrackingReport {
+        resubmitted: vec![resubmitted_to(1, "https://helper-a.example")],
+        ..ShareTrackingReport::default()
+    });
+    run.absorb(&ShareTrackingReport {
+        resubmitted: vec![resubmitted_to(1, "https://helper-b.example")],
+        ..ShareTrackingReport::default()
+    });
+    let report = run.finish(ShareTrackingQuiescence::VoteEndReached);
+
+    assert_eq!(
+        report.resubmitted,
+        vec![
+            resubmitted_to(1, "https://helper-a.example"),
+            resubmitted_to(1, "https://helper-b.example"),
+        ],
+    );
+}
+
+#[test]
+fn a_repeated_ambiguous_attempt_is_recorded_once() {
+    let mut run = Run::default();
+
+    for _ in 0..3 {
+        run.absorb(&ShareTrackingReport {
+            ambiguous: vec![resubmitted(2)],
+            ..ShareTrackingReport::default()
+        });
+    }
+
+    assert_eq!(
+        run.finish(ShareTrackingQuiescence::VoteEndReached)
+            .ambiguous,
+        vec![resubmitted(2)],
+    );
+}
+
+#[test]
+fn a_settled_attempt_does_not_become_ambiguous_again() {
+    // Once any pass is told plainly that the helper took the share, that is
+    // known. A later attempt at the same helper whose outcome is unreadable
+    // does not unlearn it.
+    let mut run = Run::default();
+
+    run.absorb(&ShareTrackingReport {
+        resubmitted: vec![resubmitted(3)],
+        ..ShareTrackingReport::default()
+    });
+    run.absorb(&ShareTrackingReport {
+        ambiguous: vec![resubmitted(3)],
+        ..ShareTrackingReport::default()
+    });
+    let report = run.finish(ShareTrackingQuiescence::VoteEndReached);
+
+    assert!(report.ambiguous.is_empty(), "got {:?}", report.ambiguous);
+    assert_eq!(report.resubmitted, vec![resubmitted(3)]);
+}

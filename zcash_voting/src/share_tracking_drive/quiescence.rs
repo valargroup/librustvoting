@@ -32,10 +32,16 @@ pub enum ShareTrackingQuiescence {
     /// should read the holder's report rather than retry, and a host that
     /// starts runs on lifecycle events can ignore this entirely.
     ///
-    /// A run *departing* — cancelled, and unwinding — does not produce this in
-    /// its replacement: a caller waits briefly for the round to be released
-    /// first, so cancelling a run and starting another does not leave the
-    /// round undriven.
+    /// A run *departing* — cancelled, or left behind by an epoch change — does
+    /// not produce this in its replacement: the replacement waits for the
+    /// round to be released and takes it over, so cancelling a run and
+    /// starting another does not leave the round undriven.
+    ///
+    /// That wait is **unbounded**, and ends only when the departing holder
+    /// releases the round or the waiting caller is itself cancelled. A holder
+    /// releases by completing or being dropped, so a host that retains a
+    /// cancelled run's future without polling it to completion or dropping it
+    /// leaves its replacement waiting indefinitely.
     AlreadyDriving,
     /// Passes kept failing. The shares are untouched and a later run may still
     /// succeed, so this is a reason to back off and surface state, not a

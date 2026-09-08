@@ -140,7 +140,10 @@ This release is `zcash_voting` 4.0.0.
   replacement cannot leave the round undriven. Each pass acts under the wallet
   its run was admitted for. `ShareTrackingReport` gains `unconfirmed_at_entry`,
   what the round owed when a pass began — absent when the pass failed before it
-  could look — which is what separates `NothingToTrack` from `AllConfirmed`. Vote
+  could look — which is what separates `NothingToTrack` from `AllConfirmed`. The
+  run report accumulates which helpers a share reached rather than how many
+  times, since recovery re-sends an overdue share to helpers that already
+  accepted it, and the per-pass events keep every attempt. Vote
   end is what bounds a healthy run — every wait is shortened to what is left of
   the window, and `max_passes` is `None` by default, because a pass count is
   not a duration and any budget expires inside a multi-day voting window. A

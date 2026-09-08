@@ -112,17 +112,29 @@ where
 pub struct ShareTrackingRunReport {
     /// Why the run stopped.
     pub quiescence: ShareTrackingQuiescence,
-    /// Passes that actually polled, successful or not.
+    /// Tracking passes this run dispatched, successful or not.
+    ///
+    /// Attempts, not helper traffic: a pass over a round that owes nothing
+    /// polls no helper, and a pass that fails validating the configured fleet
+    /// fails before it reaches one. Read the `PassFinished` events for what a
+    /// pass actually did.
     pub passes: u32,
     /// Shares durably confirmed during this run, in the order observed.
     pub confirmed: Vec<ShareKey>,
-    /// Shares that reached a new helper during this run.
-    pub resubmitted: Vec<ResubmittedShare>,
-    /// Recovery attempts whose helper acceptance outcome remains unknown.
+    /// Distinct helpers this run reached for each share, in the order first
+    /// reached.
     ///
-    /// An attempt leaves this list when a later pass retries the same helper
-    /// and is told plainly: the outcome is then known, and the attempt appears
-    /// in `resubmitted` instead.
+    /// One entry per `(share, helper)`, however many passes re-sent it: an
+    /// overdue share whose helpers have all accepted it is re-POSTed on every
+    /// pass, and a run bounded only by vote end has many. The per-pass
+    /// `PassFinished` events carry each attempt for telemetry.
+    pub resubmitted: Vec<ResubmittedShare>,
+    /// `(share, helper)` pairs whose acceptance outcome remains unknown, one
+    /// entry each.
+    ///
+    /// A pair leaves this list — and never re-enters it — once any pass is
+    /// told plainly that the helper took the share: the outcome is known then,
+    /// and the pair appears in `resubmitted` instead.
     pub ambiguous: Vec<ResubmittedShare>,
     /// Shares the last pass reported as beyond repair by retrying.
     ///
@@ -245,6 +257,13 @@ impl<'a> ShareTrackingDriver<'a> {
                 return run.finish(ShareTrackingQuiescence::Cancelled);
             }
             let host_context = host.host_context();
+            // The host callback is synchronous and arbitrary, so cancellation
+            // can land while it runs. Rechecking here keeps the verdicts below
+            // from reporting a stale view of the round — `VoteEndReached` or
+            // `PassBudgetExhausted` — for a run the host has already dropped.
+            if interrupted() {
+                return run.finish(ShareTrackingQuiescence::Cancelled);
+            }
             // Checked before the pass, not after: recovery is already closed
             // at this point, so a pass here could only re-poll shares it
             // cannot act on.

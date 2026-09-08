@@ -84,8 +84,9 @@ async fn moving_to_another_operation_epoch_stops_the_run() {
 
     assert_eq!(report.quiescence, ShareTrackingQuiescence::Cancelled);
     assert_eq!(
-        report.passes, 2,
-        "the epoch changes as the second pass is read in, and that pass stops          from inside through its own cancel callback rather than running out",
+        report.passes, 1,
+        "the epoch changes as the second pass's inputs are read, and the run \
+         stops there rather than dispatching a pass it already knows is stale",
     );
 }
 
@@ -227,20 +228,30 @@ async fn a_pass_that_fails_while_the_run_is_draining_reports_cancellation() {
     // host was draining the run says nothing about the round's health, and
     // `Failing` would send a host looking for a fault it caused. The failure
     // is still recorded.
+    //
+    // The cancellation lands inside the reporter, which the driver calls
+    // synchronously between the failure and its decision about it — the one
+    // point that reaches this branch rather than an earlier boundary check.
+    // `max_consecutive_failures: 1` means the failure alone would otherwise
+    // end the run as `Failing`, so the verdict here is the interruption
+    // winning.
     let db = db_with_pending_share(60);
     let control = ChainSubmissionControl::new(1);
-    let host = EpochBumpingHost::with_a_fleet_that_fails_the_first_pass(&control);
+    let host = ScriptedHost::scripted(vec![ShareTrackingHostContext {
+        configured_helper_urls: Vec::new(),
+        now_seconds: NOW,
+        vote_end_time_seconds: Some(VOTE_END),
+    }]);
+    let client = client();
+    let events = CancellingOnFailureReporter::new(&control);
 
-    let (report, _) = drive_with(
-        &db,
-        &host,
-        &control,
-        ShareTrackingDrivePolicy {
+    let report = ShareTrackingDriver::new(&db, &client, ROUND_ID)
+        .with_policy(ShareTrackingDrivePolicy {
             max_consecutive_failures: 1,
             ..ShareTrackingDrivePolicy::default()
-        },
-    )
-    .await;
+        })
+        .run(&host, &control, &events)
+        .await;
 
     assert_eq!(report.quiescence, ShareTrackingQuiescence::Cancelled);
     assert_eq!(report.passes, 1);
@@ -249,6 +260,34 @@ async fn a_pass_that_fails_while_the_run_is_draining_reports_cancellation() {
         1,
         "the failure is reported even though it is not why the run stopped",
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_interruption_during_the_host_callback_outranks_the_round_verdict() {
+    // `host_context()` is synchronous and arbitrary, so a host can cancel or
+    // switch epoch while it runs. The vote-end and pass-budget checks read the
+    // context it returned, so without a recheck the run would hand back a
+    // verdict about the round for a run the host had already dropped.
+    let db = db_with_pending_share(60);
+    let control = ChainSubmissionControl::new(1);
+    let host = EpochBumpingHost::with_a_fleet_that_fails_the_first_pass(&control);
+
+    let (report, events) = drive_with(
+        &db,
+        &host,
+        &control,
+        // A zero budget: the very next check after the callback would
+        // otherwise report `PassBudgetExhausted`.
+        ShareTrackingDrivePolicy {
+            max_passes: Some(0),
+            ..ShareTrackingDrivePolicy::default()
+        },
+    )
+    .await;
+
+    assert_eq!(report.quiescence, ShareTrackingQuiescence::Cancelled);
+    assert_eq!(report.passes, 0);
+    assert_eq!(events.passes_started(), 0);
 }
 
 #[tokio::test(start_paused = true)]

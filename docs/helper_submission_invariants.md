@@ -649,8 +649,12 @@ the pass and the timing policy.
   last until vote end, so queuing behind it would block the caller for hours.
 
   Meeting a *departing* holder it waits for the round to be released and takes
-  over, observing its own cancellation every tick so a host draining it never
-  waits the release out. This is the case that matters most: a host that
+  over. That wait is **unbounded**: it ends when the holder releases the round
+  or when the waiting caller is itself cancelled, which it observes every tick,
+  and never by timing the holder out. A holder releases by completing or being
+  dropped, so a host must poll a cancelled run's future to completion or drop
+  it; one retained in neither state holds its round for the life of the process
+  and leaves a replacement waiting. This is the case that matters most: a host that
   cancels a run and starts its replacement arrives between the cancel and the
   holder's return, and turning that replacement away would leave the round with
   no run at all until the next lifecycle event — possibly after vote end.
@@ -675,13 +679,29 @@ the pass and the timing policy.
   The run folds those into its report and the `PassFailed` event carries them.
   An accumulated ambiguous attempt is withdrawn when a later pass retries that
   same helper and is told plainly: the run's `ambiguous` promises outcomes that
-  remain unknown, and that one is known now.
+  remain unknown, and that one is known now. It does not return to `ambiguous`
+  afterwards, because the share is known to have reached that helper however an
+  even later attempt reads.
+
+  A run accumulates *which* helpers a share reached, not how many times. A pass
+  re-sends an overdue share to helpers that already accepted it — duplicate-safe,
+  and the point of recovery — so the same `(share, helper)` recurs pass after
+  pass, and a run bounded only by vote end has many. Each pair is recorded once;
+  the per-pass `PassFinished` events keep every attempt for telemetry. `passes`
+  counts dispatched passes rather than helper traffic for the same reason: a
+  pass over a round that owes nothing, or one that fails validating the fleet,
+  polls no helper at all.
   A partial pass's `unrecoverable` is *not* folded: that set is a statement
   about the whole round, and a prefix of the walk would narrow it. It is kept,
   not frozen — a share the partial pass confirmed or reached a helper with is
   no longer beyond repair, and is dropped from the retained set, so one report
   never calls a share both recovered and unrecoverable. A **cancelled** pass is
   partial for exactly the same reason and is folded the same way.
+- **Cancellation is rechecked after the host callback.** `host_context()` is
+  synchronous and arbitrary, and the vote-end and pass-budget checks read what
+  it returned. Without the recheck a cancellation landing during the callback
+  would be answered with a verdict about the round — `VoteEndReached` or
+  `PassBudgetExhausted` — for a run the host had already dropped.
 - **A run always reports why it stopped.** `ShareTrackingQuiescence` is
   exhaustive over the reasons, so a host acts on it rather than re-reading
   share rows: `NothingToTrack`, `AllConfirmed`, `VoteEndReached`, `Cancelled`,
@@ -736,6 +756,7 @@ Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
 `vote_end_reached_between_passes_stops_the_run`,
 `a_share_that_never_becomes_pollable_stops_at_the_pass_budget`,
 `a_pass_that_fails_while_the_run_is_draining_reports_cancellation`,
+`an_interruption_during_the_host_callback_outranks_the_round_verdict`,
 `a_round_that_owed_a_share_is_never_reported_as_nothing_to_track`,
 `a_pass_that_failed_before_looking_reports_no_entry_count_at_all`,
 `a_wallet_switched_under_a_run_neither_redirects_it_nor_outlives_it`,
@@ -763,7 +784,11 @@ Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
 `a_partial_pass_drops_the_shares_it_recovered_from_the_snapshot`,
 `an_ambiguous_recovery_attempt_also_clears_a_share`,
 `an_ambiguous_attempt_settled_by_a_later_pass_leaves_the_run_report`,
-`a_settled_attempt_at_another_helper_leaves_the_ambiguity_alone`, and
+`a_settled_attempt_at_another_helper_leaves_the_ambiguity_alone`,
+`a_helper_reached_again_on_a_later_pass_is_recorded_once`,
+`a_share_reaching_two_helpers_keeps_both`,
+`a_repeated_ambiguous_attempt_is_recorded_once`,
+`a_settled_attempt_does_not_become_ambiguous_again`, and
 `a_complete_pass_replaces_the_unrecoverable_set` in
 [`share_tracking_drive/tests/partial_progress.rs`](../zcash_voting/src/share_tracking_drive/tests/partial_progress.rs);
 `the_wait_between_passes_is_the_one_the_pass_computed`,
