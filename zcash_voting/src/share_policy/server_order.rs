@@ -31,7 +31,13 @@ pub const SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS: u64 = 60_000;
 /// burn the helper into an outcome-unknown state for that share.
 pub const SHARE_DELIVERY_MIN_ATTEMPT_BUDGET_MILLISECONDS: u64 = 1_000;
 /// Maximum helper share POSTs a client should keep in flight at once.
-pub const SHARE_HELPER_MAX_CONCURRENT_POSTS: usize = VOTE_COMMITMENT_SHARE_COUNT;
+///
+/// Delivery is concurrent on two axes — shares run together, and a share's
+/// outstanding targets are posted together — so this bounds the POSTs
+/// themselves rather than either axis. Bounding only one would let their
+/// product exceed it. The enforcing semaphore lives beside the delivery loop
+/// in `share_tracking::post_capacity`.
+pub const SHARE_HELPER_MAX_CONCURRENT_POSTS: usize = 128;
 
 const _: () = assert!(VOTE_COMMITMENT_SHARE_COUNT >= 2);
 const _: () = assert!(SHARE_HELPER_INITIAL_MAX_FRACTION_DENOMINATOR > 0);

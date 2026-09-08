@@ -560,10 +560,11 @@ impl CommittedVote {
         use std::time::Duration;
         use tokio::sync::Semaphore;
 
+        // Bound active share workflows separately from the process-wide POST limit.
+        const MAX_CONCURRENT_SHARE_DELIVERIES: usize = 16;
         const DELIVERY_PERMIT_CANCEL_CHECK_MILLISECONDS: u64 = 50;
-        static DELIVERY_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
-            Semaphore::new(crate::share_policy::SHARE_HELPER_MAX_CONCURRENT_POSTS)
-        });
+        static DELIVERY_PERMITS: LazyLock<Semaphore> =
+            LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_SHARE_DELIVERIES));
 
         let scope = crate::share::ShareOperationScope::capture(db);
         let (plan, plan_generation) = crate::share_tracking::load_share_delivery_plan(
@@ -682,7 +683,7 @@ impl CommittedVote {
                     }))
                 }
             })
-            .buffer_unordered(crate::share_policy::SHARE_HELPER_MAX_CONCURRENT_POSTS)
+            .buffer_unordered(MAX_CONCURRENT_SHARE_DELIVERIES)
             .collect::<Vec<Result<Option<crate::share_tracking::ShareDeliveryOutcome>, VotingError>>>()
             .await;
         crate::share_tracking::batch_delivery_report(

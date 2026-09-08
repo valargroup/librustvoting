@@ -1,6 +1,154 @@
 use super::*;
 use crate::share_policy::SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS;
 
+#[tokio::test(start_paused = true)]
+async fn resumed_delivery_rechecks_capacity_after_wave_outcomes() {
+    for (reply, expected_accepted, expected_ambiguous) in [
+        (http_status(400), helper(3), vec![helper(1)]),
+        (http_status(503), helper(3), vec![helper(2), helper(1)]),
+        (json_status("queued"), helper(2), vec![helper(1)]),
+    ] {
+        let db = db_with_delivery(&[], &[], 2);
+        let configured = helpers(3);
+        // A crash left helper 1 reserved. Helper 2 fills the only remaining
+        // slot, so helper 3 cannot be reserved until this wave is resolved.
+        assert!(share::begin_existing_delivery_attempt(
+            &db,
+            &share::ShareDeliveryAttemptParams {
+                round_id: ROUND_ID,
+                bundle_index: 0,
+                proposal_id: 1,
+                share_index: 0,
+                server_url: &helper(1),
+                target_count: 2,
+                submit_at: SUBMIT_AT,
+            },
+            &configured,
+        )
+        .unwrap());
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_post(&format!("{}/shielded-vote/v1/shares", helper(2)), reply);
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(3)),
+            json_status("queued"),
+        );
+        let request = InitialShareSubmissionParams {
+            target_count: 2,
+            ..initial_submission(&configured)
+        };
+        let report = submit_share_to_helpers(
+            &db,
+            &client_with(transport.clone()),
+            &request,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            transport.call_count(&helper(1)),
+            0,
+            "an interrupted POST is not replayed"
+        );
+        assert_eq!(transport.call_count(&helper(2)), 1);
+        assert_eq!(
+            transport.call_count(&helper(3)),
+            usize::from(expected_accepted == helper(3))
+        );
+        assert_eq!(report.accepted_urls, vec![expected_accepted]);
+        assert_eq!(report.ambiguous_urls, expected_ambiguous);
+        assert_eq!(only_share(&db).attempting_urls, vec![helper(1)]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_capacity_cancellation_clears_unsent_reservations() {
+    let capacity_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut held_permits = Vec::new();
+    for _ in 0..crate::share_policy::SHARE_HELPER_MAX_CONCURRENT_POSTS {
+        held_permits.push(
+            super::super::post_capacity::acquire(capacity_deadline, &never_cancel())
+                .await
+                .unwrap(),
+        );
+    }
+    let db = db_with_recoverable_vote();
+    let configured = helpers(1);
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let cancel = || cancelled.load(Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let trigger = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancelled.store(true, Ordering::SeqCst);
+    };
+    let request = initial_submission(&configured);
+    let (report, ()) = tokio::join!(
+        submit_share_to_helpers(&db, &client, &request, &cancel),
+        trigger
+    );
+    let report = report.unwrap();
+    assert!(started.elapsed() <= Duration::from_millis(150));
+    assert!(report.accepted_urls.is_empty());
+    assert!(report.ambiguous_urls.is_empty());
+    assert!(only_share(&db).attempting_urls.is_empty());
+    assert!(transport.calls().is_empty());
+    drop(held_permits);
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        json_status("queued"),
+    );
+    let resumed = submit_share_to_helpers(&db, &client, &request, &never_cancel())
+        .await
+        .unwrap();
+    assert_eq!(resumed.accepted_urls, configured);
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_capacity_deadline_clears_unsent_reservations() {
+    let capacity_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut held_permits = Vec::new();
+    for _ in 0..crate::share_policy::SHARE_HELPER_MAX_CONCURRENT_POSTS {
+        held_permits.push(
+            super::super::post_capacity::acquire(capacity_deadline, &never_cancel())
+                .await
+                .unwrap(),
+        );
+    }
+    let db = db_with_recoverable_vote();
+    let configured = helpers(1);
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let started = tokio::time::Instant::now();
+    let report = submit_share_to_helpers(
+        &db,
+        &client,
+        &initial_submission(&configured),
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(59));
+    assert!(report.accepted_urls.is_empty());
+    assert!(report.ambiguous_urls.is_empty());
+    assert!(only_share(&db).attempting_urls.is_empty());
+    assert!(transport.calls().is_empty());
+    drop(held_permits);
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        json_status("queued"),
+    );
+    let resumed = submit_share_to_helpers(
+        &db,
+        &client,
+        &initial_submission(&configured),
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.accepted_urls, configured);
+}
+
 // ---- Initial fan-out -------------------------------------------------
 
 #[tokio::test(start_paused = true)]
@@ -311,7 +459,7 @@ async fn fan_out_retains_server_error_as_ambiguous_without_retrying() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn fan_out_stops_at_the_overall_deadline_and_clamps_the_last_request() {
+async fn fan_out_bounds_every_attempt_by_the_overall_deadline() {
     let transport = Arc::new(MockTransport::default());
     let first_url = format!("{}/shielded-vote/v1/shares", helper(1));
     let second_url = format!("{}/shielded-vote/v1/shares", helper(2));
@@ -338,15 +486,37 @@ async fn fan_out_stops_at_the_overall_deadline_and_clamps_the_last_request() {
     )
     .await;
 
+    // The outstanding targets are posted together, so each carries the whole
+    // remaining budget rather than the remainder left by the attempt before
+    // it. The operation ends when the slowest accepted attempt returns, still
+    // inside the overall deadline — which is what that deadline is for.
+    //
+    // This replaces an assertion that the *last* request was clamped to the
+    // leftover budget. That clamping was a consequence of walking helpers one
+    // at a time, not a property of delivery: a helper was starved because
+    // another had spent the budget first, and it recorded an ambiguous outcome
+    // for a share it may never have received.
+    assert!(
+        started.elapsed() <= Duration::from_millis(SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS),
+        "the overall deadline still bounds the operation: {:?}",
+        started.elapsed()
+    );
     assert_eq!(
         started.elapsed(),
-        Duration::from_millis(SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS)
+        Duration::from_secs(50),
+        "the slowest accepted attempt ends it"
     );
-    assert_eq!(report.accepted_urls, vec![helper(1)]);
-    assert_eq!(report.ambiguous_urls, vec![helper(2)]);
+    assert_eq!(
+        report.accepted_urls,
+        vec![helper(1), helper(2), helper(3)],
+        "no target is starved of budget by a slower sibling"
+    );
+    assert!(
+        report.ambiguous_urls.is_empty(),
+        "nothing is burned into ambiguity"
+    );
     assert_eq!(transport.timeout_for(&first_url), Duration::from_secs(60));
-    assert_eq!(transport.timeout_for(&second_url), Duration::from_secs(10));
-    assert_eq!(transport.call_count(&helper(3)), 0);
+    assert_eq!(transport.timeout_for(&second_url), Duration::from_secs(60));
 }
 
 #[tokio::test(start_paused = true)]
@@ -380,12 +550,19 @@ async fn definite_failure_in_backoff_is_not_marked_ambiguous() {
     .await;
 
     assert!(report.accepted_urls.is_empty());
+    // The property under test: a definite pre-response failure stays definite
+    // and is not converted into an unknown outcome by the deadline landing
+    // mid-backoff. That is unchanged by posting the targets together.
     assert!(
         report.ambiguous_urls.is_empty(),
         "a definite pre-response failure must stay definite: {:?}",
         report.ambiguous_urls
     );
-    assert_eq!(transport.call_count(&helper(2)), 0);
+    // Helper 2 is now contacted. It previously was not, only because helper 1
+    // had consumed 59.9s of the 60s budget before failing — starvation, not a
+    // decision. Both helpers are targets of this share, so reaching both is
+    // within its placement, and the share is no worse off for it.
+    assert!(transport.call_count(&helper(2)) > 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -427,11 +604,18 @@ async fn definite_failure_at_backoff_deadline_clears_durable_attempt_and_retries
 #[tokio::test(start_paused = true)]
 async fn no_attempt_starts_under_minimum_budget() {
     let transport = Arc::new(MockTransport::default());
-    transport.queue_post_after(
-        &format!("{}/shielded-vote/v1/shares", helper(1)),
-        Duration::from_millis(59_500),
-        json_status("queued"),
-    );
+    // Two helpers are needed, and both definitely fail just before the
+    // deadline. The need is still two afterwards, so a further wave would
+    // reach for the third helper — with 500 ms left, below the minimum
+    // attempt budget. The guard runs per reservation, so it is between waves
+    // that it now has anything to refuse.
+    for index in 1..=2 {
+        transport.queue_post_after(
+            &format!("{}/shielded-vote/v1/shares", helper(index)),
+            Duration::from_millis(59_500),
+            Err(HelperTransportError::Transport("refused".to_string())),
+        );
+    }
     let config = HelperClientConfig::default()
         .with_post_timeout(Duration::from_secs(90))
         .unwrap()
@@ -441,18 +625,21 @@ async fn no_attempt_starts_under_minimum_budget() {
     let report = submit_initial_share_to_candidates(
         &client,
         valid_share_json(),
-        &helpers(2),
+        &helpers(3),
         2,
         10,
         &never_cancel(),
     )
     .await;
 
-    assert_eq!(report.accepted_urls, vec![helper(1)]);
-    assert!(report.ambiguous_urls.is_empty());
-    // 500 ms of budget is below the minimum, so the second helper is
-    // never contacted rather than burned into ambiguity.
-    assert_eq!(transport.call_count(&helper(2)), 0);
+    assert!(report.accepted_urls.is_empty());
+    assert!(
+        report.ambiguous_urls.is_empty(),
+        "definite failures stay definite"
+    );
+    // 500 ms of budget is below the minimum, so the third helper is never
+    // contacted rather than burned into ambiguity.
+    assert_eq!(transport.call_count(&helper(3)), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -794,7 +981,12 @@ async fn repeated_partial_committed_submission_sends_original_schedule_to_new_he
     let new_url = format!("{}/shielded-vote/v1/shares", helper(3));
     let transport = Arc::new(MockTransport::default());
     transport.queue_post_after(&first_url, Duration::from_secs(50), json_status("queued"));
-    transport.queue_post_after(&second_url, Duration::from_secs(20), json_status("queued"));
+    // Helper 2 outlives the delivery deadline, so the first submission is
+    // genuinely partial and its outcome genuinely unknown. Previously helper 2
+    // answered in 20s and was only left unknown because helper 1 had spent the
+    // budget ahead of it — starvation standing in for an ambiguous transport,
+    // which stops happening once the targets are posted together.
+    transport.queue_post_after(&second_url, Duration::from_secs(70), json_status("queued"));
     transport.queue_post(&new_url, json_status("queued"));
     let config = HelperClientConfig::default()
         .with_post_timeout(Duration::from_secs(90))
@@ -1925,16 +2117,14 @@ async fn initial_delivery_does_not_recreate_share_after_round_deletion() {
     }
     let client = client_with(transport.clone());
     let cleared = AtomicBool::new(false);
-    let clear_after_first_acceptance = || {
-        if !cleared.load(Ordering::Relaxed)
-            && share::list(&db, ROUND_ID)
-                .unwrap()
-                .first()
-                .is_some_and(|record| !record.sent_to_urls.is_empty())
-        {
-            // The host deliberately forgets a round mid-delivery; the share
-            // rows it already delivered are exactly what the checked path
-            // refuses to destroy.
+    // The host forgets the round while a POST is on the wire — after the
+    // durable attempt was reserved and before it is resolved. That is the
+    // window the checked path exists for, and the one delivery must refuse to
+    // write back into. Keying on a dispatched POST rather than on a recorded
+    // acceptance keeps the scenario reachable however delivery batches its
+    // attempts: an acceptance is only written once the wire work is done.
+    let clear_while_a_post_is_in_flight = || {
+        if !cleared.load(Ordering::Relaxed) && !transport.calls().is_empty() {
             db.clear_round_discarding_recovery(ROUND_ID).unwrap();
             cleared.store(true, Ordering::Relaxed);
         }
@@ -1945,7 +2135,7 @@ async fn initial_delivery_does_not_recreate_share_after_round_deletion() {
         ..initial_submission(&configured)
     };
 
-    let error = submit_share_to_helpers(&db, &client, &request, &clear_after_first_acceptance)
+    let error = submit_share_to_helpers(&db, &client, &request, &clear_while_a_post_is_in_flight)
         .await
         .unwrap_err();
 
@@ -1953,6 +2143,18 @@ async fn initial_delivery_does_not_recreate_share_after_round_deletion() {
     assert!(error
         .to_string()
         .contains("committed share changed while helper delivery was in flight"));
-    assert_eq!(transport.call_count("/shares"), 1);
+    // Clearing the round cannot undo POSTs already dispatched. Reserved targets
+    // still waiting for capacity must pass journal revalidation before dispatch;
+    // queued_delivery tests verify that deletion stops them. Cancellation is
+    // checked per POST. The wave's outstanding-need cap bounds the number of
+    // POSTs that could have started before the clear.
+    assert!(
+        transport.call_count("/shares") <= request.target_count,
+        "a mid-flight clear never pushes a share past its target: {} > {}",
+        transport.call_count("/shares"),
+        request.target_count
+    );
+    // The property this test is named for: the checked path refuses to write
+    // the share rows back into a round the host has forgotten.
     assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
 }

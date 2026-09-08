@@ -9,6 +9,54 @@ use crate::{
 static GLOBAL_BATCH_LIMIT_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// A full commitment offers 160 POSTs, so the transport must queue requests above 128.
+#[tokio::test(start_paused = true)]
+async fn full_commitment_reaches_but_never_exceeds_128_posts() {
+    let _global_limit_guard = GLOBAL_BATCH_LIMIT_TEST_LOCK.lock().await;
+    let db = db_with_unique_recoverable_vote();
+    set_recovery_share_count(&db, 16);
+    let configured = helpers(20);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let vote = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let plan = vote
+        .prepare_share_delivery(&db, planning_params(&fleet))
+        .unwrap();
+    assert!(plan
+        .share_plans
+        .iter()
+        .all(|share| share.target_count == 10));
+    let transport = Arc::new(MockTransport::default());
+    for helper in &configured {
+        for _ in 0..16 {
+            transport.queue_post_after(
+                &format!("{helper}/shielded-vote/v1/shares"),
+                Duration::from_secs(1),
+                json_status("queued"),
+            );
+        }
+    }
+    let report = vote
+        .submit_prepared_shares_unchecked(
+            &db,
+            &client_with(transport.clone()),
+            submission_params(&configured),
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(transport.peak_posts_in_flight(), 128);
+    assert_eq!(transport.call_count("/shares"), 160);
+    assert_eq!(report.deliveries.len(), 16);
+    assert!(report.deliveries.iter().all(|delivery| {
+        delivery.submission.accepted_urls.len() == 10
+            && delivery.submission.ambiguous_urls.is_empty()
+    }));
+    assert!(share::list(&db, ROUND_ID)
+        .unwrap()
+        .iter()
+        .all(|share| share.attempting_urls.is_empty()));
+}
+
 fn planning_params<'a>(fleet: &'a HelperFleetPreflight) -> ShareDeliveryPlanningParams<'a> {
     planning_params_for(fleet, &[1])
 }
@@ -1296,7 +1344,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
 }
 
 #[tokio::test(start_paused = true)]
-async fn global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares() {
+async fn share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let _global_limit_guard = GLOBAL_BATCH_LIMIT_TEST_LOCK.lock().await;
@@ -1392,5 +1440,90 @@ async fn global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_share
             .map(|delivery| delivery.share_index)
             .collect::<Vec<_>>(),
         (0..16).collect::<Vec<_>>()
+    );
+}
+
+/// Independent shares and each share's helper targets overlap during delivery.
+#[tokio::test(start_paused = true)]
+async fn share_delivery_posts_overlap() {
+    let db = db_with_round_and_bundle();
+    seed_recoverable_vote_for_proposal(&db, 1, 0);
+    let configured = helpers(16);
+    let transport = Arc::new(MockTransport::default());
+    // Generous queueing: the plan decides which helpers it uses, and an
+    // exhausted queue would end an attempt early and depress the peak.
+    for index in 1..=16 {
+        for _ in 0..16 {
+            transport.queue_post_after(
+                &format!("{}/shielded-vote/v1/shares", helper(index)),
+                Duration::from_millis(200),
+                json_status("queued"),
+            );
+        }
+    }
+
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let vote = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    // Delivery submits against a prepared plan; without this the call is a
+    // no-op and the measurement is vacuously zero.
+    let plan = vote
+        .prepare_share_delivery(&db, planning_params_for(&fleet, &[1]))
+        .expect("the vote plans its share delivery");
+    let share_count = plan.share_plans.len();
+    let targets: Vec<u32> = plan.share_plans.iter().map(|p| p.target_count).collect();
+    let _ = vote
+        .submit_prepared_shares_unchecked(
+            &db,
+            &client_with(transport.clone()),
+            submission_params(&configured),
+            &never_cancel(),
+        )
+        .await;
+
+    let peak = transport.peak_posts_in_flight();
+    let posts = transport.calls().len();
+    let distinct: std::collections::HashSet<_> = transport.calls().into_iter().collect();
+
+    // Shares fan out to `target_count` helpers each, so the POST count is the
+    // product, and every target is a distinct helper.
+    assert_eq!(share_count, 2, "the commitment plans two shares here");
+    assert_eq!(targets, vec![8, 8], "each share targets eight helpers");
+    assert_eq!(posts, 16, "two shares x eight targets");
+    assert_eq!(distinct.len(), 16, "each POST goes to its own helper");
+
+    // Each share posts to its outstanding targets together, and shares run
+    // together too, so the peak is the product. Before this was made
+    // concurrent the peak was the share count alone (2): the stream overlapped
+    // shares while `dispatch_share_to_canonical_helpers` walked one share's
+    // eight helpers one await at a time.
+    //
+    // `SHARE_HELPER_MAX_CONCURRENT_POSTS` is not what bounds this. A sweep at
+    // 1, 4, 16 and 32 moved the old figure only at 1, because the serial part
+    // was inside a share rather than across shares.
+    assert_eq!(
+        peak,
+        share_count * targets[0] as usize,
+        "each share's outstanding targets are posted concurrently"
+    );
+
+    // The cap is the *remaining need*, never the candidate list. Sixteen
+    // helpers were configured and sixteen POSTs were sent — two shares needing
+    // eight acceptances each — so no share reached a helper beyond its target.
+    // Over-delivery would be a threshold-security regression, not a slower
+    // test, which is why this is asserted next to the concurrency it enables.
+    assert_eq!(
+        posts,
+        share_count * targets[0] as usize,
+        "delivery is capped at the outstanding need, never the candidate list"
+    );
+
+    // Concurrency on two axes multiplies, so the documented POST ceiling is
+    // enforced on the POSTs themselves. Without that bound this product would
+    // be free to grow with the share count — sixteen shares fanning out to
+    // eight helpers each is 128 simultaneous connections.
+    assert!(
+        peak <= crate::share_policy::SHARE_HELPER_MAX_CONCURRENT_POSTS,
+        "in-flight POSTs stay within the documented ceiling: {peak} > {}",
+        crate::share_policy::SHARE_HELPER_MAX_CONCURRENT_POSTS
     );
 }

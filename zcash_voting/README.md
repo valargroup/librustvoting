@@ -74,7 +74,7 @@ precompute → delegate → vote → share lifecycle:
    vote is confirmed, recover a fresh `CommittedVote`, convert it with
    `CommittedVote::confirmed`, and call `ConfirmedVote::submit_prepared_shares`
    with the complete current configured fleet. The SDK validates the plan and every payload before network I/O,
-   enforces the process-wide 16-POST ceiling, reconstructs each wire payload
+   enforces the process-wide 128-POST ceiling, reconstructs each wire payload
    with the durable confirmed VC position, and journals every attempt before
    dispatch. Removed targets and target-count drift fail instead of being
    remapped or replanned.

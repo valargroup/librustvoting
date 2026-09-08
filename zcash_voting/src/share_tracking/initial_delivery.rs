@@ -19,10 +19,14 @@ use super::{
 
 /// Fans one freshly built share out to helpers until enough accept it.
 ///
-/// Helpers are drawn in health order, re-evaluated before **every** attempt so
-/// a failure observed during this fan-out immediately demotes that helper for
-/// the remaining picks. Each helper is tried at most once: a share is spread
-/// across distinct helpers, never doubled up on one that already refused.
+/// Outstanding targets are posted together in waves capped at the definite
+/// acceptances still needed. Ambiguous attempts do not count as acceptances,
+/// so later waves may contact additional helpers.
+///
+/// Helpers are reserved in health order within the planned and fallback
+/// groups. Outcomes from one wave affect the ordering of later waves. Each
+/// helper is selected at most once by this fan-out; the client separately
+/// retries definite transient failures under its bounded retry policy.
 ///
 /// Every helper is first persisted as `attempting`; only then can its POST be
 /// dispatched. Definite acknowledgements and unknown outcomes are promoted to
@@ -223,117 +227,193 @@ async fn dispatch_share_to_canonical_helpers(
         if cancel() {
             break;
         }
-        let active_group = if remaining
-            .iter()
-            .any(|url| planned_set.contains(url.as_str()))
-        {
-            remaining
-                .iter()
-                .filter(|url| planned_set.contains(url.as_str()))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            remaining.clone()
-        };
-        let ordered = client
-            .health()
-            .candidate_servers(&active_group, params.now_seconds);
-        let Some(server_url) = ordered.into_iter().next() else {
-            break;
-        };
-        remaining.retain(|url| url != &server_url);
-
-        let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining_time < Duration::from_millis(SHARE_DELIVERY_MIN_ATTEMPT_BUDGET_MILLISECONDS) {
-            // An attempt started with almost no budget is guaranteed to end
-            // as an unknown outcome; leave the helper untouched instead.
-            break;
-        }
-
-        let attempt = share::ShareDeliveryAttemptParams {
-            round_id: params.round_id,
-            bundle_index: params.bundle_index,
-            proposal_id: params.proposal_id,
-            share_index: params.share_index,
-            server_url: &server_url,
-            target_count: definite_acceptance_target,
-            submit_at: params.submit_at,
-        };
-        match share::begin_delivery_attempt_for_generation(db, &attempt, generation, &candidates)? {
-            crate::storage::queries::ShareAttemptReservation::Started => {}
-            crate::storage::queries::ShareAttemptReservation::AlreadyRecorded => continue,
-            crate::storage::queries::ShareAttemptReservation::PlacementCapacityReached => break,
-            crate::storage::queries::ShareAttemptReservation::StaleGeneration => {
-                return Err(stale_delivery_error(params));
-            }
-        }
-
-        let helper_post_outcome = tokio::time::timeout_at(
-            deadline,
-            client.submit_share_with_timeout(
-                &server_url,
-                params.share_wire_json,
-                params.now_seconds,
-                cancel,
-                remaining_time,
-                Some(deadline),
-            ),
-        )
-        .await;
-        match helper_post_outcome {
-            Err(_) => {
-                // The client returns a held definite error rather than
-                // sleeping a retry backoff into this deadline, so an elapse
-                // here can only cancel an in-flight HTTP attempt, whose
-                // transport outcome is genuinely unknown; retain it for
-                // polling.
-                if !share::resolve_delivery_attempt_for_generation(
-                    db,
-                    &attempt,
-                    generation,
-                    share::ShareDeliveryAttemptOutcome::Ambiguous,
-                    false,
-                )? {
-                    return Err(stale_delivery_error(params));
-                }
-                delivery_state.mark_outcome_unknown(&server_url)?;
+        // Reserve only the outstanding acceptance need. Sequential reservations
+        // preserve planned-before-fallback ordering and let the durable capacity
+        // check observe every reservation already made in this wave.
+        let need = definite_acceptance_target.saturating_sub(delivery_state.accepted_urls().len());
+        let mut wave: Vec<String> = Vec::new();
+        let mut stop_after_wave = false;
+        while wave.len() < need && !remaining.is_empty() {
+            if cancel() {
+                stop_after_wave = true;
                 break;
             }
-            Ok(Ok(_)) => {
-                if !share::resolve_delivery_attempt_for_generation(
-                    db,
-                    &attempt,
-                    generation,
-                    share::ShareDeliveryAttemptOutcome::Accepted,
-                    false,
-                )? {
+            let active_group = if remaining
+                .iter()
+                .any(|url| planned_set.contains(url.as_str()))
+            {
+                remaining
+                    .iter()
+                    .filter(|url| planned_set.contains(url.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                remaining.clone()
+            };
+            let ordered = client
+                .health()
+                .candidate_servers(&active_group, params.now_seconds);
+            let Some(server_url) = ordered.into_iter().next() else {
+                break;
+            };
+            let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining_time
+                < Duration::from_millis(SHARE_DELIVERY_MIN_ATTEMPT_BUDGET_MILLISECONDS)
+            {
+                // An attempt started with almost no budget is guaranteed to end
+                // as an unknown outcome; leave the helper untouched instead.
+                stop_after_wave = true;
+                break;
+            }
+
+            let attempt = share::ShareDeliveryAttemptParams {
+                round_id: params.round_id,
+                bundle_index: params.bundle_index,
+                proposal_id: params.proposal_id,
+                share_index: params.share_index,
+                server_url: &server_url,
+                target_count: definite_acceptance_target,
+                submit_at: params.submit_at,
+            };
+            match share::begin_delivery_attempt_for_generation(
+                db,
+                &attempt,
+                generation,
+                &candidates,
+            )? {
+                crate::storage::queries::ShareAttemptReservation::Started => {
+                    remaining.retain(|url| url != &server_url);
+                    wave.push(server_url);
+                }
+                crate::storage::queries::ShareAttemptReservation::AlreadyRecorded => {
+                    remaining.retain(|url| url != &server_url);
+                    continue;
+                }
+                crate::storage::queries::ShareAttemptReservation::PlacementCapacityReached => {
+                    // Resolving this wave can free capacity. Keep this helper
+                    // eligible and reassess after those outcomes are durable.
+                    break;
+                }
+                crate::storage::queries::ShareAttemptReservation::StaleGeneration => {
                     return Err(stale_delivery_error(params));
                 }
-                delivery_state.mark_accepted(&server_url)?;
             }
-            Ok(Err(error)) if error.is_ambiguous() => {
-                if !share::resolve_delivery_attempt_for_generation(
-                    db,
-                    &attempt,
-                    generation,
-                    share::ShareDeliveryAttemptOutcome::Ambiguous,
-                    false,
-                )? {
-                    return Err(stale_delivery_error(params));
+        }
+
+        if wave.is_empty() {
+            break;
+        }
+
+        let placement_fleet = candidates.as_slice();
+        let posts = wave.iter().map(|server_url| async move {
+            // Waiting consumes the fan-out budget, but an unsent reservation
+            // must remain a definite failure on cancellation or expiry.
+            let _permit = match super::post_capacity::acquire(deadline, cancel).await {
+                Ok(permit) => permit,
+                Err(error) => return Ok(Ok(Err(error))),
+            };
+            // A permit wait can outlive the durable generation or its attempt.
+            // Validate the starting wallet's journal again before any POST.
+            let current_delivery = load_current_delivery_state(
+                db,
+                scope,
+                params,
+                generation.nullifier(),
+                placement_fleet,
+            )?;
+            if !current_delivery.in_flight_urls().contains(server_url) {
+                return Err(stale_delivery_error(params));
+            }
+            let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
+            Ok(tokio::time::timeout_at(
+                deadline,
+                client.submit_share_with_timeout(
+                    server_url,
+                    params.share_wire_json,
+                    params.now_seconds,
+                    cancel,
+                    remaining_time,
+                    Some(deadline),
+                ),
+            )
+            .await)
+        });
+        let helper_post_outcomes = futures_util::future::join_all(posts).await;
+
+        // Outcomes are applied in wave order, one at a time: each writes the
+        // durable attempt row, and a stale generation must abort before a
+        // later write can mask it.
+        let mut deadline_elapsed = false;
+        for (server_url, helper_post_outcome) in wave.iter().zip(helper_post_outcomes) {
+            let helper_post_outcome = helper_post_outcome?;
+            let attempt = share::ShareDeliveryAttemptParams {
+                round_id: params.round_id,
+                bundle_index: params.bundle_index,
+                proposal_id: params.proposal_id,
+                share_index: params.share_index,
+                server_url,
+                target_count: definite_acceptance_target,
+                submit_at: params.submit_at,
+            };
+            match helper_post_outcome {
+                Err(_) => {
+                    // The client returns a held definite error rather than
+                    // sleeping a retry backoff into this deadline, so an elapse
+                    // here can only cancel an in-flight HTTP attempt, whose
+                    // transport outcome is genuinely unknown; retain it for
+                    // polling.
+                    if !share::resolve_delivery_attempt_for_generation(
+                        db,
+                        &attempt,
+                        generation,
+                        share::ShareDeliveryAttemptOutcome::Ambiguous,
+                        false,
+                    )? {
+                        return Err(stale_delivery_error(params));
+                    }
+                    delivery_state.mark_outcome_unknown(server_url)?;
+                    deadline_elapsed = true;
                 }
-                delivery_state.mark_outcome_unknown(&server_url)?;
-            }
-            Ok(Err(_)) => {
-                if !share::resolve_delivery_attempt_for_generation(
-                    db,
-                    &attempt,
-                    generation,
-                    share::ShareDeliveryAttemptOutcome::DefiniteFailure,
-                    false,
-                )? {
-                    return Err(stale_delivery_error(params));
+                Ok(Ok(_)) => {
+                    if !share::resolve_delivery_attempt_for_generation(
+                        db,
+                        &attempt,
+                        generation,
+                        share::ShareDeliveryAttemptOutcome::Accepted,
+                        false,
+                    )? {
+                        return Err(stale_delivery_error(params));
+                    }
+                    delivery_state.mark_accepted(server_url)?;
+                }
+                Ok(Err(error)) if error.is_ambiguous() => {
+                    if !share::resolve_delivery_attempt_for_generation(
+                        db,
+                        &attempt,
+                        generation,
+                        share::ShareDeliveryAttemptOutcome::Ambiguous,
+                        false,
+                    )? {
+                        return Err(stale_delivery_error(params));
+                    }
+                    delivery_state.mark_outcome_unknown(server_url)?;
+                }
+                Ok(Err(_)) => {
+                    if !share::resolve_delivery_attempt_for_generation(
+                        db,
+                        &attempt,
+                        generation,
+                        share::ShareDeliveryAttemptOutcome::DefiniteFailure,
+                        false,
+                    )? {
+                        return Err(stale_delivery_error(params));
+                    }
                 }
             }
+        }
+
+        if deadline_elapsed || stop_after_wave {
+            break;
         }
     }
     delivery_state =

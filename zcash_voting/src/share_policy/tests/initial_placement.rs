@@ -39,7 +39,7 @@ fn helper_selection_policy_exposes_shared_limits() {
             preflight_hard_timeout_milliseconds: 30_000,
             post_timeout_milliseconds: 30_000,
             initial_delivery_timeout_milliseconds: 60_000,
-            max_concurrent_posts: 16,
+            max_concurrent_posts: 128,
         }
     );
     assert_eq!(
