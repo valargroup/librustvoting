@@ -636,16 +636,46 @@ the pass and the timing policy.
   plans from the rows the previous one wrote. The per-share locks keep two runs
   off one share but not off one round: interleaved runs re-poll shares the
   other has just answered, doubling the round's helper traffic for no added
-  progress. A run started while another holds the same wallet's round stops
-  immediately with `AlreadyDriving`, without reading the host context or
-  touching a share — the work it was started for is already in flight, and a
-  run can last until vote end, so queuing behind it would block the caller for
-  hours. Admission is released when the holding run ends, however it ends.
+  progress. A round is keyed by sidecar, wallet, and round id: two
+  independently opened databases hold separate share rows, so they are not each
+  other's concurrency.
+
+  **A live holder turns a caller away; a departing one hands the round over.**
+  The holder's own liveness is recorded with its claim — a holder is live while
+  its control is uncancelled and still on the epoch it was admitted under — so
+  a caller decides on state rather than by waiting. Meeting a live holder it
+  stops at once with `AlreadyDriving`, without reading the host context or
+  touching a share: the work it was started for is in flight, and a run can
+  last until vote end, so queuing behind it would block the caller for hours.
+
+  Meeting a *departing* holder it waits for the round to be released and takes
+  over, observing its own cancellation every tick so a host draining it never
+  waits the release out. This is the case that matters most: a host that
+  cancels a run and starts its replacement arrives between the cancel and the
+  holder's return, and turning that replacement away would leave the round with
+  no run at all until the next lifecycle event — possibly after vote end.
+  Because the decision reads the holder's state rather than racing its unwind,
+  a departing holder that is descheduled or slow still hands the round over.
+  Admission is released when the holding run ends, however it ends, including a
+  dropped future.
+
+- **A run's subject is fixed at entry, and each pass acts under it.** The
+  operation epoch is captured before the wallet, so a switch landing between
+  the two cannot leave a run holding the old wallet's admission while accepting
+  the new wallet's epoch as its own. The captured scope is then passed into
+  every pass rather than re-captured there: a switch landing between a run's
+  boundary check and its next pass would otherwise redirect that pass to
+  another wallet's rows, under this run's admission and beside that wallet's
+  own admitted run. The boundary check is what *stops* such a run; the passed
+  scope is what keeps the pass already under way honest.
 - **A failed pass's durable effects are kept.** A pass commits each
   confirmation and retained recovery attempt as it walks, so an error means the
   walk stopped, not that nothing happened, and the next pass walks only
   unconfirmed shares — an effect dropped here is one nothing can rediscover.
   The run folds those into its report and the `PassFailed` event carries them.
+  An accumulated ambiguous attempt is withdrawn when a later pass retries that
+  same helper and is told plainly: the run's `ambiguous` promises outcomes that
+  remain unknown, and that one is known now.
   A partial pass's `unrecoverable` is *not* folded: that set is a statement
   about the whole round, and a prefix of the walk would narrow it. It is kept,
   not frozen — a share the partial pass confirmed or reached a helper with is
@@ -658,7 +688,10 @@ the pass and the timing policy.
   `AlreadyDriving`, `Failing`, and `PassBudgetExhausted`. `NothingToTrack` rests
   on the pass's own `unconfirmed_at_entry`, not on an empty effect list: a pass
   that confirmed and resubmitted nothing may still have walked a share another
-  task confirmed underneath it, and that round did owe something.
+  task confirmed underneath it, and that round did owe something. That
+  observation is absent, not zero, when a pass failed before it could look —
+  validating the fleet, or reading the round's shares — so a host is never told
+  a round owed nothing on the strength of a pass that never asked.
 - **A failing pass is retried, then surfaced.** `max_consecutive_failures`
   consecutive failures end the run with the messages, rather than retrying
   silently for the rest of the round. A successful pass resets the count.
@@ -704,6 +737,8 @@ Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
 `a_share_that_never_becomes_pollable_stops_at_the_pass_budget`,
 `a_pass_that_fails_while_the_run_is_draining_reports_cancellation`,
 `a_round_that_owed_a_share_is_never_reported_as_nothing_to_track`,
+`a_pass_that_failed_before_looking_reports_no_entry_count_at_all`,
+`a_wallet_switched_under_a_run_neither_redirects_it_nor_outlives_it`,
 `the_default_run_is_bounded_by_vote_end_rather_than_a_pass_count`,
 `a_zero_budget_stops_without_polling`, and
 `repeated_pass_failures_stop_the_run_and_are_reported` in
@@ -715,6 +750,8 @@ Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
 `a_round_with_no_vote_end_keeps_the_delay_it_was_given` in
 [`share_tracking_drive/tests/window.rs`](../zcash_voting/src/share_tracking_drive/tests/window.rs);
 `a_second_run_for_the_same_round_is_turned_away_without_polling`,
+`a_live_holder_turns_a_caller_away_without_making_it_wait`,
+`a_holder_left_behind_by_an_epoch_change_hands_the_round_over`,
 `a_finished_run_releases_its_round_for_the_next_one`,
 `another_round_in_the_same_wallet_runs_alongside`,
 `a_replacement_takes_the_round_over_from_a_cancelled_run`,
@@ -724,7 +761,9 @@ Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
 `a_partial_pass_still_hands_over_what_it_committed`,
 `a_partial_pass_does_not_narrow_the_unrecoverable_set`,
 `a_partial_pass_drops_the_shares_it_recovered_from_the_snapshot`,
-`an_ambiguous_recovery_attempt_also_clears_a_share`, and
+`an_ambiguous_recovery_attempt_also_clears_a_share`,
+`an_ambiguous_attempt_settled_by_a_later_pass_leaves_the_run_report`,
+`a_settled_attempt_at_another_helper_leaves_the_ambiguity_alone`, and
 `a_complete_pass_replaces_the_unrecoverable_set` in
 [`share_tracking_drive/tests/partial_progress.rs`](../zcash_voting/src/share_tracking_drive/tests/partial_progress.rs);
 `the_wait_between_passes_is_the_one_the_pass_computed`,

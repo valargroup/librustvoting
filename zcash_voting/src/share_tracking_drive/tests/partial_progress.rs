@@ -22,9 +22,13 @@ fn share(share_index: u32) -> ShareKey {
 }
 
 fn resubmitted(share_index: u32) -> ResubmittedShare {
+    resubmitted_to(share_index, "https://helper.example")
+}
+
+fn resubmitted_to(share_index: u32, server_url: &str) -> ResubmittedShare {
     ResubmittedShare {
         share: share(share_index),
-        server_url: "https://helper.example".to_string(),
+        server_url: server_url.to_string(),
     }
 }
 
@@ -131,4 +135,51 @@ fn an_ambiguous_recovery_attempt_also_clears_a_share() {
         .finish(ShareTrackingQuiescence::Cancelled)
         .unrecoverable
         .is_empty());
+}
+
+#[test]
+fn an_ambiguous_attempt_settled_by_a_later_pass_leaves_the_run_report() {
+    // A pass records an attempt as ambiguous when it could not tell whether
+    // the helper took the share. A later pass retrying that same helper can be
+    // told plainly. Keeping both would leave the run's `ambiguous` claiming an
+    // unknown outcome that is now known.
+    let mut run = Run::default();
+
+    run.absorb(&ShareTrackingReport {
+        ambiguous: vec![resubmitted(1)],
+        ..ShareTrackingReport::default()
+    });
+    run.absorb(&ShareTrackingReport {
+        resubmitted: vec![resubmitted(1)],
+        ..ShareTrackingReport::default()
+    });
+    let report = run.finish(ShareTrackingQuiescence::AllConfirmed);
+
+    assert!(
+        report.ambiguous.is_empty(),
+        "the attempt's outcome is known now, got {:?}",
+        report.ambiguous,
+    );
+    assert_eq!(report.resubmitted, vec![resubmitted(1)]);
+}
+
+#[test]
+fn a_settled_attempt_at_another_helper_leaves_the_ambiguity_alone() {
+    // Ambiguity is per attempt, not per share: reaching helper B says nothing
+    // about whether helper A took the share.
+    let mut run = Run::default();
+
+    run.absorb(&ShareTrackingReport {
+        ambiguous: vec![resubmitted_to(1, "https://helper-a.example")],
+        ..ShareTrackingReport::default()
+    });
+    run.absorb(&ShareTrackingReport {
+        resubmitted: vec![resubmitted_to(1, "https://helper-b.example")],
+        ..ShareTrackingReport::default()
+    });
+
+    assert_eq!(
+        run.finish(ShareTrackingQuiescence::AllConfirmed).ambiguous,
+        vec![resubmitted_to(1, "https://helper-a.example")],
+    );
 }

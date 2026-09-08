@@ -119,6 +119,10 @@ pub struct ShareTrackingRunReport {
     /// Shares that reached a new helper during this run.
     pub resubmitted: Vec<ResubmittedShare>,
     /// Recovery attempts whose helper acceptance outcome remains unknown.
+    ///
+    /// An attempt leaves this list when a later pass retries the same helper
+    /// and is told plainly: the outcome is then known, and the attempt appears
+    /// in `resubmitted` instead.
     pub ambiguous: Vec<ResubmittedShare>,
     /// Shares the last pass reported as beyond repair by retrying.
     ///
@@ -213,15 +217,16 @@ impl<'a> ShareTrackingDriver<'a> {
         let scope = ShareOperationScope::capture(self.database);
         let round =
             admission::RoundKey::new(self.database.sidecar_id(), scope.wallet_id(), self.round_id);
-        let _admission = match admission::claim_round(&round, &interrupted).await {
-            admission::RoundClaim::Admitted(admission) => admission,
-            admission::RoundClaim::HeldByALiveRun => {
-                return run.finish(ShareTrackingQuiescence::AlreadyDriving)
-            }
-            admission::RoundClaim::Interrupted => {
-                return run.finish(ShareTrackingQuiescence::Cancelled)
-            }
-        };
+        let _admission =
+            match admission::claim_round(&round, control, entry_epoch, &interrupted).await {
+                admission::RoundClaim::Admitted(admission) => admission,
+                admission::RoundClaim::HeldByALiveRun => {
+                    return run.finish(ShareTrackingQuiescence::AlreadyDriving)
+                }
+                admission::RoundClaim::Interrupted => {
+                    return run.finish(ShareTrackingQuiescence::Cancelled)
+                }
+            };
         let mut consecutive_failures = 0u32;
 
         loop {
@@ -253,7 +258,7 @@ impl<'a> ShareTrackingDriver<'a> {
             run.passes += 1;
             events.report(ShareTrackingEvent::PassStarted { pass: run.passes });
             let pass_started_at = monotonic_seconds();
-            let outcome = self.pass(&host_context, &interrupted).await;
+            let outcome = self.pass(&scope, &host_context, &interrupted).await;
             let pass_seconds = monotonic_seconds().saturating_sub(pass_started_at);
 
             let delay = match outcome {
@@ -264,8 +269,9 @@ impl<'a> ShareTrackingDriver<'a> {
                     // What the round owed when this pass began, which only the
                     // pass can say: a pass that confirmed and resubmitted
                     // nothing looks the same whether it had no share to walk
-                    // or walked one another task confirmed underneath it.
-                    let owed_nothing_at_entry = report.unconfirmed_at_entry == 0;
+                    // or walked one another task confirmed underneath it. An
+                    // absent observation is not a zero one.
+                    let owed_nothing_at_entry = report.unconfirmed_at_entry == Some(0);
                     let first_pass = run.passes == 1;
                     // A cancelled pass walked a prefix, so its `unrecoverable`
                     // is a partial snapshot like a failed pass's.
@@ -354,8 +360,15 @@ impl<'a> ShareTrackingDriver<'a> {
     /// it acts on the fact of the failure rather than its variant. What the
     /// pass had already committed is carried, because nothing else can
     /// recover it.
+    ///
+    /// `scope` is the run's own, not the sidecar's current one. The boundary
+    /// check above stops a run whose wallet changed, but a switch landing
+    /// between that check and the pass would otherwise redirect the pass to
+    /// another wallet's rows — under this run's admission, and with helper
+    /// configuration read for the wallet it is no longer acting on.
     async fn pass(
         &self,
+        scope: &ShareOperationScope,
         host_context: &ShareTrackingHostContext,
         interrupted: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ShareTrackingReport, FailedPass> {
@@ -368,12 +381,18 @@ impl<'a> ShareTrackingDriver<'a> {
             #[cfg(test)]
             random_bytes: &crate::share_tracking::os_random_bytes,
         };
-        track_pending_shares_recording_partial(self.database, &params, self.client, interrupted)
-            .await
-            .map_err(|failure| FailedPass {
-                message: failure.error.to_string(),
-                partial: failure.partial,
-            })
+        track_pending_shares_recording_partial(
+            self.database,
+            scope,
+            &params,
+            self.client,
+            interrupted,
+        )
+        .await
+        .map_err(|failure| FailedPass {
+            message: failure.error.to_string(),
+            partial: failure.partial,
+        })
     }
 }
 

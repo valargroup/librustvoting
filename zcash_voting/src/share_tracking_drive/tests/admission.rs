@@ -170,6 +170,9 @@ async fn a_replacement_takes_the_round_over_from_a_cancelled_run() {
 
     let replacement_run =
         replacement.run(&replacement_host, &replacement_control, &replacement_events);
+    // The holder is not polled at all between its cancellation and this
+    // point, so the replacement's takeover cannot depend on the holder having
+    // unwound promptly — only on its state being readable.
     tokio::pin!(replacement_run);
     // Polled first, while the holder still holds the round: the replacement
     // must wait for the departure rather than conclude a run is active.
@@ -279,4 +282,93 @@ async fn two_sidecars_holding_the_same_round_do_not_block_each_other() {
 
     control.cancel();
     holding_run.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_holder_turns_a_caller_away_without_making_it_wait() {
+    // Liveness is read from the holder's own control, not inferred from how
+    // long it takes to release, so a caller meeting a live run is answered at
+    // once rather than after a handoff window.
+    let db = db_with_pending_share(60);
+    let host = ScriptedHost::fixed(Some(VOTE_END));
+    let control = ChainSubmissionControl::new(1);
+    let client = client();
+    let holder_events = RecordingReporter::default();
+    let holder = ShareTrackingDriver::new(&db, &client, ROUND_ID).with_policy(waiting_policy());
+
+    let holding_run = holder.run(&host, &control, &holder_events);
+    tokio::pin!(holding_run);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut holding_run)
+            .await
+            .is_err(),
+        "the first run should be waiting for its share to come due"
+    );
+
+    let second_host = ScriptedHost::fixed(Some(VOTE_END));
+    let second_events = RecordingReporter::default();
+    let second = ShareTrackingDriver::new(&db, &client, ROUND_ID).with_policy(waiting_policy());
+    let report = tokio::time::timeout(
+        Duration::from_millis(1),
+        second.run(&second_host, &control, &second_events),
+    )
+    .await
+    .expect("a live holder is an immediate answer, not a wait");
+
+    assert_eq!(report.quiescence, ShareTrackingQuiescence::AlreadyDriving);
+
+    control.cancel();
+    holding_run.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_holder_left_behind_by_an_epoch_change_hands_the_round_over() {
+    // A host that switches account moves the epoch rather than cancelling, and
+    // the run it left behind is departing just as surely. Its replacement runs
+    // under the new epoch and must not be turned away.
+    let db = db_with_pending_share(60);
+    let host = ScriptedHost::fixed(Some(VOTE_END));
+    let control = ChainSubmissionControl::new(1);
+    let client = client();
+    let holder_events = RecordingReporter::default();
+    let holder = ShareTrackingDriver::new(&db, &client, ROUND_ID).with_policy(waiting_policy());
+
+    let holding_run = holder.run(&host, &control, &holder_events);
+    tokio::pin!(holding_run);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut holding_run)
+            .await
+            .is_err(),
+        "the first run should be waiting for its share to come due"
+    );
+
+    control.set_operation_epoch(2);
+
+    let replacement_host = ScriptedHost::fixed(Some(VOTE_END));
+    let replacement_events = RecordingReporter::default();
+    let replacement =
+        ShareTrackingDriver::new(&db, &client, ROUND_ID).with_policy(ShareTrackingDrivePolicy {
+            max_passes: Some(1),
+            ..ShareTrackingDrivePolicy::default()
+        });
+    let replacement_run = replacement.run(&replacement_host, &control, &replacement_events);
+    tokio::pin!(replacement_run);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut replacement_run)
+            .await
+            .is_err(),
+        "the replacement waits for the run the epoch change left behind"
+    );
+
+    let (holder_report, replacement_report) = tokio::join!(holding_run, replacement_run);
+
+    assert_eq!(holder_report.quiescence, ShareTrackingQuiescence::Cancelled);
+    assert!(
+        matches!(
+            replacement_report.quiescence,
+            ShareTrackingQuiescence::PassBudgetExhausted { .. }
+        ),
+        "the replacement drives the round, got {:?}",
+        replacement_report.quiescence,
+    );
 }

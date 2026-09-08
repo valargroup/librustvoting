@@ -133,11 +133,14 @@ This release is `zcash_voting` 4.0.0.
   re-reading share rows: `NothingToTrack`, `AllConfirmed`, `VoteEndReached`,
   `Cancelled`, `AlreadyDriving`, `Failing`, and `PassBudgetExhausted`. A round
   — keyed by sidecar, wallet, and round id — admits one run: a second started
-  while the first is in flight stops with `AlreadyDriving` rather than doubling
-  the round's helper traffic, after first waiting a short window in case the
-  holder is a cancelled run on its way out. `ShareTrackingReport` gains
-  `unconfirmed_at_entry`, what the round owed when a pass began, which is what
-  separates `NothingToTrack` from `AllConfirmed`. Vote
+  while a *live* one is in flight stops with `AlreadyDriving` rather than
+  doubling the round's helper traffic, while one started against a *departing*
+  holder — cancelled, or left behind by an epoch change — waits for it to
+  release the round and takes over, so cancelling a run and starting its
+  replacement cannot leave the round undriven. Each pass acts under the wallet
+  its run was admitted for. `ShareTrackingReport` gains `unconfirmed_at_entry`,
+  what the round owed when a pass began — absent when the pass failed before it
+  could look — which is what separates `NothingToTrack` from `AllConfirmed`. Vote
   end is what bounds a healthy run — every wait is shortened to what is left of
   the window, and `max_passes` is `None` by default, because a pass count is
   not a duration and any budget expires inside a multi-day voting window. A

@@ -242,6 +242,39 @@ impl ShareTrackingHostSource for EpochBumpingHost<'_> {
     }
 }
 
+/// Switches the sidecar's wallet once the run is under way.
+///
+/// The host source is read once per pass, which makes it the one deterministic
+/// place a test can change the world mid-run without racing the driver.
+pub(super) struct WalletSwitchingHost<'a> {
+    database: &'a VotingDb,
+    reads: Mutex<u32>,
+}
+
+impl<'a> WalletSwitchingHost<'a> {
+    pub(super) fn after_first_pass(database: &'a VotingDb) -> Self {
+        Self {
+            database,
+            reads: Mutex::new(0),
+        }
+    }
+}
+
+impl ShareTrackingHostSource for WalletSwitchingHost<'_> {
+    fn host_context(&self) -> ShareTrackingHostContext {
+        let mut reads = self.reads.lock().unwrap();
+        *reads += 1;
+        if *reads > 1 {
+            self.database.set_wallet_id(&unique_wallet_id());
+        }
+        ShareTrackingHostContext {
+            configured_helper_urls: fleet(),
+            now_seconds: NOW,
+            vote_end_time_seconds: Some(VOTE_END),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RecordingReporter {
     pub(super) events: Mutex<Vec<ShareTrackingEvent>>,
@@ -261,7 +294,7 @@ impl RecordingReporter {
     }
 
     /// What each finished pass reported the round owed when it began.
-    pub(super) fn unconfirmed_at_entry(&self) -> Vec<u32> {
+    pub(super) fn unconfirmed_at_entry(&self) -> Vec<Option<u32>> {
         self.events
             .lock()
             .unwrap()
@@ -269,6 +302,21 @@ impl RecordingReporter {
             .filter_map(|event| match event {
                 ShareTrackingEvent::PassFinished { report, .. } => {
                     Some(report.unconfirmed_at_entry)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What each failed pass reported the round owed when it began.
+    pub(super) fn failed_pass_entry_counts(&self) -> Vec<Option<u32>> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                ShareTrackingEvent::PassFailed { partial, .. } => {
+                    Some(partial.unconfirmed_at_entry)
                 }
                 _ => None,
             })

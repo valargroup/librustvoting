@@ -34,7 +34,7 @@ fn resubmitted(share_index: u32) -> ResubmittedShare {
 
 fn pass_report() -> ShareTrackingReport {
     ShareTrackingReport {
-        unconfirmed_at_entry: 4,
+        unconfirmed_at_entry: Some(4),
         confirmed: vec![share(0)],
         resubmitted: vec![resubmitted(1)],
         ambiguous: vec![resubmitted(2)],
@@ -130,7 +130,8 @@ fn a_finished_pass_carries_everything_that_pass_did() {
     assert!(!report.cancelled);
     assert_eq!(report.next_delay_seconds, Some(90));
     assert_eq!(
-        report.unconfirmed_at_entry, 4,
+        report.unconfirmed_at_entry,
+        Some(4),
         "what the round owed at entry is the one observation the effect lists cannot carry",
     );
 }

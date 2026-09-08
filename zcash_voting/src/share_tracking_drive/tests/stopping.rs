@@ -18,7 +18,7 @@ async fn a_round_with_nothing_pending_is_not_tracked() {
     assert!(events.delays().is_empty(), "nothing to wait for");
     assert_eq!(
         events.unconfirmed_at_entry(),
-        vec![0],
+        vec![Some(0)],
         "the verdict rests on what the round owed at entry, which the pass reports",
     );
 }
@@ -47,7 +47,7 @@ async fn a_round_that_owed_a_share_is_never_reported_as_nothing_to_track() {
 
     assert_eq!(
         events.unconfirmed_at_entry(),
-        vec![1],
+        vec![Some(1)],
         "the pass reports the share it set out to track",
     );
     assert!(
@@ -289,5 +289,69 @@ async fn repeated_pass_failures_stop_the_run_and_are_reported() {
             ShareTrackingDrivePolicy::default().failure_retry,
         ],
         "a failed pass computes no delay, so the policy supplies one",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wallet_switched_under_a_run_neither_redirects_it_nor_outlives_it() {
+    // Two properties, and the host here switches the wallet at the one moment
+    // that tests both: after the run's boundary check, while its next pass is
+    // being set up.
+    //
+    // The pass acts under the wallet the run was *admitted* for, not whatever
+    // the sidecar is scoped to by the time it starts — otherwise a switch
+    // landing in this window would have the run drive another wallet's rows
+    // under this run's admission, beside that wallet's own admitted run. Each
+    // pass finding the share proves it: scoped to the switched-in wallet it
+    // would have found none.
+    //
+    // And the run does not carry on past the switch: the next boundary check
+    // ends it, because the host is driving something else now.
+    let db = db_with_pending_share(60);
+    let control = ChainSubmissionControl::new(1);
+    let host = WalletSwitchingHost::after_first_pass(&db);
+
+    let (report, events) =
+        drive_with(&db, &host, &control, ShareTrackingDrivePolicy::default()).await;
+
+    assert_eq!(
+        events.unconfirmed_at_entry(),
+        vec![Some(1), Some(1)],
+        "every pass walked the admitted wallet's share",
+    );
+    assert_eq!(report.quiescence, ShareTrackingQuiescence::Cancelled);
+    assert_eq!(
+        report.passes, 2,
+        "the pass already under way completed; the run stopped at the next boundary",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pass_that_failed_before_looking_reports_no_entry_count_at_all() {
+    // An empty fleet is rejected before storage is read, so the pass never
+    // learns what the round owed. Reporting zero there would tell a host the
+    // round owed nothing while it still held pending shares.
+    let db = db_with_pending_share(60);
+    let control = ChainSubmissionControl::new(1);
+
+    let (_, events) = drive(
+        &db,
+        &ScriptedHost::scripted(vec![ShareTrackingHostContext {
+            configured_helper_urls: Vec::new(),
+            now_seconds: NOW,
+            vote_end_time_seconds: Some(VOTE_END),
+        }]),
+        &control,
+        ShareTrackingDrivePolicy {
+            max_consecutive_failures: 1,
+            ..ShareTrackingDrivePolicy::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        events.failed_pass_entry_counts(),
+        vec![None],
+        "absent, not zero: the pass failed before it could look",
     );
 }

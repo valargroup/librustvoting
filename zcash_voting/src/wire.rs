@@ -739,9 +739,10 @@ pub struct ResubmittedShareView {
 pub struct ShareTrackingPassReportView {
     /// Unconfirmed shares the round held when the pass began. Zero means the
     /// round owed nothing at that moment, which the effect lists alone cannot
-    /// establish.
+    /// establish. Absent when the pass failed before it could look, which is
+    /// not the same as zero.
     #[serde(default)]
-    pub unconfirmed_at_entry: u32,
+    pub unconfirmed_at_entry: Option<u32>,
     #[serde(default)]
     pub confirmed: Vec<ShareKeyView>,
     #[serde(default)]

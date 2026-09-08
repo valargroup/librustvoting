@@ -69,8 +69,18 @@ impl Run {
     }
 
     /// The three per-share effects a pass commits as it makes them.
+    ///
+    /// Ambiguity is the one that can be *un*made. A pass records an attempt as
+    /// ambiguous when it could not tell whether the helper took the share; a
+    /// later pass retrying that same helper can be told plainly, and reports
+    /// the attempt as a definite resubmission. Keeping both would leave the
+    /// run's `ambiguous` claiming an unknown outcome that is now known, so the
+    /// resolved attempt is withdrawn from it.
     fn absorb_durable_effects(&mut self, report: &ShareTrackingReport) {
         self.confirmed.extend(report.confirmed.iter().copied());
+        for settled in &report.resubmitted {
+            self.ambiguous.retain(|attempt| attempt != settled);
+        }
         self.resubmitted.extend(report.resubmitted.iter().cloned());
         self.ambiguous.extend(report.ambiguous.iter().cloned());
     }

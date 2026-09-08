@@ -377,14 +377,20 @@ pub(crate) struct InitialShareSubmissionParams<'a> {
 /// What one tracking pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShareTrackingReport {
-    /// Unconfirmed shares the round held when this pass began.
+    /// Unconfirmed shares the round held when this pass began, once the pass
+    /// got far enough to look.
     ///
-    /// What the pass set out to track, before it learned anything. Zero means
-    /// the round owed nothing at that moment — the one thing the other fields
-    /// cannot establish, because a pass that confirms nothing and resubmits
-    /// nothing looks identical whether it had no share to walk or walked one
-    /// another task confirmed underneath it.
-    pub unconfirmed_at_entry: u32,
+    /// What the pass set out to track, before it learned anything. `Some(0)`
+    /// means the round owed nothing at that moment — the one thing the other
+    /// fields cannot establish, because a pass that confirms nothing and
+    /// resubmits nothing looks identical whether it had no share to walk or
+    /// walked one another task confirmed underneath it.
+    ///
+    /// `None` means the pass never made the observation: it failed validating
+    /// the helper fleet or reading the round's shares, before it could know
+    /// what was owed. That is not the same as owing nothing, and a caller must
+    /// not read it as such.
+    pub unconfirmed_at_entry: Option<u32>,
     /// Shares durably marked confirmed during this pass.
     pub confirmed: Vec<ShareKey>,
     /// Shares that reached a new helper during this pass.
@@ -413,7 +419,8 @@ pub(crate) struct FailedTrackingPass {
     pub(crate) error: VotingError,
     /// Effects committed before the error. Its `unrecoverable` and
     /// `next_delay_seconds` are meaningless — the walk did not reach every
-    /// share, and the delay is computed only once it does.
+    /// share, and the delay is computed only once it does — and its
+    /// `unconfirmed_at_entry` is absent when the pass failed before looking.
     pub(crate) partial: ShareTrackingReport,
 }
 
@@ -670,7 +677,8 @@ pub async fn track_pending_shares(
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareTrackingReport, VotingError> {
-    track_pending_shares_recording_partial(db, params, client, cancel)
+    let scope = share::ShareOperationScope::capture(db);
+    track_pending_shares_recording_partial(db, &scope, params, client, cancel)
         .await
         .map_err(|failure| failure.error)
 }
@@ -684,14 +692,22 @@ pub async fn track_pending_shares(
 /// into a run needs: the run's report would otherwise omit durable progress
 /// that no later pass can rediscover, because a confirmed share is no longer
 /// walked.
+///
+/// `scope` is the wallet identity this pass acts under, supplied rather than
+/// captured. A caller that composes passes has already decided whose shares it
+/// is driving — and been admitted to drive them — so a wallet switch landing
+/// between that decision and this call must not silently redirect the pass to
+/// another wallet's rows. The composing caller notices the switch at its own
+/// boundary and stops; this pass finishes the round it was asked for.
 pub(crate) async fn track_pending_shares_recording_partial(
     db: &VotingDb,
+    scope: &share::ShareOperationScope,
     params: &ShareTrackingParams<'_>,
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareTrackingReport, FailedTrackingPass> {
     let started_at = Instant::now();
-    track_pending_shares_with_elapsed(db, params, client, cancel, &|| {
+    track_pending_shares_with_elapsed(db, scope, params, client, cancel, &|| {
         started_at.elapsed().as_secs()
     })
     .await
@@ -699,13 +715,24 @@ pub(crate) async fn track_pending_shares_recording_partial(
 
 async fn track_pending_shares_with_elapsed(
     db: &VotingDb,
+    scope: &share::ShareOperationScope,
     params: &ShareTrackingParams<'_>,
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
 ) -> Result<ShareTrackingReport, FailedTrackingPass> {
     let mut report = ShareTrackingReport::default();
-    match walk_pending_shares(db, params, client, cancel, elapsed_seconds, &mut report).await {
+    match walk_pending_shares(
+        db,
+        scope,
+        params,
+        client,
+        cancel,
+        elapsed_seconds,
+        &mut report,
+    )
+    .await
+    {
         Ok(()) => Ok(report),
         Err(error) => Err(FailedTrackingPass {
             error,
@@ -721,22 +748,23 @@ async fn track_pending_shares_with_elapsed(
 /// share that failed. `unrecoverable` and `next_delay_seconds` are the two
 /// observations a partial report cannot be trusted for — the first because the
 /// walk did not reach every share, the second because it is computed last.
+#[allow(clippy::too_many_arguments)]
 async fn walk_pending_shares(
     db: &VotingDb,
+    scope: &share::ShareOperationScope,
     params: &ShareTrackingParams<'_>,
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
     report: &mut ShareTrackingReport,
 ) -> Result<(), VotingError> {
-    let scope = share::ShareOperationScope::capture(db);
     // Validate the complete trust boundary before reading or mutating storage
     // and before dispatching any helper request.
     let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
     let configured_urls = configured_fleet.urls();
 
     let pending_shares = share::unconfirmed_for_scope(db, &scope, params.round_id)?;
-    report.unconfirmed_at_entry = u32::try_from(pending_shares.len()).unwrap_or(u32::MAX);
+    report.unconfirmed_at_entry = Some(u32::try_from(pending_shares.len()).unwrap_or(u32::MAX));
 
     for loaded_share in pending_shares {
         if cancel() {

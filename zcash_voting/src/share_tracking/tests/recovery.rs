@@ -789,8 +789,10 @@ async fn resubmission_rechecks_the_cutoff_before_every_post() {
         }
     };
 
+    let scope = share::ShareOperationScope::capture(&db);
     let report = track_pending_shares_with_elapsed(
         &db,
+        &scope,
         &params(&configured, now_seconds, &random),
         &client,
         &never_cancel(),
