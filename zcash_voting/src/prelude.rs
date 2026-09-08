@@ -116,6 +116,12 @@ pub use crate::share_tracking::{
     ShareDeliverySubmissionParams, ShareKey, SharePlacementGuarantee, ShareSubmissionReport,
     ShareTrackingFlags, ShareTrackingParams, ShareTrackingReport,
 };
+pub use crate::share_tracking_drive::{
+    NoopShareTrackingReporter, ShareTrackingDrivePolicy, ShareTrackingDriver, ShareTrackingEvent,
+    ShareTrackingHostContext, ShareTrackingHostSource, ShareTrackingHostSourceBridge,
+    ShareTrackingQuiescence, ShareTrackingReporter, ShareTrackingReporterBridge,
+    ShareTrackingRunReport,
+};
 pub use crate::types::{
     validate_proposal_id, validate_vote_decision, validate_vote_options, DelegationProgressBridge,
     DelegationProgressReporter, Network, NoopProgressReporter, NoteInfo, NoteRef,

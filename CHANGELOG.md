@@ -119,6 +119,45 @@ This release is `zcash_voting` 4.0.0.
   `share::next_tracking_delay_for_round` let a host schedule background share
   tracking without holding durable share rows: the plan says whether any share
   is still unconfirmed, and the delay is computed from the round's own records.
+- `share_tracking_drive` composes `track_pending_shares` passes into one run:
+  `ShareTrackingDriver::run` repeats a pass until a round's helper shares are
+  quiescent, waiting exactly the delay each pass computed and supplying a
+  cadence of its own only after a failed pass, which computed none. It is the
+  share-side counterpart of `round_drive` and mirrors its shape: a
+  `ShareTrackingDrivePolicy`, a `ShareTrackingHostSource` read once per pass so
+  a refreshed helper fleet or clock reaches the next one, a synchronous
+  `ShareTrackingReporter` over `ShareTrackingEvent`, and one
+  `ShareTrackingRunReport`. Passes are strictly sequential, because each plans
+  from the share rows the previous one wrote. `ShareTrackingQuiescence` is
+  exhaustive over why a run stopped, so a host acts on it rather than
+  re-reading share rows: `NothingToTrack`, `AllConfirmed`, `VoteEndReached`,
+  `Cancelled`, `AlreadyDriving`, `Failing`, and `PassBudgetExhausted`. A round
+  — keyed by sidecar, wallet, and round id — admits one run: a second started
+  while a *live* one is in flight stops with `AlreadyDriving` rather than
+  doubling the round's helper traffic, while one started against a *departing*
+  holder — cancelled, or left behind by an epoch change — waits for it to
+  release the round and takes over, so cancelling a run and starting its
+  replacement cannot leave the round undriven. Each pass acts under the wallet
+  its run was admitted for. `ShareTrackingReport` gains `unconfirmed_at_entry`,
+  what the round owed when a pass began — absent when the pass failed before it
+  could look — which is what separates `NothingToTrack` from `AllConfirmed`. The
+  run report accumulates which helpers a share reached rather than how many
+  times, since recovery re-sends an overdue share to helpers that already
+  accepted it, and the per-pass events keep every attempt. Vote
+  end is what bounds a healthy run — every wait is shortened to what is left of
+  the window, and `max_passes` is `None` by default, because a pass count is
+  not a duration and any budget expires inside a multi-day voting window. A
+  failed pass hands back what it had already committed, so a run's report and
+  its `PassFailed` event keep durable progress no later pass could rediscover.
+  Cancellation and an
+  operation-epoch change are observed between passes, during the wait, and
+  inside a pass through its cancel callback, and the wait is woken by the
+  control rather than polled, so a wait that spans the hours until a delayed
+  share is due costs one timer and a host draining a run does not wait it out.
+  Wire views — `ShareTrackingRunReportView`, `ShareTrackingQuiescenceView`,
+  `ShareTrackingEventView`, `ShareTrackingPassReportView`, and
+  `ResubmittedShareView` — follow the same flat, serde-stable shape as the
+  round-drive views.
 - `PirFleet`, `PirSession`, and `PirProofSource`: ordered PIR endpoints with
   failover on typed retryable failures, serviced from a dedicated thread so
   proving can run inside another runtime's blocking pool.

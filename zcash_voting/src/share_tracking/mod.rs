@@ -5,9 +5,12 @@
 //! module is the part in between: it asks helpers what they know, decides what
 //! their answers mean, and drives the durable state forward.
 //!
-//! Wallets should call [`track_pending_shares`] on a timer and keep only the
-//! lifecycle concerns — the timer itself, app lock, and round expiry — on their
-//! side, surfaced through the `cancel` callback.
+//! [`track_pending_shares`] performs one pass.
+//! [`share_tracking_drive`](crate::share_tracking_drive) repeats it on the
+//! cadence each pass computes, so a wallet keeps only what it alone can
+//! observe — app lock and account or round identity — surfaced through the
+//! `cancel` callback. Calling this directly is still supported for a single
+//! pass, and makes the caller responsible for the cadence again.
 //!
 //! # Trust model
 //!
@@ -374,6 +377,20 @@ pub(crate) struct InitialShareSubmissionParams<'a> {
 /// What one tracking pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShareTrackingReport {
+    /// Unconfirmed shares the round held when this pass began, once the pass
+    /// got far enough to look.
+    ///
+    /// What the pass set out to track, before it learned anything. `Some(0)`
+    /// means the round owed nothing at that moment — the one thing the other
+    /// fields cannot establish, because a pass that confirms nothing and
+    /// resubmits nothing looks identical whether it had no share to walk or
+    /// walked one another task confirmed underneath it.
+    ///
+    /// `None` means the pass never made the observation: it failed validating
+    /// the helper fleet or reading the round's shares, before it could know
+    /// what was owed. That is not the same as owing nothing, and a caller must
+    /// not read it as such.
+    pub unconfirmed_at_entry: Option<u32>,
     /// Shares durably marked confirmed during this pass.
     pub confirmed: Vec<ShareKey>,
     /// Shares that reached a new helper during this pass.
@@ -389,6 +406,22 @@ pub struct ShareTrackingReport {
     pub cancelled: bool,
     /// Seconds to wait before the next pass, or `None` when nothing is pending.
     pub next_delay_seconds: Option<u64>,
+}
+
+/// A tracking pass that failed, with what it had already done durably.
+///
+/// A pass is not atomic: it walks a round's unconfirmed shares in order and
+/// commits each confirmation and retained recovery attempt as it makes it. An
+/// error therefore means "the walk stopped here", not "nothing happened", and
+/// `partial` is what did.
+#[derive(Debug)]
+pub(crate) struct FailedTrackingPass {
+    pub(crate) error: VotingError,
+    /// Effects committed before the error. Its `unrecoverable` and
+    /// `next_delay_seconds` are meaningless — the walk did not reach every
+    /// share, and the delay is computed only once it does — and its
+    /// `unconfirmed_at_entry` is absent when the pass failed before looking.
+    pub(crate) partial: ShareTrackingReport,
 }
 
 /// Inputs for a focused confirmation check over one durable helper share.
@@ -644,8 +677,37 @@ pub async fn track_pending_shares(
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareTrackingReport, VotingError> {
+    let scope = share::ShareOperationScope::capture(db);
+    track_pending_shares_recording_partial(db, &scope, params, client, cancel)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// [`track_pending_shares`], keeping what a failed pass had already recorded.
+///
+/// A pass writes each confirmation and each retained recovery attempt as it
+/// reaches it, so a storage failure on a later share does not undo what the
+/// earlier ones durably did. This variant hands those effects back with the
+/// error instead of dropping them, which is what a caller composing passes
+/// into a run needs: the run's report would otherwise omit durable progress
+/// that no later pass can rediscover, because a confirmed share is no longer
+/// walked.
+///
+/// `scope` is the wallet identity this pass acts under, supplied rather than
+/// captured. A caller that composes passes has already decided whose shares it
+/// is driving — and been admitted to drive them — so a wallet switch landing
+/// between that decision and this call must not silently redirect the pass to
+/// another wallet's rows. The composing caller notices the switch at its own
+/// boundary and stops; this pass finishes the round it was asked for.
+pub(crate) async fn track_pending_shares_recording_partial(
+    db: &VotingDb,
+    scope: &share::ShareOperationScope,
+    params: &ShareTrackingParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<ShareTrackingReport, FailedTrackingPass> {
     let started_at = Instant::now();
-    track_pending_shares_with_elapsed(db, params, client, cancel, &|| {
+    track_pending_shares_with_elapsed(db, scope, params, client, cancel, &|| {
         started_at.elapsed().as_secs()
     })
     .await
@@ -653,19 +715,58 @@ pub async fn track_pending_shares(
 
 async fn track_pending_shares_with_elapsed(
     db: &VotingDb,
+    scope: &share::ShareOperationScope,
     params: &ShareTrackingParams<'_>,
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
-) -> Result<ShareTrackingReport, VotingError> {
-    let scope = share::ShareOperationScope::capture(db);
+) -> Result<ShareTrackingReport, FailedTrackingPass> {
+    let mut report = ShareTrackingReport::default();
+    match walk_pending_shares(
+        db,
+        scope,
+        params,
+        client,
+        cancel,
+        elapsed_seconds,
+        &mut report,
+    )
+    .await
+    {
+        Ok(()) => Ok(report),
+        Err(error) => Err(FailedTrackingPass {
+            error,
+            partial: report,
+        }),
+    }
+}
+
+/// The pass itself, writing into the report as it goes.
+///
+/// Split out so an error carries the durable effects recorded before it: the
+/// caller owns the report, and every `?` here leaves it populated up to the
+/// share that failed. `unrecoverable` and `next_delay_seconds` are the two
+/// observations a partial report cannot be trusted for — the first because the
+/// walk did not reach every share, the second because it is computed last.
+#[allow(clippy::too_many_arguments)]
+async fn walk_pending_shares(
+    db: &VotingDb,
+    scope: &share::ShareOperationScope,
+    params: &ShareTrackingParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
+    report: &mut ShareTrackingReport,
+) -> Result<(), VotingError> {
     // Validate the complete trust boundary before reading or mutating storage
     // and before dispatching any helper request.
     let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
     let configured_urls = configured_fleet.urls();
-    let mut report = ShareTrackingReport::default();
 
-    for loaded_share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
+    let pending_shares = share::unconfirmed_for_scope(db, &scope, params.round_id)?;
+    report.unconfirmed_at_entry = Some(u32::try_from(pending_shares.len()).unwrap_or(u32::MAX));
+
+    for loaded_share in pending_shares {
         if cancel() {
             report.cancelled = true;
             break;
@@ -816,21 +917,28 @@ async fn track_pending_shares_with_elapsed(
                     cancel,
                     elapsed_seconds,
                 )
-                .await?;
+                .await;
+                let resubmission = match resubmission {
+                    Ok(resubmission) => resubmission,
+                    Err(failure) => {
+                        record_ambiguous_recovery_effects(
+                            &mut delivery_state,
+                            report,
+                            &share,
+                            failure.outcome_unknown_urls,
+                        )?;
+                        return Err(failure.error);
+                    }
+                };
                 if matches!(resubmission.outcome, ResubmitOutcome::StaleGeneration) {
                     break;
                 }
-                for server_url in resubmission.outcome_unknown_urls {
-                    let newly_outcome_unknown =
-                        !delivery_state.outcome_unknown_urls().contains(&server_url);
-                    delivery_state.mark_outcome_unknown(&server_url)?;
-                    if newly_outcome_unknown {
-                        report.ambiguous.push(ResubmittedShare {
-                            share: ShareKey::of(&share),
-                            server_url,
-                        });
-                    }
-                }
+                record_ambiguous_recovery_effects(
+                    &mut delivery_state,
+                    report,
+                    &share,
+                    resubmission.outcome_unknown_urls,
+                )?;
                 match resubmission.outcome {
                     ResubmitOutcome::DefinitelyAcceptedByHelper(server_url) => {
                         // An overdue re-POST can convert an outcome-unknown
@@ -877,7 +985,26 @@ async fn track_pending_shares_with_elapsed(
         current_time,
         params.policy,
     );
-    Ok(report)
+    Ok(())
+}
+
+fn record_ambiguous_recovery_effects(
+    delivery_state: &mut share::ShareDeliveryState,
+    report: &mut ShareTrackingReport,
+    recovered_share: &ShareDelegationRecord,
+    outcome_unknown_urls: Vec<String>,
+) -> Result<(), VotingError> {
+    for server_url in outcome_unknown_urls {
+        let newly_outcome_unknown = !delivery_state.outcome_unknown_urls().contains(&server_url);
+        delivery_state.mark_outcome_unknown(&server_url)?;
+        if newly_outcome_unknown {
+            report.ambiguous.push(ResubmittedShare {
+                share: ShareKey::of(recovered_share),
+                server_url,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn dedupe_preserving_order(urls: impl Iterator<Item = String>) -> Vec<String> {

@@ -54,6 +54,7 @@ pub mod session;
 pub mod share;
 pub mod share_policy;
 pub mod share_tracking;
+pub mod share_tracking_drive;
 mod shielded_protocol;
 pub mod storage;
 pub mod transport;
@@ -122,6 +123,12 @@ pub use round_drive::{
     FailureIsolation, NoopRoundDriveReporter, ProgressBaseline, RoundDriveEvent, RoundDrivePolicy,
     RoundDriveReporter, RoundDriveReporterBridge, RoundDriver, RoundHostSource,
     RoundHostSourceBridge, RoundQuiescence, RoundRunReport, RoundStepFailureRecord, RoundWorkTally,
+};
+pub use share_tracking_drive::{
+    NoopShareTrackingReporter, ShareTrackingDrivePolicy, ShareTrackingDriver, ShareTrackingEvent,
+    ShareTrackingHostContext, ShareTrackingHostSource, ShareTrackingHostSourceBridge,
+    ShareTrackingQuiescence, ShareTrackingReporter, ShareTrackingReporterBridge,
+    ShareTrackingRunReport,
 };
 pub use transport::{
     DirectRoute, PirHttpFailure, PirHttpFailurePhase, RouteError, RouteFuture, RouteHttp,
