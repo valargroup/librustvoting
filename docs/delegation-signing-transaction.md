@@ -576,6 +576,12 @@ setup. If persistence wins before cleanup, cleanup preserves the proved bundle.
 Hosts should use the cache-only `reset_vote_tree` for normal navigation so
 background proofs and later signing can reuse the durable transaction.
 
+Signature retention rechecks the bundle's current sighash and randomized key
+inside the same immediate write transaction as insertion or idempotent replay.
+A missing or replaced signing context returns `KeystoneSignatureConflict` and
+rolls back the entire batch. This prevents a signature validated before a
+replacement from being stored against the replacement and blocking its signer.
+
 Concurrent initial setup can return `Busy` while another caller holds the
 bundle setup lease. A retry loads that caller's persisted transaction without
 waiting for its full proof generation.
@@ -589,3 +595,6 @@ committing a target replacement while the request snapshot remains open.
 `storage/operations/tests/proof_persistence.rs` covers reset and replacement
 from a second connection before proof completion, retry after reset, and cleanup
 after successful proof persistence.
+`storage/operations/tests/keystone_signatures.rs` covers replacement from a
+second connection after signature validation, rejection of missing or changed
+signing context, and atomic rollback including stale idempotent replays.

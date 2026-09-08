@@ -1189,6 +1189,7 @@ mod session_reset_tests {
         conn.execute(
             "UPDATE bundles
              SET pczt_sighash = :sighash,
+                 rk = :rk,
                  tx1_effects = :tx1_effects,
                  padded_note_secrets = :secrets,
                  padded_note_data = :padded
@@ -1200,6 +1201,7 @@ mod session_reset_tests {
                 ":wallet_id": WALLET_ID,
                 ":bundle_index": bundle_index,
                 ":sighash": vec![0xAAu8; 32],
+                ":rk": vec![0x22u8; 32],
                 ":tx1_effects": crate::tx1::placeholder_tx1_effects(),
                 ":secrets": vec![0xBBu8; 64],
                 ":padded": vec![0xCCu8; 32],

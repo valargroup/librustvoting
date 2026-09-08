@@ -2599,10 +2599,11 @@ impl VotingDb {
 
     /// Atomically store a batch of Keystone delegation signatures.
     ///
-    /// Replaying a tuple with the same sighash and randomized key is
-    /// idempotent even if the signature bytes differ. Reusing a bundle index
-    /// for a different signing context returns a typed conflict and rolls the
-    /// complete batch back.
+    /// Every tuple must match the bundle's current PCZT sighash and randomized
+    /// key inside the storage transaction, including on an idempotent replay.
+    /// Missing or different setup returns `KeystoneSignatureConflict` and rolls
+    /// the complete batch back. Replaying a matching stored context remains
+    /// idempotent even if the signature bytes differ.
     pub fn store_keystone_signatures_batch(
         &self,
         round_id: &str,
@@ -2646,6 +2647,37 @@ impl VotingDb {
         let mut already_present = 0u32;
 
         for signature in signatures {
+            // Validation may have preceded a setup replacement on another
+            // connection. Hold the write transaction across this check and save.
+            let matches_bundle: bool = tx
+                .query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM bundles
+                        WHERE round_id = :round_id AND wallet_id = :wallet_id
+                          AND bundle_index = :bundle_index
+                          AND pczt_sighash = :sighash AND rk = :rk
+                     )",
+                    rusqlite::named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": &wallet_id,
+                        ":bundle_index": signature.bundle_index as i64,
+                        ":sighash": &signature.sighash,
+                        ":rk": &signature.rk,
+                    },
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    VotingError::from_sqlite(
+                        "failed to read Keystone bundle signing context",
+                        &error,
+                    )
+                })?;
+            if !matches_bundle {
+                return Err(VotingError::KeystoneSignatureConflict {
+                    bundle_index: signature.bundle_index,
+                });
+            }
+
             let existing = tx
                 .query_row(
                     "SELECT sighash, rk FROM keystone_signatures
@@ -3279,6 +3311,7 @@ mod pir_wallet_scope_tests;
 mod tests {
     mod broadcast_protection;
     mod fixtures;
+    mod keystone_signatures;
     mod keystone_snapshot;
     mod proof_persistence;
     mod proof_phase;
@@ -3974,6 +4007,12 @@ mod tests {
             &[identity_note_with_position(8)],
         )
         .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET pczt_sighash = ?1, rk = ?2",
+                rusqlite::params![vec![0x22u8; 32], vec![0x33u8; 32]],
+            )
+            .unwrap();
         let signature = KeystoneSignatureInput {
             bundle_index: 0,
             sig: vec![0x11; 64],
