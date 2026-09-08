@@ -127,15 +127,33 @@ fn every_draft_of_a_bundle_is_one_cast_obligation_with_its_delegation_prerequisi
             _ => None,
         })
         .collect::<Vec<_>>();
-    // Each bundle's two choices are one cast while batching is on, and one
-    // cast apiece while it is off; the delegation prerequisite rides on every
-    // cast either way.
-    if crate::ATOMIC_VOTE_BATCHES_ENABLED {
-        assert_eq!(casts, vec![(0, 2, Some(0)), (1, 2, None)]);
-    } else {
-        assert_eq!(
-            casts,
-            vec![(0, 1, Some(0)), (0, 1, Some(0)), (1, 1, None), (1, 1, None)]
-        );
+    assert_eq!(casts, vec![(0, 2, Some(0)), (1, 2, None)]);
+}
+
+#[test]
+fn no_choices_produce_no_cast_and_one_choice_remains_a_singleton() {
+    for decision in [Decision::Skipped, Decision::Choice(0)] {
+        let snapshot = snapshot()
+            .bundle(0, DelegationPhase::Confirmed)
+            .intent(1, decision)
+            .intent(2, Decision::Skipped)
+            .build();
+        let obligations = classify_round(&snapshot, &[1, 2]).unwrap();
+        let drafts = obligations
+            .obligations
+            .iter()
+            .filter_map(|obligation| match obligation {
+                Obligation::Cast { drafts, .. } => Some(drafts),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match decision {
+            Decision::Skipped => assert!(drafts.is_empty()),
+            Decision::Choice(_) => {
+                assert_eq!(drafts.len(), 1);
+                assert_eq!(drafts[0].len(), 1);
+                assert_eq!(drafts[0][0].proposal_id, 1);
+            }
+        }
     }
 }

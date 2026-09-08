@@ -189,16 +189,16 @@ otherwise `Blocked` with the reason.
 `open_proposals`, `unrostered_intents` and the absence of a cast step.
 
 How a bundle's drafts are grouped into cast obligations follows the build's
-`ATOMIC_VOTE_BATCHES_ENABLED` constant, and nothing else:
+`ATOMIC_VOTE_BATCHES_ENABLED` constant, and nothing else. It ships enabled;
+target chains must serve `cast-vote-batch` before adopting this SDK version:
 
 - with batching **on**, all drafts for one bundle form one `Cast` obligation
   and are cast as one atomic batch (or one singleton when there is one draft)
   (`every_draft_of_a_bundle_is_one_cast_obligation_with_its_delegation_prerequisite`,
   `a_cast_step_for_one_proposal_resolves_to_the_bundles_whole_draft_set`);
-- with batching **off**, which is how it currently ships because no deployed
-  chain serves the `cast-vote-batch` route, each draft becomes its own `Cast`
+- with batching **off**, each draft becomes its own `Cast`
   obligation over a single proposal, and each is dispatched as a singleton on
-  `cast-vote`. The same two tests state this shape.
+  `cast-vote`. The conformance tests require the shipped, enabled shape.
 
 The grouping decision is made once, in `classify`, and the rest of the
 specification is written in terms of the units it produces. A singleton

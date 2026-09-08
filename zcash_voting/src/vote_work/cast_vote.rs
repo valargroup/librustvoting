@@ -245,7 +245,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
 
         let (votes, batch) = self
-            .recover_committed(&round_id, recovery)
+            .recover_committed(&round_id, recovery, &scope.observations)
             .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
         self.complete_vote_unit(
             scope,
@@ -263,13 +263,20 @@ impl<T: ChainTransport> RoundExecutor<T> {
         &self,
         round_id: &str,
         recovery: VoteCommitmentRecovery,
+        observations: &crate::ObservationScope,
     ) -> Result<(Vec<CommittedVote>, Option<SignedVoteBatch>), VotingError> {
         let bundle_index = recovery.bundle_index();
         let votes = recovery
             .proposal_ids()
             .into_iter()
             .map(|proposal_id| {
-                CommittedVote::recover(&self.database, round_id, bundle_index, proposal_id)
+                CommittedVote::observe_recover(
+                    &self.database,
+                    round_id,
+                    bundle_index,
+                    proposal_id,
+                    observations,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let batch = match recovery {
