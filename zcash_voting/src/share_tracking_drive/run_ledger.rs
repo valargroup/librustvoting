@@ -8,6 +8,21 @@ use crate::share_tracking::{ResubmittedShare, ShareKey, ShareTrackingReport};
 
 use super::{quiescence::ShareTrackingQuiescence, ShareTrackingRunReport};
 
+/// Shares a pass proved are not beyond repair.
+///
+/// A confirmation settles it outright. So does reaching a helper, whether the
+/// acceptance was definite or ambiguous: recovery could only send a share it
+/// still had the material for.
+fn recovered_shares(report: &ShareTrackingReport) -> Vec<ShareKey> {
+    report
+        .confirmed
+        .iter()
+        .copied()
+        .chain(report.resubmitted.iter().map(|attempt| attempt.share))
+        .chain(report.ambiguous.iter().map(|attempt| attempt.share))
+        .collect()
+}
+
 /// What the run has accumulated so far.
 #[derive(Default)]
 pub(super) struct Run {
@@ -36,12 +51,21 @@ impl Run {
     /// only unconfirmed shares, so a share this one confirmed is never seen
     /// again and would be missing from the run's report altogether.
     ///
-    /// `unrecoverable` is deliberately left alone. It is a statement about the
-    /// whole round, taken from the last pass that saw every share; a partial
-    /// walk saw a prefix, and letting it replace the set would drop shares
-    /// whose material is still missing.
+    /// The retained `unrecoverable` set is kept rather than replaced. It is a
+    /// statement about the whole round, taken from the last pass that saw
+    /// every share; a partial walk saw a prefix, and letting it replace the
+    /// set would drop shares whose material is still missing.
+    ///
+    /// Kept is not frozen, though: a share this pass confirmed or reached a
+    /// helper with is no longer beyond repair, whatever an earlier pass
+    /// concluded. Leaving those in would let one report call a share both
+    /// recovered and unrecoverable, and let `PassBudgetExhausted` name a share
+    /// that is already confirmed.
     pub(super) fn absorb_partial(&mut self, report: &ShareTrackingReport) {
         self.absorb_durable_effects(report);
+        let recovered = recovered_shares(report);
+        self.unrecoverable
+            .retain(|share| !recovered.contains(share));
     }
 
     /// The three per-share effects a pass commits as it makes them.

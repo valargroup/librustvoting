@@ -260,6 +260,21 @@ impl RecordingReporter {
             .collect()
     }
 
+    /// What each finished pass reported the round owed when it began.
+    pub(super) fn unconfirmed_at_entry(&self) -> Vec<u32> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                ShareTrackingEvent::PassFinished { report, .. } => {
+                    Some(report.unconfirmed_at_entry)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(super) fn passes_started(&self) -> usize {
         self.events
             .lock()
@@ -298,6 +313,35 @@ pub(super) async fn drive_with(
     let report = ShareTrackingDriver::new(db, &client, ROUND_ID)
         .with_policy(policy)
         .run(host, control, &events)
+        .await;
+    (report, events)
+}
+
+/// [`drive`] with a clock that charges `seconds_per_pass` to every pass.
+///
+/// A test cannot make a pass take an hour, so the clock the driver measures a
+/// pass by is supplied instead — the same seam `track_pending_shares_with_elapsed`
+/// uses one layer down.
+pub(super) async fn drive_charging_each_pass(
+    db: &VotingDb,
+    host: &dyn ShareTrackingHostSource,
+    control: &ChainSubmissionControl,
+    policy: ShareTrackingDrivePolicy,
+    seconds_per_pass: u64,
+) -> (ShareTrackingRunReport, RecordingReporter) {
+    let client = client();
+    let events = RecordingReporter::default();
+    // The driver reads the clock twice per pass, so a reading advances by the
+    // charge on every second read.
+    let reads = Mutex::new(0u64);
+    let elapsed = move || {
+        let mut reads = reads.lock().unwrap();
+        *reads += 1;
+        (*reads / 2) * seconds_per_pass
+    };
+    let report = ShareTrackingDriver::new(db, &client, ROUND_ID)
+        .with_policy(policy)
+        .run_on_clock(host, control, &events, &elapsed)
         .await;
     (report, events)
 }

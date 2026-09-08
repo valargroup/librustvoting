@@ -1095,6 +1095,7 @@ impl From<crate::share_tracking::ResubmittedShare> for ResubmittedShareView {
 impl From<crate::share_tracking::ShareTrackingReport> for ShareTrackingPassReportView {
     fn from(report: crate::share_tracking::ShareTrackingReport) -> Self {
         Self {
+            unconfirmed_at_entry: report.unconfirmed_at_entry,
             confirmed: report
                 .confirmed
                 .into_iter()

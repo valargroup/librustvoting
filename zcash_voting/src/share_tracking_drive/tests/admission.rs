@@ -131,3 +131,152 @@ async fn another_round_in_the_same_wallet_runs_alongside() {
     control.cancel();
     holding_run.await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_replacement_takes_the_round_over_from_a_cancelled_run() {
+    // The dangerous overlap is not two live runs, it is a run replacing a
+    // cancelled one. A host that cancels a run and starts its replacement can
+    // arrive between the cancel and the holder's return; turning that
+    // replacement away would leave the round with no run at all, and nothing
+    // restarts it until the next lifecycle event.
+    let db = db_with_pending_share(60);
+    let host = ScriptedHost::fixed(Some(VOTE_END));
+    let holder_control = ChainSubmissionControl::new(1);
+    let client = client();
+    let holder_events = RecordingReporter::default();
+    let holder = ShareTrackingDriver::new(&db, &client, ROUND_ID).with_policy(waiting_policy());
+
+    let holding_run = holder.run(&host, &holder_control, &holder_events);
+    tokio::pin!(holding_run);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut holding_run)
+            .await
+            .is_err(),
+        "the first run should be waiting for its share to come due"
+    );
+
+    // Cancel the holder but do not poll it: the replacement starts while the
+    // holder still holds the round, which is exactly the race.
+    holder_control.cancel();
+
+    let replacement_control = ChainSubmissionControl::new(1);
+    let replacement_host = ScriptedHost::fixed(Some(VOTE_END));
+    let replacement_events = RecordingReporter::default();
+    let replacement =
+        ShareTrackingDriver::new(&db, &client, ROUND_ID).with_policy(ShareTrackingDrivePolicy {
+            max_passes: Some(1),
+            ..ShareTrackingDrivePolicy::default()
+        });
+
+    let replacement_run =
+        replacement.run(&replacement_host, &replacement_control, &replacement_events);
+    tokio::pin!(replacement_run);
+    // Polled first, while the holder still holds the round: the replacement
+    // must wait for the departure rather than conclude a run is active.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut replacement_run)
+            .await
+            .is_err(),
+        "the replacement should be waiting for the departing holder to release"
+    );
+
+    let (holder_report, replacement_report) = tokio::join!(holding_run, replacement_run);
+
+    assert_eq!(holder_report.quiescence, ShareTrackingQuiescence::Cancelled);
+    assert!(
+        matches!(
+            replacement_report.quiescence,
+            ShareTrackingQuiescence::PassBudgetExhausted { .. }
+        ),
+        "the replacement drives the round rather than being turned away, got {:?}",
+        replacement_report.quiescence,
+    );
+    assert_eq!(replacement_report.passes, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_caller_cancelled_while_waiting_for_the_round_reports_cancellation() {
+    // A caller waiting out a departing holder still observes its own stop
+    // signal, and must not report the wait as another run's activity.
+    let db = db_with_pending_share(60);
+    let host = ScriptedHost::fixed(Some(VOTE_END));
+    let holder_control = ChainSubmissionControl::new(1);
+    let client = client();
+    let holder_events = RecordingReporter::default();
+    let holder = ShareTrackingDriver::new(&db, &client, ROUND_ID).with_policy(waiting_policy());
+
+    let holding_run = holder.run(&host, &holder_control, &holder_events);
+    tokio::pin!(holding_run);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut holding_run)
+            .await
+            .is_err(),
+        "the first run should be waiting for its share to come due"
+    );
+
+    let waiter_control = ChainSubmissionControl::new(1);
+    waiter_control.cancel();
+    let waiter_host = ScriptedHost::fixed(Some(VOTE_END));
+    let waiter_events = RecordingReporter::default();
+    let waiter = ShareTrackingDriver::new(&db, &client, ROUND_ID).with_policy(waiting_policy());
+    let report = waiter
+        .run(&waiter_host, &waiter_control, &waiter_events)
+        .await;
+
+    assert_eq!(report.quiescence, ShareTrackingQuiescence::Cancelled);
+    assert_eq!(report.passes, 0);
+
+    holder_control.cancel();
+    holding_run.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_sidecars_holding_the_same_round_do_not_block_each_other() {
+    // Two independently opened databases can carry the same wallet id and
+    // round id while holding separate share rows. A run over one cannot touch
+    // the other's rows, so they are not each other's concurrency.
+    let shared_wallet = unique_wallet_id();
+    let first = empty_db();
+    first.set_wallet_id(&shared_wallet);
+    seed_round_with_pending_share(&first, ROUND_ID, 60);
+    let second = empty_db();
+    second.set_wallet_id(&shared_wallet);
+    seed_round_with_pending_share(&second, ROUND_ID, 60);
+
+    let control = ChainSubmissionControl::new(1);
+    let client = client();
+    let host = ScriptedHost::fixed(Some(VOTE_END));
+    let holder_events = RecordingReporter::default();
+    let holder = ShareTrackingDriver::new(&first, &client, ROUND_ID).with_policy(waiting_policy());
+
+    let holding_run = holder.run(&host, &control, &holder_events);
+    tokio::pin!(holding_run);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut holding_run)
+            .await
+            .is_err(),
+        "the first run should be waiting for its share to come due"
+    );
+
+    let other_host = ScriptedHost::fixed(Some(VOTE_END));
+    let other_events = RecordingReporter::default();
+    let other = ShareTrackingDriver::new(&second, &client, ROUND_ID).with_policy(
+        ShareTrackingDrivePolicy {
+            max_passes: Some(1),
+            ..ShareTrackingDrivePolicy::default()
+        },
+    );
+    let report = other.run(&other_host, &control, &other_events).await;
+
+    assert!(
+        matches!(
+            report.quiescence,
+            ShareTrackingQuiescence::PassBudgetExhausted { .. }
+        ),
+        "the other sidecar's run polls its own rows, got {:?}",
+        report.quiescence,
+    );
+
+    control.cancel();
+    holding_run.await;
+}

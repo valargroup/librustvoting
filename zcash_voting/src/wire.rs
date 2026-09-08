@@ -737,6 +737,11 @@ pub struct ResubmittedShareView {
 /// What one helper-share tracking pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareTrackingPassReportView {
+    /// Unconfirmed shares the round held when the pass began. Zero means the
+    /// round owed nothing at that moment, which the effect lists alone cannot
+    /// establish.
+    #[serde(default)]
+    pub unconfirmed_at_entry: u32,
     #[serde(default)]
     pub confirmed: Vec<ShareKeyView>,
     #[serde(default)]

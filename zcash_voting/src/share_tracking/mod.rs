@@ -377,6 +377,14 @@ pub(crate) struct InitialShareSubmissionParams<'a> {
 /// What one tracking pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShareTrackingReport {
+    /// Unconfirmed shares the round held when this pass began.
+    ///
+    /// What the pass set out to track, before it learned anything. Zero means
+    /// the round owed nothing at that moment — the one thing the other fields
+    /// cannot establish, because a pass that confirms nothing and resubmits
+    /// nothing looks identical whether it had no share to walk or walked one
+    /// another task confirmed underneath it.
+    pub unconfirmed_at_entry: u32,
     /// Shares durably marked confirmed during this pass.
     pub confirmed: Vec<ShareKey>,
     /// Shares that reached a new helper during this pass.
@@ -727,7 +735,10 @@ async fn walk_pending_shares(
     let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
     let configured_urls = configured_fleet.urls();
 
-    for loaded_share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
+    let pending_shares = share::unconfirmed_for_scope(db, &scope, params.round_id)?;
+    report.unconfirmed_at_entry = u32::try_from(pending_shares.len()).unwrap_or(u32::MAX);
+
+    for loaded_share in pending_shares {
         if cancel() {
             report.cancelled = true;
             break;

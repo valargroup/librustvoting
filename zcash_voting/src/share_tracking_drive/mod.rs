@@ -42,7 +42,7 @@ pub use progress::{
 };
 pub use quiescence::ShareTrackingQuiescence;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{
     helper::client::HelperClient,
@@ -177,20 +177,59 @@ impl<'a> ShareTrackingDriver<'a> {
         control: &ChainSubmissionControl,
         events: &dyn ShareTrackingReporter,
     ) -> ShareTrackingRunReport {
+        let started_at = Instant::now();
+        self.run_on_clock(host, control, events, &|| started_at.elapsed().as_secs())
+            .await
+    }
+
+    /// [`run`](Self::run), reading elapsed wall time through `monotonic_seconds`.
+    ///
+    /// Seconds since the run began, from a clock only this layer needs: the
+    /// vote-end boundary is in host time, and closing on it correctly means
+    /// knowing how much of the window a pass just spent. Injected for the same
+    /// reason `track_pending_shares_with_elapsed` injects its own — a test
+    /// cannot make a pass take an hour.
+    async fn run_on_clock(
+        &self,
+        host: &dyn ShareTrackingHostSource,
+        control: &ChainSubmissionControl,
+        events: &dyn ShareTrackingReporter,
+        monotonic_seconds: &(dyn Fn() -> u64 + Send + Sync),
+    ) -> ShareTrackingRunReport {
         let mut run = run_ledger::Run::default();
-        // Wallet-qualified, and captured once: which wallet's shares this run
-        // drives is fixed at entry, and a host that switches wallet moves the
-        // operation epoch, which ends the run.
-        let scope = ShareOperationScope::capture(self.database);
-        let Some(_admission) = admission::admit_run(scope.wallet_id(), self.round_id) else {
-            return run.finish(ShareTrackingQuiescence::AlreadyDriving);
-        };
+        // The epoch comes first, and the wallet is read under it. Captured the
+        // other way round, a switch landing between the two would leave the
+        // run holding the old wallet's admission while accepting the new
+        // wallet's epoch as its own — and every pass re-reads the sidecar's
+        // current wallet, so it would drive the new wallet's shares beside a
+        // correctly admitted run of its own.
         let entry_epoch = control.operation_epoch();
         let interrupted = || control.is_cancelled() || control.operation_epoch() != entry_epoch;
+        if interrupted() {
+            return run.finish(ShareTrackingQuiescence::Cancelled);
+        }
+        let scope = ShareOperationScope::capture(self.database);
+        let round =
+            admission::RoundKey::new(self.database.sidecar_id(), scope.wallet_id(), self.round_id);
+        let _admission = match admission::claim_round(&round, &interrupted).await {
+            admission::RoundClaim::Admitted(admission) => admission,
+            admission::RoundClaim::HeldByALiveRun => {
+                return run.finish(ShareTrackingQuiescence::AlreadyDriving)
+            }
+            admission::RoundClaim::Interrupted => {
+                return run.finish(ShareTrackingQuiescence::Cancelled)
+            }
+        };
         let mut consecutive_failures = 0u32;
 
         loop {
             if interrupted() {
+                return run.finish(ShareTrackingQuiescence::Cancelled);
+            }
+            // The sidecar's wallet is the subject of every pass, re-read by
+            // each one. A host that switched it under this run is driving
+            // something else now, and this run's admission does not cover it.
+            if self.database.wallet_id() != scope.wallet_id() {
                 return run.finish(ShareTrackingQuiescence::Cancelled);
             }
             let host_context = host.host_context();
@@ -211,16 +250,28 @@ impl<'a> ShareTrackingDriver<'a> {
 
             run.passes += 1;
             events.report(ShareTrackingEvent::PassStarted { pass: run.passes });
+            let pass_started_at = monotonic_seconds();
             let outcome = self.pass(&host_context, &interrupted).await;
+            let pass_seconds = monotonic_seconds().saturating_sub(pass_started_at);
 
             let delay = match outcome {
                 Ok(report) => {
                     consecutive_failures = 0;
                     let cancelled = report.cancelled;
                     let next_delay = report.next_delay_seconds;
+                    // What the round owed when this pass began, which only the
+                    // pass can say: a pass that confirmed and resubmitted
+                    // nothing looks the same whether it had no share to walk
+                    // or walked one another task confirmed underneath it.
+                    let owed_nothing_at_entry = report.unconfirmed_at_entry == 0;
                     let first_pass = run.passes == 1;
-                    let idle = report.confirmed.is_empty() && report.resubmitted.is_empty();
-                    run.absorb(&report);
+                    // A cancelled pass walked a prefix, so its `unrecoverable`
+                    // is a partial snapshot like a failed pass's.
+                    if cancelled {
+                        run.absorb_partial(&report);
+                    } else {
+                        run.absorb(&report);
+                    }
                     events.report(ShareTrackingEvent::PassFinished {
                         pass: run.passes,
                         report: Box::new(report),
@@ -231,7 +282,7 @@ impl<'a> ShareTrackingDriver<'a> {
                     }
                     let Some(seconds) = next_delay else {
                         // No delay means no unconfirmed share is left to poll.
-                        return run.finish(if first_pass && idle {
+                        return run.finish(if first_pass && owed_nothing_at_entry {
                             ShareTrackingQuiescence::NothingToTrack
                         } else {
                             ShareTrackingQuiescence::AllConfirmed
@@ -268,7 +319,7 @@ impl<'a> ShareTrackingDriver<'a> {
                     self.policy.failure_retry
                 }
             };
-            let delay = wait_within_voting_window(delay, &host_context);
+            let delay = wait_within_voting_window(delay, &host_context, pass_seconds);
 
             // Checked before the wait, not after it: waiting out a delay only
             // to find the budget spent would report exhaustion a full pass
@@ -338,13 +389,22 @@ struct FailedPass {
 /// until a whole poll interval had elapsed — and after a failed pass, would
 /// spend the last usable retry of the window on a wait.
 ///
+/// `pass_seconds` is how much of the window the pass that produced this delay
+/// consumed.
+///
 /// A round whose host reports no vote end has no such boundary, and keeps the
 /// delay it was given.
-fn wait_within_voting_window(delay: Duration, host_context: &ShareTrackingHostContext) -> Duration {
+fn wait_within_voting_window(
+    delay: Duration,
+    host_context: &ShareTrackingHostContext,
+    pass_seconds: u64,
+) -> Duration {
     let Some(vote_end) = host_context.vote_end_time_seconds else {
         return delay;
     };
-    delay.min(Duration::from_secs(
-        vote_end.saturating_sub(host_context.now_seconds),
-    ))
+    // `now_seconds` was read before the pass, so the pass's own duration has
+    // already been spent out of the window. Charging it here is what keeps a
+    // slow pass followed by a capped wait from landing past the boundary.
+    let spent_at = host_context.now_seconds.saturating_add(pass_seconds);
+    delay.min(Duration::from_secs(vote_end.saturating_sub(spent_at)))
 }

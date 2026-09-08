@@ -94,3 +94,49 @@ async fn a_round_with_no_vote_end_keeps_the_delay_it_was_given() {
         vec![Duration::from_secs(timing.future_check_max_delay_seconds)],
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_pass_that_produced_a_delay_is_charged_to_the_window() {
+    // `now_seconds` is read before the pass, so a pass that takes real time
+    // has already spent part of the window by the time the cap is computed.
+    // Capping against the pre-pass clock would let a slow pass plus a capped
+    // wait land past vote end, holding the round — and its admission — beyond
+    // the boundary.
+    let db = db_with_pending_share(60);
+    let host = closing_window(20, fleet());
+    let control = ChainSubmissionControl::new(1);
+
+    let (report, events) =
+        drive_charging_each_pass(&db, &host, &control, ShareTrackingDrivePolicy::default(), 8)
+            .await;
+
+    assert_eq!(
+        events.delays(),
+        vec![Duration::from_secs(12)],
+        "twenty seconds of window less the eight the pass spent",
+    );
+    assert_eq!(report.quiescence, ShareTrackingQuiescence::VoteEndReached);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pass_that_outlasts_the_window_leaves_no_wait_at_all() {
+    let db = db_with_pending_share(60);
+    let host = closing_window(5, fleet());
+    let control = ChainSubmissionControl::new(1);
+
+    let (_, events) = drive_charging_each_pass(
+        &db,
+        &host,
+        &control,
+        ShareTrackingDrivePolicy::default(),
+        30,
+    )
+    .await;
+
+    assert_eq!(
+        events.delays(),
+        vec![Duration::ZERO],
+        "the window closed during the pass, so the run goes straight back to \
+         the boundary check rather than sleeping past it",
+    );
+}

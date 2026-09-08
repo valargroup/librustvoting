@@ -16,6 +16,44 @@ async fn a_round_with_nothing_pending_is_not_tracked() {
         "one pass establishes there is nothing to track"
     );
     assert!(events.delays().is_empty(), "nothing to wait for");
+    assert_eq!(
+        events.unconfirmed_at_entry(),
+        vec![0],
+        "the verdict rests on what the round owed at entry, which the pass reports",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_round_that_owed_a_share_is_never_reported_as_nothing_to_track() {
+    // `NothingToTrack` and `AllConfirmed` are different answers for a host, so
+    // the run must not infer the first from a pass that merely did nothing.
+    // A pass can confirm and resubmit nothing and still have had a share to
+    // walk — one another task confirmed underneath it, for instance — and the
+    // round did owe something at entry.
+    let db = db_with_pending_share(60);
+    let host = ScriptedHost::fixed(Some(VOTE_END));
+    let control = ChainSubmissionControl::new(1);
+
+    let (report, events) = drive(
+        &db,
+        &host,
+        &control,
+        ShareTrackingDrivePolicy {
+            max_passes: Some(1),
+            ..ShareTrackingDrivePolicy::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        events.unconfirmed_at_entry(),
+        vec![1],
+        "the pass reports the share it set out to track",
+    );
+    assert!(
+        !matches!(report.quiescence, ShareTrackingQuiescence::NothingToTrack),
+        "the round owed a share, whatever the pass managed to do about it",
+    );
 }
 
 #[tokio::test(start_paused = true)]
