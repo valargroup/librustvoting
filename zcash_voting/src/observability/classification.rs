@@ -156,6 +156,42 @@ pub(crate) fn voting_error_kind(error: &crate::VotingError) -> &'static str {
     }
 }
 
+/// Projects delegation setup, where "already persisted" is not a failure.
+///
+/// `setup` is idempotent by construction: re-running it for a bundle whose
+/// PCZT sighash or tx1 effects are already stored returns
+/// [`crate::VotingError::SetupAlreadyPersisted`], and
+/// `DelegationPipeline::ensure_setup` catches exactly those two fields and
+/// continues by validating the persisted proof. Recording that branch as
+/// `Failed` reports a failure for work the round completed normally, and every
+/// re-attempt of a round produces one per bundle — noise that trains a reader
+/// to ignore `failed`, which is how a real failure gets missed.
+///
+/// [`ObservationOutcome::Reused`] is the same projection the SDK already
+/// applies to a reused proof and to a duplicate share submission.
+///
+/// The field match is deliberately narrow.
+/// [`crate::types::DelegationSetupField::PaddedNoteSecrets`] is **not**
+/// tolerated by `ensure_setup`: it means the stored setup belongs to different
+/// notes, the caller propagates it, and it must keep reporting `Failed`.
+pub(crate) fn delegation_setup_outcome<T>(
+    result: &Result<T, crate::VotingError>,
+) -> ObservationOutcome {
+    match result {
+        Ok(_) => ObservationOutcome::Succeeded,
+        Err(crate::VotingError::SetupAlreadyPersisted { field, .. })
+            if matches!(
+                field,
+                crate::types::DelegationSetupField::PcztSighash
+                    | crate::types::DelegationSetupField::Tx1Effects
+            ) =>
+        {
+            ObservationOutcome::Reused
+        }
+        Err(_) => ObservationOutcome::Failed,
+    }
+}
+
 /// Projects proof completion identically at stage and invocation boundaries.
 pub(crate) fn delegation_proof_outcome(
     result: &Result<crate::delegate::DelegationProofStatus, crate::VotingError>,

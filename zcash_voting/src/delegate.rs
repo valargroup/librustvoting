@@ -1260,11 +1260,9 @@ impl PreparedDelegationBundle {
                 observations,
             )
         })();
-        let outcome = if operation_result.is_ok() {
-            crate::ObservationOutcome::Succeeded
-        } else {
-            crate::ObservationOutcome::Failed
-        };
+        // `SetupAlreadyPersisted` on a tolerated field is reuse, not failure;
+        // see `delegation_setup_outcome`.
+        let outcome = crate::observability::delegation_setup_outcome(&operation_result);
         observation_stage.finish(
             outcome,
             operation_result
@@ -1869,11 +1867,9 @@ pub(crate) fn observe_setup(
             tx1_effects: pczt.tx1_effects,
         })
     })();
-    let outcome = if operation_result.is_ok() {
-        crate::ObservationOutcome::Succeeded
-    } else {
-        crate::ObservationOutcome::Failed
-    };
+    // `SetupAlreadyPersisted` on a tolerated field is reuse, not failure;
+    // see `delegation_setup_outcome`.
+    let outcome = crate::observability::delegation_setup_outcome(&operation_result);
     observation_stage.finish(
         outcome,
         operation_result
@@ -2512,6 +2508,7 @@ fn array64_slice(label: &str, value: &[u8]) -> Result<[u8; 64], VotingError> {
 mod tests {
     mod observability;
     mod pipeline_observability;
+    mod setup_observability;
     use super::*;
     pub(crate) use crate::backend::pasta_curves;
 
