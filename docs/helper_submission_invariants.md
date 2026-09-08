@@ -653,6 +653,9 @@ the pass and the timing policy.
 - **A failing pass is retried, then surfaced.** `max_consecutive_failures`
   consecutive failures end the run with the messages, rather than retrying
   silently for the rest of the round. A successful pass resets the count.
+  Cancellation outranks the failure verdict on both paths: a pass that failed
+  because the host was draining the run reports `Cancelled`, with the failure
+  still listed, rather than `Failing`.
 - **Vote end bounds a healthy run; the pass budget is off by default.** A share
   that never becomes pollable, and a share nothing can still repair, both stay
   unconfirmed however long the run lasts, so both keep producing a next delay
@@ -690,6 +693,7 @@ Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
 `a_round_past_its_vote_end_is_not_polled`,
 `vote_end_reached_between_passes_stops_the_run`,
 `a_share_that_never_becomes_pollable_stops_at_the_pass_budget`,
+`a_pass_that_fails_while_the_run_is_draining_reports_cancellation`,
 `the_default_run_is_bounded_by_vote_end_rather_than_a_pass_count`,
 `a_zero_budget_stops_without_polling`, and
 `repeated_pass_failures_stop_the_run_and_are_reported` in

@@ -184,6 +184,36 @@ async fn a_zero_budget_stops_without_polling() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_pass_that_fails_while_the_run_is_draining_reports_cancellation() {
+    // Cancellation outranks a failure verdict. A pass that failed because the
+    // host was draining the run says nothing about the round's health, and
+    // `Failing` would send a host looking for a fault it caused. The failure
+    // is still recorded.
+    let db = db_with_pending_share(60);
+    let control = ChainSubmissionControl::new(1);
+    let host = EpochBumpingHost::with_a_fleet_that_fails_the_first_pass(&control);
+
+    let (report, _) = drive_with(
+        &db,
+        &host,
+        &control,
+        ShareTrackingDrivePolicy {
+            max_consecutive_failures: 1,
+            ..ShareTrackingDrivePolicy::default()
+        },
+    )
+    .await;
+
+    assert_eq!(report.quiescence, ShareTrackingQuiescence::Cancelled);
+    assert_eq!(report.passes, 1);
+    assert_eq!(
+        report.failures.len(),
+        1,
+        "the failure is reported even though it is not why the run stopped",
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn repeated_pass_failures_stop_the_run_and_are_reported() {
     // An empty fleet is rejected before storage or network, so every pass
     // fails the same way. The run backs off and hands the host the messages

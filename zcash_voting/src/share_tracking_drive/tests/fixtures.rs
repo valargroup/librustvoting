@@ -198,6 +198,7 @@ pub(super) struct EpochBumpingHost<'a> {
     control: &'a ChainSubmissionControl,
     reads: Mutex<u32>,
     bump_after: u32,
+    helper_urls: Vec<String>,
 }
 
 impl<'a> EpochBumpingHost<'a> {
@@ -206,6 +207,21 @@ impl<'a> EpochBumpingHost<'a> {
             control,
             reads: Mutex::new(0),
             bump_after: 1,
+            helper_urls: fleet(),
+        }
+    }
+
+    /// Bumps as the very first pass reads its inputs, and hands that pass a
+    /// fleet it will reject — so the pass fails while the run is already
+    /// interrupted.
+    pub(super) fn with_a_fleet_that_fails_the_first_pass(
+        control: &'a ChainSubmissionControl,
+    ) -> Self {
+        Self {
+            control,
+            reads: Mutex::new(0),
+            bump_after: 0,
+            helper_urls: Vec::new(),
         }
     }
 }
@@ -219,7 +235,7 @@ impl ShareTrackingHostSource for EpochBumpingHost<'_> {
                 .set_operation_epoch(self.control.operation_epoch() + 1);
         }
         ShareTrackingHostContext {
-            configured_helper_urls: fleet(),
+            configured_helper_urls: self.helper_urls.clone(),
             now_seconds: NOW,
             vote_end_time_seconds: Some(VOTE_END),
         }

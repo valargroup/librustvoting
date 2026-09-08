@@ -166,7 +166,11 @@ impl<'a> ShareTrackingDriver<'a> {
     /// returns [`ShareTrackingQuiescence::AlreadyDriving`] immediately without
     /// polling anything, because the work it was started for is already being
     /// done and two interleaved runs would only double the round's helper
-    /// traffic.
+    /// traffic. Admission is released when this future completes or is
+    /// dropped, so a host that cancels a run and starts another for the same
+    /// round should await the cancelled one first — cancellation is observed
+    /// promptly, but the round is held until the run it belongs to actually
+    /// returns.
     pub async fn run(
         &self,
         host: &dyn ShareTrackingHostSource,
@@ -243,11 +247,20 @@ impl<'a> ShareTrackingDriver<'a> {
                     // one no later pass can rediscover.
                     run.absorb_partial(&failure.partial);
                     run.failures.push(failure.message.clone());
+                    let cancelled = failure.partial.cancelled;
                     events.report(ShareTrackingEvent::PassFailed {
                         pass: run.passes,
                         message: failure.message,
                         partial: Box::new(failure.partial),
                     });
+                    // Cancellation outranks a failure verdict, as it does on
+                    // the successful path. A pass that failed because the host
+                    // was draining the run says nothing about the round's
+                    // health, and `Failing` would send a host looking for a
+                    // fault it caused.
+                    if cancelled || interrupted() {
+                        return run.finish(ShareTrackingQuiescence::Cancelled);
+                    }
                     if consecutive_failures >= self.policy.max_consecutive_failures {
                         let messages = run.recent_failures(consecutive_failures);
                         return run.finish(ShareTrackingQuiescence::Failing { messages });
