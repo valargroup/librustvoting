@@ -218,6 +218,14 @@ This release is `zcash_voting` 4.0.0.
 
 ### Changed
 
+- Atomic vote batching is enabled by default: multiple due proposals in one
+  bundle use `cast-vote-batch`, while one proposal still uses `cast-vote`.
+  Target chains must support the batch route before adopting this release.
+  Persisted singleton and batch work retain their recovery shape.
+- Batch operation reports clear inherited member attribution for bundle-wide
+  stages and include fresh-cast committed-handle recovery. Individual proof
+  and helper stages retain their own member identities.
+
 - A PIR request now splits one 60-second budget across two bounded attempts
   instead of spending it on a single deadline. A fetch that succeeds does so in
   a few seconds; one against a dead endpoint stalls and never returns, so a

@@ -115,6 +115,19 @@ impl ObservationScope {
         }
     }
 
+    /// Attributes work to the complete bundle, clearing a triggering member's
+    /// proposal and share identity while retaining the collector and parent.
+    pub(crate) fn for_bundle(&self, bundle_index: u32) -> Self {
+        Self {
+            attribution: ObservationAttribution {
+                bundle_index: Some(bundle_index),
+                proposal_id: None,
+                share_index: None,
+            },
+            ..self.clone()
+        }
+    }
+
     /// Attributes a transport attempt and its nested measurements to a one-based index.
     pub(crate) fn attempt(&self, attempt: u32) -> Self {
         Self {
