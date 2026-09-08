@@ -13,8 +13,8 @@ use super::{
 };
 use crate::chain_submission::{
     confirmation::{
-        apply_confirmed_generation, validate_hash_confirmation,
-        validate_imported_delegation_confirmation,
+        apply_confirmed_generation, retire_rejected_combined_generation,
+        validate_hash_confirmation, validate_imported_delegation_confirmation,
     },
     coordination::SubmissionCoordination,
     generation::{
@@ -881,6 +881,26 @@ impl SqliteChainSubmissionStore {
                     transition_failure(previous, "transition unexpectedly removed durable row")
                 })?;
             record.settle_after_transition(previous, diagnostic, now);
+            // A combined generation that becomes terminally rejected is
+            // retired here, in the transition's own transaction, and its row
+            // removed: every reader that keys off the row's existence (fresh
+            // admission, the delegation phase, batch phase derivation,
+            // lifecycle ownership of the members) then falls through to the
+            // delegation's durable setup, which reads `Proved`. The returned
+            // record still describes the rejection for this invocation's
+            // caller. A standalone generation keeps its terminal row.
+            let entered_rejected = matches!(record.state, SubmissionRecordState::Rejected(_))
+                && previous != ChainSubmissionState::Rejected;
+            if entered_rejected && generation.identity().target().is_combined() {
+                retire_rejected_combined_generation(tx, generation.identity())
+                    .map_err(map_generation_error)?;
+                tx.execute(
+                    "DELETE FROM chain_submissions WHERE identity_key=?1",
+                    [submission_identity_key(generation.identity())],
+                )
+                .map_err(storage_error)?;
+                return Ok(record);
+            }
             persist_mutable(tx, &record)?;
             Ok(record)
         })

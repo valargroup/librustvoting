@@ -653,6 +653,7 @@ pub enum ChainDiagnosticKindView {
     ReconciliationPending,
     InvalidProtocolResponse,
     StorageFailure,
+    EndpointUnsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -967,6 +968,8 @@ pub enum RoundStepProgressKind {
     Delegation,
     TreeSynced,
     VoteCommit,
+    /// The signed combined delegation-and-cast envelope is durable. New with
+    /// atomic casting; hosts must treat unknown kinds as opaque progress.
     DelegateAndVoteBatchPersisted,
     HelperPlansPrepared,
     ChainOutcome,

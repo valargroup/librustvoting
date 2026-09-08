@@ -190,9 +190,17 @@ pub(crate) fn project(
     let mut work_summary = summarize_plan_work(&steps, blocking_share_work);
     for step in &steps {
         if let NextStep::CastVote { bundle_index, .. } = step {
-            if delegation
+            // A fresh cast on an unconfirmed delegation signs the delegation
+            // as part of its combined transaction. An imported delegation is
+            // already on the chain and its holder has no delegation key.
+            let imported = snapshot
+                .bundles
                 .get(bundle_index)
-                .is_some_and(|phase| *phase != DelegationPhase::Confirmed)
+                .is_some_and(|bundle| bundle.capability_imported);
+            if !imported
+                && delegation
+                    .get(bundle_index)
+                    .is_some_and(|phase| *phase != DelegationPhase::Confirmed)
             {
                 work_summary
                     .delegation_bundles_needing_signing

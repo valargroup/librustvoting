@@ -20,6 +20,7 @@ const FINAL_VAN_LEAF_INDEX_ATTRIBUTE: &str = "final_van_leaf_index";
 const VC_LEAF_INDICES_ATTRIBUTE: &str = "vote_commitment_leaf_indices";
 const PROPOSAL_IDS_ATTRIBUTE: &str = "proposal_ids";
 const VAN_NULLIFIERS_ATTRIBUTE: &str = "van_nullifiers";
+const NULLIFIER_COUNT_ATTRIBUTE: &str = "nullifier_count";
 const ROUND_ID_ATTRIBUTES: [&str; 2] = ["vote_round_id", "round_id"];
 
 /// Validates committed hash evidence against one locked generation.
@@ -91,7 +92,7 @@ pub(super) fn validate_hash_confirmation(
                 derived.request()
             {
                 let nullifiers = parse_compat_u64(
-                    required_attribute(event, batch_event, "nullifiers")?,
+                    required_attribute(event, batch_event, NULLIFIER_COUNT_ATTRIBUTE)?,
                     "combined delegation nullifier count",
                 )?;
                 if nullifiers != combined.delegation.gov_nullifiers.len() as u64 {
@@ -391,6 +392,54 @@ fn confirmation_error(error: super::ChainSubmissionConfirmationError) -> VotingE
 
 /// Projects validated terminal evidence onto the rows locked by `derived`.
 ///
+/// Retires a terminally rejected combined generation in the caller's
+/// lifecycle transaction.
+///
+/// Every member vote's recovery, shares, helper plans and immediate-share
+/// designation are cleared and the bundle's combined authorization is dropped,
+/// so the delegation reads `Proved` again and a fresh combined batch may be
+/// prepared. The delegation setup itself — PCZT, sighash, proof and any stored
+/// Keystone signature — is untouched: the chain rejected this envelope, not
+/// the delegation, and the same signature authorizes the next one. A member
+/// that reached the chain makes this an error, which the caller must roll back.
+pub(super) fn retire_rejected_combined_generation(
+    conn: &rusqlite::Transaction<'_>,
+    identity: &super::ChainSubmissionIdentity,
+) -> Result<(), VotingError> {
+    let Some(digest) = identity
+        .target()
+        .batch_digest()
+        .filter(|_| identity.target().is_combined())
+    else {
+        return Err(VotingError::Internal {
+            message: "only a combined generation retires on rejection".to_string(),
+        });
+    };
+    let round_id = hex::encode(identity.vote_round_id());
+    let members = crate::vote::load_vote_batch_recoveries_with_conn(
+        conn,
+        identity.wallet_id(),
+        &round_id,
+        identity.bundle_index(),
+        digest,
+    )?;
+    if members.is_empty() {
+        return Err(VotingError::Internal {
+            message: "rejected combined generation has no persisted members".to_string(),
+        });
+    }
+    for member in &members {
+        crate::vote::clear_unsubmitted_vote_recovery_with_conn(
+            conn,
+            identity.wallet_id(),
+            &round_id,
+            identity.bundle_index(),
+            member.proposal_id,
+        )?;
+    }
+    Ok(())
+}
+
 /// The caller must include this connection in its lifecycle transaction. The
 /// function rejects confirmation positions that do not match the generation's
 /// expected action layout and performs no network I/O. The caller must roll

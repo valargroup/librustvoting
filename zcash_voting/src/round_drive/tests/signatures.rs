@@ -287,3 +287,63 @@ async fn a_bundle_that_cannot_sign_does_not_condemn_one_that_already_has() {
         "bundle 1's stored signature is already there"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_imported_delegation_with_a_terminal_ballot_needs_no_signer() {
+    // The wallet holding an imported capability has no delegation key by
+    // construction. Its cast waits for the imported transaction to confirm and
+    // then casts against a confirmed delegation, so the cast must not be
+    // counted as a combined delegation-and-cast that owes a signature.
+    let database = database_with_imported_delegation();
+    let chain = Arc::new(ScriptedChain::default());
+    chain.queue_confirmed();
+    let executor = executor_over_chain(Arc::clone(&database), Arc::clone(&chain));
+    executor
+        .set_ballot_intents(&[BallotIntent {
+            proposal_id: 1,
+            decision: Decision::Choice(0),
+        }])
+        .unwrap();
+    let plan = executor.plan().unwrap();
+    assert!(
+        plan.next_steps
+            .contains(&NextStep::AdvanceImportedDelegation { bundle_index: 0 }),
+        "{:?}",
+        plan.next_steps
+    );
+    assert!(
+        !plan.needs_delegation_signing,
+        "an imported delegation never asks for the voter's key: {:?}",
+        plan.delegation_bundles_needing_signing
+    );
+
+    let control = ChainSubmissionControl::new(1);
+    let events = RecordingReporter::default();
+    let report = RoundDriver::new(&executor)
+        .with_policy(RoundDrivePolicy {
+            max_dispatches: 1,
+            ..RoundDrivePolicy::default()
+        })
+        .run(&SinglePassHost, &control, &events)
+        .await;
+
+    assert!(
+        !matches!(
+            report.quiescence,
+            RoundQuiescence::NeedsDelegationSignatures { .. }
+        ),
+        "{:?}",
+        report.quiescence
+    );
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(
+        events.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RoundDriveEvent::StepSelected {
+                step: NextStep::AdvanceImportedDelegation { bundle_index: 0 }
+            }
+        )),
+        "the imported advance dispatched without a signer handoff"
+    );
+    assert_eq!(*chain.gets.lock().unwrap(), 1);
+}

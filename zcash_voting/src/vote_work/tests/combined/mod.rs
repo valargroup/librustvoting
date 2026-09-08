@@ -45,8 +45,12 @@ async fn prepare_early(
         .unwrap();
 }
 
-fn assert_completed(executor: &RoundExecutor<std::sync::Arc<Peers>>, peers: &Peers) {
-    assert_eq!(peers.posts.lock().unwrap().len(), 1);
+fn assert_completed(
+    executor: &RoundExecutor<std::sync::Arc<Peers>>,
+    peers: &Peers,
+    expected_posts: usize,
+) {
+    assert_eq!(peers.posts.lock().unwrap().len(), expected_posts);
     assert_eq!(peers.deliveries.load(Ordering::SeqCst), 2);
     let db = executor.database();
     assert_eq!(
@@ -95,7 +99,7 @@ async fn combined_executor_zkp2_prepares_submits_confirms_and_delivers() {
     .unwrap();
     assert_eq!(outcome.disposition, RoundStepDisposition::Advanced);
     assert_eq!(driver.signed.load(Ordering::SeqCst), 1);
-    assert_completed(&executor, &peers);
+    assert_completed(&executor, &peers, 1);
 }
 
 struct CancelAfterPersistence(ChainSubmissionControl);
@@ -262,7 +266,151 @@ async fn combined_executor_zkp2_cancellation_reopens_and_resumes_without_signing
         .unwrap();
     assert_eq!(outcome.disposition, RoundStepDisposition::Advanced);
     assert_eq!(peers.posts.lock().unwrap()[0], before.batch_json.as_bytes());
-    assert_completed(&resumed, &peers);
+    assert_completed(&resumed, &peers, 1);
     drop((resumed, peers));
     std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "generates real ZKP2 proofs; run make proofs"]
+async fn combined_executor_zkp2_rejection_returns_the_bundle_to_proved_and_recasts_on_the_next_run()
+{
+    let (db, driver) = database();
+    let peers = Peers::new(db.clone());
+    peers.rejections.store(1, Ordering::SeqCst);
+    let executor = executor(db.clone(), peers.clone(), true);
+    let host = context(driver.clone());
+    let control = ChainSubmissionControl::new(1);
+    prepare_early(&executor, &host, &control).await;
+
+    // The run that observes the rejection ends there and never recasts
+    // within itself.
+    let outcome = advance_plan_head(
+        &executor,
+        &host,
+        &control,
+        &NoopRoundStepProgressReporter {},
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.disposition, RoundStepDisposition::ChainTerminal);
+    assert!(
+        matches!(
+            outcome.chain_outcome,
+            Some(ChainSubmissionResult::Rejected(_))
+        ),
+        "{:?}",
+        outcome.chain_outcome
+    );
+    assert_eq!(driver.signed.load(Ordering::SeqCst), 1);
+    assert_eq!(peers.posts.lock().unwrap().len(), 1);
+    assert_eq!(peers.deliveries.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        db.delegation_phase(ROUND_ID, 0).unwrap(),
+        phases::DelegationPhase::Proved
+    );
+    let rows: u32 = db
+        .conn()
+        .query_row("SELECT count(*) FROM chain_submissions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 0, "the rejected generation leaves no lifecycle row");
+    let plan = executor.plan().unwrap();
+    assert!(
+        plan.next_steps.iter().any(|step| matches!(
+            step,
+            session::NextStep::CastVote {
+                bundle_index: 0,
+                ..
+            }
+        )),
+        "{:?}",
+        plan.next_steps
+    );
+
+    // The next run signs the same delegation again and submits a new digest.
+    let outcome = advance_plan_head(
+        &executor,
+        &host,
+        &control,
+        &NoopRoundStepProgressReporter {},
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.disposition, RoundStepDisposition::Advanced);
+    assert_eq!(driver.signed.load(Ordering::SeqCst), 2);
+    let posts = peers.posts.lock().unwrap().clone();
+    assert_eq!(posts.len(), 2);
+    let digests: Vec<[u8; 32]> = posts
+        .iter()
+        .map(|post| {
+            serde_json::from_slice::<wire::DelegateAndVoteBatchWire>(post)
+                .unwrap()
+                .authorization_digest()
+                .unwrap()
+        })
+        .collect();
+    assert_ne!(digests[0], digests[1], "a recast is a fresh generation");
+    assert_completed(&executor, &peers, 2);
+}
+
+#[tokio::test]
+#[ignore = "generates real ZKP2 proofs; run make proofs"]
+async fn combined_executor_zkp2_changed_ballot_after_persistence_rebuilds_one_authorization() {
+    // Persisted but never dispatched, a combined batch is still the voter's
+    // to change. A new choice retires the old members and their authorization
+    // and the rebuilt batch carries exactly one authorization and one POST.
+    let (db, driver) = database();
+    let peers = Peers::new(db.clone());
+    let executor = executor(db.clone(), peers.clone(), true);
+    let host = context(driver.clone());
+    let control = ChainSubmissionControl::new(1);
+    prepare_early(&executor, &host, &control).await;
+    let outcome = advance_plan_head(
+        &executor,
+        &host,
+        &control,
+        &CancelAfterPersistence(control.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
+    let before =
+        delegate_and_vote_batch::recover_delegate_and_vote_batch(&db, ROUND_ID, 0, 1).unwrap();
+
+    executor
+        .set_ballot_intents(&[BallotIntent {
+            proposal_id: 2,
+            decision: session::Decision::Choice(2),
+        }])
+        .unwrap();
+    let control = ChainSubmissionControl::new(2);
+    let outcome = advance_plan_head(
+        &executor,
+        &host,
+        &control,
+        &NoopRoundStepProgressReporter {},
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.disposition, RoundStepDisposition::Advanced);
+    let authorizations: u32 = db
+        .conn()
+        .query_row("SELECT count(*) FROM delegate_cast_recovery", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        authorizations, 1,
+        "the retired batch leaves no authorization"
+    );
+    let posts = peers.posts.lock().unwrap().clone();
+    assert_eq!(posts.len(), 1);
+    assert_ne!(posts[0], before.batch_json.as_bytes());
+    assert_completed(&executor, &peers, 1);
 }

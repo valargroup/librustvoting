@@ -11,6 +11,20 @@ const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 fn fixture(count: u32) -> (Arc<VotingDb>, AdvanceVoteBatch) {
     let (db, _, signature) = persisted_delegation();
+    let db = Arc::new(db);
+    let request = persist_combined_batch(&db, signature, count, 0);
+    (db, request)
+}
+
+/// Persists a signed combined batch of `count` members over the fixture's
+/// delegation. `variant` perturbs every vote commitment so two batches over
+/// the same delegation get distinct digests.
+fn persist_combined_batch(
+    db: &VotingDb,
+    signature: [u8; 64],
+    count: u32,
+    variant: u8,
+) -> AdvanceVoteBatch {
     let authorization = crate::delegate_and_vote_batch::DelegationAuthorization::capture(
         &db.conn(),
         "wallet-1",
@@ -24,6 +38,7 @@ fn fixture(count: u32) -> (Arc<VotingDb>, AdvanceVoteBatch) {
             let mut vote = recovery(proposal);
             vote.anchor_height = 0;
             vote.vc_tree_position = 0;
+            vote.vote_commitment[31] = variant;
             vote
         })
         .collect();
@@ -50,25 +65,22 @@ fn fixture(count: u32) -> (Arc<VotingDb>, AdvanceVoteBatch) {
             index: index as u32,
             size: count,
         });
-        crate::vote::insert_recovery_fixture(&db, vote).unwrap();
+        crate::vote::insert_recovery_fixture(db, vote).unwrap();
     }
     authorization.persist(&db.conn(), &digest).unwrap();
-    (
-        Arc::new(db),
-        AdvanceVoteBatch {
-            vote_round_id: [0x11; 32],
-            bundle_index: 0,
-            ordered_batch_digest: digest,
-            ordered_proposal_ids: (1..=count).collect(),
-        },
-    )
+    AdvanceVoteBatch {
+        vote_round_id: [0x11; 32],
+        bundle_index: 0,
+        ordered_batch_digest: digest,
+        ordered_proposal_ids: (1..=count).collect(),
+    }
 }
 
 fn event(request: &AdvanceVoteBatch) -> serde_json::Value {
     let attributes = [
         ("round_id", ROUND.to_owned()),
         (
-            "nullifiers",
+            "nullifier_count",
             crate::governance::BUNDLE_NOTE_SLOTS.to_string(),
         ),
         ("batch_digest", hex::encode(request.ordered_batch_digest)),
@@ -142,7 +154,7 @@ impl ChainTransport for Transport {
 
 #[tokio::test]
 async fn combined_lifecycle_confirms_delegation_and_every_vote_together() {
-    for count in [1, 2, crate::vote::MAX_VOTE_BATCH_ACTIONS as u32] {
+    for count in [1, 2, 37, crate::vote::MAX_VOTE_BATCH_ACTIONS as u32] {
         let (db, request) = fixture(count);
         let transport = Arc::new(Transport {
             request: request.clone(),
@@ -239,6 +251,131 @@ async fn combined_lifecycle_confirms_delegation_and_every_vote_together() {
             .unwrap();
         assert_eq!(rows, 1);
     }
+}
+
+/// An already-submitted 37-question ballot must recover by its saved hash
+/// after restart, without another POST or access to the delegation signer.
+#[tokio::test]
+async fn combined_chain_receipt_recovers_after_reopen_without_resubmission() {
+    let (db, request) = fixture(37);
+    let transport = Arc::new(Transport {
+        request: request.clone(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let config = || {
+        ChainSubmissionClientConfig::for_network(
+            crate::Network::Testnet,
+            vec!["https://vote.example".to_owned()],
+        )
+    };
+    let client =
+        ChainSubmissionClient::with_transport(db.clone(), transport.clone(), config()).unwrap();
+    let control = ChainSubmissionControl::new(1);
+    let pending = client
+        .advance_delegate_and_vote_batch(request.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    assert!(matches!(pending, ChainSubmissionResult::Pending(_)));
+    // A malformed committed receipt must leave the saved hash available to
+    // a later client. It is not permission to POST the batch again.
+    struct MissingCountReceipt(Arc<Transport>);
+    impl ChainTransport for MissingCountReceipt {
+        fn chain_get<'a>(&'a self, request: ChainHttpRequest) -> ChainTransportFuture<'a> {
+            Box::pin(async move {
+                let response = self.0.chain_get(request).await?;
+                let mut receipt: serde_json::Value =
+                    serde_json::from_slice(response.body()).unwrap();
+                receipt["events"][0]["attributes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|attribute| attribute["key"] != "nullifier_count");
+                Ok(ChainHttpResponse::json(
+                    200,
+                    serde_json::to_vec(&receipt).unwrap(),
+                ))
+            })
+        }
+        fn chain_post_json<'a>(
+            &'a self,
+            _: ChainHttpRequest,
+            _: Vec<u8>,
+        ) -> ChainTransportFuture<'a> {
+            panic!("a saved candidate must be polled, never resubmitted");
+        }
+    }
+    let malformed_client = ChainSubmissionClient::with_transport(
+        db.clone(),
+        Arc::new(MissingCountReceipt(transport.clone())),
+        config(),
+    )
+    .unwrap();
+    let error = malformed_client
+        .advance_delegate_and_vote_batch(request.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("nullifier_count"));
+    assert_eq!(
+        db.delegation_phase(ROUND, 0).unwrap(),
+        crate::phases::DelegationPhase::SubmissionManaged
+    );
+    for proposal in 1..=37 {
+        assert_eq!(
+            db.vote_phase(ROUND, 0, proposal).unwrap(),
+            crate::phases::VotePhase::SubmissionManaged
+        );
+    }
+    drop(malformed_client);
+    let path = std::env::temp_dir().join(format!(
+        "combined-confirmation-reopen-{}.sqlite",
+        rand::random::<u64>(),
+    ));
+    db.conn()
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    drop(client);
+    drop(db);
+    let reopened = Arc::new(VotingDb::open(path.to_str().unwrap()).unwrap());
+    reopened.set_wallet_id("wallet-1");
+    let resumed =
+        ChainSubmissionClient::with_transport(reopened.clone(), transport.clone(), config())
+            .unwrap();
+    let confirmed = resumed
+        .advance_delegate_and_vote_batch(request.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    assert!(matches!(confirmed, ChainSubmissionResult::Confirmed(_)));
+    assert_eq!(
+        reopened.delegation_phase(ROUND, 0).unwrap(),
+        crate::phases::DelegationPhase::Confirmed
+    );
+    for proposal in 1..=37 {
+        assert_eq!(
+            reopened.vote_phase(ROUND, 0, proposal).unwrap(),
+            crate::phases::VotePhase::Confirmed
+        );
+    }
+    resumed
+        .advance_delegate_and_vote_batch(request, ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    let calls = transport.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        4,
+        "one POST, pending and malformed polls, then one recovery poll"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|url| url.ends_with("/delegate-and-cast-vote-batch"))
+            .count(),
+        1
+    );
+    assert!(calls[3].ends_with(HASH));
+    drop(calls);
+    drop(resumed);
+    drop(reopened);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -510,7 +647,7 @@ fn combined_confirmation_rejects_wrong_kind_partial_roster_and_wrong_layout() {
     for (field, replacement) in [
         ("batch_digest", hex::encode([0; 32])),
         ("batch_size", "1".into()),
-        ("nullifiers", "0".into()),
+        ("nullifier_count", "0".into()),
         ("proposal_ids", "2,1".into()),
         ("van_nullifiers", hex::encode([0x10; 32])),
         ("vote_commitment_leaf_indices", "8,10".into()),
@@ -543,6 +680,84 @@ fn combined_confirmation_rejects_wrong_kind_partial_roster_and_wrong_layout() {
         )
         .is_err()
     );
+}
+
+/// The deployed chain emits one `nullifier_count`; malformed counts cannot
+/// confirm a locally locked generation, even when every other event field matches.
+#[test]
+fn combined_confirmation_requires_one_matching_chain_nullifier_count() {
+    let (db, request) = fixture(2);
+    let identity = ChainSubmissionIdentity::new(
+        "wallet-1",
+        crate::Network::Testnet,
+        [0x11; 32],
+        0,
+        ChainSubmissionTarget::DelegateAndVoteBatch {
+            ordered_batch_digest: request.ordered_batch_digest,
+        },
+    )
+    .unwrap();
+    let derived = derive_vote_batch(&db.conn(), &identity).unwrap();
+    let valid: crate::confirmation::TxEvent = serde_json::from_value(event(&request)).unwrap();
+    let hash = CandidateTransactionHash::from_bytes([0xaa; 32]);
+    let validate = |event: &crate::confirmation::TxEvent| {
+        crate::chain_submission::confirmation::validate_hash_confirmation(
+            &derived,
+            hash,
+            std::slice::from_ref(event),
+        )
+    };
+    assert!(validate(&valid).is_ok());
+    for count in [
+        "",
+        "0",
+        "4",
+        "6",
+        "-1",
+        "5.0",
+        "abc",
+        "18446744073709551616",
+    ] {
+        let mut malformed = valid.clone();
+        malformed
+            .attributes
+            .iter_mut()
+            .find(|attribute| attribute.key == "nullifier_count")
+            .unwrap()
+            .value = count.to_owned();
+        assert!(validate(&malformed).is_err(), "accepted count {count:?}");
+    }
+    let mut missing = valid.clone();
+    missing
+        .attributes
+        .retain(|attribute| attribute.key != "nullifier_count");
+    assert!(validate(&missing).is_err());
+    let mut legacy = valid.clone();
+    legacy
+        .attributes
+        .iter_mut()
+        .find(|attribute| attribute.key == "nullifier_count")
+        .unwrap()
+        .key = "nullifiers".to_owned();
+    assert!(
+        validate(&legacy).is_err(),
+        "accepted the old, unsupported field name"
+    );
+    for count in ["5", "4"] {
+        let mut duplicate = valid.clone();
+        let mut attribute = duplicate
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == "nullifier_count")
+            .unwrap()
+            .clone();
+        attribute.value = count.to_owned();
+        duplicate.attributes.push(attribute);
+        assert!(
+            validate(&duplicate).is_err(),
+            "accepted duplicate count {count}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -610,4 +825,352 @@ fn combined_authorization_and_envelope_survive_database_reopen() {
     assert_eq!(after.batch_digest, before.batch_digest);
     drop(reopened);
     std::fs::remove_file(path).unwrap();
+}
+
+/// The fixture's delegation signature, read back from its persisted authorization.
+fn stored_signature(db: &VotingDb) -> [u8; 64] {
+    let signature: Vec<u8> = db
+        .conn()
+        .query_row(
+            "SELECT spend_auth_signature FROM delegate_cast_recovery LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    signature.try_into().unwrap()
+}
+
+fn count(db: &VotingDb, table: &str) -> u32 {
+    db.conn()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// What the retirement must leave behind: no lifecycle row, no members, no
+/// authorization, no helper records, and the delegation setup intact.
+fn assert_retired_to_proved(db: &VotingDb, proposals: u32) {
+    assert_eq!(count(db, "chain_submissions"), 0);
+    assert_eq!(count(db, "delegate_cast_recovery"), 0);
+    assert_eq!(count(db, "share_delegations"), 0);
+    assert_eq!(count(db, "helper_share_plans"), 0);
+    for proposal in 1..=proposals {
+        assert!(crate::vote::recovery_bundle(db, ROUND, 0, proposal)
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(count(db, "proofs"), 1, "the delegation proof is reused");
+    let (sighash, tx_hash, position): (Option<Vec<u8>>, Option<String>, Option<i64>) = db
+        .conn()
+        .query_row(
+            "SELECT pczt_sighash, delegation_tx_hash, van_leaf_position FROM bundles",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(
+        sighash.is_some(),
+        "the PCZT sighash the signature covers stays"
+    );
+    assert!(tx_hash.is_none() && position.is_none());
+    assert_eq!(
+        db.delegation_phase(ROUND, 0).unwrap(),
+        crate::phases::DelegationPhase::Proved
+    );
+}
+
+/// Scripted POST answers ahead of the accepting `Transport`.
+struct ScriptedPosts {
+    inner: Transport,
+    posts: Mutex<Vec<ChainHttpResponse>>,
+}
+
+impl ChainTransport for ScriptedPosts {
+    fn chain_get<'a>(&'a self, request: ChainHttpRequest) -> ChainTransportFuture<'a> {
+        self.inner.chain_get(request)
+    }
+    fn chain_post_json<'a>(
+        &'a self,
+        request: ChainHttpRequest,
+        json: Vec<u8>,
+    ) -> ChainTransportFuture<'a> {
+        let scripted = self.posts.lock().unwrap().pop();
+        match scripted {
+            Some(response) => {
+                self.inner
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .push(request.url().to_owned());
+                Box::pin(async move { Ok(response) })
+            }
+            None => self.inner.chain_post_json(request, json),
+        }
+    }
+}
+
+fn rejection(code: u32, request: &AdvanceVoteBatch) -> ChainHttpResponse {
+    ChainHttpResponse::json(
+        422,
+        format!(
+            r#"{{"code":{code},"log":"round closed","batch_digest":"{}"}}"#,
+            hex::encode(request.ordered_batch_digest)
+        )
+        .into_bytes(),
+    )
+}
+
+fn client_over<T: ChainTransport + 'static>(
+    db: &Arc<VotingDb>,
+    transport: Arc<T>,
+) -> ChainSubmissionClient<Arc<T>> {
+    ChainSubmissionClient::with_transport(
+        db.clone(),
+        transport,
+        ChainSubmissionClientConfig::for_network(
+            crate::Network::Testnet,
+            vec!["https://vote.example".to_owned()],
+        )
+        .with_post_attempts(2, vec![std::time::Duration::from_millis(1)]),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_definitely_rejected_combined_batch_retires_its_members_and_frees_the_delegation() {
+    let (db, request) = fixture(2);
+    let signature = stored_signature(&db);
+    let transport = Arc::new(ScriptedPosts {
+        inner: Transport {
+            request: request.clone(),
+            calls: Mutex::new(Vec::new()),
+        },
+        posts: Mutex::new(vec![rejection(7, &request)]),
+    });
+    let control = ChainSubmissionControl::new(1);
+    let client = client_over(&db, transport.clone());
+
+    let result = client
+        .advance_delegate_and_vote_batch(request.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    let ChainSubmissionResult::Rejected(diagnostic) = result else {
+        panic!("a first-POST rejection of a combined batch is terminal: {result:?}")
+    };
+    assert!(diagnostic.message().contains("round closed"));
+    assert_eq!(transport.inner.calls.lock().unwrap().len(), 1, "no retry");
+    assert_retired_to_proved(&db, 2);
+
+    // The same signature authorizes a fresh batch over the untouched setup.
+    let fresh = persist_combined_batch(&db, signature, 2, 1);
+    assert_ne!(fresh.ordered_batch_digest, request.ordered_batch_digest);
+    let accepting = Arc::new(Transport {
+        request: fresh.clone(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let client = client_over(&db, accepting.clone());
+    let pending = client
+        .advance_delegate_and_vote_batch(fresh.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    assert!(matches!(pending, ChainSubmissionResult::Pending(_)));
+    let confirmed = client
+        .advance_delegate_and_vote_batch(fresh, ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    assert!(matches!(confirmed, ChainSubmissionResult::Confirmed(_)));
+    assert_eq!(
+        db.delegation_phase(ROUND, 0).unwrap(),
+        crate::phases::DelegationPhase::Confirmed
+    );
+    assert_eq!(count(&db, "chain_submissions"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejection_after_an_ambiguous_combined_post_keeps_the_row_recovering() {
+    // The first POST may have been dispatched, so a later rejection cannot
+    // prove the generation is off the chain: the row keeps its ambiguity and
+    // every member stays locked for tree recovery.
+    let (db, request) = fixture(2);
+    let transport = Arc::new(ScriptedPosts {
+        inner: Transport {
+            request: request.clone(),
+            calls: Mutex::new(Vec::new()),
+        },
+        posts: Mutex::new(vec![
+            rejection(7, &request),
+            ChainHttpResponse::new(
+                502,
+                b"<html>bad gateway</html>".to_vec(),
+                Some("text/html".to_string()),
+                Vec::new(),
+            ),
+        ]),
+    });
+    let control = ChainSubmissionControl::new(1);
+    let client = client_over(&db, transport.clone());
+
+    let failure = client
+        .advance_delegate_and_vote_batch(request.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Protocol);
+    assert_eq!(transport.inner.calls.lock().unwrap().len(), 2);
+    let state: String = db
+        .conn()
+        .query_row("SELECT state FROM chain_submissions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(state, "recovering");
+    assert_eq!(count(&db, "delegate_cast_recovery"), 1);
+    for proposal in 1..=2 {
+        assert!(crate::vote::recovery_bundle(&db, ROUND, 0, proposal)
+            .unwrap()
+            .is_some());
+    }
+    assert_eq!(
+        db.delegation_phase(ROUND, 0).unwrap(),
+        crate::phases::DelegationPhase::SubmissionManaged
+    );
+}
+
+#[tokio::test]
+async fn a_nullifier_spent_first_post_keeps_the_combined_row_recovering() {
+    // Code 2 says the delegation notes are spent by something this wallet
+    // did not classify. Only tree recovery can explain it, and a recast would
+    // fail the same way, so the generation is not retired.
+    let (db, request) = fixture(1);
+    let transport = Arc::new(ScriptedPosts {
+        inner: Transport {
+            request: request.clone(),
+            calls: Mutex::new(Vec::new()),
+        },
+        posts: Mutex::new(vec![rejection(2, &request)]),
+    });
+    let control = ChainSubmissionControl::new(1);
+    let client = client_over(&db, transport.clone());
+
+    let result = client
+        .advance_delegate_and_vote_batch(request.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ChainSubmissionResult::Pending(_)),
+        "{result:?}"
+    );
+    assert_eq!(count(&db, "chain_submissions"), 1);
+    assert_eq!(count(&db, "delegate_cast_recovery"), 1);
+    assert!(crate::vote::recovery_bundle(&db, ROUND, 0, 1)
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn a_combined_candidate_that_commits_unsuccessfully_retires_the_generation() {
+    // The accepted hash names this one signed envelope; when the chain
+    // reports it committed with an error, no other dispatch of the same
+    // bytes can have landed, so the generation is terminal and retired.
+    struct FailingCommit(Transport);
+    impl ChainTransport for FailingCommit {
+        fn chain_get<'a>(&'a self, request: ChainHttpRequest) -> ChainTransportFuture<'a> {
+            self.0.calls.lock().unwrap().push(request.url().to_owned());
+            Box::pin(async {
+                Ok(ChainHttpResponse::json(
+                    422,
+                    br#"{"height":"9","code":12,"log":"rejected","events":[]}"#.to_vec(),
+                ))
+            })
+        }
+        fn chain_post_json<'a>(
+            &'a self,
+            request: ChainHttpRequest,
+            json: Vec<u8>,
+        ) -> ChainTransportFuture<'a> {
+            self.0.chain_post_json(request, json)
+        }
+    }
+    let (db, request) = fixture(2);
+    let signature = stored_signature(&db);
+    let transport = Arc::new(FailingCommit(Transport {
+        request: request.clone(),
+        calls: Mutex::new(Vec::new()),
+    }));
+    let control = ChainSubmissionControl::new(1);
+    let client = client_over(&db, transport.clone());
+
+    let result = client
+        .advance_delegate_and_vote_batch(request.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ChainSubmissionResult::Rejected(_)),
+        "{result:?}"
+    );
+    assert_eq!(
+        transport.0.calls.lock().unwrap().len(),
+        2,
+        "one POST, one poll"
+    );
+    assert_retired_to_proved(&db, 2);
+    persist_combined_batch(&db, signature, 2, 1);
+}
+
+#[tokio::test]
+async fn combined_admission_refuses_a_bundle_with_delegation_evidence() {
+    // A persisted combined batch is admitted only while the bundle carries no
+    // chain submission evidence at all. Any lifecycle row for the bundle,
+    // here a standalone delegation still recovering, refuses it before a
+    // reservation exists and before any bytes leave.
+    let (db, request) = fixture(2);
+    let standalone = ChainSubmissionIdentity::new(
+        "wallet-1",
+        crate::Network::Testnet,
+        [0x11; 32],
+        0,
+        ChainSubmissionTarget::Delegation,
+    )
+    .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO chain_submissions
+               (identity_key, round_id, wallet_id, network, bundle_index, kind,
+                generation_digest, state, committed_post_reservations,
+                diagnostic_kind, diagnostic, created_at, updated_at)
+             VALUES (?1, ?2, 'wallet-1', 'testnet', 0, 'delegation', ?3, 'recovering', 1,
+                     'ambiguous_dispatch', 'timed out', 9, 9)",
+            rusqlite::params![
+                crate::chain_submission::identity::submission_identity_key(&standalone),
+                ROUND,
+                vec![0x33_u8; 32]
+            ],
+        )
+        .unwrap();
+    let transport = Arc::new(Transport {
+        request: request.clone(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let client = client_over(&db, transport.clone());
+
+    let failure = client
+        .advance_delegate_and_vote_batch(
+            request,
+            ChainRecoveryMode::StatusOnly,
+            &ChainSubmissionControl::new(1),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::InvalidInput);
+    assert!(
+        failure
+            .message()
+            .contains("combined admission requires a fresh delegation"),
+        "{}",
+        failure.message()
+    );
+    assert!(transport.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        count(&db, "chain_submissions"),
+        1,
+        "no combined reservation"
+    );
 }

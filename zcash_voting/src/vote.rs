@@ -3655,7 +3655,17 @@ pub(crate) fn retire_undispatched_votes_outside_roster_with_conn(
     Ok(retired)
 }
 
-fn clear_unsubmitted_vote_recovery_with_conn(
+/// Retires one signed, never-confirmed vote in the caller's transaction.
+///
+/// Clears the recovery JSON (which the generation-change triggers turn into
+/// deleted helper plans and immediate-share designation), deletes the vote's
+/// share records, and drops the bundle's combined authorization once no
+/// combined member remains. Refuses a vote that reached the chain.
+///
+/// This is the lifecycle's retirement primitive and deliberately does not
+/// consult `vote_recovery_is_lifecycle_owned`: the chain lifecycle calls it
+/// when it has itself decided that the generation is terminal.
+pub(crate) fn clear_unsubmitted_vote_recovery_with_conn(
     conn: &rusqlite::Connection,
     wallet_id: &str,
     round_id: &str,
@@ -5312,6 +5322,43 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn combined_recovery_format_requires_delegation_van_and_anchor_zero() {
+        // The combined format is the batch format plus an initial VAN and a
+        // synthetic anchor. Each half without the other is a different record
+        // wearing the wrong name.
+        let (_, recoveries) = two_action_recovery_batch();
+        let mut combined = recoveries[0].clone();
+        combined.anchor_height = 0;
+        combined.batch.as_mut().unwrap().delegation_van = Some([0x09; 32]);
+        let json = serialize_recovery(&combined).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["format"], DELEGATE_AND_VOTE_BATCH_RECOVERY_FORMAT);
+        assert_eq!(
+            parse_recovery(&json).unwrap().batch.unwrap().delegation_van,
+            Some([0x09; 32])
+        );
+
+        let mut wrong_name = value.clone();
+        wrong_name["format"] = serde_json::json!(VOTE_BATCH_RECOVERY_FORMAT);
+        assert!(parse_recovery(&wrong_name.to_string()).is_err());
+
+        let mut anchored = value.clone();
+        anchored["anchor_height"] = serde_json::json!(5);
+        assert!(parse_recovery(&anchored.to_string()).is_err());
+
+        let mut without_van = value.clone();
+        without_van["delegation_van"] = serde_json::Value::Null;
+        assert!(parse_recovery(&without_van.to_string()).is_err());
+
+        let mut singleton = value;
+        singleton["format"] = serde_json::json!(VOTE_RECOVERY_FORMAT);
+        for key in ["batch_digest", "batch_index", "batch_size"] {
+            singleton[key] = serde_json::Value::Null;
+        }
+        assert!(parse_recovery(&singleton.to_string()).is_err());
     }
 
     #[test]

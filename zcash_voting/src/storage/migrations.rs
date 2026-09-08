@@ -213,6 +213,10 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
                 upgraded = from + 1;
                 continue;
             }
+            if *from == 22 && reconcile_combined_preview(&tx)? {
+                upgraded = from + 1;
+                continue;
+            }
             tx.execute_batch(sql).map_err(|e| {
                 VotingError::from_sqlite(
                     &format!(
@@ -243,6 +247,61 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     // A ladder that ends on a different shape than this build describes is the
     // same drift, reached the long way round.
     ensure_current_chain_submission_schema(conn)
+}
+
+/// Recognizes the version-22 combined-vote preview without discarding its
+/// immutable recovery records. Only the exact current schema, optionally
+/// missing the nullable PCZT column, is accepted. The caller owns the migration
+/// transaction, so both the column repair and version advance commit together.
+fn reconcile_combined_preview(conn: &Connection) -> Result<bool, VotingError> {
+    let has_recovery: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'delegate_cast_recovery')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(migration_error)?;
+    if !has_recovery {
+        return Ok(false);
+    }
+    let expected = Connection::open_in_memory().map_err(migration_error)?;
+    expected
+        .execute_batch(include_str!("migrations/001_init.sql"))
+        .map_err(migration_error)?;
+    let actual = preview_schema_fingerprint(conn)?;
+    if actual == preview_schema_fingerprint(&expected)? {
+        return Ok(true);
+    }
+    expected
+        .execute_batch("ALTER TABLE bundles DROP COLUMN delegation_pczt;")
+        .map_err(migration_error)?;
+    if actual != preview_schema_fingerprint(&expected)? {
+        return Err(VotingError::Internal {
+            message: "unsupported version-22 combined-vote preview schema; existing recovery records were preserved".into(),
+        });
+    }
+    conn.execute_batch("ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;")
+        .map_err(migration_error)?;
+    Ok(true)
+}
+
+/// Compares all explicit schema objects, including recovery constraints and
+/// triggers; table existence alone cannot establish migration compatibility.
+fn preview_schema_fingerprint(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String)>, VotingError> {
+    let mut statement = conn.prepare(
+        "SELECT type, name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY type, name",
+    ).map_err(migration_error)?;
+    let fingerprint = statement
+        .query_map([], |row| {
+            let sql: String = row.get(2)?;
+            Ok((row.get(0)?, row.get(1)?, normalize_schema_sql(&sql)))
+        })
+        .map_err(migration_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(migration_error)?;
+    Ok(fingerprint)
 }
 
 /// Brings `chain_submissions` to the shape `002_chain_submissions.sql`

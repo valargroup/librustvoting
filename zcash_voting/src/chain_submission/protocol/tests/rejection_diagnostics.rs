@@ -85,12 +85,13 @@ async fn a_hostile_server_log_cannot_exceed_or_escape_the_durable_diagnostic() {
 #[tokio::test]
 async fn a_non_json_response_reports_its_type_and_body() {
     let transport = Arc::new(ScriptedTransport::default());
-    // What a router 404 or proxy error page looks like: the gateway itself
-    // always answers in JSON, so this is the case where knowing the body
-    // is the whole diagnosis.
+    // What a proxy error page looks like: the gateway itself always answers
+    // in JSON, so this is the case where knowing the body is the whole
+    // diagnosis. (A router 404 or 405 is the separate, definitely-unsent
+    // `EndpointUnsupported` case.)
     transport.queue(Ok(ChainHttpResponse::new(
-        404,
-        b"404 page not found".to_vec(),
+        502,
+        b"502 bad gateway".to_vec(),
         Some("text/plain; charset=utf-8".to_string()),
         Vec::new(),
     )));
@@ -107,7 +108,7 @@ async fn a_non_json_response_reports_its_type_and_body() {
         diagnostic.message()
     );
     assert!(
-        diagnostic.message().contains("404 page not found"),
+        diagnostic.message().contains("502 bad gateway"),
         "{}",
         diagnostic.message()
     );
@@ -150,4 +151,111 @@ async fn nullifier_spent_is_classified_only_by_numeric_code() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn an_html_200_from_a_proxy_is_definitely_unsent_with_endpoint_unsupported() {
+    let transport = Arc::new(ScriptedTransport::default());
+    // What production answered on 2026-09-08 for a route its vote-sdk did not
+    // yet serve: the explorer's single-page fallback, HTTP 200 and HTML. The
+    // gateway never writes HTML, so the body was never decoded and nothing
+    // was dispatched.
+    transport.queue(Ok(ChainHttpResponse::new(
+        200,
+        b"<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />".to_vec(),
+        Some("text/html; charset=utf-8".to_string()),
+        Vec::new(),
+    )));
+    let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+
+    let PostAttemptOutcome::EndpointUnsupported(diagnostic) =
+        client.submit_delegation(0, &delegation()).await
+    else {
+        panic!("a fallback page proves the route was never reached");
+    };
+    assert_eq!(
+        diagnostic.kind(),
+        ChainSubmissionDiagnosticKind::EndpointUnsupported
+    );
+    assert!(
+        diagnostic
+            .message()
+            .contains("does not serve /shielded-vote/v1/delegate-vote"),
+        "{}",
+        diagnostic.message()
+    );
+    assert!(
+        diagnostic.message().contains("text/html"),
+        "{}",
+        diagnostic.message()
+    );
+}
+
+#[tokio::test]
+async fn a_router_404_or_405_is_definitely_unsent_with_endpoint_unsupported() {
+    // gorilla mux answers before any handler runs: 404 for an unknown path,
+    // 405 for a known path with the wrong method. JSON or not, no handler
+    // decoded the request.
+    for (status, body, content_type) in [
+        (
+            404,
+            r#"{"error":"not found"}"#,
+            Some("application/json".to_string()),
+        ),
+        (
+            405,
+            "405 method not allowed",
+            Some("text/plain; charset=utf-8".to_string()),
+        ),
+        (404, "", None),
+    ] {
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.queue(Ok(ChainHttpResponse::new(
+            status,
+            body.as_bytes().to_vec(),
+            content_type,
+            Vec::new(),
+        )));
+        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+        let outcome = client.submit_delegation(0, &delegation()).await;
+        assert!(
+            matches!(
+                outcome,
+                PostAttemptOutcome::EndpointUnsupported(ref diagnostic)
+                    if diagnostic.message().contains(&format!("HTTP {status}"))
+            ),
+            "status {status}: {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn other_non_json_answers_stay_ambiguous() {
+    // A proxy error page or challenge after the request may have been
+    // forwarded is still unknown dispatch, not proof the route is missing;
+    // so is a 200 of any type other than HTML.
+    for (status, content_type) in [
+        (403, "text/html"),
+        (500, "text/html"),
+        (502, "text/html"),
+        (503, "text/html"),
+        (504, "text/html"),
+        (200, "text/plain"),
+    ] {
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.queue(Ok(ChainHttpResponse::new(
+            status,
+            b"<html>error</html>".to_vec(),
+            Some(content_type.to_string()),
+            Vec::new(),
+        )));
+        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+        assert!(
+            matches!(
+                client.submit_delegation(0, &delegation()).await,
+                PostAttemptOutcome::PossiblyDispatched(_)
+            ),
+            "status {status}"
+        );
+    }
 }

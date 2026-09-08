@@ -241,6 +241,24 @@ persisted recovery bundles rather than from the constant.
   cancels after combined persistence, reopens the database, and advances the
   exact same envelope without a hotkey or delegation driver. Both run through
   `make proofs` with scripted transports, without contacting a live chain.
+- A `Cast` on an imported delegation never owes the voter's key: the imported
+  transaction is already on the chain, the cast waits for it to confirm, and
+  the wallet holding an imported capability has no delegation key to offer.
+  `an_imported_delegation_with_a_terminal_ballot_needs_no_signer` pins this;
+  only a fresh combined cast is counted by the signing preflight.
+- A combined batch whose first POST the chain definitely rejects is retired by
+  the lifecycle (see `docs/chain_submission_invariants.md`, "Definite
+  rejection"): the bundle's delegation reads `Proved` again and the next plan
+  owes a fresh `Cast` with a new digest. The run that observed the rejection
+  ends `ChainTerminal` and never recasts within itself; a host that runs again
+  retries exactly once per run. The release-only
+  `combined_executor_zkp2_rejection_returns_the_bundle_to_proved_and_recasts_on_the_next_run`
+  exercises both runs.
+- For hosts: the delegation signature prompt has moved from ballot-open to
+  ballot-terminal time. `NeedsDelegationSignatures` no longer fires for
+  `Delegate`, which only prepares the proof; it fires for the `Cast` that signs
+  the combined transaction. `RoundStepProgress::DelegateAndVoteBatchPersisted`
+  is a new progress kind between vote signing and helper planning.
 
 ### Share obligations
 

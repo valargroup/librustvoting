@@ -1902,3 +1902,10 @@ combined POST. A recovered unit already owned by the chain lifecycle reconciles
 that lifecycle first. Helper delivery starts only after the unit's complete
 confirmation records the final VAN and every VC position. The existing timeout,
 placement, ambiguous-POST and durable delivery rules apply unchanged.
+
+A definite first-POST rejection of the combined unit retires it: the members'
+recovery JSON is cleared, which the existing generation-change triggers turn
+into deleted helper plans and a cleared immediate-share designation, and the
+members' share records are deleted with it. Nothing was delivered, because
+delivery waits for confirmation. The recast is a fresh cast and re-plans its
+helpers before its own POST.

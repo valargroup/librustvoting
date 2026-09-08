@@ -37,9 +37,15 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
     skipped: &[u32],
 ) -> Result<Vec<u32>, VotingError> {
     let mut required = signer_bundles(obligations, skipped);
+    // A cast on an unconfirmed delegation signs that delegation itself as a
+    // combined transaction, so it needs the voter's key. The exception is a
+    // bundle whose delegation was imported: its transaction is already on the
+    // chain, the cast waits for it to confirm, and the wallet holding an
+    // imported capability has no delegation key to offer.
     for obligation in obligations {
         if let Obligation::Cast { bundle_index, .. } = obligation {
             if !skipped.contains(bundle_index)
+                && !imported_delegation_bundles(obligations).contains(bundle_index)
                 && executor
                     .database()
                     .delegation_phase(round_id, *bundle_index)?
@@ -115,6 +121,21 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
                     .any(|record| record.bundle_index == *bundle_index)
         })
         .collect())
+}
+
+/// Bundles whose delegation is an imported capability already on the chain.
+fn imported_delegation_bundles(obligations: &[Obligation]) -> Vec<u32> {
+    obligations
+        .iter()
+        .filter_map(|obligation| match obligation {
+            Obligation::AdvanceDelegation {
+                bundle_index,
+                imported: true,
+                ..
+            } => Some(*bundle_index),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The bundles whose delegation obligations still need signing material.

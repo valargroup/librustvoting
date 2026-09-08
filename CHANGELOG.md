@@ -10,6 +10,31 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Preserve combined-vote recovery records when upgrading version-22 preview
+  databases, including previews missing the delegation PCZT column. Unknown
+  preview schemas fail without changing stored state.
+
+- A cast on an imported delegation no longer asks the host for a delegation
+  signature. The imported transaction is already on the chain and its holder
+  has no delegation key; the run proceeds to the imported advance instead of
+  stopping at `NeedsDelegationSignatures`.
+- A combined delegation-and-cast batch that the chain definitely rejects on its
+  first POST is retired: its members, helper plans and delegation authorization
+  are cleared, the lifecycle row is removed, and the bundle returns to `Proved`
+  so the next run casts a fresh batch with the same delegation setup. A
+  rejection after an ambiguous POST, or a code-2 rejection, keeps the row
+  recoverable as before.
+- A vote-chain node that does not serve a mutation route (HTTP 404/405, or an
+  HTTP 200 HTML fallback page instead of JSON) is now classified as definitely
+  unsent with the `endpoint_unsupported` diagnostic and a `Protocol` failure
+  naming the route. Previously the answer was treated as an ambiguous dispatch
+  and started hashless recovery for bytes the API never decoded.
+
+- Combined delegation-and-vote confirmation reads the chain event
+  `nullifier_count` field. Previously the SDK expected `nullifiers`, leaving
+  successfully committed batches in tracking. Existing submissions recover
+  through their saved transaction hash without being submitted again.
+
 - Helper-delivery diagnostics classify definite acceptance, ambiguous delivery,
   and definitely-unsent shares consistently at stage and invocation boundaries.
   Atomic-batch helper attempts and retries carry their actual bundle, proposal,

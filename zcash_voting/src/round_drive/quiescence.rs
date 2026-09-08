@@ -72,8 +72,11 @@ pub enum RoundQuiescence {
     /// again immediately can queue behind it.
     Cancelled,
     /// A chain submission ended without a confirmation: rejected, or
-    /// dispatched without a usable transaction hash. Nothing further is
-    /// planned for it and no retry can help.
+    /// dispatched without a usable transaction hash. For a standalone
+    /// submission nothing further is planned for it and no retry can help. A
+    /// rejected combined delegation-and-cast batch is retired instead: its
+    /// bundle reads `Proved` again and the next run casts afresh, so a host
+    /// that runs again on this outcome retries once per run.
     ChainTerminal {
         step: NextStep,
         outcome: ChainSubmissionResult,

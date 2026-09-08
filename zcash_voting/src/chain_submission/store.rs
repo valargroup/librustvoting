@@ -1109,6 +1109,15 @@ pub(super) mod memory {
                         )
                     })?;
                 record.settle_after_transition(previous_state, None, now);
+                // Parity with the SQLite store: a combined generation that
+                // becomes terminally rejected leaves no row behind.
+                if matches!(record.state, SubmissionRecordState::Rejected(_))
+                    && previous_state != ChainSubmissionState::Rejected
+                    && generation.identity().target().is_combined()
+                {
+                    state.records.remove(generation.identity());
+                    return Ok(record);
+                }
                 state
                     .records
                     .insert(generation.identity().clone(), record.clone());
@@ -1189,6 +1198,13 @@ pub(super) mod memory {
                     .map_err(|error| transition_failure(previous_state, error))?
                     .expect("reconciliation cannot remove a row");
                 record.settle_after_transition(previous_state, diagnostic, now);
+                if matches!(record.state, SubmissionRecordState::Rejected(_))
+                    && previous_state != ChainSubmissionState::Rejected
+                    && generation.identity().target().is_combined()
+                {
+                    state.records.remove(generation.identity());
+                    return Ok(record);
+                }
                 state
                     .records
                     .insert(generation.identity().clone(), record.clone());

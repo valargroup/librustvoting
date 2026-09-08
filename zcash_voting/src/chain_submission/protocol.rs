@@ -85,6 +85,9 @@ pub(super) enum PostAttemptOutcome {
     },
     LocalFailure(ChainSubmissionDiagnostic),
     DefinitelyUnsent(ChainTransportError),
+    /// The node answered from outside the vote-chain API, so it does not
+    /// serve this route. Nothing decoded the body, so nothing was dispatched.
+    EndpointUnsupported(ChainSubmissionDiagnostic),
     PossiblyDispatched(ChainSubmissionDiagnostic),
 }
 
@@ -365,7 +368,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                     "vote-chain submission timed out",
                 ),
             ),
-            Ok(Ok(response)) => parse_post_response(response, expected_batch_digest),
+            Ok(Ok(response)) => parse_post_response(response, endpoint, expected_batch_digest),
             Ok(Err(error)) if error.kind() == ChainTransportFailureKind::DefinitelyUnsent => {
                 PostAttemptOutcome::DefinitelyUnsent(error)
             }
@@ -388,6 +391,10 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             PostAttemptOutcome::DefinitelyUnsent(_) => {
                 (crate::ObservationOutcome::Failed, Some("DefinitelyUnsent"))
             }
+            PostAttemptOutcome::EndpointUnsupported(_) => (
+                crate::ObservationOutcome::Failed,
+                Some("EndpointUnsupported"),
+            ),
             PostAttemptOutcome::LocalFailure(_) => {
                 (crate::ObservationOutcome::Failed, Some("Protocol"))
             }
@@ -500,8 +507,12 @@ fn chain_request(url: String, has_json_body: bool, timeout: Duration) -> ChainHt
 
 fn parse_post_response(
     response: ChainHttpResponse,
+    endpoint: &str,
     expected_batch_digest: Option<[u8; 32]>,
 ) -> PostAttemptOutcome {
+    if let Some(diagnostic) = unsupported_endpoint(&response, endpoint) {
+        return PostAttemptOutcome::EndpointUnsupported(diagnostic);
+    }
     if let Err(diagnostic) = validate_json_response(&response) {
         return PostAttemptOutcome::PossiblyDispatched(diagnostic);
     }
@@ -637,19 +648,64 @@ fn parse_status_response(
     }
 }
 
+/// Recognizes a mutation answer that never reached the vote-chain API.
+///
+/// The gateway writes `application/json` on every response it produces,
+/// including its errors, and never answers a mounted mutation route with 404
+/// or 405. Those two statuses therefore come from the router before any
+/// handler ran, and an HTML body with status 200 comes from whatever sits in
+/// front of the node — in production the explorer's single-page fallback,
+/// which answers every unknown path with HTTP 200 and `text/html`. In each
+/// case the request body was never decoded, so the attempt is definitely
+/// unsent rather than ambiguous, and no retry against the same node can change
+/// the answer. Every other non-JSON or unexpected-status answer (a proxy 502,
+/// a challenge page, a panic, a 200 of any other type) may have followed a
+/// dispatched request and stays ambiguous.
+fn unsupported_endpoint(
+    response: &ChainHttpResponse,
+    endpoint: &str,
+) -> Option<ChainSubmissionDiagnostic> {
+    let status = response.status();
+    let routed_elsewhere = match status {
+        404 | 405 => true,
+        200 => has_media_type(response, "text/html"),
+        _ => false,
+    };
+    if !routed_elsewhere || response.body().len() > MAX_CHAIN_HTTP_RESPONSE_BYTES {
+        return None;
+    }
+    let observed = response.content_type().unwrap_or("(absent)");
+    Some(ChainSubmissionDiagnostic::from_redacted_message(
+        ChainSubmissionDiagnosticKind::EndpointUnsupported,
+        format!(
+            "vote-chain endpoint unsupported: this node does not serve /{}/{endpoint} \
+             (HTTP {status}, Content-Type {observed}); it needs a vote-sdk release that \
+             includes the route",
+            API_PREFIX.join("/")
+        ),
+    ))
+}
+
+fn is_json_content_type(response: &ChainHttpResponse) -> bool {
+    has_media_type(response, "application/json")
+}
+
+fn has_media_type(response: &ChainHttpResponse, media_type: &str) -> bool {
+    response.content_type().is_some_and(|content_type| {
+        content_type
+            .split(';')
+            .next()
+            .is_some_and(|observed| observed.trim().eq_ignore_ascii_case(media_type))
+    })
+}
+
 fn validate_json_response(response: &ChainHttpResponse) -> Result<(), ChainSubmissionDiagnostic> {
     if response.body().len() > MAX_CHAIN_HTTP_RESPONSE_BYTES {
         return Err(invalid_protocol(format!(
             "vote-chain response exceeds {MAX_CHAIN_HTTP_RESPONSE_BYTES} byte limit"
         )));
     }
-    let is_json = response.content_type().is_some_and(|content_type| {
-        content_type
-            .split(';')
-            .next()
-            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
-    });
-    if !is_json {
+    if !is_json_content_type(response) {
         // Report what actually arrived. The gateway sets `application/json` on
         // every response it writes, including its errors, so a different type
         // means the answer came from somewhere else — a proxy error page, a

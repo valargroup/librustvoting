@@ -194,6 +194,8 @@ pub(super) struct Peers {
     pub db: Arc<round::VotingDb>,
     pub posts: Mutex<Vec<Vec<u8>>>,
     pub deliveries: AtomicUsize,
+    /// How many leading chain POSTs answer with a definite rejection.
+    pub rejections: AtomicUsize,
 }
 
 impl Peers {
@@ -202,6 +204,7 @@ impl Peers {
             db,
             posts: Mutex::new(Vec::new()),
             deliveries: AtomicUsize::new(0),
+            rejections: AtomicUsize::new(0),
         })
     }
 }
@@ -227,7 +230,19 @@ impl ChainTransport for Peers {
             );
         }
         self.posts.lock().unwrap().push(json);
+        let rejected = self
+            .rejections
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
         Box::pin(async move {
+            if rejected {
+                return Ok(ChainHttpResponse::json(
+                    422,
+                    serde_json::to_vec(&serde_json::json!({"code":7,"log":"round closed","batch_digest":hex::encode(digest)})).unwrap(),
+                ));
+            }
             Ok(ChainHttpResponse::json(200, serde_json::to_vec(&serde_json::json!({"tx_hash":HASH,"code":0,"batch_digest":hex::encode(digest)})).unwrap()))
         })
     }
@@ -242,7 +257,7 @@ impl ChainTransport for Peers {
             serde_json::from_slice(posts.last().unwrap()).unwrap();
         let attrs = [
             ("round_id", ROUND_ID.to_owned()),
-            ("nullifiers", governance::BUNDLE_NOTE_SLOTS.to_string()),
+            ("nullifier_count", governance::BUNDLE_NOTE_SLOTS.to_string()),
             (
                 "batch_digest",
                 hex::encode(envelope.authorization_digest().unwrap()),

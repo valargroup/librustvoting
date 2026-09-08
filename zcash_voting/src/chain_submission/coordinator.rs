@@ -284,6 +284,7 @@ where
         let observations = control.observations();
 
         let mut ambiguity_seen = is_retryable_dispatch_ambiguity(&reserved);
+        let mut unsupported_endpoints = std::collections::BTreeSet::new();
         for attempt_index in first_attempt_index..self.policy.maximum_post_attempts {
             let observations = observations
                 .attempt(u32::try_from(attempt_index.saturating_add(1)).unwrap_or(u32::MAX));
@@ -374,10 +375,26 @@ where
                             )
                             .await;
                     }
-                    let record = self.classify_dispatched_post(
-                        derived.generation(),
-                        SubmissionObservation::DefiniteRejection(diagnostic.clone()),
-                    )?;
+                    // A combined delegation-and-cast batch rejected on its
+                    // first POST, with no attempt possibly dispatched, is
+                    // chain evidence that nothing landed: the store retires
+                    // the generation and frees the delegation for a fresh
+                    // batch. A code-2 rejection is excluded because it says
+                    // the delegation notes are spent by something else, which
+                    // only tree recovery can explain, and a recast would fail
+                    // the same way. Standalone generations keep the recoverable
+                    // classification: their members stay locked until the
+                    // ballot decides otherwise.
+                    let terminal = !ambiguity_seen
+                        && derived.generation().identity().target().is_combined()
+                        && kind != ChainRejectionKind::NullifierAlreadySpent;
+                    let observation = if terminal {
+                        SubmissionObservation::TerminalRejection(diagnostic.clone())
+                    } else {
+                        SubmissionObservation::DefiniteRejection(diagnostic.clone())
+                    };
+                    let record =
+                        self.classify_dispatched_post(derived.generation(), observation)?;
                     if ambiguity_seen {
                         return Err(ChainSubmissionFailure::with_durable_state(
                             ChainSubmissionFailureKind::Protocol,
@@ -410,6 +427,49 @@ where
                         ChainSubmissionState::Recovering,
                         diagnostic.message(),
                     ));
+                }
+                PostAttemptOutcome::EndpointUnsupported(diagnostic) => {
+                    // The node answered from outside the vote-chain API, so
+                    // nothing decoded the body and nothing was dispatched: the
+                    // fresh reservation is released exactly as for a
+                    // definitely-unsent attempt. Another configured node may
+                    // still serve the route, so the remaining attempts rotate
+                    // on; once every node has answered this way, or the budget
+                    // is spent, the invocation stops instead of backing off
+                    // against an answer that cannot change. The failure is a
+                    // protocol failure, not a transport one: the network works,
+                    // the node speaks an older protocol.
+                    unsupported_endpoints.insert(endpoint_index);
+                    if ambiguity_seen {
+                        reserved = self.reconcile_with_durable_state(
+                            derived.generation(),
+                            SubmissionObservation::DefinitelyUnsent,
+                            Some(ChainSubmissionDiagnostic::from_redacted_message(
+                                ChainSubmissionDiagnosticKind::ReconciliationPending,
+                                diagnostic.message(),
+                            )),
+                            ChainSubmissionState::Recovering,
+                        )?;
+                    } else {
+                        self.remove_fresh_reservation(derived.generation())?;
+                    }
+                    let every_node_refused =
+                        unsupported_endpoints.len() >= self.protocol.endpoint_count();
+                    if every_node_refused || attempt_index + 1 == self.policy.maximum_post_attempts
+                    {
+                        return Err(if ambiguity_seen {
+                            ChainSubmissionFailure::with_durable_state(
+                                ChainSubmissionFailureKind::Protocol,
+                                ChainSubmissionState::Recovering,
+                                diagnostic.message(),
+                            )
+                        } else {
+                            ChainSubmissionFailure::without_state(
+                                ChainSubmissionFailureKind::Protocol,
+                                diagnostic.message(),
+                            )
+                        });
+                    }
                 }
                 PostAttemptOutcome::DefinitelyUnsent(error) => {
                     if ambiguity_seen {
@@ -753,7 +813,14 @@ where
                             ChainSubmissionDiagnosticKind::ChainRejected,
                             "tracked vote-chain transaction committed unsuccessfully",
                         );
-                        let observation = if request.is_imported_delegation() {
+                        // An imported delegation has one immutable candidate,
+                        // and a combined batch's candidate is the hash of its
+                        // one signed envelope, so a committed failure of that
+                        // hash is the generation's final word: no other
+                        // dispatch of the same bytes can have landed.
+                        let terminal = request.is_imported_delegation()
+                            || derived.generation().identity().target().is_combined();
+                        let observation = if terminal {
                             SubmissionObservation::TerminalCandidateFailure(diagnostic.clone())
                         } else {
                             SubmissionObservation::CandidateCommittedFailure(diagnostic.clone())
@@ -1298,6 +1365,26 @@ where
                     ChainSubmissionFailureKind::Transport,
                     ChainSubmissionState::Recovering,
                     error.message(),
+                ));
+            }
+            // The retry never left the node's front door, so the row keeps
+            // its earlier dispatch ambiguity untouched; the answer is reported
+            // as a protocol failure because no node in rotation serves the
+            // route this generation needs.
+            PostAttemptOutcome::EndpointUnsupported(diagnostic) => {
+                self.reconcile_with_durable_state(
+                    derived.generation(),
+                    SubmissionObservation::DefinitelyUnsent,
+                    Some(ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::ReconciliationPending,
+                        diagnostic.message(),
+                    )),
+                    ChainSubmissionState::Recovering,
+                )?;
+                return Err(ChainSubmissionFailure::with_durable_state(
+                    ChainSubmissionFailureKind::Protocol,
+                    ChainSubmissionState::Recovering,
+                    diagnostic.message(),
                 ));
             }
             PostAttemptOutcome::LocalFailure(diagnostic) => {

@@ -50,6 +50,10 @@ pub enum ChainSubmissionDiagnosticKind {
     ReconciliationPending,
     InvalidProtocolResponse,
     StorageFailure,
+    /// The node answered a mutation from outside the vote-chain API (a
+    /// router 404/405 or a proxy's fallback page), so it does not serve the
+    /// requested route. Nothing decoded the request, so nothing was dispatched.
+    EndpointUnsupported,
 }
 
 impl ChainSubmissionDiagnosticKind {
@@ -65,6 +69,7 @@ impl ChainSubmissionDiagnosticKind {
             Self::ReconciliationPending => "reconciliation_pending",
             Self::InvalidProtocolResponse => "invalid_protocol_response",
             Self::StorageFailure => "storage_failure",
+            Self::EndpointUnsupported => "endpoint_unsupported",
         }
     }
 
@@ -79,6 +84,7 @@ impl ChainSubmissionDiagnosticKind {
             "reconciliation_pending" => Some(Self::ReconciliationPending),
             "invalid_protocol_response" => Some(Self::InvalidProtocolResponse),
             "storage_failure" => Some(Self::StorageFailure),
+            "endpoint_unsupported" => Some(Self::EndpointUnsupported),
             _ => None,
         }
     }

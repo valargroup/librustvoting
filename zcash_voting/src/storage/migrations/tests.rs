@@ -1798,3 +1798,116 @@ fn v22_upgrades_combined_storage_to_the_fresh_schema() {
         CURRENT_VERSION
     );
 }
+
+fn combined_preview(has_pczt: bool) -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    let schema = include_str!("001_init.sql");
+    conn.execute_batch(&if has_pczt {
+        schema.to_string()
+    } else {
+        schema.replace("    delegation_pczt     BLOB,\n", "")
+    })
+    .unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA user_version=22;")
+        .unwrap();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    insert_v17_delegation_with_complete_setup(&conn, ROUND, "wallet", 0, None);
+    conn.execute(
+        "INSERT INTO delegate_cast_recovery VALUES (?1, 'wallet', 0, ?2, ?3, ?4)",
+        rusqlite::params![ROUND, vec![1_u8; 32], vec![2_u8; 32], vec![3_u8; 64]],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO chain_submissions
+         (identity_key, round_id, wallet_id, network, bundle_index, kind,
+          ordered_batch_digest, generation_digest, state, candidate_transaction_hash,
+          tracking_started_at, created_at, updated_at)
+         VALUES (?1, ?2, 'wallet', 'testnet', 0, 'delegate_and_cast_vote_batch',
+                 ?3, ?4, 'tracking', ?5, 8, 9, 10)",
+        rusqlite::params![
+            vec![4_u8; 32],
+            ROUND,
+            vec![1_u8; 32],
+            vec![2_u8; 32],
+            vec![5_u8; 32]
+        ],
+    )
+    .unwrap();
+    conn
+}
+
+#[test]
+fn v22_combined_preview_preserves_recovery_and_tracking_with_or_without_pczt() {
+    for has_pczt in [false, true] {
+        let mut conn = combined_preview(has_pczt);
+        if has_pczt {
+            conn.execute("UPDATE bundles SET delegation_pczt=X'010203'", [])
+                .unwrap();
+        }
+        let recovery = dump_table(&conn, "delegate_cast_recovery");
+        let submissions = dump_table(&conn, "chain_submissions");
+        let bundles = dump_table(&conn, "bundles");
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(recovery, dump_table(&conn, "delegate_cast_recovery"));
+        assert_eq!(submissions, dump_table(&conn, "chain_submissions"));
+        let migrated_bundles = dump_table(&conn, "bundles");
+        if has_pczt {
+            assert_eq!(bundles, migrated_bundles);
+        } else {
+            assert_eq!(bundles.len(), migrated_bundles.len());
+            for (old, new) in bundles.iter().zip(&migrated_bundles) {
+                assert_eq!(old, &new[..old.len()]);
+            }
+            let pczt: Option<Vec<u8>> = conn
+                .query_row("SELECT delegation_pczt FROM bundles", [], |r| r.get(0))
+                .unwrap();
+            assert!(pczt.is_none());
+        }
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            CURRENT_VERSION
+        );
+        assert!(conn
+            .execute(
+                "UPDATE delegate_cast_recovery SET spend_auth_signature=zeroblob(64)",
+                []
+            )
+            .is_err());
+    }
+}
+
+#[test]
+fn v22_unknown_combined_preview_rolls_back_without_losing_recovery() {
+    for drift in [
+        "DROP TRIGGER delegate_cast_recovery_immutable",
+        "ALTER TABLE delegate_cast_recovery ADD COLUMN unknown BLOB",
+        "CREATE TABLE unknown_preview_table (id INTEGER)",
+    ] {
+        let mut conn = combined_preview(false);
+        conn.execute_batch(drift).unwrap();
+        let schema = preview_schema_fingerprint(&conn).unwrap();
+        let recovery = dump_table(&conn, "delegate_cast_recovery");
+        let submissions = dump_table(&conn, "chain_submissions");
+        assert!(migrate(&mut conn)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported version-22 combined-vote preview schema"));
+        assert_eq!(schema, preview_schema_fingerprint(&conn).unwrap());
+        assert_eq!(recovery, dump_table(&conn, "delegate_cast_recovery"));
+        assert_eq!(submissions, dump_table(&conn, "chain_submissions"));
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            22
+        );
+    }
+}
