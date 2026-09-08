@@ -1247,6 +1247,8 @@ pub fn prove(
 /// waiting notification, is delivered live from a dedicated delivery thread
 /// that the producer never waits on; a reporter that reenters proof
 /// coordination waits at most until the current operation releases its lock.
+/// If the original setup is cleared or replaced while proving, persistence
+/// fails without saving the proof or advancing the round phase.
 pub fn ensure_proof(
     db: &VotingDb,
     round_id: &str,

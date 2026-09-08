@@ -14,7 +14,8 @@ This release is `zcash_voting` 4.0.0.
   warmup and wallet restart. The SDK validates and loads the signing transaction
   from one database snapshot, preventing concurrent setup replacement from
   mixing targets. Display memos come from that transaction, preserving the
-  original round name. Schema 22 adds its storage without repairing legacy round state.
+  original round name. Proof completion rejects setup that was cleared or
+  replaced during proving. Schema 22 adds storage without repairing legacy round state.
 
 - `round_drive` composes `RoundExecutor` calls into one run: `RoundDriver::run`
   re-plans from durable state, dispatches the obligations the plan lists, paces

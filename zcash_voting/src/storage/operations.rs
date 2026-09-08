@@ -82,16 +82,26 @@ fn validate_delegation_keys_for_round(
 /// Bundles progress independently, so another bundle may already have moved
 /// the round to `VoteReady`. In that case this proof still commits and the
 /// later round phase is preserved.
+/// The original setup must still exist and match when the proof commits.
 fn persist_delegation_proof_result(
     conn: &mut rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
+    expected_pczt_sighash: &[u8],
     delegation_proof: &DelegationProofResult,
 ) -> Result<(), VotingError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::from_sqlite("failed to begin proof result transaction", &e))?;
+    let stored_sighash = queries::load_pczt_sighash(&tx, round_id, wallet_id, bundle_index)?;
+    if stored_sighash != expected_pczt_sighash {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "delegation setup changed during proof generation for round={round_id}, bundle={bundle_index}"
+            ),
+        });
+    }
     queries::store_proof(
         &tx,
         round_id,
@@ -1866,6 +1876,7 @@ impl VotingDb {
             queries::load_round_params_with_network(&conn, round_id, wallet_id)?;
         validate_delegation_keys_for_round(&params, stored_network, keys)?;
         queries::require_bundle_notes(&conn, round_id, wallet_id, bundle_index, notes)?;
+        let pczt_sighash = queries::load_pczt_sighash(&conn, round_id, wallet_id, bundle_index)?;
         let alpha = queries::load_alpha(&conn, round_id, wallet_id, bundle_index)?;
         let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, wallet_id, bundle_index)?;
         let witnesses = queries::load_witnesses(&conn, round_id, wallet_id, bundle_index)?;
@@ -2034,6 +2045,7 @@ impl VotingDb {
             identity.round_id(),
             identity.wallet_id(),
             identity.bundle_index(),
+            &pczt_sighash,
             &result,
         )?;
 
@@ -3268,6 +3280,7 @@ mod tests {
     mod broadcast_protection;
     mod fixtures;
     mod keystone_snapshot;
+    mod proof_persistence;
     mod proof_phase;
     mod setup_target_rebuild;
 

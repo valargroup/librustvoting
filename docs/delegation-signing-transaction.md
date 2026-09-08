@@ -562,6 +562,13 @@ snapshot. A concurrent setup replacement cannot substitute a different target's
 transaction between validation and loading. The returned request belongs to
 that snapshot; later signing and submission still check the current setup.
 
+Proof generation captures the setup's transaction hash before starting. The
+proof persistence transaction requires that same hash to still be present, so
+a reset or replacement cannot leave a late proof attached to missing or different
+setup. If persistence wins before cleanup, cleanup preserves the proved bundle.
+Hosts should use the cache-only `reset_vote_tree` for normal navigation so
+background proofs and later signing can reuse the durable transaction.
+
 Concurrent initial setup can return `Busy` while another caller holds the
 bundle setup lease. A retry loads that caller's persisted transaction without
 waiting for its full proof generation.
@@ -572,3 +579,6 @@ creation, legacy rejection without rebuilding, and changed-note, changed-target,
 corrupt-PCZT, and unrecoverable-memo rejection.
 `storage/operations/tests/keystone_snapshot.rs` covers another connection
 committing a target replacement while the request snapshot remains open.
+`storage/operations/tests/proof_persistence.rs` covers reset and replacement
+from a second connection before proof completion, retry after reset, and cleanup
+after successful proof persistence.
