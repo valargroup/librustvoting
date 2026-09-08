@@ -93,6 +93,14 @@ struct MockTransport {
     post_delays: Mutex<HashMap<String, VecDeque<Duration>>>,
     get_observer: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
     post_observer: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
+    /// POSTs currently between dispatch and completion.
+    ///
+    /// The `post_observer` hook fires on entry only, so it cannot measure how
+    /// many requests are in flight at once — the property that decides whether
+    /// share delivery is actually parallel or merely configured to be.
+    posts_in_flight: std::sync::atomic::AtomicUsize,
+    /// High-water mark of [`Self::posts_in_flight`].
+    peak_posts_in_flight: std::sync::atomic::AtomicUsize,
 }
 
 impl MockTransport {
@@ -113,6 +121,11 @@ impl MockTransport {
             .entry(url.to_string())
             .or_default()
             .push_back(delay);
+    }
+
+    /// Highest number of POSTs that were in flight simultaneously.
+    fn peak_posts_in_flight(&self) -> usize {
+        self.peak_posts_in_flight.load(Ordering::SeqCst)
     }
 
     fn queue_post(&self, url: &str, reply: Reply) {
@@ -196,6 +209,15 @@ impl MockTransport {
     }
 }
 
+/// Releases the mock's in-flight count when transport work completes or is dropped.
+struct ActiveMockPost<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for ActiveMockPost<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl HelperTransport for MockTransport {
     fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> HelperFuture<'a> {
         self.timeouts
@@ -239,7 +261,14 @@ impl HelperTransport for MockTransport {
             .and_then(VecDeque::pop_front)
             .unwrap_or_default();
         let reply = self.take(&self.posts, "POST", url);
+        let in_flight = &self.posts_in_flight;
+        let peak = &self.peak_posts_in_flight;
         Box::pin(async move {
+            // Counted across the await, not just at entry: concurrency is how
+            // many POSTs overlap, which only the span can show.
+            let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::SeqCst);
+            let _active_post = ActiveMockPost(in_flight);
             tokio::time::sleep(delay).await;
             reply
         })
@@ -584,6 +613,7 @@ mod batch_report;
 mod confirmation;
 mod delivery_plan;
 mod initial_delivery;
+mod queued_delivery;
 mod recovery;
 mod timing_policy;
 

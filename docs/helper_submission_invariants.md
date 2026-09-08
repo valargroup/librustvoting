@@ -839,7 +839,7 @@ report invalid or unfinished entries as not ready.
 | Concurrent status GETs per share | 4 (from `SHARE_STATUS_MAX_CONCURRENT_POLLS`) | `poll_share_helpers` |
 | Total status quorum search for one share | 10 seconds (from `SHARE_STATUS_POLL_BUDGET_MILLISECONDS`) | `poll_share_helpers` |
 | One helper POST | 30 seconds | `HelperClient` |
-| Concurrent initial POSTs across the process | 16 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `ConfirmedVote::submit_prepared_shares` |
+| Concurrent initial POSTs across the process | 128 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `ConfirmedVote::submit_prepared_shares` |
 | Total initial fan-out per share | 60 seconds | committed share delivery |
 | Minimum budget to start an initial POST | 1 second | committed share delivery |
 | Retry backoffs | 200 ms, then 600 ms | `HelperClient::with_retry` |
@@ -903,7 +903,7 @@ Regression tests: `preflight_keeps_slow_probes_alive_until_the_target_is_ready`,
 `every_retry_is_capped_to_the_remaining_delivery_deadline`,
 `retry_backoff_does_not_turn_a_definite_failure_ambiguous`,
 `retries_without_an_overall_deadline_keep_the_configured_timeout`,
-`fan_out_stops_at_the_overall_deadline_and_clamps_the_last_request`,
+`fan_out_bounds_every_attempt_by_the_overall_deadline`,
 `definite_failure_in_backoff_is_not_marked_ambiguous`,
 `definite_failure_at_backoff_deadline_clears_durable_attempt_and_retries_later`,
 `no_attempt_starts_under_minimum_budget`, and the
@@ -1000,8 +1000,17 @@ The raw per-share executor is
 crate-private, and there is no public post-hoc delivery mutator.
 
 Up to 16 share tasks across all wallets and committed votes in the process may
-hold a delivery permit at once. Each task retains per-share serialization, the
-30-second request deadline, the 60-second total fan-out deadline, and durable
+hold a delivery permit at once. Separately, a process-wide semaphore limits
+initial POST operations across those tasks to 128. Waiting for a POST permit
+observes cancellation every 50 milliseconds and stops when one second or less
+remains in the fan-out budget. An unsent reservation is cleared as a
+definite failure on cancellation or budget exhaustion. After admission, the
+executor re-reads the starting wallet's exact share nullifier and requires the
+helper's attempting marker before dispatch. Deletion, generation replacement,
+or loss of that reservation fails without sending the queued payload or
+applying its outcome to a different generation. Each task retains
+per-share serialization, the 30-second request deadline, the 60-second total
+fan-out deadline, and durable
 reservation-before-POST. `ShareBatchDeliveryReport` is sorted by domain share
 index. It contains durable reports for completed tasks, the indexes still
 queued when cancellation stopped new work, a final cancellation flag, and the
@@ -1054,10 +1063,12 @@ pass walk disjoint fallbacks beyond the shared target.
 Planned targets are attempted first, followed by the remaining configured
 fleet. Health ranking is applied independently within those groups, so a
 healthy fallback never moves ahead of a degraded planned target. For every
-selected helper it writes
-`attempting_urls` before dispatch, then:
+selected helper it writes `attempting_urls` before dispatch. Helpers are reserved
+sequentially in waves capped at the outstanding definite acceptances, and each
+wave's POSTs run concurrently subject to the process-wide 128-POST limit. The
+executor:
 
-1. re-evaluates helper health before each attempt;
+1. re-evaluates helper health before each reservation;
 2. selects each helper at most once in the outer fan-out (the client can still
    repeat a definite transient transport attempt under its retry policy);
 3. resolves definite and ambiguous outcomes into their separate durable sets;
@@ -1065,6 +1076,14 @@ selected helper it writes
    exhausted, cancellation fires, or the 60-second deadline expires; and
 5. returns partial or empty acceptance as a report rather than treating it as
    a network-level function error.
+
+Reaching placement capacity during reservation ends the current wave, not the
+whole pass. The capacity-rejected helper remains eligible for the next wave.
+After outcomes are persisted, definite failures and ambiguous completions can
+free reservation capacity; accepted and still-attempting helpers continue to
+count against the target. A wave that cannot reserve any helper ends the pass
+without dispatch. `resumed_delivery_rechecks_capacity_after_wave_outcomes`
+covers all three outcomes with a preexisting interrupted attempt.
 
 Ambiguous attempts do not satisfy the target. The returned report summarizes
 the exact current durable generation after fan-out, including placements made
@@ -1127,7 +1146,7 @@ are `stale_handle_cannot_prepare_same_commitment_replacement`,
 `planning_rejects_incomplete_duplicate_and_omitting_rosters_before_persistence`,
 `later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan`,
 `delayed_immediate_plan_is_rejected_before_network`, and
-`global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`.
+`share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`.
 These replace the former wallet-example planner and per-share delivery tests.
 
 ### Delivery diagnostics
@@ -1361,8 +1380,13 @@ already-persisted delivery history. A definite acceptance moves the helper to
 and a definite failure of a fresh attempt removes the reservation so the
 helper can be retried in a later pass. A definite failure of an overdue
 outcome-unknown re-POST leaves that earlier unknown state in place, while a
-failure of an accepted fallback leaves the earlier acceptance intact. Each
-transition is persisted before the workflow contacts another helper.
+failure of an accepted fallback leaves the earlier acceptance intact. Recovery
+persists each outcome transition before contacting another helper. Initial
+delivery reserves every target in a wave durably before dispatch, waits for
+all POST operations in that wave to finish, then persists their outcomes one
+at a time in wave order before reserving or dispatching the next wave. Until
+an outcome is persisted, its helper remains in `attempting_urls`, even if its
+POST has already completed.
 
 A process interruption during an in-flight initial or recovery request leaves
 the helper in `attempting_urls`. On restart, that state is exposed as
@@ -1463,7 +1487,7 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
 `cancelled_pass_reports_cancellation_and_keeps_durable_effects`,
 `cancellation_aborts_initial_wait_for_live_share_operation`,
 `cancellation_aborts_wait_for_live_share_operation`,
-`global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`,
+`share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`,
 `cancellation_before_request_is_not_scored`,
 `late_cancellation_does_not_replace_final_failed_poll`, and
 `late_cancellation_does_not_replace_final_failed_resubmission`.
@@ -1758,13 +1782,21 @@ host wallet:
 ### Exported policy values versus enforced behavior
 
 `share_server_selection_policy` describes a two-second preflight soft window,
-a 30-second hard deadline, and 16 concurrent POSTs.
+a 30-second hard deadline, and 128 concurrent POSTs.
 `HelperClient::preflight_fleet` enforces both windows and derives the readiness
 target internally. `ConfirmedVote::submit_prepared_shares` enforces the
-process-wide 16-POST ceiling with a shared semaphore. Complete-plan persistence
+process-wide 128-POST ceiling with a shared semaphore. Complete-plan persistence
 lets the SDK validate commitment-wide quota, current-fleet compatibility, and
-restart reuse before network dispatch. These are enforced behavior, not host
-integration metadata.
+restart reuse before network dispatch. The POST ceiling is exercised by
+`full_commitment_reaches_but_never_exceeds_128_posts`; cancellation and
+budget expiry while queued are covered by
+`post_capacity_cancellation_clears_unsent_reservations` and
+`post_capacity_deadline_clears_unsent_reservations`. Generation-bound admission
+is covered by `queued_delivery_rejects_a_deleted_round_before_posting`,
+`queued_delivery_leaves_a_replacement_generation_untouched`,
+`queued_delivery_requires_its_attempt_reservation`, and
+`queued_delivery_does_not_validate_against_a_different_wallet`.
+These are enforced behavior, not host integration metadata.
 
 `SHARE_STATUS_MAX_CONCURRENT_POLLS` and
 `SHARE_STATUS_POLL_BUDGET_MILLISECONDS` are enforced tracker behavior, not
@@ -1820,5 +1852,5 @@ A change to helper submission or recovery should answer all of the following:
 - Can cancellation interrupt a wait for the per-share operation lock?
 - Is the trust placed in a helper `confirmed` response still explicit?
 - Do schema and wire changes preserve legacy rows and safe helper identity?
-- Are readiness, status, per-share timeout, and the process-wide 16-POST limit
+- Are readiness, status, per-share timeout, and the process-wide 128-POST limit
   still enforced by their SDK entry points?
