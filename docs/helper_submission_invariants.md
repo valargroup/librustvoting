@@ -755,7 +755,7 @@ Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
 `a_finished_run_releases_its_round_for_the_next_one`,
 `another_round_in_the_same_wallet_runs_alongside`,
 `a_replacement_takes_the_round_over_from_a_cancelled_run`,
-`a_caller_cancelled_while_waiting_for_the_round_reports_cancellation`, and
+`a_caller_cancelled_inside_the_wait_reports_cancellation`, and
 `two_sidecars_holding_the_same_round_do_not_block_each_other` in
 [`share_tracking_drive/tests/admission.rs`](../zcash_voting/src/share_tracking_drive/tests/admission.rs);
 `a_partial_pass_still_hands_over_what_it_committed`,

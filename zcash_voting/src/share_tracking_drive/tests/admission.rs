@@ -198,9 +198,11 @@ async fn a_replacement_takes_the_round_over_from_a_cancelled_run() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_caller_cancelled_while_waiting_for_the_round_reports_cancellation() {
+async fn a_caller_cancelled_inside_the_wait_reports_cancellation() {
     // A caller waiting out a departing holder still observes its own stop
-    // signal, and must not report the wait as another run's activity.
+    // signal, and must not report the wait as another run's activity. The
+    // wait for a departing holder is unbounded by design, so this is the only
+    // thing that ends it.
     let db = db_with_pending_share(60);
     let host = ScriptedHost::fixed(Some(VOTE_END));
     let holder_control = ChainSubmissionControl::new(1);
@@ -217,19 +219,37 @@ async fn a_caller_cancelled_while_waiting_for_the_round_reports_cancellation() {
         "the first run should be waiting for its share to come due"
     );
 
+    // Put the holder into its departing state, so the waiter genuinely waits
+    // rather than being refused, and do not poll it — the waiter must be
+    // sitting inside the wait when its own cancellation lands.
+    holder_control.cancel();
+
     let waiter_control = ChainSubmissionControl::new(1);
-    waiter_control.cancel();
     let waiter_host = ScriptedHost::fixed(Some(VOTE_END));
     let waiter_events = RecordingReporter::default();
     let waiter = ShareTrackingDriver::new(&db, &client, ROUND_ID).with_policy(waiting_policy());
-    let report = waiter
-        .run(&waiter_host, &waiter_control, &waiter_events)
-        .await;
+    let waiting_run = waiter.run(&waiter_host, &waiter_control, &waiter_events);
+    tokio::pin!(waiting_run);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut waiting_run)
+            .await
+            .is_err(),
+        "the waiter should be inside the wait for the departing holder"
+    );
+
+    waiter_control.cancel();
+    let report = tokio::time::timeout(Duration::from_secs(1), waiting_run)
+        .await
+        .expect("a cancelled waiter stops rather than waiting the release out");
 
     assert_eq!(report.quiescence, ShareTrackingQuiescence::Cancelled);
     assert_eq!(report.passes, 0);
+    assert_eq!(
+        *waiter_host.reads.lock().unwrap(),
+        0,
+        "a waiter that never got the round read nothing",
+    );
 
-    holder_control.cancel();
     holding_run.await;
 }
 

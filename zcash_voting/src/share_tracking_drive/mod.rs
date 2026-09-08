@@ -172,11 +172,16 @@ impl<'a> ShareTrackingDriver<'a> {
     /// two interleaved runs would only double the round's helper traffic.
     ///
     /// A second run started while the first is on its way out takes the round
-    /// over instead: admission is released when this future completes or is
-    /// dropped, and a caller waits briefly for that before concluding a run is
-    /// live. That is what lets a host cancel a run and start its replacement
-    /// without the round falling between them — though awaiting the cancelled
-    /// run first removes the question entirely.
+    /// over instead: a caller that meets a *departing* holder — one whose
+    /// control is cancelled, or which the host has moved past — waits for it to
+    /// release the round rather than concluding a run is active. That is what
+    /// lets a host cancel a run and start its replacement without the round
+    /// falling between them.
+    ///
+    /// This future must therefore be polled to completion or dropped. Both
+    /// release the round; a future that is left in neither state holds its
+    /// round for the life of the process, and a replacement waiting on it
+    /// waits until its own control is cancelled.
     pub async fn run(
         &self,
         host: &dyn ShareTrackingHostSource,
