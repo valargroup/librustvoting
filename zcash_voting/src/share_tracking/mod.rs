@@ -268,7 +268,9 @@ pub struct ShareDeliveryOutcome {
 /// Results of one commitment-wide initial-delivery pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareBatchDeliveryReport {
+    /// Processed shares, including those without any definite acceptance.
     pub deliveries: Vec<ShareDeliveryOutcome>,
+    /// Shares without a completed task; this is not a placement-success measure.
     pub pending_share_indices: Vec<u32>,
     pub cancelled: bool,
     pub placement_guarantee: SharePlacementGuarantee,
@@ -485,11 +487,13 @@ pub(crate) fn os_random_bytes(len: usize) -> Vec<u8> {
 mod configured_fleet;
 mod confirmation;
 mod delivery_plan;
+mod delivery_progress;
 mod immediate_designation;
 mod initial_delivery;
 mod recovery;
 
 pub(crate) use delivery_plan::{load_share_delivery_plan, prepare_share_delivery_plan};
+pub(crate) use delivery_progress::{delivery_progress, DeliveryProgress};
 
 use configured_fleet::ConfiguredHelperFleet;
 #[cfg(test)]
@@ -525,65 +529,122 @@ pub async fn confirm_pending_share(
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareConfirmationReport, VotingError> {
-    let scope = share::ShareOperationScope::capture(db);
-    let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
-    let loaded_share = share::get_delegation_for_scope(
-        db,
-        &scope,
-        params.round_id,
-        params.share.bundle_index,
-        params.share.proposal_id,
-        params.share.share_index,
-    )?
-    .ok_or_else(|| VotingError::InvalidInput {
-        message: format!(
-            "helper share not found: round={}, bundle={}, proposal={}, share={}",
+    observe_confirm_pending_share(db, params, client, cancel).await
+}
+
+pub(crate) async fn observe_confirm_pending_share(
+    db: &VotingDb,
+    params: &ShareConfirmationParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<ShareConfirmationReport, VotingError> {
+    let observations = client.observation_scope();
+    observations.bind_round_id(params.round_id);
+    let attributed = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(params.share.bundle_index),
+        proposal_id: Some(params.share.proposal_id),
+        share_index: Some(params.share.share_index),
+    });
+    let stage = attributed.stage("helper::confirm_pending_share");
+    let observed_client = client.observing(stage.scope());
+    let client = &observed_client;
+    let operation_result: Result<ShareConfirmationReport, VotingError> = async {
+        let scope = share::ShareOperationScope::capture(db);
+        let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
+        let loaded_share = share::get_delegation_for_scope(
+            db,
+            &scope,
             params.round_id,
             params.share.bundle_index,
             params.share.proposal_id,
-            params.share.share_index
-        ),
-    })?;
+            params.share.share_index,
+        )?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "helper share not found: round={}, bundle={}, proposal={}, share={}",
+                params.round_id,
+                params.share.bundle_index,
+                params.share.proposal_id,
+                params.share.share_index
+            ),
+        })?;
 
-    let Some(_operation_guard) = lock_share_operation_or_cancel(
-        &scope,
-        params.round_id,
-        params.share.bundle_index,
-        params.share.proposal_id,
-        params.share.share_index,
-        cancel,
-    )
-    .await?
-    else {
-        return Ok(ShareConfirmationReport {
-            cancelled: true,
-            ..ShareConfirmationReport::default()
-        });
+        let Some(_operation_guard) = lock_share_operation_or_cancel(
+            &scope,
+            params.round_id,
+            params.share.bundle_index,
+            params.share.proposal_id,
+            params.share.share_index,
+            cancel,
+        )
+        .await?
+        else {
+            return Ok(ShareConfirmationReport {
+                cancelled: true,
+                ..ShareConfirmationReport::default()
+            });
+        };
+
+        let Some(share) = share::get_delegation_for_scope(
+            db,
+            &scope,
+            params.round_id,
+            params.share.bundle_index,
+            params.share.proposal_id,
+            params.share.share_index,
+        )?
+        .filter(|share| share.nullifier == loaded_share.nullifier) else {
+            return Ok(ShareConfirmationReport::default());
+        };
+
+        poll_and_confirm_share(
+            db,
+            &scope,
+            params.round_id,
+            &share,
+            configured_fleet.urls(),
+            client,
+            params.now_seconds,
+            cancel,
+        )
+        .await
+    }
+    .await;
+    let outcome = match &operation_result {
+        Err(_) => crate::ObservationOutcome::Failed,
+        Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
+        Ok(report) if !report.confirmed => crate::ObservationOutcome::Pending,
+        Ok(_) => crate::ObservationOutcome::Succeeded,
     };
+    stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
 
-    let Some(share) = share::get_delegation_for_scope(
-        db,
-        &scope,
-        params.round_id,
-        params.share.bundle_index,
-        params.share.proposal_id,
-        params.share.share_index,
-    )?
-    .filter(|share| share.nullifier == loaded_share.nullifier) else {
-        return Ok(ShareConfirmationReport::default());
+/// Runs this workflow with optional per-call diagnostics, including on errors.
+pub async fn confirm_pending_share_with_report(
+    db: &VotingDb,
+    params: &ShareConfirmationParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<ShareConfirmationReport, VotingError>> {
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let observed_client = client.observing(invocation.scope());
+    let operation_result =
+        observe_confirm_pending_share(db, params, &observed_client, cancel).await;
+    let outcome = match &operation_result {
+        Err(_) => crate::ObservationOutcome::Failed,
+        Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
+        Ok(report) if !report.confirmed => crate::ObservationOutcome::Pending,
+        Ok(_) => crate::ObservationOutcome::Succeeded,
     };
-
-    poll_and_confirm_share(
-        db,
-        &scope,
-        params.round_id,
-        &share,
-        configured_fleet.urls(),
-        client,
-        params.now_seconds,
-        cancel,
-    )
-    .await
+    invocation.complete("confirm_pending_share", outcome, operation_result)
 }
 
 async fn poll_and_confirm_share(
@@ -677,10 +738,61 @@ pub async fn track_pending_shares(
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareTrackingReport, VotingError> {
-    let scope = share::ShareOperationScope::capture(db);
-    track_pending_shares_recording_partial(db, &scope, params, client, cancel)
-        .await
-        .map_err(|failure| failure.error)
+    observe_track_pending_shares(db, params, client, cancel).await
+}
+
+pub(crate) async fn observe_track_pending_shares(
+    db: &VotingDb,
+    params: &ShareTrackingParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<ShareTrackingReport, VotingError> {
+    let observations = client.observation_scope();
+    observations.bind_round_id(params.round_id);
+    let stage = observations.stage("helper::track_pending_shares");
+    let observed_client = client.observing(stage.scope());
+    let client = &observed_client;
+    let operation_result: Result<ShareTrackingReport, VotingError> = async {
+        let scope = share::ShareOperationScope::capture(db);
+        track_pending_shares_recording_partial(db, &scope, params, client, cancel)
+            .await
+            .map_err(|failure| failure.error)
+    }
+    .await;
+    let outcome = match &operation_result {
+        Err(_) => crate::ObservationOutcome::Failed,
+        Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
+        Ok(report) if report.next_delay_seconds.is_some() => crate::ObservationOutcome::Pending,
+        Ok(_) => crate::ObservationOutcome::Succeeded,
+    };
+    stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
+}
+
+/// Runs this workflow with optional per-call diagnostics, including on errors.
+pub async fn track_pending_shares_with_report(
+    db: &VotingDb,
+    params: &ShareTrackingParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    options: Option<crate::ObservabilityOptions>,
+) -> crate::OperationReport<Result<ShareTrackingReport, VotingError>> {
+    let invocation = crate::ObservationScope::new(options).invocation();
+    let observed_client = client.observing(invocation.scope());
+    let operation_result = observe_track_pending_shares(db, params, &observed_client, cancel).await;
+    let outcome = match &operation_result {
+        Err(_) => crate::ObservationOutcome::Failed,
+        Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
+        Ok(report) if report.next_delay_seconds.is_some() => crate::ObservationOutcome::Pending,
+        Ok(_) => crate::ObservationOutcome::Succeeded,
+    };
+    invocation.complete("track_pending_shares", outcome, operation_result)
 }
 
 /// [`track_pending_shares`], keeping what a failed pass had already recorded.
@@ -767,6 +879,15 @@ async fn walk_pending_shares(
     report.unconfirmed_at_entry = Some(u32::try_from(pending_shares.len()).unwrap_or(u32::MAX));
 
     for loaded_share in pending_shares {
+        let observations = client
+            .observation_scope()
+            .attributed(crate::ObservationAttribution {
+                bundle_index: Some(loaded_share.bundle_index),
+                proposal_id: Some(loaded_share.proposal_id),
+                share_index: Some(loaded_share.share_index),
+            });
+        let observed_client = client.observing(&observations);
+        let client = &observed_client;
         if cancel() {
             report.cancelled = true;
             break;

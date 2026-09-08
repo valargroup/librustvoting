@@ -201,6 +201,7 @@ pub struct ChainSubmissionControl {
     /// is hours for a delayed share. Polling that at a latency a destructive
     /// drain would accept means waking tens of times a second for hours.
     interrupt: Arc<tokio::sync::Notify>,
+    pub(crate) observations: Option<crate::ObservationScope>,
 }
 
 /// Selects whether a bounded advancement may use exact commitment-tree
@@ -221,6 +222,7 @@ impl ChainSubmissionControl {
             cancelled: Arc::new(AtomicBool::new(false)),
             operation_epoch: Arc::new(AtomicU64::new(operation_epoch)),
             interrupt: Arc::new(tokio::sync::Notify::new()),
+            observations: None,
         }
     }
 
@@ -261,6 +263,12 @@ impl ChainSubmissionControl {
 }
 
 impl SubmissionControl for ChainSubmissionControl {
+    fn observations(&self) -> crate::ObservationScope {
+        self.observations
+            .clone()
+            .unwrap_or_else(crate::ObservationScope::disabled)
+    }
+
     fn is_cancelled(&self) -> bool {
         self.is_cancelled()
     }
@@ -434,6 +442,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         Ok(Self {
             wallet_id,
             network: config.network,
+
             coordinator,
         })
     }
@@ -470,17 +479,68 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         request: AdvanceDelegation,
         control: &ChainSubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
-        let identity = self.identity(
-            request.vote_round_id,
-            request.bundle_index,
-            ChainSubmissionTarget::Delegation,
-        )?;
-        self.coordinator
-            .advance(
-                StoreAdvancementRequest::delegation(identity, request.spend_auth_signature),
-                control,
-            )
-            .await
+        self.observe_advance_delegation(request, control).await
+    }
+
+    pub(crate) async fn observe_advance_delegation(
+        &self,
+        request: AdvanceDelegation,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let invocation_observations = control
+            .observations
+            .clone()
+            .unwrap_or_else(crate::ObservationScope::disabled);
+        invocation_observations.bind_round_bytes(&request.vote_round_id);
+        let attributed_observations =
+            invocation_observations.attributed(crate::ObservationAttribution {
+                bundle_index: Some(request.bundle_index),
+                ..Default::default()
+            });
+        let observation_stage = attributed_observations.stage("chain::advance_delegation");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(observation_stage.scope().clone());
+        let control = &observed_control;
+        let operation_result: Result<ChainSubmissionResult, ChainSubmissionFailure> = async {
+            let identity = self.identity(
+                request.vote_round_id,
+                request.bundle_index,
+                ChainSubmissionTarget::Delegation,
+            )?;
+            self.coordinator
+                .advance(
+                    StoreAdvancementRequest::delegation(identity, request.spend_auth_signature),
+                    control,
+                )
+                .await
+        }
+        .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::chain_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn advance_delegation_with_report(
+        &self,
+        request: AdvanceDelegation,
+        control: &ChainSubmissionControl,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ChainSubmissionResult, ChainSubmissionFailure>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(invocation.scope().clone());
+        let operation_result = self
+            .observe_advance_delegation(request, &observed_control)
+            .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        invocation.complete("advance_delegation", outcome, operation_result)
     }
 
     /// Adopts and advances one already-broadcast capability delegation.
@@ -504,17 +564,69 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         request: AdvanceImportedDelegation,
         control: &ChainSubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
-        let identity = self.identity(
-            request.vote_round_id,
-            request.bundle_index,
-            ChainSubmissionTarget::Delegation,
-        )?;
-        self.coordinator
-            .advance(
-                StoreAdvancementRequest::imported_delegation(identity),
-                control,
-            )
+        self.observe_advance_imported_delegation(request, control)
             .await
+    }
+
+    pub(crate) async fn observe_advance_imported_delegation(
+        &self,
+        request: AdvanceImportedDelegation,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let invocation_observations = control
+            .observations
+            .clone()
+            .unwrap_or_else(crate::ObservationScope::disabled);
+        invocation_observations.bind_round_bytes(&request.vote_round_id);
+        let attributed_observations =
+            invocation_observations.attributed(crate::ObservationAttribution {
+                bundle_index: Some(request.bundle_index),
+                ..Default::default()
+            });
+        let observation_stage = attributed_observations.stage("chain::advance_imported_delegation");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(observation_stage.scope().clone());
+        let control = &observed_control;
+        let operation_result: Result<ChainSubmissionResult, ChainSubmissionFailure> = async {
+            let identity = self.identity(
+                request.vote_round_id,
+                request.bundle_index,
+                ChainSubmissionTarget::Delegation,
+            )?;
+            self.coordinator
+                .advance(
+                    StoreAdvancementRequest::imported_delegation(identity),
+                    control,
+                )
+                .await
+        }
+        .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::chain_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn advance_imported_delegation_with_report(
+        &self,
+        request: AdvanceImportedDelegation,
+        control: &ChainSubmissionControl,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ChainSubmissionResult, ChainSubmissionFailure>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(invocation.scope().clone());
+        let operation_result = self
+            .observe_advance_imported_delegation(request, &observed_control)
+            .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        invocation.complete("advance_imported_delegation", outcome, operation_result)
     }
 
     /// Advances one prepared delegation through one bounded pass.
@@ -538,18 +650,77 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         recovery: ChainRecoveryMode,
         control: &ChainSubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
-        let identity = self.identity(
-            request.vote_round_id,
-            request.bundle_index,
-            ChainSubmissionTarget::Delegation,
-        )?;
-        self.coordinator
-            .advance_with_recovery(
-                StoreAdvancementRequest::delegation(identity, request.spend_auth_signature),
-                recovery,
-                control,
-            )
+        self.observe_advance_delegation_with_recovery(request, recovery, control)
             .await
+    }
+
+    pub(crate) async fn observe_advance_delegation_with_recovery(
+        &self,
+        request: AdvanceDelegation,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let invocation_observations = control
+            .observations
+            .clone()
+            .unwrap_or_else(crate::ObservationScope::disabled);
+        invocation_observations.bind_round_bytes(&request.vote_round_id);
+        let attributed_observations =
+            invocation_observations.attributed(crate::ObservationAttribution {
+                bundle_index: Some(request.bundle_index),
+                ..Default::default()
+            });
+        let observation_stage =
+            attributed_observations.stage("chain::advance_delegation_with_recovery");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(observation_stage.scope().clone());
+        let control = &observed_control;
+        let operation_result: Result<ChainSubmissionResult, ChainSubmissionFailure> = async {
+            let identity = self.identity(
+                request.vote_round_id,
+                request.bundle_index,
+                ChainSubmissionTarget::Delegation,
+            )?;
+            self.coordinator
+                .advance_with_recovery(
+                    StoreAdvancementRequest::delegation(identity, request.spend_auth_signature),
+                    recovery,
+                    control,
+                )
+                .await
+        }
+        .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::chain_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn advance_delegation_with_recovery_with_report(
+        &self,
+        request: AdvanceDelegation,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ChainSubmissionResult, ChainSubmissionFailure>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(invocation.scope().clone());
+        let operation_result = self
+            .observe_advance_delegation_with_recovery(request, recovery, &observed_control)
+            .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        invocation.complete(
+            "advance_delegation_with_recovery",
+            outcome,
+            operation_result,
+        )
     }
 
     /// Advances one prepared singleton vote through one bounded status-only pass.
@@ -578,16 +749,65 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         request: AdvanceVote,
         control: &ChainSubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
-        let identity = self.identity(
-            request.vote_round_id,
-            request.bundle_index,
-            ChainSubmissionTarget::Vote {
-                proposal_id: request.proposal_id,
-            },
-        )?;
-        self.coordinator
-            .advance(StoreAdvancementRequest::vote(identity), control)
-            .await
+        self.observe_advance_vote(request, control).await
+    }
+
+    pub(crate) async fn observe_advance_vote(
+        &self,
+        request: AdvanceVote,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let invocation_observations = control
+            .observations
+            .clone()
+            .unwrap_or_else(crate::ObservationScope::disabled);
+        invocation_observations.bind_round_bytes(&request.vote_round_id);
+        let attributed_observations =
+            invocation_observations.attributed(crate::ObservationAttribution {
+                bundle_index: Some(request.bundle_index),
+                ..Default::default()
+            });
+        let observation_stage = attributed_observations.stage("chain::advance_vote");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(observation_stage.scope().clone());
+        let control = &observed_control;
+        let operation_result: Result<ChainSubmissionResult, ChainSubmissionFailure> = async {
+            let identity = self.identity(
+                request.vote_round_id,
+                request.bundle_index,
+                ChainSubmissionTarget::Vote {
+                    proposal_id: request.proposal_id,
+                },
+            )?;
+            self.coordinator
+                .advance(StoreAdvancementRequest::vote(identity), control)
+                .await
+        }
+        .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::chain_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn advance_vote_with_report(
+        &self,
+        request: AdvanceVote,
+        control: &ChainSubmissionControl,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ChainSubmissionResult, ChainSubmissionFailure>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(invocation.scope().clone());
+        let operation_result = self.observe_advance_vote(request, &observed_control).await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        invocation.complete("advance_vote", outcome, operation_result)
     }
 
     /// Advances one prepared singleton vote through one bounded pass.
@@ -611,16 +831,70 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         recovery: ChainRecoveryMode,
         control: &ChainSubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
-        let identity = self.identity(
-            request.vote_round_id,
-            request.bundle_index,
-            ChainSubmissionTarget::Vote {
-                proposal_id: request.proposal_id,
-            },
-        )?;
-        self.coordinator
-            .advance_with_recovery(StoreAdvancementRequest::vote(identity), recovery, control)
+        self.observe_advance_vote_with_recovery(request, recovery, control)
             .await
+    }
+
+    pub(crate) async fn observe_advance_vote_with_recovery(
+        &self,
+        request: AdvanceVote,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let invocation_observations = control
+            .observations
+            .clone()
+            .unwrap_or_else(crate::ObservationScope::disabled);
+        invocation_observations.bind_round_bytes(&request.vote_round_id);
+        let attributed_observations =
+            invocation_observations.attributed(crate::ObservationAttribution {
+                bundle_index: Some(request.bundle_index),
+                ..Default::default()
+            });
+        let observation_stage = attributed_observations.stage("chain::advance_vote_with_recovery");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(observation_stage.scope().clone());
+        let control = &observed_control;
+        let operation_result: Result<ChainSubmissionResult, ChainSubmissionFailure> = async {
+            let identity = self.identity(
+                request.vote_round_id,
+                request.bundle_index,
+                ChainSubmissionTarget::Vote {
+                    proposal_id: request.proposal_id,
+                },
+            )?;
+            self.coordinator
+                .advance_with_recovery(StoreAdvancementRequest::vote(identity), recovery, control)
+                .await
+        }
+        .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::chain_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn advance_vote_with_recovery_with_report(
+        &self,
+        request: AdvanceVote,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ChainSubmissionResult, ChainSubmissionFailure>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(invocation.scope().clone());
+        let operation_result = self
+            .observe_advance_vote_with_recovery(request, recovery, &observed_control)
+            .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        invocation.complete("advance_vote_with_recovery", outcome, operation_result)
     }
 
     /// Advances one prepared atomic vote batch through one bounded status-only pass.
@@ -652,8 +926,59 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         request: AdvanceVoteBatch,
         control: &ChainSubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
-        self.advance_vote_batch_with_recovery(request, ChainRecoveryMode::StatusOnly, control)
-            .await
+        self.observe_advance_vote_batch(request, control).await
+    }
+
+    pub(crate) async fn observe_advance_vote_batch(
+        &self,
+        request: AdvanceVoteBatch,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let invocation_observations = control
+            .observations
+            .clone()
+            .unwrap_or_else(crate::ObservationScope::disabled);
+        invocation_observations.bind_round_bytes(&request.vote_round_id);
+        let attributed_observations =
+            invocation_observations.attributed(crate::ObservationAttribution {
+                bundle_index: Some(request.bundle_index),
+                ..Default::default()
+            });
+        let observation_stage = attributed_observations.stage("chain::advance_vote_batch");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(observation_stage.scope().clone());
+        let control = &observed_control;
+        let operation_result: Result<ChainSubmissionResult, ChainSubmissionFailure> = async {
+            self.advance_vote_batch_with_recovery(request, ChainRecoveryMode::StatusOnly, control)
+                .await
+        }
+        .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::chain_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn advance_vote_batch_with_report(
+        &self,
+        request: AdvanceVoteBatch,
+        control: &ChainSubmissionControl,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ChainSubmissionResult, ChainSubmissionFailure>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(invocation.scope().clone());
+        let operation_result = self
+            .observe_advance_vote_batch(request, &observed_control)
+            .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        invocation.complete("advance_vote_batch", outcome, operation_result)
     }
 
     /// Advances one prepared atomic vote batch through one bounded pass.
@@ -680,18 +1005,77 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         recovery: ChainRecoveryMode,
         control: &ChainSubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
-        let identity = self.identity(
-            request.vote_round_id,
-            request.bundle_index,
-            ChainSubmissionTarget::VoteBatch {
-                ordered_batch_digest: request.ordered_batch_digest,
-            },
-        )?;
-        let advancement =
-            StoreAdvancementRequest::vote_batch(identity, request.ordered_proposal_ids)?;
-        self.coordinator
-            .advance_with_recovery(advancement, recovery, control)
+        self.observe_advance_vote_batch_with_recovery(request, recovery, control)
             .await
+    }
+
+    pub(crate) async fn observe_advance_vote_batch_with_recovery(
+        &self,
+        request: AdvanceVoteBatch,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let invocation_observations = control
+            .observations
+            .clone()
+            .unwrap_or_else(crate::ObservationScope::disabled);
+        invocation_observations.bind_round_bytes(&request.vote_round_id);
+        let attributed_observations =
+            invocation_observations.attributed(crate::ObservationAttribution {
+                bundle_index: Some(request.bundle_index),
+                ..Default::default()
+            });
+        let observation_stage =
+            attributed_observations.stage("chain::advance_vote_batch_with_recovery");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(observation_stage.scope().clone());
+        let control = &observed_control;
+        let operation_result: Result<ChainSubmissionResult, ChainSubmissionFailure> = async {
+            let identity = self.identity(
+                request.vote_round_id,
+                request.bundle_index,
+                ChainSubmissionTarget::VoteBatch {
+                    ordered_batch_digest: request.ordered_batch_digest,
+                },
+            )?;
+            let advancement =
+                StoreAdvancementRequest::vote_batch(identity, request.ordered_proposal_ids)?;
+            self.coordinator
+                .advance_with_recovery(advancement, recovery, control)
+                .await
+        }
+        .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::chain_error_kind),
+        );
+        operation_result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn advance_vote_batch_with_recovery_with_report(
+        &self,
+        request: AdvanceVoteBatch,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<ChainSubmissionResult, ChainSubmissionFailure>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(invocation.scope().clone());
+        let operation_result = self
+            .observe_advance_vote_batch_with_recovery(request, recovery, &observed_control)
+            .await;
+        let outcome = crate::observability::chain_result_outcome(&operation_result);
+        invocation.complete(
+            "advance_vote_batch_with_recovery",
+            outcome,
+            operation_result,
+        )
     }
 
     /// One bounded pass of `request` for work begun earlier under
@@ -793,17 +1177,41 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         control: &ChainSubmissionControl,
         entry_epoch: u64,
     ) -> Result<ChainAdvanceOutcome, ChainSubmissionFailure> {
-        // Imported delegations carry no recovery mode.
-        let imported = matches!(request, ChainAdvanceRequest::ImportedDelegation(_));
-        run_episode(policy, control, entry_epoch, |recovery| {
-            let recovery = if imported {
-                ChainRecoveryMode::StatusOnly
-            } else {
-                recovery
-            };
-            self.advance_pass_in_epoch(&request, recovery, control, entry_epoch)
-        })
-        .await
+        let invocation_observations = control
+            .observations
+            .clone()
+            .unwrap_or_else(|| crate::ObservationScope::disabled())
+            .invocation();
+        let attributed_observations =
+            invocation_observations.attributed(crate::ObservationAttribution::default());
+        let observation_stage =
+            attributed_observations.stage("chain::advance_until_terminal_in_epoch");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(observation_stage.scope().clone());
+        let control = &observed_control;
+        let operation_result: Result<ChainAdvanceOutcome, ChainSubmissionFailure> = async {
+            // Imported delegations carry no recovery mode.
+            let imported = matches!(request, ChainAdvanceRequest::ImportedDelegation(_));
+            run_episode(policy, control, entry_epoch, |recovery| {
+                let recovery = if imported {
+                    ChainRecoveryMode::StatusOnly
+                } else {
+                    recovery
+                };
+                self.advance_pass_in_epoch(&request, recovery, control, entry_epoch)
+            })
+            .await
+        }
+        .await;
+        let outcome = crate::observability::chain_episode_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result
+                .as_ref()
+                .err()
+                .map(crate::observability::chain_error_kind),
+        );
+        operation_result
     }
 }
 

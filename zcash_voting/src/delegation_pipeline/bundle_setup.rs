@@ -9,7 +9,6 @@ use crate::{
     delegate::{self, DelegationRoundContext},
     note_bundling::MinimumVotingEligibility,
     round::BundleLayout,
-    selection::select_notes_with_wallet_db,
     types::{NoteInfo, VotingError, VotingHotkey},
 };
 
@@ -54,24 +53,86 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
 
     /// Ensures the round row exists and returns its display context.
     pub fn ensure_round(&self) -> Result<DelegationRoundContext, VotingError> {
-        delegate::ensure_round_context(
+        self.observe_ensure_round(&crate::ObservationScope::disabled())
+    }
+
+    pub(crate) fn observe_ensure_round(
+        &self,
+        observations: &crate::ObservationScope,
+    ) -> Result<DelegationRoundContext, VotingError> {
+        observations.bind_round_id(self.round_id());
+        let attributed = observations.attributed(Default::default());
+        let stage = attributed.stage("delegation::ensure_round");
+        let result = self.execute_ensure_round(stage.scope());
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        result
+    }
+
+    pub(crate) fn execute_ensure_round(
+        &self,
+        observations: &crate::ObservationScope,
+    ) -> Result<DelegationRoundContext, VotingError> {
+        delegate::observe_ensure_round_context(
             self.scoped_voting_db()?,
             self.lwd.network,
             &self.lwd.round_params,
             &self.lwd.resolved_round_name,
             self.session_json.as_deref(),
+            observations,
         )
     }
 
     /// Selects the account's voting-eligible notes at the round snapshot.
     pub fn select_notes(&self) -> Result<Vec<NoteInfo>, VotingError> {
+        self.observe_select_notes(&crate::ObservationScope::disabled())
+    }
+
+    pub(crate) fn observe_select_notes(
+        &self,
+        observations: &crate::ObservationScope,
+    ) -> Result<Vec<NoteInfo>, VotingError> {
+        observations.bind_round_id(self.round_id());
+        let attributed = observations.attributed(Default::default());
+        let stage = attributed.stage("delegation::select_notes");
+        let result = self.execute_select_notes(stage.scope());
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        result
+    }
+
+    pub(crate) fn execute_select_notes(
+        &self,
+        observations: &crate::ObservationScope,
+    ) -> Result<Vec<NoteInfo>, VotingError> {
         let wallet = self.wallet.open_for_read()?;
-        let selected = select_notes_with_wallet_db(
+        let selected = crate::selection::observe_select_notes_with_wallet_db(
             &wallet,
             self.lwd.network,
             &self.account_uuid,
             self.snapshot_height(),
             self.anchor_tree_state()?,
+            observations,
         )?;
         Ok(selected.voting_note_infos())
     }
@@ -81,8 +142,54 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     /// Existing rows are reused only when they match the current eligible
     /// note set.
     pub fn setup_bundles(&self) -> Result<BundleLayout, VotingError> {
-        self.ensure_round()?;
-        let notes = self.select_notes()?;
+        self.observe_setup_bundles(&crate::ObservationScope::disabled())
+    }
+
+    pub(crate) fn observe_setup_bundles(
+        &self,
+        observations: &crate::ObservationScope,
+    ) -> Result<BundleLayout, VotingError> {
+        observations.bind_round_id(self.round_id());
+        let attributed = observations.attributed(Default::default());
+        let stage = attributed.stage("delegation::setup_bundles");
+        let result = self.execute_setup_bundles(stage.scope());
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub fn setup_bundles_with_report(
+        &self,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<BundleLayout, VotingError>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+
+        let result = self.observe_setup_bundles(invocation.scope());
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        invocation.complete("setup_bundles", outcome, result)
+    }
+
+    pub(crate) fn execute_setup_bundles(
+        &self,
+        observations: &crate::ObservationScope,
+    ) -> Result<BundleLayout, VotingError> {
+        self.execute_ensure_round(observations)?;
+        let notes = self.execute_select_notes(observations)?;
         self.scoped_voting_db()?
             .ensure_bundles_with_skipped_suffix_with_policy(
                 self.round_id(),
@@ -97,7 +204,54 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
     /// and is used instead of the pipeline's seed policy, so the preview
     /// describes the plan the round would actually derive.
     pub fn eligibility(&self) -> Result<VotingEligibilityReport, VotingError> {
-        let notes = self.select_notes()?;
+        self.observe_eligibility(&crate::ObservationScope::disabled())
+    }
+
+    /// Checks eligibility with optional diagnostics, including wallet-selection failures.
+    /// Uses the same read-only workflow and errors as [`Self::eligibility`].
+    pub fn eligibility_with_report(
+        &self,
+
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<Result<VotingEligibilityReport, VotingError>> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+        let result = self.observe_eligibility(invocation.scope());
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        invocation.complete("delegation::eligibility", outcome, result)
+    }
+
+    pub(crate) fn observe_eligibility(
+        &self,
+        observations: &crate::ObservationScope,
+    ) -> Result<VotingEligibilityReport, VotingError> {
+        observations.bind_round_id(self.round_id());
+        let attributed = observations.attributed(Default::default());
+        let stage = attributed.stage("delegation::eligibility");
+        let result = self.execute_eligibility(stage.scope());
+        let outcome = if result.is_ok() {
+            crate::ObservationOutcome::Succeeded
+        } else {
+            crate::ObservationOutcome::Failed
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        result
+    }
+
+    pub(crate) fn execute_eligibility(
+        &self,
+        observations: &crate::ObservationScope,
+    ) -> Result<VotingEligibilityReport, VotingError> {
+        let notes = self.execute_select_notes(observations)?;
         let policy = self
             .scoped_voting_db()?
             .effective_bundle_policy(self.round_id(), self.bundle_policy)?;

@@ -186,6 +186,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             endpoint_index,
             submission,
             ChainPostDispatch::default(),
+            &crate::ObservationScope::disabled(),
         )
         .await
     }
@@ -195,6 +196,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         endpoint_index: usize,
         submission: &DelegationSubmissionWire,
         dispatch: ChainPostDispatch,
+        observations: &crate::ObservationScope,
     ) -> PostAttemptOutcome {
         let body = match submission.to_json() {
             Ok(json) => json.into_bytes(),
@@ -204,8 +206,15 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                 )))
             }
         };
-        self.post(endpoint_index, DELEGATION_ENDPOINT, body, None, dispatch)
-            .await
+        self.post(
+            endpoint_index,
+            DELEGATION_ENDPOINT,
+            body,
+            None,
+            dispatch,
+            observations,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -214,8 +223,13 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         endpoint_index: usize,
         submission: &VoteCommitmentWire,
     ) -> PostAttemptOutcome {
-        self.submit_vote_with_dispatch(endpoint_index, submission, ChainPostDispatch::default())
-            .await
+        self.submit_vote_with_dispatch(
+            endpoint_index,
+            submission,
+            ChainPostDispatch::default(),
+            &crate::ObservationScope::disabled(),
+        )
+        .await
     }
 
     pub(super) async fn submit_vote_with_dispatch(
@@ -223,6 +237,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         endpoint_index: usize,
         submission: &VoteCommitmentWire,
         dispatch: ChainPostDispatch,
+        observations: &crate::ObservationScope,
     ) -> PostAttemptOutcome {
         let body = match submission.to_json() {
             Ok(json) => json.into_bytes(),
@@ -232,8 +247,15 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                 )))
             }
         };
-        self.post(endpoint_index, VOTE_ENDPOINT, body, None, dispatch)
-            .await
+        self.post(
+            endpoint_index,
+            VOTE_ENDPOINT,
+            body,
+            None,
+            dispatch,
+            observations,
+        )
+        .await
     }
 
     pub(super) async fn submit_vote_batch_with_dispatch(
@@ -242,6 +264,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         submission: &crate::wire::VoteCommitmentBatchWire,
         expected_batch_digest: [u8; 32],
         dispatch: ChainPostDispatch,
+        observations: &crate::ObservationScope,
     ) -> PostAttemptOutcome {
         let body = match submission.to_json() {
             Ok(json) => json.into_bytes(),
@@ -257,6 +280,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             body,
             Some(expected_batch_digest),
             dispatch,
+            observations,
         )
         .await
     }
@@ -268,6 +292,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         body: Vec<u8>,
         expected_batch_digest: Option<[u8; 32]>,
         dispatch: ChainPostDispatch,
+        observations: &crate::ObservationScope,
     ) -> PostAttemptOutcome {
         if body.len() > MAX_CHAIN_HTTP_REQUEST_BYTES {
             return PostAttemptOutcome::LocalFailure(invalid_protocol(format!(
@@ -285,6 +310,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             self.timing.post_timeout,
         );
 
+        let stage = observations.stage("chain::post_attempt");
         let dispatch_marker = dispatch.clone();
         let response = tokio::time::timeout(
             self.timing.post_timeout,
@@ -292,7 +318,12 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                 .chain_post_json_with_dispatch(request, body, dispatch),
         )
         .await;
-        match response {
+        let http_status = response
+            .as_ref()
+            .ok()
+            .and_then(|response| response.as_ref().ok())
+            .map(|response| response.status());
+        let outcome = match response {
             // This deadline is enforced here, not by the transport. While the
             // dispatch marker is clear no request bytes reached a network
             // stack, so the attempt is definitely unsent rather than ambiguous.
@@ -317,54 +348,118 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                     error.message(),
                 ),
             ),
-        }
+        };
+        let (classification, error_kind) = match &outcome {
+            PostAttemptOutcome::Accepted(_) => (crate::ObservationOutcome::Succeeded, None),
+            PostAttemptOutcome::Rejected { .. } => {
+                (crate::ObservationOutcome::Rejected, Some("ChainRejected"))
+            }
+            PostAttemptOutcome::PossiblyDispatched(_) => (
+                crate::ObservationOutcome::PossiblyDispatched,
+                Some("PossiblyDispatched"),
+            ),
+            PostAttemptOutcome::DefinitelyUnsent(_) => {
+                (crate::ObservationOutcome::Failed, Some("DefinitelyUnsent"))
+            }
+            PostAttemptOutcome::LocalFailure(_) => {
+                (crate::ObservationOutcome::Failed, Some("Protocol"))
+            }
+        };
+        stage.finish_http(
+            classification,
+            error_kind,
+            http_status,
+            u32::try_from(endpoint_index).ok(),
+        );
+        outcome
     }
 
     pub(super) async fn transaction_status(
         &self,
         transaction_hash: CandidateTransactionHash,
+        observations: &crate::ObservationScope,
     ) -> Result<TransactionStatusObservation, LookupFailure> {
-        let hash = transaction_hash.to_hex();
-        let mut saw_pending = false;
-        let mut last_failure = None;
+        let operation = observations.stage("chain::status_lookup");
+        let observations = operation.scope();
+        let result = async {
+            let hash = transaction_hash.to_hex();
+            let mut saw_pending = false;
+            let mut last_failure = None;
 
-        for base_url in &self.endpoints {
-            let request = chain_request(
-                join_chain_url(base_url, &["tx", &hash]),
-                false,
-                self.timing.lookup_timeout,
-            );
-            match tokio::time::timeout(
-                self.timing.lookup_timeout,
-                self.transport.chain_get(request),
-            )
-            .await
-            {
-                Ok(Ok(response)) => match parse_status_response(response) {
-                    Ok(TransactionStatusObservation::Pending) => saw_pending = true,
-                    Ok(committed) => return Ok(committed),
-                    Err(error) => last_failure = Some(LookupFailure::Protocol(error)),
-                },
-                Ok(Err(error)) => last_failure = Some(LookupFailure::Transport(error)),
-                Err(_) => {
-                    last_failure = Some(LookupFailure::Transport(
+            for (endpoint_index, base_url) in self.endpoints.iter().enumerate() {
+                let request = chain_request(
+                    join_chain_url(base_url, &["tx", &hash]),
+                    false,
+                    self.timing.lookup_timeout,
+                );
+                let attempt_context = observations
+                    .attempt(u32::try_from(endpoint_index.saturating_add(1)).unwrap_or(u32::MAX));
+                let stage = attempt_context.stage("chain::status_attempt");
+                let response = tokio::time::timeout(
+                    self.timing.lookup_timeout,
+                    self.transport.chain_get(request),
+                )
+                .await;
+                let status = response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.as_ref().ok())
+                    .map(|response| response.status());
+                let observed = match response {
+                    Ok(Ok(response)) => {
+                        parse_status_response(response).map_err(LookupFailure::Protocol)
+                    }
+                    Ok(Err(error)) => Err(LookupFailure::Transport(error)),
+                    Err(_) => Err(LookupFailure::Transport(
                         ChainTransportError::possibly_dispatched(
                             "vote-chain transaction lookup timed out",
                         ),
-                    ));
+                    )),
+                };
+                let (outcome, error) = match &observed {
+                    Ok(TransactionStatusObservation::Pending) => {
+                        (crate::ObservationOutcome::Pending, None)
+                    }
+                    Ok(TransactionStatusObservation::CommittedFailure(_)) => {
+                        (crate::ObservationOutcome::Rejected, Some("ChainRejected"))
+                    }
+                    Ok(_) => (crate::ObservationOutcome::Succeeded, None),
+                    Err(LookupFailure::Protocol(_)) => {
+                        (crate::ObservationOutcome::Failed, Some("Protocol"))
+                    }
+                    Err(LookupFailure::Transport(_)) => {
+                        (crate::ObservationOutcome::Failed, Some("Transport"))
+                    }
+                };
+                stage.finish_http(outcome, error, status, u32::try_from(endpoint_index).ok());
+                match observed {
+                    Ok(TransactionStatusObservation::Pending) => saw_pending = true,
+                    Ok(committed) => return Ok(committed),
+                    Err(error) => last_failure = Some(error),
                 }
             }
-        }
 
-        if saw_pending {
-            Ok(TransactionStatusObservation::Pending)
-        } else {
-            Err(last_failure.unwrap_or_else(|| {
-                LookupFailure::Protocol(invalid_protocol(
-                    "vote-chain lookup produced no endpoint result",
-                ))
-            }))
+            if saw_pending {
+                Ok(TransactionStatusObservation::Pending)
+            } else {
+                Err(last_failure.unwrap_or_else(|| {
+                    LookupFailure::Protocol(invalid_protocol(
+                        "vote-chain lookup produced no endpoint result",
+                    ))
+                }))
+            }
         }
+        .await;
+        let outcome = match &result {
+            Ok(TransactionStatusObservation::Pending) => crate::ObservationOutcome::Pending,
+            Ok(TransactionStatusObservation::CommittedFailure(_)) => {
+                crate::ObservationOutcome::Rejected
+            }
+            Ok(_) => crate::ObservationOutcome::Succeeded,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        operation.finish(outcome, result.as_ref().err().map(|_| "LookupFailure"));
+        result
     }
 }
 
@@ -899,7 +994,10 @@ mod tests {
 
         assert_eq!(
             client
-                .transaction_status(CandidateTransactionHash::from_str(HASH).unwrap())
+                .transaction_status(
+                    CandidateTransactionHash::from_str(HASH).unwrap(),
+                    &crate::ObservationScope::disabled()
+                )
                 .await
                 .unwrap(),
             TransactionStatusObservation::Pending
@@ -957,7 +1055,10 @@ mod tests {
         );
         let task = tokio::spawn(async move {
             client
-                .transaction_status(CandidateTransactionHash::from_str(HASH).unwrap())
+                .transaction_status(
+                    CandidateTransactionHash::from_str(HASH).unwrap(),
+                    &crate::ObservationScope::disabled(),
+                )
                 .await
         });
         tokio::task::yield_now().await;
@@ -1107,7 +1208,10 @@ mod tests {
         );
         let hash = CandidateTransactionHash::from_str(HASH).unwrap();
 
-        let result = client.transaction_status(hash).await.unwrap();
+        let result = client
+            .transaction_status(hash, &crate::ObservationScope::disabled())
+            .await
+            .unwrap();
         let TransactionStatusObservation::CommittedSuccess(committed) = result else {
             panic!("expected committed success");
         };
@@ -1132,7 +1236,10 @@ mod tests {
         let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
         let hash = CandidateTransactionHash::from_str(HASH).unwrap();
         assert!(matches!(
-            client.transaction_status(hash).await.unwrap(),
+            client
+                .transaction_status(hash, &crate::ObservationScope::disabled())
+                .await
+                .unwrap(),
             TransactionStatusObservation::CommittedFailure(CommittedTransaction {
                 height: 43,
                 code: 9,
@@ -1147,7 +1254,9 @@ mod tests {
         )));
         let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
         assert!(matches!(
-            client.transaction_status(hash).await,
+            client
+                .transaction_status(hash, &crate::ObservationScope::disabled())
+                .await,
             Err(LookupFailure::Protocol(_))
         ));
     }
@@ -1170,7 +1279,10 @@ mod tests {
             let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
             assert!(matches!(
                 client
-                    .transaction_status(CandidateTransactionHash::from_str(HASH).unwrap())
+                    .transaction_status(
+                        CandidateTransactionHash::from_str(HASH).unwrap(),
+                        &crate::ObservationScope::disabled()
+                    )
                     .await,
                 Err(LookupFailure::Protocol(_))
             ));

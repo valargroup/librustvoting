@@ -8,7 +8,31 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 This release is `zcash_voting` 4.0.0.
 
+### Fixed
+
+- Helper-delivery diagnostics classify definite acceptance, ambiguous delivery,
+  and definitely-unsent shares consistently at stage and invocation boundaries.
+  Atomic-batch helper attempts and retries carry their actual bundle, proposal,
+  and share identity.
+
 ### Added
+
+- Pipeline cached-proof diagnostics consistently report `Reused` at both stage
+  and invocation boundaries. Diagnostic output structs and wire projections are
+  non-exhaustive to allow future fields.
+
+- Reported variants for delegation eligibility, Keystone request preparation, and
+  round-independent PIR cache warm-up, with an explicit observability coverage
+  checklist for future workflow changes.
+
+- Optional per-invocation API observability, including per-bundle proof, chain,
+  and helper measurements. Selective `*_with_report` workflows accept optional
+  per-call settings and return `OperationReport<T>`, including on errors. Existing
+  signatures and plain results are preserved. Reports include outcome-specific
+  summaries, wall-clock anchors, retry indexes, and bounded collection. See
+  [observability and migration](docs/observability.md). Lightwalletd input
+  gathering and `recovery_bundle` remain unchanged; tree sync is timed by its
+  production caller.
 
 - Keystone signing requests retain the exact transaction across background ZKP1
   warmup and wallet restart. The SDK validates and loads the signing transaction

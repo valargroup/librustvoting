@@ -69,10 +69,12 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         prepared: &PreparedDelegationBundle,
         bundle_index: u32,
         signer: &DelegationSigner,
+        observations: &crate::ObservationScope,
     ) -> Result<PreparedSigner, VotingError> {
         match signer {
             DelegationSigner::Software(signer) => {
-                let request = prepared.signing_request(self.scoped_voting_db()?)?;
+                let request =
+                    prepared.observe_signing_request(self.scoped_voting_db()?, observations)?;
                 let sig = signer.sign(request)?;
                 Ok(PreparedSigner::signature(sig, request.sighash))
             }

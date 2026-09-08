@@ -1863,6 +1863,7 @@ impl VotingDb {
         keys: &DelegationKeys,
         pir_client: &dyn crate::pir::PirProofSource,
         stages: &dyn DelegationProgressReporter,
+        observations: &crate::ObservationScope,
     ) -> Result<DelegationProofResult, VotingError> {
         let wallet_id = identity.wallet_id();
         let round_id = identity.round_id();
@@ -2017,7 +2018,7 @@ impl VotingDb {
             bundle_index,
         )?;
 
-        let result = crate::zkp1::build_and_prove_delegation(
+        let result = crate::zkp1::observe_build_and_prove_delegation(
             notes,
             &keys.hotkey_raw_address,
             &alpha,
@@ -2029,6 +2030,7 @@ impl VotingDb {
             keys.network,
             stages,
             Some(&precomputed),
+            observations,
         )?;
         let prove_elapsed = prove_start.elapsed();
         eprintln!(
@@ -2087,6 +2089,7 @@ impl VotingDb {
         anchor_height: u32,
         single_share: bool,
         progress: &dyn ProgressReporter,
+        observations: &crate::ObservationScope,
     ) -> Result<PreparedVoteProof, VotingError> {
         let mut conn = self.conn();
         let wallet_id = self.wallet_id();
@@ -2154,6 +2157,7 @@ impl VotingDb {
             state.zkp2.proposal_authority,
             single_share,
             progress,
+            observations,
         )?;
 
         Ok(PreparedVoteProof {
@@ -5291,6 +5295,7 @@ mod tests {
                 100,
                 false,
                 &crate::types::NoopProgressReporter,
+                &crate::ObservationScope::disabled(),
             )
             .err()
             .expect("network mismatch must fail");

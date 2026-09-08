@@ -22,7 +22,13 @@ async fn constructs_exact_atomic_vote_batch_url_and_json() {
 
     assert!(matches!(
         client
-            .submit_vote_batch_with_dispatch(0, &wire, batch_digest, ChainPostDispatch::default(),)
+            .submit_vote_batch_with_dispatch(
+                0,
+                &wire,
+                batch_digest,
+                ChainPostDispatch::default(),
+                &crate::ObservationScope::disabled()
+            )
             .await,
         PostAttemptOutcome::Accepted(_)
     ));
@@ -52,7 +58,13 @@ async fn accepts_rejection_with_matching_server_digest() {
 
     assert!(matches!(
         client
-            .submit_vote_batch_with_dispatch(0, &wire, batch_digest, ChainPostDispatch::default(),)
+            .submit_vote_batch_with_dispatch(
+                0,
+                &wire,
+                batch_digest,
+                ChainPostDispatch::default(),
+                &crate::ObservationScope::disabled()
+            )
             .await,
         PostAttemptOutcome::Rejected {
             code: 7,
@@ -92,6 +104,7 @@ async fn rejects_missing_noncanonical_or_mismatched_server_digest() {
                     &wire,
                     expected_batch_digest,
                     ChainPostDispatch::default(),
+                    &crate::ObservationScope::disabled()
                 )
                 .await,
             PostAttemptOutcome::PossiblyDispatched(_)

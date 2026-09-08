@@ -9,6 +9,7 @@ pub(super) fn request(
     prepared: &PreparedDelegationBundle,
     voting_db: &VotingDb,
     stages: &dyn DelegationProgressReporter,
+    observations: &crate::ObservationScope,
 ) -> Result<KeystoneSigningRequest, VotingError> {
     let scoped_db = voting_db.scoped(&voting_db.wallet_id())?;
     let voting_db = &scoped_db;
@@ -18,7 +19,7 @@ pub(super) fn request(
     if voting_db.delegation_phase(&prepared.round_id, prepared.bundle_index)?
         == DelegationPhase::Prepared
     {
-        match prepared.setup(voting_db, stages) {
+        match prepared.observe_setup(voting_db, stages, observations) {
             Ok(_) | Err(VotingError::SetupAlreadyPersisted { .. }) => {}
             Err(error) => return Err(error),
         }

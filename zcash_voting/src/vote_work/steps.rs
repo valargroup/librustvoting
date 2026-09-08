@@ -127,13 +127,33 @@ impl<T: ChainTransport> RoundExecutor<T> {
         entry_epoch: u64,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
-        self.advance_step_under(
-            step,
-            host,
-            StepControl::in_epoch(control, entry_epoch),
-            progress,
-        )
-        .await
+        let invocation_observations = control
+            .observations
+            .clone()
+            .unwrap_or_else(|| crate::ObservationScope::disabled())
+            .invocation();
+        let attributed_observations =
+            invocation_observations.attributed(crate::observability::step_attribution(&step));
+        let observation_stage = attributed_observations.stage("round::advance_step");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(observation_stage.scope().clone());
+        let control = &observed_control;
+        let operation_result = async {
+            self.advance_step_under(
+                step,
+                host,
+                StepControl::in_epoch(control, entry_epoch),
+                progress,
+            )
+            .await
+        }
+        .await;
+        let outcome = crate::observability::step_result_outcome(&operation_result);
+        observation_stage.finish(
+            outcome,
+            operation_result.as_ref().err().map(|_| "RoundStepFailure"),
+        );
+        operation_result
     }
 
     /// Runs one step under a control captured by the public entry point.

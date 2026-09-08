@@ -343,6 +343,7 @@ impl RoundExecutor<HyperTransport> {
             database,
             chain_client,
             helper_client,
+
             tree_transport: None,
             binding: None,
         })
@@ -376,6 +377,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             database,
             chain_client,
             helper_client,
+
             tree_transport: None,
             binding: None,
         })
@@ -509,7 +511,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         Ok(())
     }
 
-    fn binding(&self) -> Result<&RoundBinding, VotingError> {
+    pub(crate) fn binding(&self) -> Result<&RoundBinding, VotingError> {
         self.binding
             .as_ref()
             .ok_or_else(|| VotingError::InvalidInput {

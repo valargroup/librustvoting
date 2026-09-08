@@ -36,6 +36,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // even if this future is dropped, so no second pass can start a
         // competing proof for the same bundle meanwhile.
         let held_lock = Arc::clone(lock);
+        let observations = scope.observations.clone();
         std::thread::Builder::new()
             .name("voting-delegation-step".to_string())
             .stack_size(PROVING_STACK_BYTES)
@@ -44,7 +45,25 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 let reporter = DelegationProgressBridge::new(move |progress| {
                     let _ = progress_tx.send(progress);
                 });
-                let result = driver.prove_and_sign_blocking(bundle_index, &signer, &pir, &reporter);
+                let driver_stage = observations.stage("delegation::driver_prove_and_sign");
+                let result = driver.prove_and_sign_blocking_observed(
+                    bundle_index,
+                    &signer,
+                    &pir,
+                    &reporter,
+                    driver_stage.scope(),
+                );
+                driver_stage.finish(
+                    if result.is_ok() {
+                        crate::ObservationOutcome::Succeeded
+                    } else {
+                        crate::ObservationOutcome::Failed
+                    },
+                    result
+                        .as_ref()
+                        .err()
+                        .map(crate::observability::voting_error_kind),
+                );
                 let _ = done_tx.send(result);
             })
             .map_err(|error| {
@@ -125,9 +144,10 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // The signing task keeps the bundle lock while it runs, so an aborted
         // future cannot let a new pass prompt the host signer concurrently.
         let held_lock = Arc::clone(lock);
+        let observations = scope.observations.clone();
         let signature = tokio::task::spawn_blocking(move || {
             let _held_lock = held_lock;
-            driver.resign_blocking(bundle_index, &signer)
+            driver.resign_blocking_observed(bundle_index, &signer, &observations)
         })
         .await
         .map_err(|error| {

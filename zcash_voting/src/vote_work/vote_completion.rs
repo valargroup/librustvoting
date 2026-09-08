@@ -5,9 +5,10 @@
 use crate::{
     round_planning::VoteUnitId,
     share_tracking::{
-        ShareBatchDeliveryReport, ShareDeliveryPlanningParams, ShareDeliverySubmissionParams,
+        delivery_progress, DeliveryProgress, ShareDeliveryPlanningParams,
+        ShareDeliverySubmissionParams,
     },
-    vote::{recover_atomic_vote_batch, CommittedVote, SignedVoteBatch},
+    vote::{CommittedVote, SignedVoteBatch},
     AdvanceVote, AdvanceVoteBatch, ChainAdvanceOutcome, ChainAdvancePolicy, ChainAdvanceRequest,
     ChainTransport, VotingError,
 };
@@ -34,41 +35,6 @@ pub(super) enum CompletionEntry {
         advance_chain: bool,
         plans_first: bool,
     },
-}
-
-/// What one vote's helper delivery report says about the shares it covers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DeliveryProgress {
-    /// Every share reached at least one helper definitely.
-    Complete,
-    /// Every share reached the helpers, but some only ambiguously: no helper
-    /// definitely holds it yet, and tracking must reconcile those attempts
-    /// before another delivery can make progress.
-    AwaitingAmbiguousHelpers,
-    /// Some share reached no helper at all, or was left pending.
-    Incomplete,
-}
-
-/// Classifies `report`. Ambiguous attempts are excluded from the next
-/// delivery pass, so treating them as complete would let a step report
-/// `Advanced` forever without a share ever landing.
-pub(super) fn delivery_progress(report: &ShareBatchDeliveryReport) -> DeliveryProgress {
-    if !report.pending_share_indices.is_empty()
-        || report.deliveries.iter().any(|delivery| {
-            delivery.submission.accepted_urls.is_empty()
-                && delivery.submission.ambiguous_urls.is_empty()
-        })
-    {
-        return DeliveryProgress::Incomplete;
-    }
-    if report
-        .deliveries
-        .iter()
-        .any(|delivery| delivery.submission.accepted_urls.is_empty())
-    {
-        return DeliveryProgress::AwaitingAmbiguousHelpers;
-    }
-    DeliveryProgress::Complete
 }
 
 /// Planning inputs for one vote's helper plan under the host's clock.
@@ -101,7 +67,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let ledger = StepLedger::default();
         let (votes, batch) = self
-            .recover_unit_votes(&scope.round_id, unit, ordered_proposal_ids)
+            .recover_unit_votes(
+                &scope.round_id,
+                unit,
+                ordered_proposal_ids,
+                &scope.observations,
+            )
             .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
         self.complete_vote_unit(
             scope,
@@ -127,9 +98,14 @@ impl<T: ChainTransport> RoundExecutor<T> {
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
         let ledger = StepLedger::default();
-        let vote =
-            CommittedVote::recover(&self.database, &scope.round_id, bundle_index, proposal_id)
-                .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
+        let vote = CommittedVote::observe_recover(
+            &self.database,
+            &scope.round_id,
+            bundle_index,
+            proposal_id,
+            &scope.observations,
+        )
+        .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
         self.complete_vote_unit(
             scope,
             vec![vote],
@@ -152,17 +128,19 @@ impl<T: ChainTransport> RoundExecutor<T> {
         round_id: &str,
         unit: VoteUnitId,
         ordered_proposal_ids: &[u32],
+        observations: &crate::ObservationScope,
     ) -> Result<(Vec<CommittedVote>, Option<SignedVoteBatch>), VotingError> {
         match unit {
             VoteUnitId::Singleton {
                 bundle_index,
                 proposal_id,
             } => Ok((
-                vec![CommittedVote::recover(
+                vec![CommittedVote::observe_recover(
                     &self.database,
                     round_id,
                     bundle_index,
                     proposal_id,
+                    observations,
                 )?],
                 None,
             )),
@@ -174,17 +152,23 @@ impl<T: ChainTransport> RoundExecutor<T> {
                         .ok_or_else(|| VotingError::Internal {
                             message: "an atomic batch obligation names no members".to_string(),
                         })?;
-                let batch =
-                    recover_atomic_vote_batch(&self.database, round_id, bundle_index, anchor)?;
+                let batch = crate::vote::observe_recover_atomic_vote_batch(
+                    &self.database,
+                    round_id,
+                    bundle_index,
+                    anchor,
+                    observations,
+                )?;
                 let votes = batch
                     .commitments
                     .iter()
                     .map(|commitment| {
-                        CommittedVote::recover(
+                        CommittedVote::observe_recover(
                             &self.database,
                             round_id,
                             bundle_index,
                             commitment.proposal_id,
+                            observations,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -207,6 +191,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
         mut ledger: StepLedger,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
+        let helper_client = self.helper_client.observing(&scope.observations);
+
         let host = scope.host;
         let round_id = scope.round_id.as_str();
         let proposal_ids = scope.proposal_ids();
@@ -252,9 +238,10 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 return self.step_cancelled(scope, ledger);
             }
             for vote in &votes {
-                vote.prepare_share_delivery(
+                vote.observe_prepare_share_delivery(
                     &self.database,
                     planning_params(&preflight, host, &proposal_ids),
+                    &scope.observations,
                 )
                 .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
             }
@@ -315,11 +302,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
             }
             // Confirmation updates the durable recovery generation, so recover
             // a fresh handle and let the type system prove it is confirmed.
-            let vote = CommittedVote::recover(
+            let vote = CommittedVote::observe_recover(
                 &self.database,
                 round_id,
                 vote.bundle_index(),
                 vote.proposal_id(),
+                &scope.observations,
             )
             .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
             if !plans_before_chain {
@@ -344,9 +332,10 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 let preflight = fleet_preflight
                     .as_ref()
                     .expect("preflight was just taken for resumed work");
-                vote.prepare_share_delivery(
+                vote.observe_prepare_share_delivery(
                     &self.database,
                     planning_params(preflight, host, &proposal_ids),
+                    &scope.observations,
                 )
                 .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
                 progress.report(RoundStepProgress::HelperPlansPrepared(vec![vote_key(
@@ -372,7 +361,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
             let delivery = match vote
                 .submit_prepared_shares_keeping_partial_report(
                     &self.database,
-                    &self.helper_client,
+                    &helper_client,
                     ShareDeliverySubmissionParams {
                         configured_server_urls: &host.configured_helper_urls,
                         now_seconds: host.now_seconds,

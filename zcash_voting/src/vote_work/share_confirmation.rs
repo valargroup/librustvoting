@@ -17,6 +17,8 @@ impl<T: ChainTransport> RoundExecutor<T> {
         share: ShareKey,
         progress: &dyn RoundStepProgressReporter,
     ) -> Result<RoundStepOutcome, RoundStepFailure> {
+        let helper_client = self.helper_client.observing(&scope.observations);
+
         let ledger = StepLedger::default();
         let cancel = || scope.interrupted();
         let report = confirm_pending_share(
@@ -27,7 +29,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 configured_server_urls: &scope.host.configured_helper_urls,
                 now_seconds: scope.host.now_seconds,
             },
-            &self.helper_client,
+            &helper_client,
             &cancel,
         )
         .await

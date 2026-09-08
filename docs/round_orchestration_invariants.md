@@ -394,6 +394,17 @@ returned on an outcome is a host-facing projection, not a control input.
   boundary, and a queued lock wait abandons its place.
 - **Locks outlive detached work.** A lock is held by the detached proving or
   re-signing task, not by the future that may be dropped.
+- **Delivery evidence has one classifier.** Vote completion and delivery
+  diagnostics share `share_tracking::delivery_progress`: a completed task with
+  no accepted or ambiguous helper is incomplete; an ambiguous-only share waits
+  for tracking; definite acceptance of every share permits completion. The
+  existing `a_share_every_helper_answered_ambiguously_waits_for_tracking_rather_than_advancing`
+  conformance test covers the executor classification.
+- **Helper observations name the delivered share.** An atomic step retains its
+  anchor proposal identity, while every member's helper HTTP attempts and retries
+  bind that member's actual bundle, proposal, and share index
+  (`atomic_round_delivery_attributes_every_proposal_share_and_retry` in
+  `share_tracking/tests/observability.rs`).
 - **One completion path.** Fresh casts and resumed units go through one
   completion routine that differs only in when helper plans are made
   durable; there is no second driver.

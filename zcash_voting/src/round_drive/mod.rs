@@ -215,6 +215,43 @@ impl<'a, T: ChainTransport> RoundDriver<'a, T> {
         control: &ChainSubmissionControl,
         events: &dyn RoundDriveReporter,
     ) -> RoundRunReport {
-        self.drive(host, control, events).await
+        self.observe_run(host, control, events, &crate::ObservationScope::disabled())
+            .await
+    }
+
+    pub(crate) async fn observe_run(
+        &self,
+        host: &dyn RoundHostSource,
+        control: &ChainSubmissionControl,
+        events: &dyn RoundDriveReporter,
+        observations: &crate::ObservationScope,
+    ) -> RoundRunReport {
+        let stage = observations.stage("round::run");
+        let mut observed_control = control.clone();
+        observed_control.observations = Some(stage.scope().clone());
+        let result = self.drive(host, &observed_control, events).await;
+        if let Ok(binding) = self.executor.binding() {
+            observations.bind_round_id(&binding.round_id);
+        }
+        let outcome = crate::observability::round_run_outcome(&result);
+        stage.finish(outcome, None);
+        result
+    }
+
+    /// Runs this workflow with optional per-call diagnostics, including on errors.
+    pub async fn run_with_report(
+        &self,
+        host: &dyn RoundHostSource,
+        control: &ChainSubmissionControl,
+        events: &dyn RoundDriveReporter,
+        options: Option<crate::ObservabilityOptions>,
+    ) -> crate::OperationReport<RoundRunReport> {
+        let invocation = crate::ObservationScope::new(options).invocation();
+
+        let result = self
+            .observe_run(host, control, events, invocation.scope())
+            .await;
+        let outcome = crate::observability::round_run_outcome(&result);
+        invocation.complete("run", outcome, result)
     }
 }

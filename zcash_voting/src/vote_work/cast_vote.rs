@@ -7,8 +7,8 @@ use crate::{
     round_planning::CastDraft,
     types::VoteCommitStageBridge,
     vote::{
-        persist_prepared_vote_work, prepare_vote_work, validate_draft_votes, CommittedVote,
-        SignedVoteBatch, VoteCommitStage, VoteCommitmentRecovery, VoteSigner, VoteWorkRequest,
+        validate_draft_votes, CommittedVote, SignedVoteBatch, VoteCommitStage,
+        VoteCommitmentRecovery, VoteSigner, VoteWorkRequest,
     },
     wire::DraftVote,
     ChainTransport, Network, VotingError, VotingHotkey,
@@ -181,6 +181,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // old CastVote plan and start a competing proof meanwhile.
         let held_lock = Arc::clone(lock);
         let proving_round_id = round_id.clone();
+        let observations = scope.observations.clone();
         std::thread::Builder::new()
             .name("voting-vote-commit".to_string())
             .stack_size(PROVING_STACK_BYTES)
@@ -192,7 +193,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     let stages = VoteCommitStageBridge::new(move |stage| {
                         let _ = stage_tx.send(stage);
                     });
-                    let prepared = prepare_vote_work(
+                    let prepared = crate::vote::observe_prepare_vote_work(
                         &db,
                         VoteSigner::hotkey(&hotkey),
                         VoteWorkRequest {
@@ -203,8 +204,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
                             stages: &stages,
                             max_proof_concurrency,
                         },
+                        &observations,
                     )?;
-                    persist_prepared_vote_work(&db, prepared)
+                    crate::vote::observe_persist_prepared_vote_work(&db, prepared, &observations)
                 })();
                 let _ = done_tx.send(result);
             })

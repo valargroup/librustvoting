@@ -162,3 +162,9 @@ pub use crate::precompute::delegation_pir;
 pub use crate::precompute::{
     reset_vote_tree, reset_voting_session_state, sync_vote_tree, van_witness,
 };
+
+// Optional invocation diagnostics.
+pub use crate::observability::{
+    ObservabilityOptions, ObservationAttribution, ObservationOutcome, ObservationRecord,
+    ObservationSummary, OperationObservability, OperationReport,
+};

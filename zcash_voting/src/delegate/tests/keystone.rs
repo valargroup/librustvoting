@@ -206,3 +206,93 @@ fn persisted_keystone_request_rejects_changed_notes_target_and_bytes() {
         .keystone_request(&db, &NoopProgressReporter)
         .is_err());
 }
+
+#[test]
+fn observed_keystone_requests_preserve_durable_reuse_and_missing_pczt_errors() {
+    let (db, _, _, prepared) = prepared_wallet_delegation_fixture();
+    let mut original = None;
+    for warmed in [false, true] {
+        if warmed {
+            queries::store_proof(
+                &db.conn(),
+                &prepared.round_id,
+                &db.wallet_id(),
+                0,
+                &[0xAB; 96],
+            )
+            .unwrap();
+        }
+        let invocation =
+            crate::ObservationScope::new(Some(crate::ObservabilityOptions::default())).invocation();
+        let request = prepared
+            .observe_keystone_request(&db, &NoopProgressReporter, invocation.scope())
+            .unwrap();
+        assert_eq!(
+            request,
+            prepared
+                .keystone_request(&db, &NoopProgressReporter)
+                .unwrap()
+        );
+        if let Some(original) = &original {
+            assert_eq!(&request, original);
+        } else {
+            original = Some(request.clone());
+        }
+        let diagnostics = invocation
+            .complete(
+                "keystone_request",
+                crate::ObservationOutcome::Succeeded,
+                request,
+            )
+            .observability
+            .unwrap();
+        assert_eq!(
+            diagnostics.round_id.as_deref(),
+            Some(prepared.round_id.as_str())
+        );
+        let stage = diagnostics
+            .records
+            .iter()
+            .find(|record| record.stage.as_ref() == "delegation::keystone_request")
+            .unwrap();
+        assert_eq!(stage.outcome, crate::ObservationOutcome::Succeeded);
+        assert_eq!(stage.attribution.bundle_index, Some(0));
+        assert_eq!(
+            diagnostics
+                .records
+                .iter()
+                .any(|record| record.stage.as_ref() == "delegation::setup"),
+            !warmed
+        );
+    }
+    db.conn()
+        .execute("UPDATE bundles SET delegation_pczt = NULL", [])
+        .unwrap();
+    let invocation =
+        crate::ObservationScope::new(Some(crate::ObservabilityOptions::default())).invocation();
+    let failure = prepared
+        .observe_keystone_request(&db, &NoopProgressReporter, invocation.scope())
+        .unwrap_err();
+    assert!(matches!(
+        failure,
+        VotingError::DelegationPcztUnavailable { .. }
+    ));
+    let diagnostics = invocation
+        .complete(
+            "keystone_request",
+            crate::ObservationOutcome::Failed,
+            failure,
+        )
+        .observability
+        .unwrap();
+    let stage = diagnostics
+        .records
+        .iter()
+        .find(|record| record.stage.as_ref() == "delegation::keystone_request")
+        .unwrap();
+    assert_eq!(stage.outcome, crate::ObservationOutcome::Failed);
+    assert_eq!(
+        stage.error_kind.as_deref(),
+        Some("DelegationPcztUnavailable")
+    );
+}

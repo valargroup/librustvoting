@@ -9,7 +9,7 @@ use std::borrow::Borrow;
 use crate::shielded_protocol::VotingShieldedProtocol;
 use crate::storage::VotingDb;
 use crate::{
-    delegate::{load_account_keys, DelegationKeys},
+    delegate::DelegationKeys,
     types::{
         Network, NoteInfo, NoteRef, RoundBoundVotingHotkeyTarget, SelectedNotes, VotingError,
         VotingHotkey,
@@ -75,9 +75,55 @@ where
     C: Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    ensure_wallet_network(wallet_db.params(), network)?;
-    ensure_wallet_scanned_to_snapshot(wallet_db, snapshot_height)?;
-    select_snapshot_notes(wallet_db, account_uuid, snapshot_height, anchor_tree_state)
+    observe_select_notes_with_wallet_db(
+        wallet_db,
+        network,
+        account_uuid,
+        snapshot_height,
+        anchor_tree_state,
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_select_notes_with_wallet_db<C, P, CL, R>(
+    wallet_db: &WalletDb<C, P, CL, R>,
+    network: Network,
+    account_uuid: &str,
+    snapshot_height: u64,
+    anchor_tree_state: TreeState,
+    observations: &crate::ObservationScope,
+) -> Result<SelectedNotes, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("selection::select_notes_with_wallet_db");
+    let observations = observation_stage.scope();
+    let operation_result: Result<SelectedNotes, VotingError> = (|| {
+        ensure_wallet_network(wallet_db.params(), network)?;
+        ensure_wallet_scanned_to_snapshot(wallet_db, snapshot_height)?;
+        observe_select_snapshot_notes(
+            wallet_db,
+            account_uuid,
+            snapshot_height,
+            anchor_tree_state,
+            observations,
+        )
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Selects voting-eligible notes and fetches the real snapshot anchor.
@@ -96,27 +142,66 @@ pub async fn select_notes_with_lwd(
     network: Network,
     snapshot_height: u64,
 ) -> Result<SelectedNotes, VotingError> {
-    let wallet_id = voting_db.wallet_id();
-    let anchor_tree_state =
-        crate::lwd::anchor_tree_state_with_retry(lightwalletd_url, snapshot_height).await?;
-    // Open after the await so async callers do not capture rusqlite state in
-    // generated Send futures.
-    let conn = rusqlite::Connection::open(db_path).map_err(|e| VotingError::Internal {
-        message: format!("failed to open wallet database: {e}"),
-    })?;
-    let wallet_db = WalletDb::from_connection(
-        conn,
+    observe_select_notes_with_lwd(
+        voting_db,
+        db_path,
+        lightwalletd_url,
         network,
-        SystemClock,
-        voting_crypto_deps::rand::rngs::OsRng,
-    );
-    select_notes_with_wallet_db(
-        &wallet_db,
-        network,
-        &wallet_id,
         snapshot_height,
-        anchor_tree_state,
+        &crate::ObservationScope::disabled(),
     )
+    .await
+}
+
+pub(crate) async fn observe_select_notes_with_lwd(
+    voting_db: &VotingDb,
+    db_path: &str,
+    lightwalletd_url: &str,
+    network: Network,
+    snapshot_height: u64,
+    observations: &crate::ObservationScope,
+) -> Result<SelectedNotes, VotingError> {
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("selection::select_notes_with_lwd");
+    let observations = observation_stage.scope();
+    let operation_result: Result<SelectedNotes, VotingError> = async {
+        let wallet_id = voting_db.wallet_id();
+        let anchor_tree_state =
+            crate::lwd::anchor_tree_state_with_retry(lightwalletd_url, snapshot_height).await?;
+        // Open after the await so async callers do not capture rusqlite state in
+        // generated Send futures.
+        let conn = rusqlite::Connection::open(db_path).map_err(|e| VotingError::Internal {
+            message: format!("failed to open wallet database: {e}"),
+        })?;
+        let wallet_db = WalletDb::from_connection(
+            conn,
+            network,
+            SystemClock,
+            voting_crypto_deps::rand::rngs::OsRng,
+        );
+        observe_select_notes_with_wallet_db(
+            &wallet_db,
+            network,
+            &wallet_id,
+            snapshot_height,
+            anchor_tree_state,
+            observations,
+        )
+    }
+    .await;
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 struct SnapshotNote {
@@ -138,12 +223,49 @@ where
     C: Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    let entries = select_snapshot_note_entries(db, account_uuid, snapshot_height)?;
-    Ok(SelectedNotes {
-        notes: entries.into_iter().map(|entry| entry.note_ref).collect(),
+    observe_select_snapshot_notes(
+        db,
+        account_uuid,
         snapshot_height,
         anchor_tree_state,
-    })
+        &crate::ObservationScope::disabled(),
+    )
+}
+
+pub(crate) fn observe_select_snapshot_notes<C, P, CL, R>(
+    db: &WalletDb<C, P, CL, R>,
+    account_uuid: &str,
+    snapshot_height: u64,
+    anchor_tree_state: TreeState,
+    observations: &crate::ObservationScope,
+) -> Result<SelectedNotes, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("selection::select_snapshot_notes");
+    let operation_result: Result<SelectedNotes, VotingError> = (|| {
+        let entries = select_snapshot_note_entries(db, account_uuid, snapshot_height)?;
+        Ok(SelectedNotes {
+            notes: entries.into_iter().map(|entry| entry.note_ref).collect(),
+            snapshot_height,
+            anchor_tree_state,
+        })
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Selects snapshot-eligible notes in the proof-input shape.
@@ -156,12 +278,47 @@ where
     C: Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    Ok(
-        select_snapshot_note_entries(db, account_uuid, snapshot_height)?
-            .into_iter()
-            .map(|entry| entry.note_info)
-            .collect(),
+    observe_select_snapshot_note_infos(
+        db,
+        account_uuid,
+        snapshot_height,
+        &crate::ObservationScope::disabled(),
     )
+}
+
+pub(crate) fn observe_select_snapshot_note_infos<C, P, CL, R>(
+    db: &WalletDb<C, P, CL, R>,
+    account_uuid: &str,
+    snapshot_height: u64,
+    observations: &crate::ObservationScope,
+) -> Result<Vec<NoteInfo>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let attributed_observations = observations.clone();
+    let observation_stage = attributed_observations.stage("selection::select_snapshot_note_infos");
+    let operation_result: Result<Vec<NoteInfo>, VotingError> = (|| {
+        Ok(
+            select_snapshot_note_entries(db, account_uuid, snapshot_height)?
+                .into_iter()
+                .map(|entry| entry.note_info)
+                .collect(),
+        )
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Reads snapshot-eligible notes and delegation keys from a wallet DB.
@@ -179,15 +336,48 @@ where
     C: Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    gather_delegation_wallet_inputs_impl(GatherDelegationWalletCommonParams {
-        wallet_db: params.wallet_db,
-        account_uuid: params.account_uuid,
-        target: GatherDelegationTarget::Hotkey(params.voting_hotkey),
-        snapshot_height: params.snapshot_height,
-        scanned_height: params.scanned_height,
-        anchor_tree_state_bytes: params.anchor_tree_state_bytes,
-        resolved_round_name: params.resolved_round_name,
-    })
+    observe_gather_delegation_wallet_inputs(params, &crate::ObservationScope::disabled())
+}
+
+pub(crate) fn observe_gather_delegation_wallet_inputs<C, P, CL, R>(
+    params: GatherDelegationWalletParams<'_, C, P, CL, R>,
+    observations: &crate::ObservationScope,
+) -> Result<DelegationWalletInputs, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let attributed_observations = observations.clone();
+    let observation_stage =
+        attributed_observations.stage("selection::gather_delegation_wallet_inputs");
+    let observations = observation_stage.scope();
+    let operation_result: Result<DelegationWalletInputs, VotingError> = (|| {
+        gather_delegation_wallet_inputs_impl(
+            GatherDelegationWalletCommonParams {
+                wallet_db: params.wallet_db,
+                account_uuid: params.account_uuid,
+                target: GatherDelegationTarget::Hotkey(params.voting_hotkey),
+                snapshot_height: params.snapshot_height,
+                scanned_height: params.scanned_height,
+                anchor_tree_state_bytes: params.anchor_tree_state_bytes,
+                resolved_round_name: params.resolved_round_name,
+            },
+            observations,
+        )
+    })();
+    let outcome = if operation_result.is_ok() {
+        crate::ObservationOutcome::Succeeded
+    } else {
+        crate::ObservationOutcome::Failed
+    };
+    observation_stage.finish(
+        outcome,
+        operation_result
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    operation_result
 }
 
 /// Reads snapshot-eligible notes and delegation keys for a public target.
@@ -200,20 +390,24 @@ where
 /// are returned as [`VotingError::Internal`].
 pub(crate) fn gather_delegation_wallet_inputs_for_target<C, P, CL, R>(
     params: GatherDelegationWalletForTargetParams<'_, C, P, CL, R>,
+    observations: &crate::ObservationScope,
 ) -> Result<DelegationWalletInputs, VotingError>
 where
     C: Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    gather_delegation_wallet_inputs_impl(GatherDelegationWalletCommonParams {
-        wallet_db: params.wallet_db,
-        account_uuid: params.account_uuid,
-        target: GatherDelegationTarget::RoundBound(params.voting_target),
-        snapshot_height: params.snapshot_height,
-        scanned_height: params.scanned_height,
-        anchor_tree_state_bytes: params.anchor_tree_state_bytes,
-        resolved_round_name: params.resolved_round_name,
-    })
+    gather_delegation_wallet_inputs_impl(
+        GatherDelegationWalletCommonParams {
+            wallet_db: params.wallet_db,
+            account_uuid: params.account_uuid,
+            target: GatherDelegationTarget::RoundBound(params.voting_target),
+            snapshot_height: params.snapshot_height,
+            scanned_height: params.scanned_height,
+            anchor_tree_state_bytes: params.anchor_tree_state_bytes,
+            resolved_round_name: params.resolved_round_name,
+        },
+        observations,
+    )
 }
 
 enum GatherDelegationTarget<'a> {
@@ -274,6 +468,7 @@ struct GatherDelegationWalletCommonParams<'a, C, P, CL, R> {
 
 fn gather_delegation_wallet_inputs_impl<C, P, CL, R>(
     params: GatherDelegationWalletCommonParams<'_, C, P, CL, R>,
+    observations: &crate::ObservationScope,
 ) -> Result<DelegationWalletInputs, VotingError>
 where
     C: Borrow<rusqlite::Connection>,
@@ -293,12 +488,17 @@ where
         });
     }
 
-    let round_note_infos = select_snapshot_note_infos(
+    let round_note_infos = observe_select_snapshot_note_infos(
         params.wallet_db,
         params.account_uuid,
         params.snapshot_height,
+        observations,
     )?;
-    let account = load_account_keys(params.wallet_db, params.account_uuid)?;
+    let account = crate::delegate::observe_load_account_keys(
+        params.wallet_db,
+        params.account_uuid,
+        observations,
+    )?;
     let delegation_keys = params.target.into_delegation_keys(
         account.orchard_fvk_bytes.to_vec(),
         account.seed_fingerprint,
@@ -894,8 +1094,8 @@ mod tests {
         .validate_for("vote-chain-1", network, &round_params)
         .unwrap();
 
-        let inputs =
-            gather_delegation_wallet_inputs_for_target(GatherDelegationWalletForTargetParams {
+        let inputs = gather_delegation_wallet_inputs_for_target(
+            GatherDelegationWalletForTargetParams {
                 wallet_db: &db,
                 account_uuid: &account_uuid,
                 voting_target: &voting_target,
@@ -903,8 +1103,10 @@ mod tests {
                 scanned_height: snapshot_height,
                 anchor_tree_state_bytes: vec![0xAA, 0xBB],
                 resolved_round_name: "Demo Round".to_string(),
-            })
-            .unwrap();
+            },
+            &crate::ObservationScope::disabled(),
+        )
+        .unwrap();
 
         assert_eq!(inputs.round_note_infos.len(), 1);
         assert_eq!(
@@ -934,8 +1136,8 @@ mod tests {
             [1; 32],
         );
 
-        let err =
-            gather_delegation_wallet_inputs_for_target(GatherDelegationWalletForTargetParams {
+        let err = gather_delegation_wallet_inputs_for_target(
+            GatherDelegationWalletForTargetParams {
                 wallet_db: &db,
                 account_uuid: "550e8400-e29b-41d4-a716-446655440000",
                 voting_target: &target,
@@ -943,9 +1145,11 @@ mod tests {
                 scanned_height: 12,
                 anchor_tree_state_bytes: vec![],
                 resolved_round_name: "Demo Round".to_string(),
-            })
-            .unwrap_err()
-            .to_string();
+            },
+            &crate::ObservationScope::disabled(),
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("voting target network does not match wallet DB network"));
     }
