@@ -241,8 +241,9 @@ upgrading the crate.
   `ConfirmedVote`.
 - Replace a host loop over share-tracking passes with
   `ShareTrackingDriver::run`. It repeats a pass on the delay each pass
-  computes, stops at the round's boundaries, and reports why it stopped; a host
-  keeps only what it alone can see, such as app lock and account identity.
+  computes, keeps every wait inside the round's voting window, and reports why
+  it stopped; a host keeps only what it alone can see, such as app lock and
+  account identity.
 - Start chain submissions with `ChainSubmissionClientConfig::for_network` and
   drive them with `advance_until_terminal` instead of a host polling loop.
 

@@ -115,10 +115,10 @@ This release is `zcash_voting` 4.0.0.
   usable transaction hash the same way it reports a healthy submission, and
   retrying that would resubmit. `submission_diagnostic` says which terminal
   outcome it was.
-- `RoundPlan::has_unconfirmed_shares` and
-  `share::next_tracking_delay_for_round` let a host schedule background share
-  tracking without holding durable share rows: the plan says whether any share
-  is still unconfirmed, and the delay is computed from the round's own records.
+- `RoundPlan::has_unconfirmed_shares` says whether a round still owes a helper
+  share, so a host can decide whether to start share tracking at all without
+  holding durable share rows. When to run each pass is `ShareTrackingDriver`'s;
+  this release does not ship a host-side way to derive that schedule.
 - `share_tracking_drive` composes `track_pending_shares` passes into one run:
   `ShareTrackingDriver::run` repeats a pass until a round's helper shares are
   quiescent, waiting exactly the delay each pass computed and supplying a
@@ -776,12 +776,15 @@ This release is `zcash_voting` 4.0.0.
   `SHARE_STATUS_CHECK_GRACE_SECONDS`, `SHARE_READY_POLL_INTERVAL_SECONDS`,
   `SHARE_FUTURE_CHECK_MAX_DELAY_SECONDS`, and
   `SHARE_MIN_TRACKING_DELAY_SECONDS`. Pass cadence is `ShareTrackingDriver`'s:
-  it repeats a pass on the delay each pass computes, caps that delay at the
-  round's boundaries, and reports why it stopped through
+  it repeats a pass on the delay each pass computes, shortens that delay to
+  what is left before vote end — which the pass cannot do, since it computes
+  from share rows alone — and reports why it stopped through
   `ShareTrackingQuiescence`. A host that scheduled passes itself should run the
   driver and observe its events; one that needs a default value reads it from
   `ShareTimingPolicy::default()`, which is still public and is what the
-  driver's policy is built from.
+  driver's policy is built from. Per-share readiness is still readable through
+  `summarize_share_tracking`, which classifies with the same predicate and is
+  now exported from `prelude` alongside the `ShareTrackingSummary` it returns.
 
 - **Breaking:** removed the persisted-vote recovery driver
   `VoteRecoveryExecutor::advance` with `VoteRecoveryRequest`,

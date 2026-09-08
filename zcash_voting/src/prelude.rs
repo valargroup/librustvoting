@@ -109,6 +109,7 @@ pub use crate::share::{
     unconfirmed as unconfirmed_shares, SharePlan, ShareRecord, ShareServerSelectionPolicy,
     ShareTimingPolicy, ShareTrackingSummary,
 };
+pub use crate::share_policy::summarize_share_tracking;
 pub use crate::share_tracking::{
     confirm_pending_share, share_tracking_flags, track_pending_shares, ResubmittedShare,
     ShareBatchDeliveryReport, ShareConfirmationParams, ShareConfirmationReport,
