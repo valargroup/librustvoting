@@ -4,7 +4,7 @@ use std::sync::{Arc, Barrier};
 
 #[test]
 fn keystone_request_reuses_warmed_setup_and_survives_restart() {
-    let (_, params, _, prepared) = prepared_wallet_delegation_fixture();
+    let (_, params, _, mut prepared) = prepared_wallet_delegation_fixture();
     let path =
         std::env::temp_dir().join(format!("keystone-warmup-{}.sqlite", uuid::Uuid::new_v4()));
     let path = path.to_str().unwrap();
@@ -22,9 +22,19 @@ fn keystone_request_reuses_warmed_setup_and_survives_restart() {
         .unwrap();
     assert_eq!(before.pczt_bytes, setup.pczt_bytes);
     assert_eq!(before.pczt_sighash, setup.pczt_sighash);
+    assert_eq!(
+        before.display_memo,
+        display_memo(
+            &prepared.round_name,
+            crate::round::raw_bundle_weight(&prepared.bundle_note_infos).unwrap()
+        )
+    );
     drop(db);
     let reopened = VotingDb::open(path).unwrap();
     reopened.set_wallet_id("keystone");
+    // A refreshed host title must not change the metadata of the saved request.
+    prepared.round_name = "Renamed after restart".to_string();
+    prepared.delegation_keys.round_name = prepared.round_name.clone();
     let after = prepared
         .keystone_request(&reopened, &NoopProgressReporter)
         .unwrap();
@@ -35,6 +45,58 @@ fn keystone_request_reuses_warmed_setup_and_survives_restart() {
         .has_persisted_proof());
     drop(reopened);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn keystone_request_recovers_truncated_unicode_memo() {
+    let (db, _, _, mut prepared) = prepared_wallet_delegation_fixture();
+    prepared.round_name = "投票🗳".repeat(200);
+    prepared.delegation_keys.round_name = prepared.round_name.clone();
+    let expected = display_memo(
+        &prepared.round_name,
+        crate::round::raw_bundle_weight(&prepared.bundle_note_infos).unwrap(),
+    );
+    let before = prepared
+        .keystone_request(&db, &NoopProgressReporter)
+        .unwrap();
+    assert_eq!(before.display_memo, expected);
+    prepared.round_name = "Updated title".to_string();
+    prepared.delegation_keys.round_name = prepared.round_name.clone();
+    let after = prepared
+        .keystone_request(&db, &NoopProgressReporter)
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn keystone_request_rejects_unrecoverable_persisted_memo() {
+    let (db, _, _, prepared) = prepared_wallet_delegation_fixture();
+    let original = prepared
+        .keystone_request(&db, &NoopProgressReporter)
+        .unwrap();
+    let pczt = crate::action::pczt::Pczt::parse(&original.pczt_bytes).unwrap();
+    let pczt = crate::action::pczt::roles::redactor::Redactor::new(pczt)
+        .redact_ironwood_with(|mut bundle| {
+            bundle.redact_action(original.action_index as usize, |mut action| {
+                action.clear_output_recipient();
+            });
+        })
+        .finish()
+        .serialize()
+        .unwrap();
+    // Removing recovery metadata leaves the signed transaction hash unchanged.
+    assert_eq!(
+        pczt_sighash(&pczt).unwrap().as_slice(),
+        original.pczt_sighash
+    );
+    db.conn()
+        .execute("UPDATE bundles SET delegation_pczt = ?1", [&pczt])
+        .unwrap();
+    assert!(matches!(
+        prepared.keystone_request(&db, &NoopProgressReporter),
+        Err(VotingError::Internal { message })
+            if message == "persisted delegation PCZT memo cannot be recovered"
+    ));
 }
 
 #[test]

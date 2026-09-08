@@ -552,6 +552,11 @@ matching randomized key. It never substitutes newly randomized bytes for an
 existing setup. Schema 22 adds this nullable field; legacy rows without the
 original transaction fail with `DelegationPcztUnavailable`.
 
+The display memo is recovered from the stored governance output. If the host
+supplies a different round name after restart, the request still displays the
+original signed memo. Missing recovery metadata or a non-text memo fails request
+creation instead of substituting caller-provided text.
+
 Note and target validation and transaction loading share one database read
 snapshot. A concurrent setup replacement cannot substitute a different target's
 transaction between validation and loading. The returned request belongs to
@@ -562,7 +567,8 @@ bundle setup lease. A retry loads that caller's persisted transaction without
 waiting for its full proof generation.
 
 Regression coverage lives in `delegate/tests/keystone.rs`: request reuse after
-setup and restart, concurrent request creation, legacy rejection without
-rebuilding, and changed-note, changed-target, and corrupt-PCZT rejection.
+setup and restart with a changed title, Unicode memo recovery, concurrent request
+creation, legacy rejection without rebuilding, and changed-note, changed-target,
+corrupt-PCZT, and unrecoverable-memo rejection.
 `storage/operations/tests/keystone_snapshot.rs` covers another connection
 committing a target replacement while the request snapshot remains open.

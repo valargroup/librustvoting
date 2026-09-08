@@ -837,7 +837,8 @@ pub struct KeystoneSigningRequest {
     pub rk: Vec<u8>,
     /// Governance action index within the selected shielded protocol bundle.
     pub action_index: u32,
-    /// Human-readable memo shown to the signer.
+    /// Human-readable memo recovered from the persisted transaction, retaining
+    /// the round name used at setup even if the caller supplies a new name.
     pub display_memo: String,
     /// Total eligible round weight after bundle quantization.
     pub eligible_weight_zatoshi: u64,

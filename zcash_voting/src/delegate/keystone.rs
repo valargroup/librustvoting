@@ -1,5 +1,9 @@
 //! Reuse the exact durable transaction at the external signing boundary.
 use super::*;
+use crate::action::{
+    orchard::note::NoteVersion,
+    pczt::{orchard::EncCiphertext, roles::redactor::Redactor, Pczt},
+};
 
 pub(super) fn request(
     prepared: &PreparedDelegationBundle,
@@ -42,8 +46,7 @@ pub(super) fn request(
     let rk = array32("rk", stored_rk)?;
     let action_index = crate::action::delegation_pczt_action_index(&pczt_bytes, &rk)?;
     let redacted_pczt_bytes = redact_delegation_pczt_for_signer(&pczt_bytes)?;
-    let display_weight_zatoshi = crate::round::raw_bundle_weight(&prepared.bundle_note_infos)?;
-    let display_memo = display_memo(&prepared.round_name, display_weight_zatoshi);
+    let display_memo = persisted_display_memo(&pczt_bytes, action_index)?;
     let action_index =
         crate::wire::BoundedU32::try_from(action_index).map_err(|_| VotingError::InvalidInput {
             message: format!("action_index {action_index} does not fit u32"),
@@ -61,4 +64,35 @@ pub(super) fn request(
         bundle_count: prepared.layout.bundle_count,
         bundle_index: prepared.bundle_index,
     })
+}
+
+/// Recover the signed memo without changing the persisted or signer-facing PCZT.
+fn persisted_display_memo(pczt_bytes: &[u8], action_index: usize) -> Result<String, VotingError> {
+    let pczt = Pczt::parse(pczt_bytes).map_err(|error| VotingError::Internal {
+        message: format!("failed to parse persisted delegation PCZT: {error:?}"),
+    })?;
+    let pczt = Redactor::new(pczt)
+        .redact_ironwood_with(|mut bundle| {
+            bundle.redact_action(action_index, |mut action| {
+                action.replace_enc_ciphertext_with_decrypted_memo_plaintext(NoteVersion::V3);
+            });
+        })
+        .finish();
+    let action =
+        pczt.ironwood()
+            .actions()
+            .get(action_index)
+            .ok_or_else(|| VotingError::Internal {
+                message: "persisted delegation PCZT has no governance action".to_string(),
+            })?;
+    let EncCiphertext::MemoPlaintext(memo) = action.output().enc_ciphertext() else {
+        return Err(VotingError::Internal {
+            message: "persisted delegation PCZT memo cannot be recovered".to_string(),
+        });
+    };
+    std::str::from_utf8(memo.as_stripped_bytes())
+        .map(str::to_owned)
+        .map_err(|_| VotingError::Internal {
+            message: "persisted delegation PCZT memo is not UTF-8 text".to_string(),
+        })
 }
