@@ -952,6 +952,58 @@ async fn ambiguous_attempt_is_durable_before_recovery_advances() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn failed_recovery_reports_ambiguity_retained_before_the_error() {
+    let configured = helpers(3);
+    let db = db_with_delivery(&[helper(1)], &[], 2);
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_third_helper_reservation
+             BEFORE UPDATE OF attempting_urls ON share_delegations
+             WHEN NEW.attempting_urls LIKE '%helper-3.example%'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected helper reservation failure');
+             END;",
+        )
+        .unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(2)),
+        Err(HelperTransportError::Timeout),
+    );
+    let client = client_with(transport.clone());
+    let random = preserve_two_server_order;
+    let scope = share::ShareOperationScope::capture(&db);
+
+    let failure = track_pending_shares_recording_partial(
+        &db,
+        &scope,
+        &params(&configured, SUBMIT_AT, &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .expect_err("the injected reservation failure should stop the pass");
+
+    assert_eq!(
+        failure.partial.ambiguous,
+        vec![ResubmittedShare {
+            share: ShareKey {
+                bundle_index: 0,
+                proposal_id: 1,
+                share_index: 0,
+            },
+            server_url: helper(2),
+        }]
+    );
+    let stored = only_share(&db);
+    assert_eq!(stored.ambiguous_urls, vec![helper(2)]);
+    assert!(stored.attempting_urls.is_empty());
+    assert_eq!(transport.call_count(&helper(2)), 1);
+    assert_eq!(transport.call_count(&helper(3)), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn overdue_ambiguous_attempt_resets_the_delayed_schedule() {
     let configured = helpers(2);
     let db = db_with_delivery(&[helper(1)], &[], 2);

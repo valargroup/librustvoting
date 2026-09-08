@@ -677,6 +677,9 @@ the pass and the timing policy.
   walk stopped, not that nothing happened, and the next pass walks only
   unconfirmed shares — an effect dropped here is one nothing can rediscover.
   The run folds those into its report and the `PassFailed` event carries them.
+  This includes ambiguous outcomes retained inside one share's recovery walk
+  before a later helper reservation fails; the nested recovery error carries
+  those durable effects into the pass's partial report.
   An accumulated ambiguous attempt is withdrawn when a later pass retries that
   same helper and is told plainly: the run's `ambiguous` promises outcomes that
   remain unknown, and that one is known now. It does not return to `ambiguous`
@@ -791,6 +794,8 @@ Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
 `a_settled_attempt_does_not_become_ambiguous_again`, and
 `a_complete_pass_replaces_the_unrecoverable_set` in
 [`share_tracking_drive/tests/partial_progress.rs`](../zcash_voting/src/share_tracking_drive/tests/partial_progress.rs);
+`failed_recovery_reports_ambiguity_retained_before_the_error` in
+[`share_tracking/tests/recovery.rs`](../zcash_voting/src/share_tracking/tests/recovery.rs);
 `the_wait_between_passes_is_the_one_the_pass_computed`,
 `a_pass_close_to_its_check_waits_only_until_then`,
 `the_host_context_is_read_once_per_pass`,

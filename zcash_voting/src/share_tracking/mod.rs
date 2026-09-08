@@ -917,21 +917,28 @@ async fn walk_pending_shares(
                     cancel,
                     elapsed_seconds,
                 )
-                .await?;
+                .await;
+                let resubmission = match resubmission {
+                    Ok(resubmission) => resubmission,
+                    Err(failure) => {
+                        record_ambiguous_recovery_effects(
+                            &mut delivery_state,
+                            report,
+                            &share,
+                            failure.outcome_unknown_urls,
+                        )?;
+                        return Err(failure.error);
+                    }
+                };
                 if matches!(resubmission.outcome, ResubmitOutcome::StaleGeneration) {
                     break;
                 }
-                for server_url in resubmission.outcome_unknown_urls {
-                    let newly_outcome_unknown =
-                        !delivery_state.outcome_unknown_urls().contains(&server_url);
-                    delivery_state.mark_outcome_unknown(&server_url)?;
-                    if newly_outcome_unknown {
-                        report.ambiguous.push(ResubmittedShare {
-                            share: ShareKey::of(&share),
-                            server_url,
-                        });
-                    }
-                }
+                record_ambiguous_recovery_effects(
+                    &mut delivery_state,
+                    report,
+                    &share,
+                    resubmission.outcome_unknown_urls,
+                )?;
                 match resubmission.outcome {
                     ResubmitOutcome::DefinitelyAcceptedByHelper(server_url) => {
                         // An overdue re-POST can convert an outcome-unknown
@@ -978,6 +985,25 @@ async fn walk_pending_shares(
         current_time,
         params.policy,
     );
+    Ok(())
+}
+
+fn record_ambiguous_recovery_effects(
+    delivery_state: &mut share::ShareDeliveryState,
+    report: &mut ShareTrackingReport,
+    recovered_share: &ShareDelegationRecord,
+    outcome_unknown_urls: Vec<String>,
+) -> Result<(), VotingError> {
+    for server_url in outcome_unknown_urls {
+        let newly_outcome_unknown = !delivery_state.outcome_unknown_urls().contains(&server_url);
+        delivery_state.mark_outcome_unknown(&server_url)?;
+        if newly_outcome_unknown {
+            report.ambiguous.push(ResubmittedShare {
+                share: ShareKey::of(recovered_share),
+                server_url,
+            });
+        }
+    }
     Ok(())
 }
 
