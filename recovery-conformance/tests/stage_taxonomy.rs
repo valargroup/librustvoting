@@ -54,10 +54,10 @@ fn only_the_five_in_post_stages_are_broadcast_triggered() {
         broadcast,
         vec![
             CrashStage::BeforeBroadcast,
-            CrashStage::AfterBroadcastUnread,
-            CrashStage::AfterBroadcastRead,
             CrashStage::BeforeVoteBroadcast,
+            CrashStage::AfterBroadcastUnread,
             CrashStage::AfterVoteBroadcast,
+            CrashStage::AfterBroadcastRead,
         ],
         "a stage that moved between the reporter and the transport would either \
          never fire or fire at the wrong instruction"
@@ -75,14 +75,20 @@ fn broadcast_stages_name_the_submission_they_belong_to() {
 
     assert_eq!(
         kind(CrashStage::BeforeBroadcast),
-        SubmissionKind::Delegation
+        SubmissionKind::DelegateAndVoteBatch
     );
     assert_eq!(
         kind(CrashStage::AfterBroadcastUnread),
-        SubmissionKind::Delegation
+        SubmissionKind::DelegateAndVoteBatch
     );
-    assert_eq!(kind(CrashStage::BeforeVoteBroadcast), SubmissionKind::Vote);
-    assert_eq!(kind(CrashStage::AfterVoteBroadcast), SubmissionKind::Vote);
+    assert_eq!(
+        kind(CrashStage::BeforeVoteBroadcast),
+        SubmissionKind::DelegateAndVoteBatch
+    );
+    assert_eq!(
+        kind(CrashStage::AfterVoteBroadcast),
+        SubmissionKind::DelegateAndVoteBatch
+    );
 }
 
 #[test]
@@ -119,8 +125,13 @@ fn only_stages_before_the_first_post_are_replayable_from_a_copied_sidecar() {
             CrashStage::AfterNoteSelection,
             CrashStage::AfterPczt,
             CrashStage::AfterProof,
+            CrashStage::BeforeCast,
             CrashStage::AfterSigning,
+            CrashStage::AfterVoteProof,
+            CrashStage::AfterVoteCommit,
+            CrashStage::AfterHelperPlans,
             CrashStage::BeforeBroadcast,
+            CrashStage::BeforeVoteBroadcast,
         ]
     );
 }

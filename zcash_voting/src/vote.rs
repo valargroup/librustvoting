@@ -41,6 +41,7 @@ pub const MAX_VOTE_BATCH_ACTIONS: usize = MAX_PROPOSAL_ID as usize;
 const MAX_BATCH_PROOF_CONCURRENCY: usize = 15;
 
 const VOTE_RECOVERY_FORMAT: &str = "zcash_voting_vote_recovery_v1";
+const DELEGATE_AND_VOTE_BATCH_RECOVERY_FORMAT: &str = "zcash_voting_delegate_cast_recovery_v1";
 const VOTE_BATCH_RECOVERY_FORMAT: &str = "zcash_voting_vote_batch_recovery_v1";
 
 /// Wallet-supplied cast-vote intent for one proposal in one bundle.
@@ -234,6 +235,43 @@ pub struct SignedVoteBatch {
     pub batch_json: String,
 }
 
+impl SignedVoteBatch {
+    /// Builds the typed lifecycle request from the persisted authorization kind.
+    pub fn advance_request(&self) -> Result<crate::ChainAdvanceRequest, VotingError> {
+        let first = self
+            .commitments
+            .first()
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "empty signed batch".to_string(),
+            })?;
+        let recovery = parse_recovery(&first.commitment_bundle_json)?;
+        let combined = recovery
+            .batch
+            .as_ref()
+            .is_some_and(|batch| batch.delegation_van.is_some());
+        let request = crate::AdvanceVoteBatch {
+            vote_round_id: array32(
+                "round id",
+                hex::decode(&first.vote_round_id).map_err(|error| VotingError::InvalidInput {
+                    message: error.to_string(),
+                })?,
+            )?,
+            bundle_index: self.bundle_index,
+            ordered_batch_digest: self.batch_digest,
+            ordered_proposal_ids: self
+                .commitments
+                .iter()
+                .map(|vote| vote.proposal_id)
+                .collect(),
+        };
+        Ok(if combined {
+            crate::ChainAdvanceRequest::DelegateAndVoteBatch(request)
+        } else {
+            crate::ChainAdvanceRequest::VoteBatch(request)
+        })
+    }
+}
+
 /// Unpersisted cast-vote work produced without holding the voting database lock.
 ///
 /// This is an opaque, process-local handoff between [`prepare_commit`] and
@@ -262,6 +300,7 @@ pub struct PreparedVoteCommitments {
 
 /// Unpersisted atomic cast-vote work for one delegation bundle.
 pub struct PreparedAtomicVoteBatch {
+    delegation: Option<crate::delegate_and_vote_batch::DelegationAuthorization>,
     wallet_id: String,
     round_id: String,
     bundle_index: u32,
@@ -1476,6 +1515,7 @@ pub(crate) fn observe_commit_atomic_vote_batch(
 
 /// Inputs for preparing one atomic vote batch.
 pub struct AtomicVoteBatch<'a> {
+    delegation: Option<crate::delegate_and_vote_batch::DelegationAuthorization>,
     round_id: &'a str,
     bundle_index: u32,
     drafts: &'a [DraftVote],
@@ -1494,6 +1534,7 @@ impl<'a> AtomicVoteBatch<'a> {
         stages: &'a dyn crate::types::VoteCommitStageReporter,
     ) -> Self {
         Self {
+            delegation: None,
             round_id,
             bundle_index,
             drafts,
@@ -1644,6 +1685,13 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
         }
 
         db.require_capability_delegations_confirmed(batch.round_id)?;
+        if let Some(authorization) = &batch.delegation {
+            authorization.validate_fresh(&db.conn())?;
+        } else if batch.witness.anchor_height == 0 {
+            return Err(VotingError::InvalidInput {
+                message: "standalone batches require a chain anchor".to_string(),
+            });
+        }
         for draft in batch.drafts {
             ensure_vote_rebuild_allowed(db, batch.round_id, batch.bundle_index, draft.proposal_id)?;
         }
@@ -1654,6 +1702,10 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
             batch.witness,
             network,
             &captured,
+            batch
+                .delegation
+                .as_ref()
+                .map(|authorization| authorization.van),
         )?;
 
         let first_state = &captured[0];
@@ -1677,6 +1729,15 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
                 draft.proposal_id,
                 authority,
             )?;
+            if index == 0
+                && batch.delegation.as_ref().is_some_and(|authorization| {
+                    authorization.van != transition.vote_authority_note_old
+                })
+            {
+                return Err(VotingError::InvalidInput {
+                    message: "initial cast VAN does not match the delegation".to_string(),
+                });
+            }
             authority = transition.proposal_authority_new;
             let (auth_path, position) = if index == 0 {
                 (batch.witness.auth_path_fixed()?, batch.witness.position)
@@ -1719,11 +1780,19 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
                 },
             )
             .collect::<Vec<_>>();
-        let batch_digest = crate::vote_commitment::cast_vote_batch_sighash(
-            batch.round_id,
-            batch.witness.anchor_height as u64,
-            &sighash_actions,
-        )?;
+        let batch_digest = if let Some(authorization) = &batch.delegation {
+            crate::delegate_and_vote_batch::delegate_and_vote_batch_sighash(
+                authorization.identity.vote_round_id(),
+                &authorization.van,
+                &sighash_actions,
+            )?
+        } else {
+            crate::vote_commitment::cast_vote_batch_sighash(
+                batch.round_id,
+                batch.witness.anchor_height as u64,
+                &sighash_actions,
+            )?
+        };
 
         let batch_size = u32::try_from(batch.drafts.len()).map_err(|_| VotingError::Internal {
             message: "vote batch length does not fit in u32".to_string(),
@@ -1767,6 +1836,10 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
                 vote_auth_sig,
             )?;
             recovery.batch = Some(VoteBatchRecovery {
+                delegation_van: batch
+                    .delegation
+                    .as_ref()
+                    .map(|authorization| authorization.van),
                 digest: batch_digest,
                 index: index as u32,
                 size: batch_size,
@@ -1787,8 +1860,22 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
             });
         }
 
-        let batch_json = canonical_batch_json(&commitments)?;
+        let batch_json = if let Some(authorization) = &batch.delegation {
+            crate::wire::DelegateAndVoteBatchWire {
+                delegation: authorization.submission.clone(),
+                batch: crate::wire::VoteCommitmentBatchWire {
+                    votes: commitments
+                        .iter()
+                        .map(|prepared| wire_submission_from_recovery(&prepared.recovery))
+                        .collect::<Result<_, _>>()?,
+                },
+            }
+            .to_json()?
+        } else {
+            canonical_batch_json(&commitments)?
+        };
         Ok(PreparedAtomicVoteBatch {
+            delegation: batch.delegation,
             wallet_id,
             round_id: batch.round_id.to_string(),
             bundle_index: batch.bundle_index,
@@ -1810,6 +1897,42 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
             .map(crate::observability::voting_error_kind),
     );
     operation_result
+}
+
+pub(crate) fn prepare_delegate_and_vote_batch(
+    db: &VotingDb,
+    signer: VoteSigner<'_>,
+    request: crate::delegate_and_vote_batch::DelegateAndVoteBatchRequest<'_>,
+    observations: &crate::ObservationScope,
+) -> Result<PreparedAtomicVoteBatch, VotingError> {
+    // Keep the authorization and every subsequent read on one wallet even if
+    // the host switches its active account while proofs are being prepared.
+    let db = db.scoped(&db.wallet_id())?;
+    let authorization = crate::delegate_and_vote_batch::DelegationAuthorization::capture(
+        &db.conn(),
+        &db.wallet_id(),
+        request.round_id,
+        request.bundle_index,
+        request.spend_auth_signature,
+    )?;
+    let witness = VanWitness {
+        auth_path: single_leaf_auth_path(authorization.van)?
+            .into_iter()
+            .map(|sibling| sibling.to_vec())
+            .collect(),
+        position: 0,
+        anchor_height: 0,
+    };
+    let mut batch = AtomicVoteBatch::new(
+        request.round_id,
+        request.bundle_index,
+        request.drafts,
+        &witness,
+        request.stages,
+    )
+    .with_max_proof_concurrency(request.max_proof_concurrency)?;
+    batch.delegation = Some(authorization);
+    observe_prepare_atomic_vote_batch(&db, signer, batch, observations)
 }
 
 /// Atomically persists the complete batch after revalidating every captured row.
@@ -1856,6 +1979,7 @@ where
     F: FnOnce(),
 {
     let PreparedAtomicVoteBatch {
+        delegation,
         wallet_id,
         round_id,
         bundle_index,
@@ -1872,11 +1996,14 @@ where
             message: "prepared vote batch contains mismatched storage identities".to_string(),
         });
     }
+    if let Some(authorization) = &delegation {
+        authorization.validate_scope(&wallet_id, &round_id, bundle_index)?;
+    }
     let commitments = prepared_commits
         .iter()
         .map(|prepared| signed_commitment_from_parts(&prepared.commit, &prepared.recovery))
         .collect::<Result<Vec<_>, _>>()?;
-    persist_prepared_commits(db, prepared_commits)?;
+    persist_prepared_commits(db, prepared_commits, delegation)?;
     after_persist();
     Ok(SignedVoteBatch {
         bundle_index,
@@ -2011,13 +2138,30 @@ pub(crate) fn observe_recover_atomic_vote_batch(
             let commit = commit_from_recovery(recovery)?;
             commitments.push(signed_commitment_from_parts(&commit, recovery)?);
         }
-        let batch_json = crate::wire::VoteCommitmentBatchWire {
+        let wire_batch = crate::wire::VoteCommitmentBatchWire {
             votes: commitments
                 .iter()
                 .map(crate::wire::VoteCommitmentWire::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
-        }
-        .to_json()?;
+        };
+        let batch_json = if batch.delegation_van.is_some() {
+            let delegation =
+                crate::delegate_and_vote_batch::DelegationAuthorization::recover_submission(
+                    &db.conn(),
+                    &db.wallet_id(),
+                    round_id,
+                    bundle_index,
+                    &digest,
+                )?;
+            crate::wire::DelegateAndVoteBatchWire {
+                delegation,
+                batch: wire_batch,
+            }
+            .to_json()?
+        } else {
+            wire_batch.to_json()?
+        };
+
         Ok(SignedVoteBatch {
             bundle_index,
             commitments,
@@ -2057,12 +2201,18 @@ fn validate_captured_batch_state(
     witness: &VanWitness,
     network: Network,
     captured: &[crate::storage::queries::VotePreparationState],
+    delegation_van: Option<[u8; 32]>,
 ) -> Result<(), VotingError> {
     let first = &captured[0];
-    if first.van_position != witness.position {
+    let expected_position = if delegation_van.is_some() {
+        None
+    } else {
+        Some(witness.position)
+    };
+    if first.van_position != expected_position {
         return Err(VotingError::InvalidInput {
             message: format!(
-                "VAN witness position {} does not match current bundle position {} for round={round_id}, bundle={bundle_index}",
+                "VAN witness position {} does not match current bundle position {:?} for round={round_id}, bundle={bundle_index}",
                 witness.position, first.van_position
             ),
         });
@@ -2244,6 +2394,12 @@ fn prepare_recovered_vote_batch(
                     draft.proposal_id
                 ),
             })?;
+        if metadata.delegation_van.is_some() {
+            return Err(VotingError::InvalidInput {
+                message: "combined batch is already persisted; use recover_delegate_and_vote_batch"
+                    .to_string(),
+            });
+        }
         if metadata.index != index as u32 || metadata.size != size {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -2279,6 +2435,7 @@ fn prepare_recovered_vote_batch(
     }
     let batch_json = canonical_batch_json(&commitments)?;
     Ok(PreparedAtomicVoteBatch {
+        delegation: None,
         wallet_id: wallet_id.to_string(),
         round_id: round_id.to_string(),
         bundle_index,
@@ -2440,6 +2597,8 @@ pub struct VoteRecoveryBundle {
 /// Stable recovery metadata shared by actions in one atomic vote batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoteBatchRecovery {
+    /// Initial ephemeral VAN for combined authorization; absent for ordinary batches.
+    pub delegation_van: Option<[u8; 32]>,
     pub digest: [u8; 32],
     pub index: u32,
     pub size: u32,
@@ -2469,6 +2628,8 @@ struct VoteRecoveryJson {
     share_comms: Vec<Vec<u8>>,
     #[serde(default)]
     batch_digest: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delegation_van: Option<[u8; 32]>,
     #[serde(default)]
     batch_index: Option<u32>,
     #[serde(default)]
@@ -2788,7 +2949,7 @@ pub(crate) fn observe_persist_prepared_commit(
     let attributed_observations = observations.clone();
     let observation_stage = attributed_observations.stage("vote::persist_prepared_commit");
     let operation_result: Result<CommittedVote, VotingError> = (|| {
-        persist_prepared_commits(db, vec![prepared])?
+        persist_prepared_commits(db, vec![prepared], None)?
             .pop()
             .ok_or_else(|| VotingError::Internal {
                 message: "single prepared vote persistence returned no vote".to_string(),
@@ -2812,6 +2973,7 @@ pub(crate) fn observe_persist_prepared_commit(
 fn persist_prepared_commits(
     db: &VotingDb,
     prepared: Vec<PreparedVoteCommit>,
+    delegation: Option<crate::delegate_and_vote_batch::DelegationAuthorization>,
 ) -> Result<Vec<CommittedVote>, VotingError> {
     if prepared.is_empty() {
         return Err(VotingError::Internal {
@@ -2838,6 +3000,9 @@ fn persist_prepared_commits(
         .map_err(|e| {
             VotingError::from_sqlite("failed to begin prepared vote persistence transaction", &e)
         })?;
+    if let Some(authorization) = &delegation {
+        authorization.validate_fresh(&tx)?;
+    }
     let fresh_proposal_ids = prepared
         .iter()
         .filter(|vote| matches!(&vote.captured_state, CapturedVoteState::Fresh(_)))
@@ -2925,6 +3090,17 @@ fn persist_prepared_commits(
             &first.wallet_id,
             crate::storage::RoundPhase::VoteReady,
         )?;
+    }
+    if let Some(authorization) = &delegation {
+        let digest = prepared[0]
+            .recovery
+            .batch
+            .as_ref()
+            .ok_or_else(|| VotingError::Internal {
+                message: "combined preparation lost its batch metadata".to_string(),
+            })?
+            .digest;
+        authorization.persist(&tx, &digest)?;
     }
     tx.commit().map_err(|e| {
         VotingError::from_sqlite("failed to commit prepared vote persistence transaction", &e)
@@ -3103,11 +3279,39 @@ pub(crate) fn assemble_vote_batch_recoveries(
             },
         )
         .collect::<Vec<_>>();
-    let recomputed = crate::vote_commitment::cast_vote_batch_sighash(
-        round_id,
-        recoveries[0].anchor_height as u64,
-        &actions,
-    )?;
+    let initial_van = recoveries[0]
+        .batch
+        .as_ref()
+        .and_then(|batch| batch.delegation_van);
+    if recoveries.iter().any(|recovery| {
+        recovery
+            .batch
+            .as_ref()
+            .and_then(|batch| batch.delegation_van)
+            != initial_van
+            || (initial_van.is_some() && recovery.anchor_height != 0)
+    }) {
+        return Err(VotingError::InvalidInput {
+            message: "inconsistent combined batch authorization".to_string(),
+        });
+    }
+    let recomputed = match initial_van {
+        Some(van) => crate::delegate_and_vote_batch::delegate_and_vote_batch_sighash(
+            &array32(
+                "round_id",
+                hex::decode(round_id).map_err(|e| VotingError::InvalidInput {
+                    message: e.to_string(),
+                })?,
+            )?,
+            &van,
+            &actions,
+        )?,
+        None => crate::vote_commitment::cast_vote_batch_sighash(
+            round_id,
+            recoveries[0].anchor_height as u64,
+            &actions,
+        )?,
+    };
     if recomputed != batch_digest {
         return Err(VotingError::InvalidInput {
             message: "persisted atomic vote batch digest does not match its actions".to_string(),
@@ -3327,9 +3531,9 @@ fn vote_recovery_is_lifecycle_owned(
                     AND wallet_id = :wallet_id
                     AND bundle_index = :bundle_index
                     AND (state IN ('submitting','tracking','recovering','submitted_without_hash')
-                         OR (state = 'rejected' AND kind = 'vote_batch'))
+                         OR (state = 'rejected' AND kind IN ('vote_batch','delegate_and_cast_vote_batch')))
                     AND ((kind = 'vote' AND proposal_id = :proposal_id)
-                         OR (kind = 'vote_batch' AND ordered_batch_digest = :batch_digest))
+                         OR (kind IN ('vote_batch','delegate_and_cast_vote_batch') AND ordered_batch_digest = :batch_digest))
              )",
         named_params! {
             ":round_id": round_id,
@@ -3500,6 +3704,19 @@ fn clear_unsubmitted_vote_recovery_with_conn(
     .map_err(|e| VotingError::Internal {
         message: format!("clear stale vote shares failed: {e}"),
     })?;
+    // A combined authorization survives exactly as long as its signed members.
+    // Clear it only after the final member is retired, in the caller's transaction.
+    conn.execute(
+        "DELETE FROM delegate_cast_recovery AS authorization
+         WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3
+           AND NOT EXISTS (SELECT 1 FROM votes v
+             WHERE v.round_id = authorization.round_id AND v.wallet_id = authorization.wallet_id
+               AND v.bundle_index = authorization.bundle_index
+               AND v.commitment_bundle_json IS NOT NULL
+               AND json_extract(v.commitment_bundle_json, '$.delegation_van') IS NOT NULL)",
+        rusqlite::params![round_id, wallet_id, bundle_index],
+    )
+    .map_err(|error| VotingError::from_sqlite("retire combined authorization", &error))?;
     Ok(())
 }
 
@@ -3704,8 +3921,12 @@ pub fn parse_recovery(json: &str) -> Result<VoteRecoveryBundle, VotingError> {
         || parsed.batch_index.is_some()
         || parsed.batch_size.is_some();
     match parsed.format.as_str() {
-        VOTE_RECOVERY_FORMAT if !has_batch_metadata => {}
-        VOTE_BATCH_RECOVERY_FORMAT if has_batch_metadata => {}
+        VOTE_RECOVERY_FORMAT if !has_batch_metadata && parsed.delegation_van.is_none() => {}
+        VOTE_BATCH_RECOVERY_FORMAT if has_batch_metadata && parsed.delegation_van.is_none() => {}
+        DELEGATE_AND_VOTE_BATCH_RECOVERY_FORMAT
+            if has_batch_metadata
+                && parsed.delegation_van.is_some()
+                && parsed.anchor_height == 0 => {}
         VOTE_RECOVERY_FORMAT | VOTE_BATCH_RECOVERY_FORMAT => {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -4546,7 +4767,13 @@ impl VoteRecoveryBundle {
 impl From<&VoteRecoveryBundle> for VoteRecoveryJson {
     fn from(bundle: &VoteRecoveryBundle) -> Self {
         Self {
-            format: if bundle.batch.is_some() {
+            format: if bundle
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.delegation_van.is_some())
+            {
+                DELEGATE_AND_VOTE_BATCH_RECOVERY_FORMAT
+            } else if bundle.batch.is_some() {
                 VOTE_BATCH_RECOVERY_FORMAT
             } else {
                 VOTE_RECOVERY_FORMAT
@@ -4576,6 +4803,7 @@ impl From<&VoteRecoveryBundle> for VoteRecoveryJson {
             share_blinds: bundle.share_blinds.iter().map(|v| v.to_vec()).collect(),
             share_comms: bundle.share_comms.iter().map(|v| v.to_vec()).collect(),
             batch_digest: bundle.batch.as_ref().map(|batch| batch.digest.to_vec()),
+            delegation_van: bundle.batch.as_ref().and_then(|batch| batch.delegation_van),
             batch_index: bundle.batch.as_ref().map(|batch| batch.index),
             batch_size: bundle.batch.as_ref().map(|batch| batch.size),
         }
@@ -4601,6 +4829,7 @@ impl TryFrom<VoteRecoveryJson> for VoteRecoveryBundle {
                         });
                     }
                     Some(VoteBatchRecovery {
+                        delegation_van: value.delegation_van,
                         digest: array32("batch_digest", digest)?,
                         index,
                         size,
@@ -4793,6 +5022,7 @@ pub(crate) fn record_vc_position(
 mod tests {
     mod batch_chain_reports;
     mod batch_observability;
+    mod batch_wallet_scope;
     mod tree_confirmed_completion;
 
     use super::*;
@@ -4922,11 +5152,13 @@ mod tests {
         )
         .unwrap();
         first.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: 0,
             size: 2,
         });
         second.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: 1,
             size: 2,
@@ -5073,6 +5305,7 @@ mod tests {
             assert_eq!(
                 parsed.batch,
                 Some(VoteBatchRecovery {
+                    delegation_van: None,
                     digest,
                     index: index as u32,
                     size: 2,
@@ -5329,6 +5562,7 @@ mod tests {
         let batch_json = canonical_batch_json(&commitments).unwrap();
 
         PreparedAtomicVoteBatch {
+            delegation: None,
             wallet_id: WALLET_ID.to_string(),
             round_id: ROUND_ID.to_string(),
             bundle_index: 0,
@@ -5945,6 +6179,7 @@ mod tests {
         )
         .unwrap();
         recovery.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: 0,
             size: 1,
@@ -6511,5 +6746,11 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = value;
         bytes
+    }
+}
+
+impl PreparedAtomicVoteBatch {
+    pub(crate) fn is_delegate_and_vote_batch(&self) -> bool {
+        self.delegation.is_some()
     }
 }

@@ -87,7 +87,8 @@ pub enum DelegationPhase {
     SubmittedWithoutHash,
     /// The authoritative lifecycle row is terminally rejected.
     SubmissionRejected,
-    /// The vote authority note leaf position has been recovered from chain.
+    /// The delegation or its combined batch is confirmed. The stored VAN
+    /// position names the current successor, never a combined initial VAN.
     Confirmed,
 }
 
@@ -293,7 +294,7 @@ impl VotingDb {
                         b.van_leaf_position IS NOT NULL,
                         (SELECT s.state FROM chain_submissions s
                          WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
-                           AND s.bundle_index=b.bundle_index AND s.kind='delegation')
+                           AND s.bundle_index=b.bundle_index AND s.kind IN ('delegation','delegate_and_cast_vote_batch'))
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -514,7 +515,7 @@ pub(crate) fn delegation_submission_statuses_on(
                ON s.round_id = b.round_id
               AND s.wallet_id = b.wallet_id
               AND s.bundle_index = b.bundle_index
-              AND s.kind = 'delegation'
+              AND s.kind IN ('delegation','delegate_and_cast_vote_batch')
              WHERE b.round_id = :round_id
                AND b.wallet_id = :wallet_id
              ORDER BY b.bundle_index",

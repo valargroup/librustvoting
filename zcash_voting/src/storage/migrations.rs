@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 22;
+const CURRENT_VERSION: u32 = 23;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -144,6 +144,7 @@ END;",
         include_str!("migrations/005_chain_submissions_proposal_range.sql"),
     ),
     (21, "ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;"),
+    (22, include_str!("migrations/006_delegate_cast.sql")),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
@@ -151,6 +152,7 @@ DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
 DROP TABLE IF EXISTS round_immediate_share;
 DROP TABLE IF EXISTS helper_share_plans;
+DROP TABLE IF EXISTS delegate_cast_recovery;
 DROP TABLE IF EXISTS chain_submissions;
 DROP TABLE IF EXISTS share_delegations;
 DROP TABLE IF EXISTS keystone_signatures;

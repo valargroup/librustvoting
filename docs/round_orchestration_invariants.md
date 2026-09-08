@@ -213,15 +213,34 @@ persisted recovery bundles rather than from the constant.
 ### Delegation obligations
 
 - `Delegate` is planned for a bundle whose delegation is `Prepared`,
-  `PcztBuilt` or `Proved` whenever that bundle has a `Cast` or a
+  `PcztBuilt` whenever that bundle has a `Cast` or a
   `Blocked` cast, so the prerequisite is visible while the voter decides the
   rest of the roster.
 - `AdvanceDelegation` is planned for `Submitted` and `SubmissionManaged`
   delegations; an imported capability advances without a signer.
 - `SubmittedWithoutHash` and `SubmissionRejected` delegations plan nothing and
   block their bundle's casts.
-- Every vote or share obligation on a bundle whose delegation is not
-  `Confirmed` carries that bundle's delegation step as its **prerequisite**.
+- `Delegate` prepares and persists the proof only; it never signs or broadcasts.
+  A `Proved` bundle waits for a terminal ballot, then `Cast` signs delegation
+  and casts together through `delegate-and-cast-vote-batch`, including a
+  one-choice ballot. The first witness is synthetic and needs no tree sync.
+- A combined recovery unit owns its delegation prerequisite. It plans only
+  the batch reconciliation, never a standalone `AdvanceDelegation`.
+- Existing standalone and imported delegations retain their prerequisites.
+  Terminal-ballot signing preflight covers fresh combined casts before the
+  wave starts. Early proof preparation needs a driver but no signature.
+- `a_delegate_step_cancelled_after_preparation_keeps_the_proof_without_signing`
+  and `a_partly_decided_ballot_still_runs_the_delegation_prerequisite` pin the
+  early-preparation boundary. `combined_lifecycle_confirms_delegation_and_every_vote_together`
+  pins the shared submission ownership and atomic confirmation.
+  The release-only `combined_executor_zkp2_prepares_submits_confirms_and_delivers`
+  exercises the executor with real cast proofs: early preparation does not
+  sign or POST, terminal casting submits one combined envelope, and helpers
+  receive shares only after the delegation and every vote are confirmed.
+  `combined_executor_zkp2_cancellation_reopens_and_resumes_without_signing`
+  cancels after combined persistence, reopens the database, and advances the
+  exact same envelope without a hotkey or delegation driver. Both run through
+  `make proofs` with scripted transports, without contacting a live chain.
 
 ### Share obligations
 

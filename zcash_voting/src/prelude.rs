@@ -168,3 +168,9 @@ pub use crate::observability::{
     ObservabilityOptions, ObservationAttribution, ObservationOutcome, ObservationRecord,
     ObservationSummary, OperationObservability, OperationReport,
 };
+
+/// Atomic delegation-and-cast preparation for upgraded vote chains.
+pub use crate::delegate_and_vote_batch::{
+    persist_delegate_and_vote_batch, prepare_delegate_and_vote_batch,
+    recover_delegate_and_vote_batch, DelegateAndVoteBatchRequest,
+};

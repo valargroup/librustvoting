@@ -2,8 +2,8 @@
 
 use super::fixtures::*;
 
-/// Two bundles, both with a due cast, and a chain endpoint that cannot be
-/// reached. Each bundle's delegation proves and signs, then fails at dispatch.
+/// Two bundles prepare their proofs, then their fixture signing payloads fail
+/// combined preparation. Each failure must remain attributed to its bundle.
 async fn run_two_failing_bundles(isolation: FailureIsolation) -> (RoundRunReport, Vec<String>) {
     let database = database_with_bundles(2);
     let executor = executor_over_unreachable_chain(Arc::clone(&database));
@@ -52,7 +52,7 @@ async fn a_failed_bundle_is_skipped_and_the_rest_of_the_round_runs() {
 
     assert_eq!(
         selected.len(),
-        2,
+        4,
         "the second bundle is still dispatched after the first fails: {selected:?}"
     );
     assert_eq!(report.failures.len(), 2, "{:?}", report.failures);
@@ -76,7 +76,7 @@ async fn stop_round_ends_at_the_first_failure() {
 
     assert_eq!(
         selected.len(),
-        1,
+        3,
         "nothing runs after the first failure: {selected:?}"
     );
     assert_eq!(report.failures.len(), 1);

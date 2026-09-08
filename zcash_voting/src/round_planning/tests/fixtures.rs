@@ -116,6 +116,7 @@ impl SnapshotBuilder {
         let size = recoveries.len() as u32;
         for (index, recovery) in recoveries.iter_mut().enumerate() {
             recovery.batch = Some(VoteBatchRecovery {
+                delegation_van: None,
                 digest,
                 index: index as u32,
                 size,

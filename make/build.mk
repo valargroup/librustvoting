@@ -110,3 +110,10 @@ recovery-conformance-fleet: ## Run only the staging helper-fleet matrix (network
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
 		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked \
 		-E 'not (binary(staging_conformance) or binary(stall_conformance))'
+
+.PHONY: recovery-conformance-unit
+recovery-conformance-unit: ## Run hermetic crash-recovery harness tests (no staging)
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked \
+		--test stage_taxonomy --test stage_config --test target_chain \
+		--test crash_log --test round_shape --test orchestration

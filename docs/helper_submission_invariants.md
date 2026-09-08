@@ -1891,3 +1891,14 @@ A change to helper submission or recovery should answer all of the following:
 - Do schema and wire changes preserve legacy rows and safe helper identity?
 - Are readiness, status, per-share timeout, and the process-wide 128-POST limit
   still enforced by their SDK entry points?
+
+
+## Combined delegation and cast integration
+
+A combined delegation-and-cast envelope is one atomic vote unit, including
+when it has one member. Fresh execution persists every signed vote and the
+delegation authorization, then persists the complete helper plan before the
+combined POST. A recovered unit already owned by the chain lifecycle reconciles
+that lifecycle first. Helper delivery starts only after the unit's complete
+confirmation records the final VAN and every VC position. The existing timeout,
+placement, ambiguous-POST and durable delivery rules apply unchanged.

@@ -45,6 +45,27 @@ pub trait DelegationDriver: Send + Sync {
     /// wallet id before invoking any delegation stage.
     fn shares_database_with(&self, database: &VotingDb) -> bool;
 
+    /// Prepares and persists a delegation proof without requesting a signature
+    /// or broadcasting. Repeated calls validate and reuse the stored proof.
+    fn prepare_blocking(
+        &self,
+        bundle_index: u32,
+        pir: &PirFleet,
+        progress: &dyn DelegationProgressReporter,
+    ) -> Result<crate::delegate::DelegationProofStatus, VotingError>;
+
+    /// SDK observation hook for proof-only preparation.
+    #[doc(hidden)]
+    fn prepare_blocking_observed(
+        &self,
+        bundle_index: u32,
+        pir: &PirFleet,
+        progress: &dyn DelegationProgressReporter,
+        _observations: &crate::ObservationScope,
+    ) -> Result<crate::delegate::DelegationProofStatus, VotingError> {
+        self.prepare_blocking(bundle_index, pir, progress)
+    }
+
     /// Proves and signs one bundle on the calling thread.
     ///
     /// Reports the full progress sequence through `progress`, ending in
@@ -112,6 +133,25 @@ impl<W: WalletDbOpener> DelegationDriver for DelegationPipeline<W> {
 
     fn shares_database_with(&self, database: &VotingDb) -> bool {
         self.voting_db.shares_connection_with(database)
+    }
+
+    fn prepare_blocking(
+        &self,
+        bundle_index: u32,
+        pir: &PirFleet,
+        progress: &dyn DelegationProgressReporter,
+    ) -> Result<crate::delegate::DelegationProofStatus, VotingError> {
+        self.ensure_proof(bundle_index, pir, progress)
+    }
+
+    fn prepare_blocking_observed(
+        &self,
+        bundle_index: u32,
+        pir: &PirFleet,
+        progress: &dyn DelegationProgressReporter,
+        observations: &crate::ObservationScope,
+    ) -> Result<crate::delegate::DelegationProofStatus, VotingError> {
+        self.observe_ensure_proof(bundle_index, pir, progress, observations)
     }
 
     fn prove_and_sign_blocking(

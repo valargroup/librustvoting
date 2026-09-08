@@ -104,6 +104,17 @@ impl<T: ChainTransport> RoundExecutor<T> {
             )
             .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
 
+        if self
+            .database
+            .delegation_phase(&round_id, bundle_index)
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?
+            != crate::phases::DelegationPhase::Confirmed
+        {
+            return self
+                .run_delegate_and_vote_batch(scope, bundle_index, drafts, lock, progress)
+                .await;
+        }
+
         // Tree sync and witness generation block on their own HTTP runtime.
         // Nodes are tried in order. Every failed sync drops the round's cached
         // tree, including the last node's, so neither the next node nor the

@@ -1381,6 +1381,10 @@ impl TryFrom<crate::RoundStepProgress> for RoundStepProgressView {
                 view.delegation_progress = Some(kind);
                 view.proof_progress = fraction;
             }
+            P::DelegateAndVoteBatchPersisted { bundle_index } => {
+                view.kind = RoundStepProgressKind::DelegateAndVoteBatchPersisted;
+                view.bundle_index = Some(bundle_index);
+            }
             P::TreeSynced { height } => {
                 view.kind = RoundStepProgressKind::TreeSynced;
                 view.tree_height = Some(height);

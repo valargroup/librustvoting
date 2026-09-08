@@ -119,7 +119,10 @@ impl RoundDriveReporter for CrashReporter {
                 // that, and says it from the one plan the driver itself read.
                 if armed == CrashStage::AfterVoteCommit
                     && plan.next_steps.iter().any(|step| {
-                        matches!(step, NextStep::AdvanceVote { .. }) && self.on_target(step)
+                        matches!(
+                            step,
+                            NextStep::AdvanceVote { .. } | NextStep::AdvanceVoteBatch { .. }
+                        ) && self.on_target(step)
                     })
                 {
                     self.crash(armed);
@@ -179,12 +182,16 @@ impl CrashReporter {
                 },
             ) => true,
 
+            (
+                CrashStage::AfterVoteCommit,
+                RoundStepProgress::DelegateAndVoteBatchPersisted { .. },
+            ) => true,
             (CrashStage::AfterTreeSync, RoundStepProgress::TreeSynced { .. }) => true,
 
             // A delegation and a vote both report a bare `ChainOutcome`, and
             // both can be on the target bundle, so matching the outcome alone
             // would let a vote's confirmation fire the delegation stage.
-            (CrashStage::AfterTracking, RoundStepProgress::ChainOutcome(_)) => is_delegation(step),
+            (CrashStage::AfterTracking, RoundStepProgress::ChainOutcome(_)) => true,
             (CrashStage::AfterVoteConfirmed, RoundStepProgress::ChainOutcome(_)) => {
                 !is_delegation(step)
             }

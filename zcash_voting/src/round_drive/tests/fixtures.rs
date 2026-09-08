@@ -246,6 +246,23 @@ impl crate::DelegationDriver for SigningDriver {
         self.database.shares_connection_with(database)
     }
 
+    fn prepare_blocking(
+        &self,
+        bundle_index: u32,
+        _pir: &crate::PirFleet,
+        progress: &dyn crate::types::DelegationProgressReporter,
+    ) -> Result<crate::delegate::DelegationProofStatus, crate::VotingError> {
+        crate::storage::queries::store_proof(
+            &self.database.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            bundle_index,
+            &[0x61; 96],
+        )?;
+        progress.on_progress(crate::delegate::DelegationProgress::ProofComplete);
+        Ok(crate::delegate::DelegationProofStatus::Reused)
+    }
+
     fn prove_and_sign_blocking(
         &self,
         bundle_index: u32,

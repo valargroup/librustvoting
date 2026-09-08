@@ -47,10 +47,10 @@ pub(super) fn load_authoritative_batch_phases(
         let mut statement = conn
             .prepare(
                 "SELECT bundle_index, ordered_batch_digest, generation_digest, state,
-                        diagnostic_kind, diagnostic
+                        diagnostic_kind, diagnostic, kind
                    FROM chain_submissions
                   WHERE round_id=:round_id AND wallet_id=:wallet_id
-                    AND kind='vote_batch'
+                    AND kind IN ('vote_batch','delegate_and_cast_vote_batch')
                     AND (:bundle_index IS NULL OR bundle_index=:bundle_index)",
             )
             .map_err(|error| VotingError::Internal {
@@ -71,6 +71,7 @@ pub(super) fn load_authoritative_batch_phases(
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
@@ -103,6 +104,7 @@ pub(super) fn load_authoritative_batch_phases(
         state,
         diagnostic_kind,
         diagnostic,
+        kind,
     ) in batch_rows
     {
         let Some(phase) = authoritative_submission_phase(Some(&state)) else {
@@ -133,8 +135,14 @@ pub(super) fn load_authoritative_batch_phases(
             network,
             round_bytes,
             stored_bundle_index,
-            ChainSubmissionTarget::VoteBatch {
-                ordered_batch_digest,
+            if kind == "delegate_and_cast_vote_batch" {
+                ChainSubmissionTarget::DelegateAndVoteBatch {
+                    ordered_batch_digest,
+                }
+            } else {
+                ChainSubmissionTarget::VoteBatch {
+                    ordered_batch_digest,
+                }
             },
         )
         .map_err(|error| VotingError::Internal {

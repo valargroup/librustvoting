@@ -287,3 +287,18 @@ Mobile FFI bindings live in [zcash-swift-wallet-sdk](https://github.com/valargro
 ## License
 
 TODO
+
+
+Fresh round execution now prepares the delegation proof while the ballot is
+open, then submits delegation and all chosen proposals together once the
+ballot is terminal. The chain must support `delegate-and-cast-vote-batch`.
+There is no initial vote-tree sync for this path. Previously submitted and
+imported delegations continue through their existing recovery flow.
+
+For manual integration, use `delegate_and_vote_batch::prepare_delegate_and_vote_batch`,
+`persist_delegate_and_vote_batch`, and `recover_delegate_and_vote_batch`.
+The persisted batch's `advance_request()` identifies the combined lifecycle;
+`ChainSubmissionClient::advance_delegate_and_vote_batch` advances it from
+storage. `wallet-example::example_vote::commit_delegate_and_vote_batch`
+shows the preparation and persistence boundary. A single chosen proposal also
+uses the combined envelope for a fresh delegation.

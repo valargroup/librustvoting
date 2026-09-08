@@ -65,6 +65,7 @@ pub(super) enum ChainSubmissionRequest {
     ImportedDelegation(CandidateTransactionHash),
     Vote(VoteCommitmentWire),
     VoteBatch(VoteCommitmentBatchWire),
+    DelegateAndVoteBatch(crate::wire::DelegateAndVoteBatchWire),
 }
 
 /// One semantic generation and the confirmation layout it must produce.
@@ -252,8 +253,18 @@ fn hash_identity(transcript: &mut GenerationTranscript, identity: &ChainSubmissi
         }
         ChainSubmissionTarget::VoteBatch {
             ordered_batch_digest,
+        }
+        | ChainSubmissionTarget::DelegateAndVoteBatch {
+            ordered_batch_digest,
         } => {
-            transcript.field("identity.kind", b"vote_batch");
+            transcript.field(
+                "identity.kind",
+                if identity.target().is_combined() {
+                    b"delegate_and_cast_vote_batch"
+                } else {
+                    b"vote_batch"
+                },
+            );
             transcript.bytes32("identity.ordered_batch_digest", &ordered_batch_digest);
         }
     }
@@ -1014,10 +1025,30 @@ pub(super) fn derive_vote_batch(
     for recovery in &recoveries {
         requests.push(crate::vote::wire_submission_from_recovery(recovery)?);
     }
-    Ok(DerivedChainSubmission {
-        bound,
-        request: ChainSubmissionRequest::VoteBatch(VoteCommitmentBatchWire { votes: requests }),
-    })
+    let batch = VoteCommitmentBatchWire { votes: requests };
+    let request = if identity.target().is_combined() {
+        let delegation =
+            crate::delegate_and_vote_batch::DelegationAuthorization::recover_submission(
+                conn,
+                identity.wallet_id(),
+                &hex::encode(identity.vote_round_id()),
+                identity.bundle_index(),
+                &identity
+                    .target()
+                    .batch_digest()
+                    .expect("validated batch identity"),
+            )?;
+        let composite = crate::wire::DelegateAndVoteBatchWire { delegation, batch };
+        if Some(composite.authorization_digest()?) != identity.target().batch_digest() {
+            return Err(VotingError::InvalidInput {
+                message: "combined authorization digest mismatch".to_string(),
+            });
+        }
+        ChainSubmissionRequest::DelegateAndVoteBatch(composite)
+    } else {
+        ChainSubmissionRequest::VoteBatch(batch)
+    };
+    Ok(DerivedChainSubmission { bound, request })
 }
 
 /// Binds a complete persisted atomic vote batch without building requests.
@@ -1032,10 +1063,7 @@ fn validated_vote_batch(
     conn: &rusqlite::Connection,
     identity: &ChainSubmissionIdentity,
 ) -> Result<(BoundGeneration, Vec<VoteRecoveryBundle>), VotingError> {
-    let ChainSubmissionTarget::VoteBatch {
-        ordered_batch_digest,
-    } = identity.target()
-    else {
+    let Some(ordered_batch_digest) = identity.target().batch_digest() else {
         return Err(VotingError::InvalidInput {
             message: "vote batch generation requires a vote_batch identity".to_string(),
         });
@@ -1048,6 +1076,15 @@ fn validated_vote_batch(
         identity.bundle_index(),
         ordered_batch_digest,
     )?;
+    let combined_van = recoveries[0]
+        .batch
+        .as_ref()
+        .and_then(|batch| batch.delegation_van);
+    if combined_van.is_some() != identity.target().is_combined() {
+        return Err(VotingError::InvalidInput {
+            message: "batch authorization does not match submission kind".to_string(),
+        });
+    }
     let expected_anchor = recoveries[0].anchor_height;
     let mut proposal_ids = Vec::with_capacity(recoveries.len());
     for recovery in &recoveries {
@@ -1083,8 +1120,29 @@ fn validated_vote_batch(
         .iter()
         .map(|recovery| recovery.vote_commitment)
         .collect();
+    let generation = if let Some(initial_van) = combined_van {
+        let inputs = load_delegation_inputs(conn, identity, &round_id)?.ok_or_else(|| {
+            VotingError::InvalidInput {
+                message: "combined delegation setup is missing".to_string(),
+            }
+        })?;
+        if initial_van != inputs.gov_comm || expected_anchor != 0 {
+            return Err(VotingError::InvalidInput {
+                message: "combined casts do not bind the persisted delegation VAN".to_string(),
+            });
+        }
+        let mut transcript = GenerationTranscript::new();
+        hash_identity(&mut transcript, identity);
+        hash_delegation_inputs(&mut transcript, &inputs);
+        transcript.sequence("votes", &recoveries, |transcript, index, recovery| {
+            hash_vote_recovery(transcript, &format!("votes.{index}"), recovery)
+        });
+        ChainSubmissionGeneration::new(identity.clone(), transcript.finish())
+    } else {
+        vote_generation(identity, &recoveries)
+    };
     let bound = BoundGeneration {
-        generation: vote_generation(identity, &recoveries),
+        generation,
         expected_layout: ExpectedTreeLayout::VoteBatch {
             final_successor_van,
             vote_commitments,
@@ -1129,7 +1187,7 @@ mod tests {
         }
     }
 
-    fn recovery(proposal_id: u32) -> VoteRecoveryBundle {
+    pub(super) fn recovery(proposal_id: u32) -> VoteRecoveryBundle {
         VoteRecoveryBundle {
             vote_round_id: "1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
@@ -1186,7 +1244,7 @@ mod tests {
         (rk, (&signature).into())
     }
 
-    fn persisted_delegation() -> (VotingDb, ChainSubmissionIdentity, [u8; 64]) {
+    pub(super) fn persisted_delegation() -> (VotingDb, ChainSubmissionIdentity, [u8; 64]) {
         use crate::backend::pasta_curves::group::ff::PrimeField;
 
         const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -1363,12 +1421,14 @@ mod tests {
         let batch_digest = [0xab; 32];
         let mut first = recovery(1);
         first.batch = Some(crate::vote::VoteBatchRecovery {
+            delegation_van: None,
             digest: batch_digest,
             index: 0,
             size: 2,
         });
         let mut second = recovery(2);
         second.batch = Some(crate::vote::VoteBatchRecovery {
+            delegation_van: None,
             digest: batch_digest,
             index: 1,
             size: 2,
@@ -1583,12 +1643,14 @@ mod tests {
         });
         let mut first = recovery(1);
         first.batch = Some(crate::vote::VoteBatchRecovery {
+            delegation_van: None,
             digest: batch_digest,
             index: 0,
             size: 2,
         });
         let mut second = recovery(2);
         second.batch = Some(crate::vote::VoteBatchRecovery {
+            delegation_van: None,
             digest: batch_digest,
             index: 1,
             size: 2,
@@ -1671,3 +1733,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "generation/tests/combined.rs"]
+mod combined_tests;

@@ -130,11 +130,13 @@ pub(super) fn store_two_vote_batch(db: &VotingDb) -> [u8; 32] {
     )
     .unwrap();
     first.batch = Some(VoteBatchRecovery {
+        delegation_van: None,
         digest,
         index: 0,
         size: 2,
     });
     second.batch = Some(VoteBatchRecovery {
+        delegation_van: None,
         digest,
         index: 1,
         size: 2,

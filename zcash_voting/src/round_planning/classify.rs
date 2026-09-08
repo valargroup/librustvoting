@@ -476,8 +476,19 @@ pub(crate) fn classify(
     // prerequisite for a bundle that still has a vote to cast.
     let mut delegation_bundles = BTreeSet::new();
     for (&bundle_index, phase) in &delegation {
+        let combined = snapshot.votes.iter().any(|(&(bundle, _), vote)| {
+            bundle == bundle_index
+                && vote
+                    .recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.batch.as_ref())
+                    .is_some_and(|batch| batch.delegation_van.is_some())
+        });
+        if combined {
+            continue;
+        }
         match phase {
-            DelegationPhase::Confirmed => {}
+            DelegationPhase::Confirmed | DelegationPhase::Proved => {}
             DelegationPhase::Submitted | DelegationPhase::SubmissionManaged => {
                 let imported = snapshot
                     .bundles
@@ -497,7 +508,7 @@ pub(crate) fn classify(
                 });
             }
             DelegationPhase::SubmittedWithoutHash | DelegationPhase::SubmissionRejected => {}
-            DelegationPhase::Prepared | DelegationPhase::PcztBuilt | DelegationPhase::Proved => {
+            DelegationPhase::Prepared | DelegationPhase::PcztBuilt => {
                 if bundles_needing_delegation.contains(&bundle_index) {
                     delegation_bundles.insert(bundle_index);
                     obligations.push(Obligation::Delegate { bundle_index });

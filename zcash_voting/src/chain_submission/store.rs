@@ -102,9 +102,7 @@ impl StoreAdvancementRequest {
         identity: ChainSubmissionIdentity,
         ordered_proposal_ids: Vec<u32>,
     ) -> Result<Self, ChainSubmissionFailure> {
-        if !matches!(identity.target(), ChainSubmissionTarget::VoteBatch { .. })
-            || ordered_proposal_ids.is_empty()
-        {
+        if identity.target().batch_digest().is_none() || ordered_proposal_ids.is_empty() {
             return Err(ChainSubmissionFailure::without_state(
                 ChainSubmissionFailureKind::InvalidInput,
                 "vote-batch requests require a batch identity and a non-empty ordered proposal roster",
@@ -139,6 +137,23 @@ impl StoreAdvancementRequest {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if identity.target().is_combined() {
+            member_identities.push(
+                ChainSubmissionIdentity::new(
+                    identity.wallet_id(),
+                    identity.network(),
+                    *identity.vote_round_id(),
+                    identity.bundle_index(),
+                    ChainSubmissionTarget::Delegation,
+                )
+                .map_err(|error| {
+                    ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvalidInput,
+                        error.to_string(),
+                    )
+                })?,
+            );
+        }
         member_identities.sort_by_key(SubmissionOperationKey::from_identity);
         let original_len = member_identities.len();
         member_identities.dedup();
@@ -215,6 +230,7 @@ impl StoreAdvancementRequest {
             ) | (
                 SubmissionDerivationRequest::VoteBatch { .. },
                 ChainSubmissionTarget::VoteBatch { .. }
+                    | ChainSubmissionTarget::DelegateAndVoteBatch { .. }
             )
         );
         if valid {
@@ -608,6 +624,7 @@ pub(super) mod memory {
             if matches!(
                 derived.generation().identity().target(),
                 ChainSubmissionTarget::VoteBatch { .. }
+                    | ChainSubmissionTarget::DelegateAndVoteBatch { .. }
             ) {
                 state.batch_rosters.insert(
                     derived.generation().identity().clone(),
@@ -789,6 +806,7 @@ pub(super) mod memory {
                             successor.identity().target(),
                             ChainSubmissionTarget::Vote { .. }
                                 | ChainSubmissionTarget::VoteBatch { .. }
+                                | ChainSubmissionTarget::DelegateAndVoteBatch { .. }
                         )
                         && matches!(successor.state(), SubmissionRecordState::Confirmed(_))
                 })

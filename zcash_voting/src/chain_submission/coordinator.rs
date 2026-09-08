@@ -577,6 +577,22 @@ where
                     .submit_vote_with_dispatch(endpoint_index, submission, dispatch, observations)
                     .await
             }
+            ChainSubmissionRequest::DelegateAndVoteBatch(submission) => {
+                self.protocol
+                    .submit_delegate_and_vote_batch_with_dispatch(
+                        endpoint_index,
+                        submission,
+                        derived
+                            .generation()
+                            .identity()
+                            .target()
+                            .batch_digest()
+                            .expect("combined identity"),
+                        dispatch,
+                        observations,
+                    )
+                    .await
+            }
             ChainSubmissionRequest::VoteBatch(submission) => {
                 let super::ChainSubmissionTarget::VoteBatch {
                     ordered_batch_digest,

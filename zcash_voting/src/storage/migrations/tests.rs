@@ -4,7 +4,11 @@ use crate::VotingRoundParams;
 use rusqlite::OptionalExtension;
 
 fn pre_v8_schema() -> String {
-    include_str!("001_init.sql").replace("    note_identity_hashes_blob BLOB,\n", "")
+    include_str!("001_init.sql")
+        .split("-- Immutable public delegation authorization")
+        .next()
+        .unwrap()
+        .replace("    note_identity_hashes_blob BLOB,\n", "")
 }
 
 /// Strips the `pir_proof_cache` table (added at version 15) from a schema.
@@ -55,8 +59,17 @@ fn without_round_immediate_share(schema: &str) -> String {
     schema[..start].to_string()
 }
 
+fn v22_schema() -> String {
+    include_str!("001_init.sql")
+        .split("-- Immutable public delegation authorization")
+        .next()
+        .unwrap()
+        .replace(", 'delegate_and_cast_vote_batch'", "")
+        .replace(",'delegate_and_cast_vote_batch'", "")
+}
+
 fn v21_schema() -> String {
-    include_str!("001_init.sql").replace("    delegation_pczt     BLOB,\n", "")
+    v22_schema().replace("    delegation_pczt     BLOB,\n", "")
 }
 
 /// The complete version-19 schema: everything but the designation row.
@@ -218,7 +231,7 @@ fn v21_adds_pczt_storage_without_rewriting_delegation_state() {
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            22
+            CURRENT_VERSION
         );
     }
 }
@@ -907,7 +920,7 @@ fn v17_projectionless_proved_delegation_remains_fresh_work() {
         crate::phases::DelegationPhase::Proved
     );
     let plan = crate::session::resume_plan(&db, ROUND, &[1]).unwrap();
-    assert!(plan
+    assert!(!plan
         .next_steps
         .contains(&crate::session::NextStep::Delegate { bundle_index: 0 }));
 }
@@ -1696,4 +1709,92 @@ fn repairs_a_real_sidecar_named_by_the_environment() {
         .unwrap();
     assert_eq!(before, after, "every submission must survive the repair");
     migrate(&mut conn).expect("a repaired sidecar stays repaired");
+}
+
+#[test]
+fn v22_upgrades_combined_storage_to_the_fresh_schema() {
+    let mut upgraded = Connection::open_in_memory().unwrap();
+    upgraded.execute_batch(&v22_schema()).unwrap();
+    upgraded.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    queries::insert_round(
+        &upgraded,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    insert_v17_delegation_with_complete_setup(&upgraded, ROUND, "wallet", 0, None);
+    upgraded
+        .execute("UPDATE bundles SET delegation_pczt = X'010203'", [])
+        .unwrap();
+    upgraded
+        .execute(
+            "INSERT INTO chain_submissions
+         (identity_key, round_id, wallet_id, network, bundle_index, kind,
+          proposal_id, generation_digest, state, committed_post_reservations,
+          tracking_started_at, diagnostic_kind, diagnostic, created_at, updated_at)
+         VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 50, ?3,
+                 'recovering', 7, 8, 'ambiguous_dispatch', 'timeout', 9, 10)",
+            rusqlite::params![vec![0x41_u8; 32], ROUND, vec![0x42_u8; 32]],
+        )
+        .unwrap();
+    upgraded
+        .execute(
+            "INSERT INTO keystone_signatures
+         (round_id, wallet_id, bundle_index, sig, sighash, rk, created_at)
+         VALUES (?1, 'wallet', 0, ?2, ?3, ?4, 9)",
+            rusqlite::params![
+                ROUND,
+                vec![0x51_u8; 64],
+                vec![0x52_u8; 32],
+                vec![0x53_u8; 32]
+            ],
+        )
+        .unwrap();
+    let preserved_tables = [
+        "bundles",
+        "proofs",
+        "keystone_signatures",
+        "chain_submissions",
+    ];
+    let before = preserved_tables.map(|table| dump_table(&upgraded, table));
+    upgraded.pragma_update(None, "user_version", 22).unwrap();
+    migrate(&mut upgraded).unwrap();
+    migrate(&mut upgraded).unwrap();
+    for (table, rows) in preserved_tables.into_iter().zip(before) {
+        assert_eq!(
+            dump_table(&upgraded, table),
+            rows,
+            "{table} must survive migration"
+        );
+    }
+    let mut fresh = Connection::open_in_memory().unwrap();
+    migrate(&mut fresh).unwrap();
+    let columns = |connection: &Connection, table: &str| {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for table in ["chain_submissions", "delegate_cast_recovery"] {
+        assert_eq!(columns(&upgraded, table), columns(&fresh, table));
+    }
+    assert_eq!(
+        upgraded
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        CURRENT_VERSION
+    );
 }

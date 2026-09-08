@@ -112,6 +112,14 @@ pub struct VoteCommitmentWire {
     pub vote_auth_sig: String,
 }
 
+/// A delegation and its dependent cast batch in one atomic transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateAndVoteBatchWire {
+    pub delegation: DelegationSubmissionWire,
+    pub batch: VoteCommitmentBatchWire,
+}
+
 /// Canonical request body for an atomic cast-vote batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -959,6 +967,7 @@ pub enum RoundStepProgressKind {
     Delegation,
     TreeSynced,
     VoteCommit,
+    DelegateAndVoteBatchPersisted,
     HelperPlansPrepared,
     ChainOutcome,
     ShareOutcome,

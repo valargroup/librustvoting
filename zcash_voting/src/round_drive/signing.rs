@@ -36,7 +36,21 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
     obligations: &[Obligation],
     skipped: &[u32],
 ) -> Result<Vec<u32>, VotingError> {
-    let required = signer_bundles(obligations, skipped);
+    let mut required = signer_bundles(obligations, skipped);
+    for obligation in obligations {
+        if let Obligation::Cast { bundle_index, .. } = obligation {
+            if !skipped.contains(bundle_index)
+                && executor
+                    .database()
+                    .delegation_phase(round_id, *bundle_index)?
+                    != crate::phases::DelegationPhase::Confirmed
+            {
+                required.push(*bundle_index);
+            }
+        }
+    }
+    required.sort_unstable();
+    required.dedup();
     if required.is_empty() {
         return Ok(Vec::new());
     }
@@ -45,7 +59,10 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
     // so its vote and share work is not selected yet.
     let admitted: Vec<(u32, &RoundHostContext)> = dispatches
         .iter()
-        .filter(|(step, _)| selection::needs_delegation_signer(step))
+        .filter(|(step, _)| {
+            selection::needs_delegation_signer(step)
+                && required.contains(&selection::bundle_index(step))
+        })
         .map(|(step, context)| (selection::bundle_index(step), context))
         .collect();
     if admitted.is_empty() {
@@ -105,7 +122,7 @@ fn signer_bundles(obligations: &[Obligation], skipped: &[u32]) -> Vec<u32> {
     let mut bundles: Vec<u32> = obligations
         .iter()
         .filter_map(|obligation| match obligation {
-            Obligation::Delegate { bundle_index } => Some(*bundle_index),
+            Obligation::Delegate { .. } => None,
             Obligation::AdvanceDelegation {
                 bundle_index,
                 imported: false,

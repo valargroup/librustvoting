@@ -285,6 +285,33 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         .await
     }
 
+    pub(super) async fn submit_delegate_and_vote_batch_with_dispatch(
+        &self,
+        endpoint_index: usize,
+        submission: &crate::wire::DelegateAndVoteBatchWire,
+        expected_batch_digest: [u8; 32],
+        dispatch: ChainPostDispatch,
+        observations: &crate::ObservationScope,
+    ) -> PostAttemptOutcome {
+        let body = match submission.to_json() {
+            Ok(json) => json.into_bytes(),
+            Err(error) => {
+                return PostAttemptOutcome::LocalFailure(invalid_protocol(format!(
+                    "serialize combined request failed: {error}"
+                )))
+            }
+        };
+        self.post(
+            endpoint_index,
+            "delegate-and-cast-vote-batch",
+            body,
+            Some(expected_batch_digest),
+            dispatch,
+            observations,
+        )
+        .await
+    }
+
     async fn post(
         &self,
         endpoint_index: usize,

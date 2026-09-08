@@ -1765,3 +1765,64 @@ Public-lifecycle engine coverage is anchored by
 `public_vote_writers_reserve_before_validation_and_wait_on_contention`,
 `cancellation_during_final_dispatch_persists_hashless_recovery`, and
 `operation_epoch_change_during_final_dispatch_persists_hashless_recovery`.
+
+
+## Combined delegation and cast batches
+
+Fresh round execution uses `DelegateAndVoteBatch`, a distinct submission
+identity and generation. Its endpoint is
+`/shielded-vote/v1/delegate-and-cast-vote-batch`; the body contains `delegation`
+and `batch`. There is no endpoint fallback. An existing standalone or imported
+delegation continues through its original lifecycle.
+
+The initial VAN is the locally authenticated delegation output. Every nested
+cast uses anchor height zero and the synthetic predecessor witness. The cast
+authorization binds the round, initial VAN, action count, ordered effects and
+proposal IDs with `SVOTE_DELEGATE_AND_CAST_VOTE_BATCH_SIGHASH_V1`. The canonical
+encoding is defined only in `delegate_and_vote_batch/authorization.rs`; its frozen SDK
+vector is tested in `delegate_and_vote_batch/tests/authorization.rs`.
+
+The signed delegation authorization and all vote recoveries are persisted in
+one transaction. Preparation captures one wallet-scoped handle for both the
+delegation and the votes. Persistence requires the authorization and every
+vote to share the same wallet, round and bundle, even if their cryptographic
+material is identical. `combined_authorization_requires_the_same_wallet_round_and_bundle`
+and `combined_persistence_rejects_mixed_storage_scopes_before_writing` pin this
+boundary. `combined_authorization_refuses_a_wallet_switch_with_duplicate_setup`
+checks a wallet switch with byte-identical, validly signed delegation setups.
+Schema version 23 stores the authorization and its delegation
+generation digest. The version-22 upgrade preserves existing PCZTs, proofs,
+signatures and chain submission rows, and reopening is idempotent
+(`v22_upgrades_combined_storage_to_the_fresh_schema`). Recovery requires that
+generation to remain unchanged and never needs the delegation signing key. Ordinary batch identities refuse these
+recoveries. The persisted combined unit excludes standalone delegation
+admission, and fresh combined admission excludes any delegation submission
+evidence. Retiring an undispatched batch clears its authorization after its
+last member is cleared.
+
+A combined transaction has one reservation, candidate hash, retry history and
+terminal result. Confirmation must match the combined event, digest, complete
+ordered proposal/nullifier roster, final VAN and contiguous vote leaves. The
+initial delegation VAN is not a chain leaf. In one storage transaction,
+confirmation advances the bundle to the final successor VAN and records every
+vote position and the shared transaction hash. Tree recovery follows the same
+final-VAN-plus-vote-leaves layout and does not invent an initial VAN position.
+
+Conformance coverage: `combined_lifecycle_confirms_delegation_and_every_vote_together`
+checks 1, 2 and 50 members and replay; `ordinary_batch_identity_cannot_dispatch_combined_signatures`
+checks endpoint separation; `changed_delegation_generation_refuses_combined_recovery`
+checks delegation generation binding.
+
+`combined_confirmation_rejects_wrong_kind_partial_roster_and_wrong_layout`
+checks confirmation binding, and
+`a_combined_confirmation_storage_failure_rolls_back_every_projection` checks
+transactional rollback. `combined_authorization_and_envelope_survive_database_reopen`
+checks recovery without a live signer. The release-only
+`combined_batch_builds_real_proofs_and_binds_the_initial_delegation_van` builds
+two real ZKP2 proofs and checks their composite signatures and VAN binding.
+
+The crash harness follows the fresh combined order: delegation proof, terminal
+ballot, delegation signing, cast proofs, combined persistence, helper planning,
+and one combined POST. `AfterTreeSync` is excluded from this fresh matrix.
+`make recovery-conformance-unit` runs the harness's hermetic tests;
+`make recovery-conformance` remains the separate live staging matrix.

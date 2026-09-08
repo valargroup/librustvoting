@@ -21,7 +21,7 @@ fn blocked(obligations: &[Obligation]) -> Vec<(u32, BlockedReason)> {
 #[test]
 fn an_open_proposal_blocks_the_cast_but_still_plans_the_delegation_prerequisite() {
     let snapshot = snapshot()
-        .bundle(0, DelegationPhase::Proved)
+        .bundle(0, DelegationPhase::Prepared)
         .intent(1, Decision::Choice(0))
         .build();
     let obligations = classify_round(&snapshot, &[1, 2]).unwrap();
@@ -127,7 +127,7 @@ fn every_draft_of_a_bundle_is_one_cast_obligation_with_its_delegation_prerequisi
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(casts, vec![(0, 2, Some(0)), (1, 2, None)]);
+    assert_eq!(casts, vec![(0, 2, None), (1, 2, None)]);
 }
 
 #[test]

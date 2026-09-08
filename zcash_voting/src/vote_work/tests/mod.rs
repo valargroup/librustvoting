@@ -99,6 +99,7 @@ mod ballot_intents;
 mod binding;
 mod cancellation;
 mod casting;
+mod combined;
 mod delegation_driver;
 mod delivery_progress;
 mod fixtures;

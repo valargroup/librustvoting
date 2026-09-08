@@ -2007,7 +2007,7 @@ pub(crate) struct VoteRowState {
 pub(crate) struct VotePreparationState {
     pub network: Network,
     pub zkp2: Zkp2DelegationData,
-    pub van_position: u32,
+    pub van_position: Option<u32>,
     /// `(skipped, choice)` from `ballot_intent`, if present.
     pub ballot_intent: Option<(bool, Option<u32>)>,
     pub vote: Option<VoteRowState>,
@@ -2110,7 +2110,13 @@ pub(crate) fn load_vote_preparation_state(
 ) -> Result<VotePreparationState, VotingError> {
     let network = load_round_network(conn, round_id, wallet_id)?;
     let zkp2 = load_zkp2_inputs(conn, round_id, wallet_id, bundle_index)?;
-    let van_position = load_van_position(conn, round_id, wallet_id, bundle_index)?;
+    let van_position = load_optional_van_position_u64(conn, round_id, wallet_id, bundle_index)?
+        .map(|position| {
+            u32::try_from(position).map_err(|_| VotingError::InvalidInput {
+                message: "VAN position exceeds circuit range".to_string(),
+            })
+        })
+        .transpose()?;
     let ballot_intent = conn
         .query_row(
             "SELECT skipped, choice FROM ballot_intent
@@ -2365,7 +2371,7 @@ pub(crate) fn load_van_tree_entries(
                         WHERE cs.round_id = b.round_id
                           AND cs.wallet_id = b.wallet_id
                           AND cs.bundle_index = b.bundle_index
-                          AND cs.kind IN ('vote', 'vote_batch')
+                          AND cs.kind IN ('vote', 'vote_batch', 'delegate_and_cast_vote_batch')
                           AND cs.state != 'rejected'
                     ))
              FROM bundles b

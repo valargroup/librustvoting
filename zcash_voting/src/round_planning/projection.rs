@@ -187,7 +187,30 @@ pub(crate) fn project(
         &steps,
     )?;
 
-    let work_summary = summarize_plan_work(&steps, blocking_share_work);
+    let mut work_summary = summarize_plan_work(&steps, blocking_share_work);
+    for step in &steps {
+        if let NextStep::CastVote { bundle_index, .. } = step {
+            if delegation
+                .get(bundle_index)
+                .is_some_and(|phase| *phase != DelegationPhase::Confirmed)
+            {
+                work_summary
+                    .delegation_bundles_needing_signing
+                    .push(*bundle_index);
+                work_summary
+                    .delegation_bundles_needing_work
+                    .push(*bundle_index);
+            }
+        }
+    }
+    work_summary
+        .delegation_bundles_needing_signing
+        .sort_unstable();
+    work_summary.delegation_bundles_needing_signing.dedup();
+    work_summary.delegation_bundles_needing_work.sort_unstable();
+    work_summary.delegation_bundles_needing_work.dedup();
+    work_summary.needs_delegation_signing =
+        !work_summary.delegation_bundles_needing_signing.is_empty();
 
     let has_unconfirmed_shares = snapshot.shares.iter().any(|share| !share.confirmed);
 
@@ -810,11 +833,7 @@ pub(crate) fn summarize_plan_work(
     for step in steps {
         match step {
             NextStep::Delegate { bundle_index, .. } => {
-                summary.needs_delegation_signing = true;
                 needing_work.insert(*bundle_index);
-                // Nothing is on the chain for this bundle yet, so producing a
-                // delegation needs the voter's signature.
-                needing_signing.insert(*bundle_index);
             }
             NextStep::AdvanceDelegation { bundle_index, .. } => {
                 summary.needs_delegation_signing = true;

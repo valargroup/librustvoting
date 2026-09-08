@@ -2113,10 +2113,10 @@ impl VotingDb {
         })?;
         drop(conn);
 
-        if van_position != state.van_position {
+        if Some(van_position) != state.van_position {
             return Err(VotingError::InvalidInput {
                 message: format!(
-                    "VAN witness position {van_position} does not match current bundle position {} for round={round_id}, bundle={bundle_index}",
+                    "VAN witness position {van_position} does not match current bundle position {:?} for round={round_id}, bundle={bundle_index}",
                     state.van_position
                 ),
             });

@@ -323,6 +323,7 @@ async fn atomic_round_delivery_attributes_every_proposal_share_and_retry() {
     .unwrap();
     for (index, recovery) in recoveries.iter_mut().enumerate() {
         recovery.batch = Some(crate::vote::VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: index as u32,
             size: 2,

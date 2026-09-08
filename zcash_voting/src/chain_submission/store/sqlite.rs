@@ -237,6 +237,13 @@ fn insert_fresh(
         ChainSubmissionTarget::VoteBatch {
             ordered_batch_digest,
         } => ("vote_batch", None, Some(ordered_batch_digest.to_vec())),
+        ChainSubmissionTarget::DelegateAndVoteBatch {
+            ordered_batch_digest,
+        } => (
+            "delegate_and_cast_vote_batch",
+            None,
+            Some(ordered_batch_digest.to_vec()),
+        ),
     };
     tx.execute(
         "INSERT INTO chain_submissions
@@ -450,6 +457,24 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                 }
                 return Ok(StoreAdmission::Ready { derived: Box::new(derived), record, fresh_reservation: false });
             }
+            if request.identity().target().is_combined() {
+                let occupied: bool = tx.query_row(
+                    "SELECT b.delegation_tx_hash IS NOT NULL OR b.van_leaf_position IS NOT NULL OR EXISTS(
+                       SELECT 1 FROM chain_submissions s WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id AND s.bundle_index=b.bundle_index)
+                     FROM bundles b WHERE b.round_id=?1 AND b.wallet_id=?2 AND b.bundle_index=?3",
+                    rusqlite::params![hex::encode(request.identity().vote_round_id()), request.identity().wallet_id(), request.identity().bundle_index()],
+                    |row| row.get(0),
+                ).map_err(storage_error)?;
+                if occupied { return Err(ChainSubmissionFailure::without_state(ChainSubmissionFailureKind::InvalidInput, "combined admission requires a fresh delegation")); }
+            }
+            if matches!(request.identity().target(), ChainSubmissionTarget::Delegation) {
+                let combined: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM delegate_cast_recovery WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3)",
+                    rusqlite::params![hex::encode(request.identity().vote_round_id()), request.identity().wallet_id(), request.identity().bundle_index()],
+                    |row| row.get(0),
+                ).map_err(storage_error)?;
+                if combined { return Err(ChainSubmissionFailure::without_state(ChainSubmissionFailureKind::InvalidInput, "persisted combined recovery owns this delegation")); }
+            }
             let predecessor: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM chain_submissions WHERE wallet_id=:wallet AND network=:network
                   AND round_id=:round AND bundle_index=:bundle
@@ -466,7 +491,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                 let superseded: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM chain_submissions WHERE wallet_id=:wallet AND network=:network
                       AND round_id=:round AND bundle_index=:bundle
-                      AND kind IN ('vote','vote_batch') AND state='confirmed')",
+                      AND kind IN ('vote','vote_batch','delegate_and_cast_vote_batch') AND state='confirmed')",
                     named_params! { ":wallet": request.identity().wallet_id(), ":network": network_name(request.identity().network()),
                         ":round": hex::encode(request.identity().vote_round_id()), ":bundle": request.identity().bundle_index() },
                     |row| row.get(0),

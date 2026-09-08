@@ -75,6 +75,9 @@ impl SubmissionOperationKey {
             ChainSubmissionTarget::VoteBatch {
                 ordered_batch_digest,
             } => (2, ordered_batch_digest.to_vec()),
+            ChainSubmissionTarget::DelegateAndVoteBatch {
+                ordered_batch_digest,
+            } => (3, ordered_batch_digest.to_vec()),
         };
         Self {
             bundle: BundleOperationKey {

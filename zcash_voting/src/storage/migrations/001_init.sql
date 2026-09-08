@@ -204,7 +204,7 @@ CREATE TABLE chain_submissions (
     wallet_id                    TEXT NOT NULL DEFAULT '',
     network                      TEXT NOT NULL CHECK (network IN ('mainnet','testnet','regtest')),
     bundle_index                 INTEGER NOT NULL CHECK (bundle_index BETWEEN 0 AND 4294967295),
-    kind                         TEXT NOT NULL CHECK (kind IN ('delegation','vote','vote_batch')),
+    kind                         TEXT NOT NULL CHECK (kind IN ('delegation','vote','vote_batch','delegate_and_cast_vote_batch')),
     proposal_id                  INTEGER,
     ordered_batch_digest         BLOB,
     generation_digest            BLOB NOT NULL CHECK (length(generation_digest) = 32),
@@ -224,7 +224,7 @@ CREATE TABLE chain_submissions (
     CHECK (length(identity_key) >= 32),
     CHECK ((kind = 'delegation' AND proposal_id IS NULL AND ordered_batch_digest IS NULL)
         OR (kind = 'vote' AND proposal_id BETWEEN 1 AND 50 AND ordered_batch_digest IS NULL)
-        OR (kind = 'vote_batch' AND proposal_id IS NULL AND length(ordered_batch_digest) = 32)),
+        OR (kind IN ('vote_batch','delegate_and_cast_vote_batch') AND proposal_id IS NULL AND length(ordered_batch_digest) = 32)),
     CHECK (candidate_transaction_hash IS NULL OR length(candidate_transaction_hash) = 32),
     CHECK (confirmed_transaction_hash IS NULL OR length(confirmed_transaction_hash) = 32),
     CHECK ((state = 'submitting' AND candidate_transaction_hash IS NULL AND tracking_started_at IS NULL)
@@ -314,3 +314,17 @@ BEGIN
      WHERE round_id = NEW.round_id AND wallet_id = NEW.wallet_id
        AND bundle_index = NEW.bundle_index AND proposal_id = NEW.proposal_id;
 END;
+
+-- Immutable public delegation authorization; private setup remains in bundles/proofs.
+CREATE TABLE delegate_cast_recovery (
+    round_id TEXT NOT NULL,
+    wallet_id TEXT NOT NULL,
+    bundle_index INTEGER NOT NULL,
+    batch_digest BLOB NOT NULL CHECK(length(batch_digest) = 32),
+    delegation_generation_digest BLOB NOT NULL CHECK(length(delegation_generation_digest) = 32),
+    spend_auth_signature BLOB NOT NULL CHECK(length(spend_auth_signature) = 64),
+    PRIMARY KEY(round_id, wallet_id, bundle_index, batch_digest),
+    FOREIGN KEY(round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE
+);
+CREATE TRIGGER delegate_cast_recovery_immutable BEFORE UPDATE ON delegate_cast_recovery
+BEGIN SELECT RAISE(ABORT, 'combined delegation authorization is immutable'); END;
