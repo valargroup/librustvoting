@@ -17,16 +17,25 @@ pub enum ShareTrackingQuiescence {
     /// The round's vote end passed. Recovery closes there, so no later pass
     /// could resubmit or confirm anything.
     VoteEndReached,
-    /// The host cancelled, or moved to another operation epoch. Durable
-    /// effects already made are in the report.
+    /// The host cancelled, moved to another operation epoch, or switched the
+    /// wallet the sidecar is scoped to. Durable effects already made are in
+    /// the report.
+    ///
+    /// All three say the same thing: the run's subject is no longer what it
+    /// was admitted for. A host need not tell them apart.
     Cancelled,
-    /// Another run is already driving this round's shares, so this one did
+    /// A live run is already driving this round's shares, so this one did
     /// nothing.
     ///
     /// Not a failure: the work this run was started for is in flight, and the
     /// run that holds the round reports it. A host that needs the outcome
     /// should read the holder's report rather than retry, and a host that
     /// starts runs on lifecycle events can ignore this entirely.
+    ///
+    /// A run *departing* — cancelled, and unwinding — does not produce this in
+    /// its replacement: a caller waits briefly for the round to be released
+    /// first, so cancelling a run and starting another does not leave the
+    /// round undriven.
     AlreadyDriving,
     /// Passes kept failing. The shares are untouched and a later run may still
     /// succeed, so this is a reason to back off and surface state, not a

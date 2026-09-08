@@ -162,15 +162,17 @@ impl<'a> ShareTrackingDriver<'a> {
     /// passes, during the wait, or inside a pass, which observes the same
     /// signal through its cancel callback.
     ///
-    /// A round admits one run. Starting a second while the first is in flight
-    /// returns [`ShareTrackingQuiescence::AlreadyDriving`] immediately without
-    /// polling anything, because the work it was started for is already being
-    /// done and two interleaved runs would only double the round's helper
-    /// traffic. Admission is released when this future completes or is
-    /// dropped, so a host that cancels a run and starts another for the same
-    /// round should await the cancelled one first — cancellation is observed
-    /// promptly, but the round is held until the run it belongs to actually
-    /// returns.
+    /// A round admits one run. Starting a second while the first is *live*
+    /// returns [`ShareTrackingQuiescence::AlreadyDriving`] without polling
+    /// anything, because the work it was started for is already being done and
+    /// two interleaved runs would only double the round's helper traffic.
+    ///
+    /// A second run started while the first is on its way out takes the round
+    /// over instead: admission is released when this future completes or is
+    /// dropped, and a caller waits briefly for that before concluding a run is
+    /// live. That is what lets a host cancel a run and start its replacement
+    /// without the round falling between them — though awaiting the cancelled
+    /// run first removes the question entirely.
     pub async fn run(
         &self,
         host: &dyn ShareTrackingHostSource,
