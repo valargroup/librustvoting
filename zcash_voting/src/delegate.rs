@@ -1101,6 +1101,9 @@ impl PreparedDelegationBundle {
     /// background proof generation or restart. Legacy setup without its original
     /// PCZT returns [`VotingError::DelegationPcztUnavailable`]. Concurrent setup
     /// can return [`VotingError::Busy`]; retry after the setup lease is released.
+    /// A stored setup for another hotkey returns
+    /// [`VotingError::DelegationTargetMismatch`]. Request creation preserves it;
+    /// call [`Self::setup`] to explicitly replace an unusable unbroadcast setup.
     pub fn keystone_request(
         &self,
         voting_db: &VotingDb,
