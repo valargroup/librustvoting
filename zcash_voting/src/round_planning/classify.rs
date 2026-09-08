@@ -136,6 +136,14 @@ pub(crate) struct RoundObligations {
     /// The round holds a ballot choice but no bundle rows, so the host must
     /// persist the bundle plan before any vote work can be planned.
     pub(crate) needs_bundle_setup: bool,
+    /// Rostered proposals that still owe a cast this pass could not plan:
+    /// the ballot is not yet terminal, the bundle is held by a vote already
+    /// on the wire, or the round has no bundle rows at all.
+    ///
+    /// They own no obligation, so nothing else names them. A progress measure
+    /// that reads completion as "no obligation covers it" needs them to tell
+    /// a finished choice from one whose cast has not been planned yet.
+    pub(crate) withheld_casts: BTreeSet<u32>,
 }
 
 /// Classifies `units` against `ballot` (the roster and intents already
@@ -317,6 +325,7 @@ pub(crate) fn classify(
     let mut bundles_needing_delegation = BTreeSet::new();
     let mut drafts: BTreeMap<u32, Vec<CastDraft>> = BTreeMap::new();
     let mut blocked: BTreeSet<u32> = BTreeSet::new();
+    let mut withheld_casts: BTreeSet<u32> = BTreeSet::new();
     for &proposal_id in &choice_proposals {
         let intent_choice = match intents.get(&proposal_id) {
             Some(Decision::Choice(choice)) => *choice,
@@ -336,6 +345,7 @@ pub(crate) fn classify(
             };
             if cast_due {
                 if held_bundles.contains(&bundle_index) {
+                    withheld_casts.insert(proposal_id);
                     continue;
                 }
                 // Delegation is a prerequisite either way, so it is still
@@ -348,6 +358,7 @@ pub(crate) fn classify(
                     });
                 } else {
                     blocked.insert(bundle_index);
+                    withheld_casts.insert(proposal_id);
                 }
                 continue;
             }
@@ -529,6 +540,7 @@ pub(crate) fn classify(
         unrostered_intents,
         stale_vote_keys,
         needs_bundle_setup: false,
+        withheld_casts,
     })
 }
 

@@ -622,7 +622,16 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   is dispatched; malformed stored material remains an executor failure.
 - **Progress is exact, and measured against a baseline the host selects.** A
   proposal is complete when no `Cast` and no `ReconcileChain` obligation covers
-  it. Obligation membership names every member of an atomic batch, which a host
+  it **and it is not one of the plan's `withheld_casts`** — the rostered choices
+  that still owe a cast this pass could not draw up, because the ballot is not
+  yet terminal, the bundle is held by a vote already on the wire, or the round
+  has no bundle rows at all. Those choices own no obligation, so absence alone
+  does not mean done: a ballot recorded before bundle setup — the supported
+  ordering — would otherwise read as fully complete beside a `NeedsBundleSetup`
+  quiescence and no vote at all
+  (`a_ballot_recorded_before_bundle_setup_completes_nothing`,
+  `a_withheld_cast_is_not_a_completed_ballot_question`). Obligation membership
+  names every member of an atomic batch, which a host
   counting `NextStep`s cannot see: a batch projects to one `AdvanceVoteBatch`
   carrying only its first member's id, so a host counting steps reads a
   six-proposal batch as one question.
@@ -642,6 +651,9 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
     reports a total of two.
   - `ProgressBaseline::Ballot` counts every proposal the durable ballot recorded
     a `Decision::Choice` for, read from `RoundObligations::choice_proposals`.
+    It is the baseline that can hold a choice no obligation names, which is why
+    completion reads `withheld_casts`; a run baseline holds only what its first
+    plan already owed.
     Skipped proposals are excluded: a skip is terminal and owes no vote work, so
     counting one would leave a host label permanently short of its total on a
     ballot that is in fact complete. The same resume reports the whole ballot,
@@ -804,6 +816,11 @@ Conformance is demonstrated by behavior. Tests cover:
   `a_skipped_proposal_is_not_a_ballot_question`,
   `selecting_a_baseline_does_not_disturb_a_ballot_both_agree_on`,
   `the_default_baseline_is_the_run_so_existing_hosts_are_unchanged`);
+- a choice whose cast the plan could not draw up counts as owed, not as done,
+  both for a ballot recorded before bundle setup and for a cast withheld while
+  the ballot is open
+  (`a_ballot_recorded_before_bundle_setup_completes_nothing`,
+  `a_withheld_cast_is_not_a_completed_ballot_question`);
 - a share a helper accepted or may hold is left to the host's background
   tracking, and neither can outrank a later share the foreground can deliver
   (`a_share_a_helper_already_holds_is_left_to_background_tracking`,

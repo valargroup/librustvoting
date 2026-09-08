@@ -94,6 +94,9 @@ pub(crate) fn classify_round(
     // named, rather than failing every later `plan` call with an opaque
     // error.
     if !ballot.choice_proposals.is_empty() && snapshot.delegations.is_empty() {
+        // No bundle exists to cast into, so every recorded choice still owes a
+        // cast nothing can plan yet.
+        let withheld_casts = ballot.choice_proposals.iter().copied().collect();
         return Ok(RoundObligations {
             obligations: Vec::new(),
             choice_proposals: ballot.choice_proposals,
@@ -101,6 +104,7 @@ pub(crate) fn classify_round(
             unrostered_intents: ballot.unrostered_intents,
             stale_vote_keys: Default::default(),
             needs_bundle_setup: true,
+            withheld_casts,
         });
     }
     let units = group_vote_units(snapshot, &snapshot.intents)?;

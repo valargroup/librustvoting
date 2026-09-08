@@ -7,7 +7,9 @@ use crate::round_planning::{Obligation, RoundObligations};
 /// How much of the vote work the driver is measuring against is done.
 ///
 /// A proposal is complete once no `Cast` and no `ReconcileChain` obligation
-/// covers it any more. What the total counts is the host's choice, made by
+/// covers it any more and none of the round's choices is still waiting on a
+/// cast the plan could not draw up. What the total counts is the host's
+/// choice, made by
 /// [`ProgressBaseline`](super::ProgressBaseline):
 ///
 /// - `Run` (the default) is **run-relative**: the total is the vote work the
@@ -72,6 +74,11 @@ impl BallotBaseline {
     /// roster proposals with a durable `Choice`. A skip is terminal and owes no
     /// vote work, so counting one would leave the label permanently short of
     /// its total on a ballot that is in fact complete.
+    ///
+    /// Unlike a run baseline, this total holds choices no obligation names:
+    /// a ballot the host recorded before bundle setup, and a cast withheld
+    /// while the ballot is open, own nothing in the plan. `tally` reads
+    /// `withheld_casts` so those count as owed rather than as done.
     pub(super) fn for_ballot(obligations: &RoundObligations) -> Self {
         Self {
             proposals: obligations.choice_proposals.iter().copied().collect(),
@@ -79,12 +86,21 @@ impl BallotBaseline {
     }
 
     /// Measures `obligations` against the baseline.
+    ///
+    /// A proposal is complete only when it is neither covered by a vote
+    /// obligation nor among the casts this plan could not draw up. Absence
+    /// alone does not mean done: a round awaiting bundle setup, and a bundle
+    /// whose cast is withheld while the ballot is open, plan no `Cast` for a
+    /// choice that no vote has landed for.
     pub(super) fn tally(&self, obligations: &RoundObligations) -> RoundWorkTally {
         let still_covered = covered_proposals(obligations);
         let completed = self
             .proposals
             .iter()
-            .filter(|proposal_id| !still_covered.contains(proposal_id))
+            .filter(|proposal_id| {
+                !still_covered.contains(proposal_id)
+                    && !obligations.withheld_casts.contains(proposal_id)
+            })
             .count();
         RoundWorkTally {
             completed_proposals: completed as u32,

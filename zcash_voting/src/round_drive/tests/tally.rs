@@ -65,6 +65,16 @@ fn batch_obligations(
     choices: &[u32],
     still_owed: &[u32],
 ) -> crate::round_planning::RoundObligations {
+    batch_obligations_withholding(choices, still_owed, &[])
+}
+
+/// The same, with `withheld` naming choices whose cast the plan could not draw
+/// up: an open ballot withholds them, and they own no obligation of their own.
+fn batch_obligations_withholding(
+    choices: &[u32],
+    still_owed: &[u32],
+    withheld: &[u32],
+) -> crate::round_planning::RoundObligations {
     let obligations = if still_owed.is_empty() {
         Vec::new()
     } else {
@@ -87,6 +97,7 @@ fn batch_obligations(
         unrostered_intents: Vec::new(),
         stale_vote_keys: Default::default(),
         needs_bundle_setup: false,
+        withheld_casts: withheld.iter().copied().collect(),
     }
 }
 
@@ -146,6 +157,7 @@ fn a_retire_is_not_work_the_tally_reports_as_owed() {
         unrostered_intents: Vec::new(),
         stale_vote_keys: Default::default(),
         needs_bundle_setup: false,
+        withheld_casts: Default::default(),
     };
 
     let tally = BallotBaseline::capture(&obligations).tally(&obligations);
@@ -183,6 +195,70 @@ fn the_ballot_baseline_counts_every_member_of_an_atomic_batch() {
 
     let landed = baseline.tally(&batch_obligations(&[1, 2, 3], &[]));
     assert_eq!((landed.completed_proposals, landed.total_proposals), (3, 3));
+}
+
+#[test]
+fn a_withheld_cast_is_not_a_completed_ballot_question() {
+    // Proposal 3 is chosen but its cast is withheld while the ballot is open,
+    // so no obligation names it. Reading completion as "no obligation covers
+    // it" would report a finished ballot for a round that has not cast a vote
+    // for that choice; proposal 1 has genuinely landed and still counts.
+    let partly_cast = batch_obligations_withholding(&[1, 2, 3], &[2], &[3]);
+    let baseline = BallotBaseline::for_ballot(&partly_cast);
+
+    let owed = baseline.tally(&partly_cast);
+    assert_eq!((owed.completed_proposals, owed.total_proposals), (1, 3));
+
+    // The voter resolves the ballot: the withheld cast becomes owed work, and
+    // the count does not go backwards past what already landed.
+    let unblocked = batch_obligations(&[1, 2, 3], &[2, 3]);
+    let resolved = baseline.tally(&unblocked);
+    assert_eq!(
+        (resolved.completed_proposals, resolved.total_proposals),
+        (1, 3)
+    );
+
+    let done = baseline.tally(&batch_obligations(&[1, 2, 3], &[]));
+    assert_eq!((done.completed_proposals, done.total_proposals), (3, 3));
+}
+
+#[tokio::test]
+async fn a_ballot_recorded_before_bundle_setup_completes_nothing() {
+    // Choices persisted first is the supported ordering, and it plans no vote
+    // work at all: the run stops with `NeedsBundleSetup`. The ballot total is
+    // the choices the voter made, and none of them is complete.
+    let executor = executor_over(database_without_bundles());
+    executor
+        .set_ballot_intents(&[
+            BallotIntent {
+                proposal_id: 1,
+                decision: Decision::Choice(0),
+            },
+            BallotIntent {
+                proposal_id: 2,
+                decision: Decision::Choice(1),
+            },
+        ])
+        .unwrap();
+    let control = ChainSubmissionControl::new(1);
+    let events = RecordingReporter::default();
+    let report = RoundDriver::new(&executor)
+        .with_policy(RoundDrivePolicy {
+            progress_baseline: ProgressBaseline::Ballot,
+            ..RoundDrivePolicy::default()
+        })
+        .run(&FixedHost, &control, &events)
+        .await;
+
+    assert!(matches!(
+        report.quiescence,
+        RoundQuiescence::NeedsBundleSetup
+    ));
+    assert_eq!(report.tally.total_proposals, 2);
+    assert_eq!(
+        report.tally.completed_proposals, 0,
+        "no bundle exists to have cast either choice into"
+    );
 }
 
 #[tokio::test]
