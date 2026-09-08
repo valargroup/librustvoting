@@ -104,7 +104,7 @@ async fn a_share_that_never_becomes_pollable_stops_at_the_pass_budget() {
         &host,
         &control,
         ShareTrackingDrivePolicy {
-            max_passes: 3,
+            max_passes: Some(3),
             ..ShareTrackingDrivePolicy::default()
         },
     )
@@ -123,6 +123,42 @@ async fn a_share_that_never_becomes_pollable_stops_at_the_pass_budget() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_default_run_is_bounded_by_vote_end_rather_than_a_pass_count() {
+    // A share that keeps looking pollable produces a pass per poll interval,
+    // so a pass budget is a duration in disguise — and a generous-looking one
+    // expires hours into a voting window that can last days, stopping
+    // confirmation and recovery with nothing to restart it. The default policy
+    // sets none, and vote end is what ends the run.
+    let db = db_with_pending_share(60);
+    let host = ScriptedHost::scripted(vec![
+        ShareTrackingHostContext {
+            configured_helper_urls: fleet(),
+            now_seconds: NOW,
+            vote_end_time_seconds: Some(VOTE_END),
+        },
+        ShareTrackingHostContext {
+            configured_helper_urls: fleet(),
+            now_seconds: NOW,
+            vote_end_time_seconds: Some(VOTE_END),
+        },
+        ShareTrackingHostContext {
+            configured_helper_urls: fleet(),
+            now_seconds: NOW,
+            vote_end_time_seconds: Some(NOW - 1),
+        },
+    ]);
+    let control = ChainSubmissionControl::new(1);
+
+    let (report, _) = drive(&db, &host, &control, ShareTrackingDrivePolicy::default()).await;
+
+    assert_eq!(report.quiescence, ShareTrackingQuiescence::VoteEndReached);
+    assert_eq!(
+        report.passes, 2,
+        "the run kept polling until the window closed, not until a budget did",
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_zero_budget_stops_without_polling() {
     let db = db_with_pending_share(60);
     let host = ScriptedHost::fixed(Some(VOTE_END));
@@ -133,7 +169,7 @@ async fn a_zero_budget_stops_without_polling() {
         &host,
         &control,
         ShareTrackingDrivePolicy {
-            max_passes: 0,
+            max_passes: Some(0),
             ..ShareTrackingDrivePolicy::default()
         },
     )

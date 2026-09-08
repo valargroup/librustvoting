@@ -6,6 +6,9 @@
 //! failing pass. They reach no network — a share whose status check is still
 //! in the future gives a real multi-pass run with nothing to poll.
 
+mod admission;
 mod fixtures;
 mod pacing;
+mod partial_progress;
 mod stopping;
+mod window;

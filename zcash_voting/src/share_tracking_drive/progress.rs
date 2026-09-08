@@ -20,9 +20,17 @@ pub enum ShareTrackingEvent {
         pass: u32,
         report: Box<ShareTrackingReport>,
     },
-    /// A pass returned an error. Nothing durable is implied either way: the
-    /// pass writes as it goes, so earlier shares in it may have advanced.
-    PassFailed { pass: u32, message: String },
+    /// A pass returned an error, with what it had already committed.
+    ///
+    /// A pass writes as it walks, so a failure means the walk stopped, not
+    /// that nothing happened. `partial` carries the confirmations and recovery
+    /// attempts it did make; its `unrecoverable` and `next_delay_seconds` are
+    /// meaningless, because the walk did not reach every share.
+    PassFailed {
+        pass: u32,
+        message: String,
+        partial: Box<ShareTrackingReport>,
+    },
     /// The driver is waiting before the next pass. `delay` is the pass's own
     /// computed delay, or the policy's failure retry after a failed pass.
     AwaitingNextPass { delay: Duration },

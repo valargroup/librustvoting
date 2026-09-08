@@ -17,7 +17,7 @@ async fn the_wait_between_passes_is_the_one_the_pass_computed() {
         &host,
         &control,
         ShareTrackingDrivePolicy {
-            max_passes: 2,
+            max_passes: Some(2),
             ..ShareTrackingDrivePolicy::default()
         },
     )
@@ -48,7 +48,7 @@ async fn a_pass_close_to_its_check_waits_only_until_then() {
         &host,
         &control,
         ShareTrackingDrivePolicy {
-            max_passes: 2,
+            max_passes: Some(2),
             ..ShareTrackingDrivePolicy::default()
         },
     )
@@ -75,7 +75,7 @@ async fn the_host_context_is_read_once_per_pass() {
         &host,
         &control,
         ShareTrackingDrivePolicy {
-            max_passes: 3,
+            max_passes: Some(3),
             ..ShareTrackingDrivePolicy::default()
         },
     )
@@ -147,5 +147,9 @@ fn the_default_policy_is_the_cadence_the_host_was_driving_by_hand() {
         "about an hour of retries at the failure delay, so a helper outage \
          does not abandon a round's shares",
     );
-    assert_eq!(policy.max_passes, 1024);
+    assert_eq!(
+        policy.max_passes, None,
+        "vote end bounds a healthy run; a pass count cannot be turned into a \
+         duration, so any budget expires inside a multi-day voting window",
+    );
 }

@@ -131,7 +131,15 @@ This release is `zcash_voting` 4.0.0.
   from the share rows the previous one wrote. `ShareTrackingQuiescence` is
   exhaustive over why a run stopped, so a host acts on it rather than
   re-reading share rows: `NothingToTrack`, `AllConfirmed`, `VoteEndReached`,
-  `Cancelled`, `Failing`, and `PassBudgetExhausted`. Cancellation and an
+  `Cancelled`, `AlreadyDriving`, `Failing`, and `PassBudgetExhausted`. A round
+  admits one run: a second started while the first is in flight stops at once
+  with `AlreadyDriving` rather than doubling the round's helper traffic. Vote
+  end is what bounds a healthy run — every wait is shortened to what is left of
+  the window, and `max_passes` is `None` by default, because a pass count is
+  not a duration and any budget expires inside a multi-day voting window. A
+  failed pass hands back what it had already committed, so a run's report and
+  its `PassFailed` event keep durable progress no later pass could rediscover.
+  Cancellation and an
   operation-epoch change are observed between passes, during the wait, and
   inside a pass through its cancel callback, and the wait is woken by the
   control rather than polled, so a wait that spans the hours until a delayed

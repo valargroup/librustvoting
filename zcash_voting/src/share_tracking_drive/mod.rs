@@ -9,7 +9,7 @@
 //!
 //! It is the share-side counterpart of [`round_drive`](crate::round_drive),
 //! and deliberately mirrors its shape — a policy, a host source read once per
-//! pass, a synchronous reporter, and one report carrying a quiescence. Two
+//! pass, a synchronous reporter, and one report carrying a quiescence. Three
 //! differences are worth stating, because they are structural rather than
 //! incidental:
 //!
@@ -18,10 +18,15 @@
 //!   overlapping two would have them contend for the same share locks and
 //!   re-poll helpers that were just answered.
 //! - **The cadence belongs to the pass, not the driver.** The delay comes from
-//!   the durable share rows under the timing policy, already capped at vote
-//!   end. The driver supplies a wait of its own only after a failed pass,
-//!   which computed none.
+//!   the durable share rows under the timing policy. The driver supplies a
+//!   wait of its own only after a failed pass, which computed none, and
+//!   shortens either to what is left of the round — the boundary is the one
+//!   thing about timing the pass does not know.
+//! - **A round admits one run.** Lifecycle events overlap, and two runs over
+//!   one round would double its helper traffic while breaking the sequencing
+//!   above.
 
+mod admission;
 mod policy;
 mod progress;
 mod quiescence;
@@ -43,8 +48,10 @@ use crate::{
     helper::client::HelperClient,
     round::VotingDb,
     round_drive::sleep_until_interrupted,
+    share::ShareOperationScope,
     share_tracking::{
-        track_pending_shares, ResubmittedShare, ShareKey, ShareTrackingParams, ShareTrackingReport,
+        track_pending_shares_recording_partial, ResubmittedShare, ShareKey, ShareTrackingParams,
+        ShareTrackingReport,
     },
     ChainSubmissionControl,
 };
@@ -96,7 +103,12 @@ where
 /// A run always produces a report: a failing pass is recorded rather than
 /// returned, so a run that made durable progress before failing still reports
 /// it.
+///
+/// Non-exhaustive, like [`RoundRunReport`](crate::round_drive::RoundRunReport):
+/// a run reports what it observed, and what there is to observe grows. Hosts
+/// read these fields; they never build one.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ShareTrackingRunReport {
     /// Why the run stopped.
     pub quiescence: ShareTrackingQuiescence,
@@ -149,6 +161,12 @@ impl<'a> ShareTrackingDriver<'a> {
     /// operation-epoch change ends the run at the next boundary — between
     /// passes, during the wait, or inside a pass, which observes the same
     /// signal through its cancel callback.
+    ///
+    /// A round admits one run. Starting a second while the first is in flight
+    /// returns [`ShareTrackingQuiescence::AlreadyDriving`] immediately without
+    /// polling anything, because the work it was started for is already being
+    /// done and two interleaved runs would only double the round's helper
+    /// traffic.
     pub async fn run(
         &self,
         host: &dyn ShareTrackingHostSource,
@@ -156,6 +174,13 @@ impl<'a> ShareTrackingDriver<'a> {
         events: &dyn ShareTrackingReporter,
     ) -> ShareTrackingRunReport {
         let mut run = run_ledger::Run::default();
+        // Wallet-qualified, and captured once: which wallet's shares this run
+        // drives is fixed at entry, and a host that switches wallet moves the
+        // operation epoch, which ends the run.
+        let scope = ShareOperationScope::capture(self.database);
+        let Some(_admission) = admission::admit_run(scope.wallet_id(), self.round_id) else {
+            return run.finish(ShareTrackingQuiescence::AlreadyDriving);
+        };
         let entry_epoch = control.operation_epoch();
         let interrupted = || control.is_cancelled() || control.operation_epoch() != entry_epoch;
         let mut consecutive_failures = 0u32;
@@ -176,7 +201,7 @@ impl<'a> ShareTrackingDriver<'a> {
             // Only reachable with a zero budget: once a pass has run, the
             // check below stops the run before it waits for one it cannot
             // dispatch.
-            if run.passes >= self.policy.max_passes {
+            if self.budget_spent(run.passes) {
                 return run.finish_exhausted();
             }
 
@@ -210,12 +235,18 @@ impl<'a> ShareTrackingDriver<'a> {
                     };
                     Duration::from_secs(seconds)
                 }
-                Err(message) => {
+                Err(failure) => {
                     consecutive_failures += 1;
-                    run.failures.push(message.clone());
+                    // Before the run can stop: a pass commits each
+                    // confirmation as it reaches it, and the next pass walks
+                    // only unconfirmed shares, so an effect dropped here is
+                    // one no later pass can rediscover.
+                    run.absorb_partial(&failure.partial);
+                    run.failures.push(failure.message.clone());
                     events.report(ShareTrackingEvent::PassFailed {
                         pass: run.passes,
-                        message,
+                        message: failure.message,
+                        partial: Box::new(failure.partial),
                     });
                     if consecutive_failures >= self.policy.max_consecutive_failures {
                         let messages = run.recent_failures(consecutive_failures);
@@ -224,11 +255,12 @@ impl<'a> ShareTrackingDriver<'a> {
                     self.policy.failure_retry
                 }
             };
+            let delay = wait_within_voting_window(delay, &host_context);
 
             // Checked before the wait, not after it: waiting out a delay only
             // to find the budget spent would report exhaustion a full pass
             // interval late, and a host draining the run would block on it.
-            if run.passes >= self.policy.max_passes {
+            if self.budget_spent(run.passes) {
                 return run.finish_exhausted();
             }
             events.report(ShareTrackingEvent::AwaitingNextPass { delay });
@@ -238,16 +270,29 @@ impl<'a> ShareTrackingDriver<'a> {
         }
     }
 
-    /// One pass, with its error flattened to a message.
+    /// True once a host-set pass budget leaves no pass to dispatch.
+    ///
+    /// A run without a budget is bounded by vote end, confirmation,
+    /// cancellation, and the consecutive-failure limit instead.
+    fn budget_spent(&self, passes: u32) -> bool {
+        self.policy
+            .max_passes
+            .is_some_and(|max_passes| passes >= max_passes)
+    }
+
+    /// One pass, with its error flattened to a message and its durable effects
+    /// kept.
     ///
     /// The error type is not carried onto the report: a failed pass is a
     /// transient condition the driver retries, and every caller that acts on
-    /// it acts on the fact of the failure rather than its variant.
+    /// it acts on the fact of the failure rather than its variant. What the
+    /// pass had already committed is carried, because nothing else can
+    /// recover it.
     async fn pass(
         &self,
         host_context: &ShareTrackingHostContext,
         interrupted: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<ShareTrackingReport, String> {
+    ) -> Result<ShareTrackingReport, FailedPass> {
         let params = ShareTrackingParams {
             round_id: self.round_id,
             configured_server_urls: &host_context.configured_helper_urls,
@@ -257,8 +302,36 @@ impl<'a> ShareTrackingDriver<'a> {
             #[cfg(test)]
             random_bytes: &crate::share_tracking::os_random_bytes,
         };
-        track_pending_shares(self.database, &params, self.client, interrupted)
+        track_pending_shares_recording_partial(self.database, &params, self.client, interrupted)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|failure| FailedPass {
+                message: failure.error.to_string(),
+                partial: failure.partial,
+            })
     }
+}
+
+/// A failed pass as the driver sees it: why, and what it still did.
+struct FailedPass {
+    message: String,
+    partial: ShareTrackingReport,
+}
+
+/// `delay`, shortened so a wait never spans the round's vote end.
+///
+/// The pass computes its delay from share rows alone, which say when a share
+/// is next worth polling and nothing about when the round closes. Sleeping
+/// past vote end would leave the run holding a round it can no longer act on
+/// until a whole poll interval had elapsed — and after a failed pass, would
+/// spend the last usable retry of the window on a wait.
+///
+/// A round whose host reports no vote end has no such boundary, and keeps the
+/// delay it was given.
+fn wait_within_voting_window(delay: Duration, host_context: &ShareTrackingHostContext) -> Duration {
+    let Some(vote_end) = host_context.vote_end_time_seconds else {
+        return delay;
+    };
+    delay.min(Duration::from_secs(
+        vote_end.saturating_sub(host_context.now_seconds),
+    ))
 }

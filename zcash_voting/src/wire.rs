@@ -761,6 +761,7 @@ pub enum ShareTrackingQuiescenceKind {
     AllConfirmed,
     VoteEndReached,
     Cancelled,
+    AlreadyDriving,
     Failing,
     PassBudgetExhausted,
 }
@@ -789,18 +790,23 @@ pub enum ShareTrackingEventKind {
 }
 
 /// One observation from a tracking run, flattened for host bindings.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`, because a delay is fractional seconds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShareTrackingEventView {
     pub kind: ShareTrackingEventKind,
     /// The pass this belongs to, counting from 1. Absent on
     /// `AwaitingNextPass`, which sits between two passes.
     pub pass: Option<u32>,
-    /// `PassFinished`: what that pass did.
+    /// `PassFinished`: what that pass did. `PassFailed`: what it had already
+    /// committed before it stopped, whose `unrecoverable` and
+    /// `next_delay_seconds` are meaningless because the walk did not finish.
     pub report: Option<ShareTrackingPassReportView>,
     /// `PassFailed`: why.
     pub message: Option<String>,
     /// `AwaitingNextPass`: how long the driver waits before the next one.
-    pub delay_seconds: Option<u64>,
+    /// Fractional, because a policy may set a subsecond retry.
+    pub delay_seconds: Option<f64>,
 }
 
 /// Everything one tracking run did.

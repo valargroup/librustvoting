@@ -1135,6 +1135,7 @@ impl From<crate::share_tracking_drive::ShareTrackingQuiescence> for ShareTrackin
             Q::AllConfirmed => view.kind = ShareTrackingQuiescenceKind::AllConfirmed,
             Q::VoteEndReached => view.kind = ShareTrackingQuiescenceKind::VoteEndReached,
             Q::Cancelled => view.kind = ShareTrackingQuiescenceKind::Cancelled,
+            Q::AlreadyDriving => view.kind = ShareTrackingQuiescenceKind::AlreadyDriving,
             Q::Failing { messages } => {
                 view.kind = ShareTrackingQuiescenceKind::Failing;
                 view.messages = messages;
@@ -1166,14 +1167,22 @@ impl From<crate::share_tracking_drive::ShareTrackingEvent> for ShareTrackingEven
                 view.pass = Some(pass);
                 view.report = Some(ShareTrackingPassReportView::from(*report));
             }
-            E::PassFailed { pass, message } => {
+            E::PassFailed {
+                pass,
+                message,
+                partial,
+            } => {
                 view.kind = ShareTrackingEventKind::PassFailed;
                 view.pass = Some(pass);
                 view.message = Some(message);
+                view.report = Some(ShareTrackingPassReportView::from(*partial));
             }
             E::AwaitingNextPass { delay } => {
                 view.kind = ShareTrackingEventKind::AwaitingNextPass;
-                view.delay_seconds = Some(delay.as_secs());
+                // Fractional, like the round driver's: a policy may set a
+                // subsecond retry, and truncating it would show a host a
+                // boundary the driver is not enforcing.
+                view.delay_seconds = Some(delay.as_secs_f64());
             }
         }
         view

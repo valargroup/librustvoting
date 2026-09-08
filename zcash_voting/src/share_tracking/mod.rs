@@ -394,6 +394,21 @@ pub struct ShareTrackingReport {
     pub next_delay_seconds: Option<u64>,
 }
 
+/// A tracking pass that failed, with what it had already done durably.
+///
+/// A pass is not atomic: it walks a round's unconfirmed shares in order and
+/// commits each confirmation and retained recovery attempt as it makes it. An
+/// error therefore means "the walk stopped here", not "nothing happened", and
+/// `partial` is what did.
+#[derive(Debug)]
+pub(crate) struct FailedTrackingPass {
+    pub(crate) error: VotingError,
+    /// Effects committed before the error. Its `unrecoverable` and
+    /// `next_delay_seconds` are meaningless — the walk did not reach every
+    /// share, and the delay is computed only once it does.
+    pub(crate) partial: ShareTrackingReport,
+}
+
 /// Inputs for a focused confirmation check over one durable helper share.
 ///
 /// Unlike [`ShareTrackingParams`], this request never replenishes or
@@ -647,6 +662,26 @@ pub async fn track_pending_shares(
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareTrackingReport, VotingError> {
+    track_pending_shares_recording_partial(db, params, client, cancel)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// [`track_pending_shares`], keeping what a failed pass had already recorded.
+///
+/// A pass writes each confirmation and each retained recovery attempt as it
+/// reaches it, so a storage failure on a later share does not undo what the
+/// earlier ones durably did. This variant hands those effects back with the
+/// error instead of dropping them, which is what a caller composing passes
+/// into a run needs: the run's report would otherwise omit durable progress
+/// that no later pass can rediscover, because a confirmed share is no longer
+/// walked.
+pub(crate) async fn track_pending_shares_recording_partial(
+    db: &VotingDb,
+    params: &ShareTrackingParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<ShareTrackingReport, FailedTrackingPass> {
     let started_at = Instant::now();
     track_pending_shares_with_elapsed(db, params, client, cancel, &|| {
         started_at.elapsed().as_secs()
@@ -660,13 +695,37 @@ async fn track_pending_shares_with_elapsed(
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
-) -> Result<ShareTrackingReport, VotingError> {
+) -> Result<ShareTrackingReport, FailedTrackingPass> {
+    let mut report = ShareTrackingReport::default();
+    match walk_pending_shares(db, params, client, cancel, elapsed_seconds, &mut report).await {
+        Ok(()) => Ok(report),
+        Err(error) => Err(FailedTrackingPass {
+            error,
+            partial: report,
+        }),
+    }
+}
+
+/// The pass itself, writing into the report as it goes.
+///
+/// Split out so an error carries the durable effects recorded before it: the
+/// caller owns the report, and every `?` here leaves it populated up to the
+/// share that failed. `unrecoverable` and `next_delay_seconds` are the two
+/// observations a partial report cannot be trusted for — the first because the
+/// walk did not reach every share, the second because it is computed last.
+async fn walk_pending_shares(
+    db: &VotingDb,
+    params: &ShareTrackingParams<'_>,
+    client: &HelperClient,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
+    report: &mut ShareTrackingReport,
+) -> Result<(), VotingError> {
     let scope = share::ShareOperationScope::capture(db);
     // Validate the complete trust boundary before reading or mutating storage
     // and before dispatching any helper request.
     let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
     let configured_urls = configured_fleet.urls();
-    let mut report = ShareTrackingReport::default();
 
     for loaded_share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
         if cancel() {
@@ -880,7 +939,7 @@ async fn track_pending_shares_with_elapsed(
         current_time,
         params.policy,
     );
-    Ok(report)
+    Ok(())
 }
 
 fn dedupe_preserving_order(urls: impl Iterator<Item = String>) -> Vec<String> {

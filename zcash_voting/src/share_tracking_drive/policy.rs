@@ -9,9 +9,14 @@ use crate::share_policy::ShareTimingPolicy;
 /// The driver never invents a cadence. Between two successful passes it waits
 /// exactly the delay the pass itself computed
 /// ([`ShareTrackingReport::next_delay_seconds`](crate::share_tracking::ShareTrackingReport::next_delay_seconds)),
-/// which is derived from the durable share rows under `timing` and already
-/// capped at the round's vote end. This policy governs only what the pass
-/// cannot decide for itself: what to do when one fails, and when to give up.
+/// derived from the durable share rows under `timing`. This policy governs
+/// only what the pass cannot decide for itself: what to do when one fails, and
+/// when to give up.
+///
+/// Every wait, whichever of the two produced it, is shortened to the time left
+/// before the round's vote end. The pass computes its delay from share rows
+/// alone and does not know that boundary, so without the cap a wait could span
+/// it and a run would sit on a share it can no longer act on.
 #[derive(Clone, Debug)]
 pub struct ShareTrackingDrivePolicy {
     /// Thresholds the pass uses for polling, retry, and cutoff decisions.
@@ -41,13 +46,24 @@ pub struct ShareTrackingDrivePolicy {
     pub max_consecutive_failures: u32,
 
     /// Passes before the run stops with
-    /// [`ShareTrackingQuiescence::PassBudgetExhausted`](super::ShareTrackingQuiescence).
+    /// [`ShareTrackingQuiescence::PassBudgetExhausted`](super::ShareTrackingQuiescence),
+    /// or `None` for no pass-count bound.
     ///
-    /// A safety net, not a scheduling knob: vote end normally ends a run
-    /// first. It bounds the one case that would otherwise poll forever — a
-    /// share whose recovery material is missing, which stays unconfirmed
-    /// however many times it is polled.
-    pub max_passes: u32,
+    /// `None` by default, because **vote end is the boundary of a healthy
+    /// run** and a pass count is not a duration. Passes are paced by the share
+    /// rows: a round whose shares are all ready but unconfirmed produces one
+    /// pass per `ready_poll_interval_seconds`, so any budget a host might
+    /// think generous — a thousand passes is under five hours at the default
+    /// interval — expires deep inside a multi-day voting window, and the run
+    /// would stop confirming and recovering shares that still had days to
+    /// settle. Nothing restarts it: a host starts runs on lifecycle events,
+    /// not on a timer.
+    ///
+    /// What actually bounds a run is vote end, confirmation, cancellation, and
+    /// [`max_consecutive_failures`](Self::max_consecutive_failures). Set a
+    /// budget when none of those apply — a round whose host reports no vote
+    /// end has no time boundary at all — or to bound a run for a test.
+    pub max_passes: Option<u32>,
 }
 
 impl Default for ShareTrackingDrivePolicy {
@@ -56,7 +72,7 @@ impl Default for ShareTrackingDrivePolicy {
             timing: ShareTimingPolicy::default(),
             failure_retry: Duration::from_secs(15),
             max_consecutive_failures: 240,
-            max_passes: 1024,
+            max_passes: None,
         }
     }
 }

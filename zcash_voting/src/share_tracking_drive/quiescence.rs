@@ -20,6 +20,14 @@ pub enum ShareTrackingQuiescence {
     /// The host cancelled, or moved to another operation epoch. Durable
     /// effects already made are in the report.
     Cancelled,
+    /// Another run is already driving this round's shares, so this one did
+    /// nothing.
+    ///
+    /// Not a failure: the work this run was started for is in flight, and the
+    /// run that holds the round reports it. A host that needs the outcome
+    /// should read the holder's report rather than retry, and a host that
+    /// starts runs on lifecycle events can ignore this entirely.
+    AlreadyDriving,
     /// Passes kept failing. The shares are untouched and a later run may still
     /// succeed, so this is a reason to back off and surface state, not a
     /// terminal verdict on the round.
@@ -27,12 +35,13 @@ pub enum ShareTrackingQuiescence {
         /// Consecutive failures that ended the run, most recent last.
         messages: Vec<String>,
     },
-    /// [`max_passes`](super::ShareTrackingDrivePolicy::max_passes) was reached
-    /// with shares still unconfirmed.
+    /// The host's [`max_passes`](super::ShareTrackingDrivePolicy::max_passes)
+    /// was reached with shares still unconfirmed.
     ///
-    /// Reaching it is an invariant-level event: the vote-end boundary normally
-    /// ends a run first. Shares that cannot be repaired by retrying are the
-    /// expected way to get here, and the report names them in
+    /// Only a host that sets one can see this: the budget is off by default,
+    /// because vote end is what ends a healthy run and a pass count cannot be
+    /// translated into one. Shares that cannot be repaired by retrying are the
+    /// expected way to reach a budget, and the report names them in
     /// `unrecoverable`.
     PassBudgetExhausted {
         /// Shares the last pass reported as beyond repair.

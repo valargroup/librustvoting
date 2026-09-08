@@ -64,6 +64,10 @@ fn every_quiescence_reaches_its_own_kind() {
             ShareTrackingQuiescence::Cancelled,
             ShareTrackingQuiescenceKind::Cancelled,
         ),
+        (
+            ShareTrackingQuiescence::AlreadyDriving,
+            ShareTrackingQuiescenceKind::AlreadyDriving,
+        ),
     ] {
         let view = ShareTrackingQuiescenceView::from(quiescence.clone());
         assert_eq!(view.kind, kind, "{quiescence:?}");
@@ -127,16 +131,27 @@ fn a_finished_pass_carries_everything_that_pass_did() {
 }
 
 #[test]
-fn a_failed_pass_carries_its_message_and_no_report() {
+fn a_failed_pass_carries_its_message_and_what_it_had_already_done() {
+    // A pass commits as it walks, so a host watching the event stream must see
+    // the confirmations a failing pass made. Dropping them here would leave a
+    // binding showing less progress than the native report does.
     let view = ShareTrackingEventView::from(ShareTrackingEvent::PassFailed {
         pass: 1,
-        message: "empty helper fleet".to_string(),
+        message: "share row unreadable".to_string(),
+        partial: Box::new(ShareTrackingReport {
+            confirmed: vec![share(0)],
+            ..ShareTrackingReport::default()
+        }),
     });
 
     assert_eq!(view.kind, ShareTrackingEventKind::PassFailed);
     assert_eq!(view.pass, Some(1));
-    assert_eq!(view.message.as_deref(), Some("empty helper fleet"));
-    assert!(view.report.is_none());
+    assert_eq!(view.message.as_deref(), Some("share row unreadable"));
+    let partial = view
+        .report
+        .expect("a failed pass carries what it committed");
+    assert_eq!(partial.confirmed.len(), 1);
+    assert_eq!(partial.confirmed[0].share_index, 0);
 }
 
 #[test]
@@ -146,11 +161,23 @@ fn a_wait_carries_its_delay_and_belongs_to_no_pass() {
     });
 
     assert_eq!(view.kind, ShareTrackingEventKind::AwaitingNextPass);
-    assert_eq!(view.delay_seconds, Some(15));
+    assert_eq!(view.delay_seconds, Some(15.0));
     assert!(
         view.pass.is_none(),
         "a wait sits between two passes rather than inside one"
     );
+}
+
+#[test]
+fn a_subsecond_wait_keeps_its_fraction() {
+    // A policy may set a subsecond failure retry. Truncating to whole seconds
+    // would show a host a boundary of zero while the driver waited the real
+    // one.
+    let view = ShareTrackingEventView::from(ShareTrackingEvent::AwaitingNextPass {
+        delay: Duration::from_millis(500),
+    });
+
+    assert_eq!(view.delay_seconds, Some(0.5));
 }
 
 #[test]

@@ -619,14 +619,33 @@ the pass and the timing policy.
 - **The cadence is the pass's, not the driver's.** Between two successful
   passes the driver waits exactly `next_delay_seconds`. It supplies a wait of
   its own only after a failed pass, which computed none.
+- **No wait outlasts the round.** Whichever of the two produced it, a wait is
+  shortened to the time left before vote end. The pass computes its delay from
+  share rows, which say when a share is next worth polling and nothing about
+  when the round closes; without the cap a run would sit on a round it can no
+  longer act on for a whole poll interval, and a pass that failed near the
+  boundary would spend the window's last usable retry waiting.
 - **The host context is read once per pass.** A run can span hours, so a
   refreshed helper fleet or round timing reaches the next pass. A pass already
   running completes against the inputs it was given.
 - **Vote end is checked before a pass, never after.** Recovery is closed past
   it, so a pass there could only re-poll shares it cannot act on.
-- **Passes are strictly sequential.** Each plans from the rows the previous one
-  wrote, so overlapping two would contend for the same share locks and re-poll
-  helpers that were just answered.
+- **Passes are strictly sequential, and a round admits one run.** Each pass
+  plans from the rows the previous one wrote. The per-share locks keep two runs
+  off one share but not off one round: interleaved runs re-poll shares the
+  other has just answered, doubling the round's helper traffic for no added
+  progress. A run started while another holds the same wallet's round stops
+  immediately with `AlreadyDriving`, without reading the host context or
+  touching a share — the work it was started for is already in flight, and a
+  run can last until vote end, so queuing behind it would block the caller for
+  hours. Admission is released when the holding run ends, however it ends.
+- **A failed pass's durable effects are kept.** A pass commits each
+  confirmation and retained recovery attempt as it walks, so an error means the
+  walk stopped, not that nothing happened, and the next pass walks only
+  unconfirmed shares — an effect dropped here is one nothing can rediscover.
+  The run folds those into its report and the `PassFailed` event carries them.
+  A partial pass's `unrecoverable` is *not* folded: that set is a statement
+  about the whole round, and a prefix of the walk would narrow it.
 - **A run always reports why it stopped.** `ShareTrackingQuiescence` is
   exhaustive over the reasons, so a host acts on it rather than re-reading
   share rows: `NothingToTrack`, `AllConfirmed`, `VoteEndReached`, `Cancelled`,
@@ -634,18 +653,28 @@ the pass and the timing policy.
 - **A failing pass is retried, then surfaced.** `max_consecutive_failures`
   consecutive failures end the run with the messages, rather than retrying
   silently for the rest of the round. A successful pass resets the count.
-- **The pass budget bounds the cases that never settle.** A share that never
-  becomes pollable, and a share nothing can still repair, both stay unconfirmed
-  however long the run lasts, so both keep producing a next delay and keep
-  looking pollable. `max_passes` stops the run and names the shares recovery
-  could not repair. The run never waits for a pass the budget will not allow.
+- **Vote end bounds a healthy run; the pass budget is off by default.** A share
+  that never becomes pollable, and a share nothing can still repair, both stay
+  unconfirmed however long the run lasts, so both keep producing a next delay
+  and keep looking pollable. That is the case a budget would bound — but a pass
+  count is not a duration: passes are paced by the share rows, so a round of
+  ready-but-unconfirmed shares produces one pass per
+  `ready_poll_interval_seconds`, and a budget that looks generous expires hours
+  into a window that can last days. A run stopped there would abandon
+  confirmation and recovery with nothing to restart it, because the host starts
+  runs on lifecycle events rather than on a timer. So `max_passes` is `None` by
+  default and a run is bounded by vote end, confirmation, cancellation, and
+  `max_consecutive_failures`. A host that sets a budget — for a round reported
+  with no vote end, which has no time boundary at all, or for a test — gets
+  `PassBudgetExhausted` naming the shares recovery could not repair, and the
+  run never waits for a pass the budget will not allow.
 
-  Stopping *as soon as* nothing can make progress, rather than at the budget,
-  needs a terminality classification the pass does not yet report: a share
-  whose recovery material is beyond rebuilding may still be confirmed by a
-  helper that already accepted it, so `unrecoverable` alone would end a run
-  that could still finish. Until the pass reports that, the budget is the only
-  bound on this case.
+  Stopping *as soon as* nothing can make progress needs a terminality
+  classification the pass does not yet report: a share whose recovery material
+  is beyond rebuilding may still be confirmed by a helper that already accepted
+  it, so `unrecoverable` alone would end a run that could still finish. Until
+  the pass reports that, an unsettleable share is polled for the rest of the
+  round. That is wasted traffic, not lost correctness.
 - **Cancellation is observed in three places** — between passes, during the
   wait, and inside a pass through its cancel callback — so a host draining a
   run does not wait out a delay. The wait is woken by the control rather than
@@ -661,9 +690,22 @@ Regression tests: `a_round_with_nothing_pending_is_not_tracked`,
 `a_round_past_its_vote_end_is_not_polled`,
 `vote_end_reached_between_passes_stops_the_run`,
 `a_share_that_never_becomes_pollable_stops_at_the_pass_budget`,
+`the_default_run_is_bounded_by_vote_end_rather_than_a_pass_count`,
 `a_zero_budget_stops_without_polling`, and
 `repeated_pass_failures_stop_the_run_and_are_reported` in
 [`share_tracking_drive/tests/stopping.rs`](../zcash_voting/src/share_tracking_drive/tests/stopping.rs);
+`a_pass_delay_is_shortened_to_what_is_left_of_the_window`,
+`a_failure_retry_is_shortened_to_what_is_left_of_the_window`, and
+`a_round_with_no_vote_end_keeps_the_delay_it_was_given` in
+[`share_tracking_drive/tests/window.rs`](../zcash_voting/src/share_tracking_drive/tests/window.rs);
+`a_second_run_for_the_same_round_is_turned_away_without_polling`,
+`a_finished_run_releases_its_round_for_the_next_one`, and
+`another_round_in_the_same_wallet_runs_alongside` in
+[`share_tracking_drive/tests/admission.rs`](../zcash_voting/src/share_tracking_drive/tests/admission.rs);
+`a_failed_pass_still_hands_over_what_it_committed`,
+`a_failed_pass_does_not_narrow_the_unrecoverable_set`, and
+`a_complete_pass_replaces_the_unrecoverable_set` in
+[`share_tracking_drive/tests/partial_progress.rs`](../zcash_voting/src/share_tracking_drive/tests/partial_progress.rs);
 `the_wait_between_passes_is_the_one_the_pass_computed`,
 `a_pass_close_to_its_check_waits_only_until_then`,
 `the_host_context_is_read_once_per_pass`,

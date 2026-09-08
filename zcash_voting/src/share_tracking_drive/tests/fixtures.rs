@@ -1,6 +1,7 @@
 //! Shared fixtures: an in-memory sidecar, a host source that can be varied
 //! per pass, and a reporter that records every driver event.
 
+pub(super) use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) use std::sync::{Arc, Mutex};
 pub(super) use std::time::Duration;
 
@@ -19,7 +20,9 @@ pub(super) use crate::{
 /// arbitrary 64-character string is rejected. This is `1`.
 pub(super) const ROUND_ID: &str =
     "0100000000000000000000000000000000000000000000000000000000000000";
-pub(super) const WALLET_ID: &str = "share-tracking-drive-wallet";
+/// A second round in the same wallet. This is `2`.
+pub(super) const OTHER_ROUND_ID: &str =
+    "0200000000000000000000000000000000000000000000000000000000000000";
 pub(super) const NOW: u64 = 1_000;
 pub(super) const VOTE_END: u64 = 1_000_000;
 
@@ -67,10 +70,23 @@ impl crate::helper::transport::HelperTransport for UnreachableTransport {
     }
 }
 
+/// A wallet id no other test in this process shares.
+///
+/// A driver admits one run per wallet and round, and its per-share locks are
+/// wallet-qualified too, so tests that reused one id would contend through
+/// process-wide state and turn each other's runs away.
+pub(super) fn unique_wallet_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "share-tracking-drive-wallet-{}",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// A sidecar with no share rows at all.
 pub(super) fn empty_db() -> VotingDb {
     let db = VotingDb::open_in_memory().unwrap();
-    db.set_wallet_id(WALLET_ID);
+    db.set_wallet_id(&unique_wallet_id());
     db
 }
 
@@ -79,24 +95,29 @@ pub(super) fn empty_db() -> VotingDb {
 /// poll.
 pub(super) fn db_with_pending_share(seconds_ahead: u64) -> VotingDb {
     let db = empty_db();
-    seed_voted_bundle(&db);
-    db.record_share_delegation(ROUND_ID, 0, 1, 0, &fleet(), &[0u8; 32], NOW + seconds_ahead)
-        .unwrap();
+    seed_round_with_pending_share(&db, ROUND_ID, seconds_ahead);
     db
 }
 
-/// A sidecar holding one unconfirmed share that is already overdue and whose
-/// recovery material was never stored, so retrying it can never work.
+/// Adds one more round with its own pending share to an existing sidecar.
+///
+/// Two rounds in one wallet are what shows that a run holds its own round
+/// rather than the wallet.
+pub(super) fn seed_round_with_pending_share(db: &VotingDb, round_id: &str, seconds_ahead: u64) {
+    seed_voted_bundle(db, round_id);
+    db.record_share_delegation(round_id, 0, 1, 0, &fleet(), &[0u8; 32], NOW + seconds_ahead)
+        .unwrap();
+}
 
 /// The round, bundle and stored vote a share row hangs off.
 ///
 /// A share is a child of a vote, so recording one without these fails the
 /// foreign key rather than producing an orphan the driver could poll.
-fn seed_voted_bundle(db: &VotingDb) {
+fn seed_voted_bundle(db: &VotingDb, round_id: &str) {
     db.create_round(
         crate::Network::Testnet,
         &crate::round::RoundParams {
-            vote_round_id: ROUND_ID.to_string(),
+            vote_round_id: round_id.to_string(),
             snapshot_height: 1000,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],
@@ -106,7 +127,7 @@ fn seed_voted_bundle(db: &VotingDb) {
     )
     .unwrap();
     db.ensure_bundles(
-        ROUND_ID,
+        round_id,
         &[crate::types::NoteInfo {
             commitment: vec![0x01; 32],
             nullifier: vec![0x02; 32],
@@ -120,10 +141,18 @@ fn seed_voted_bundle(db: &VotingDb) {
         }],
     )
     .unwrap();
-    db.set_ballot_intent(ROUND_ID, 1, crate::session::Decision::Choice(2), 3)
+    db.set_ballot_intent(round_id, 1, crate::session::Decision::Choice(2), 3)
         .unwrap();
-    crate::storage::queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 1, 2, &[0xCA; 32])
-        .unwrap();
+    crate::storage::queries::store_vote(
+        &db.conn(),
+        round_id,
+        &db.wallet_id(),
+        0,
+        1,
+        2,
+        &[0xCA; 32],
+    )
+    .unwrap();
 }
 
 /// Host inputs, optionally different for each pass.
