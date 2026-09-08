@@ -182,7 +182,7 @@ because a broader one would retry past real findings.
 
 ### Reaching the tracking window
 
-`ChainOutcome` is reported once per `advance_step`, at the end, and carries the
+`ChainOutcome` is reported once per step, at the end, and carries the
 episode's *terminal* outcome — not one event per poll. Under the shipped
 45-pass policy an episode polls until the submission confirms, so a stage
 waiting to observe one *still tracking* can never fire. The run therefore arms a

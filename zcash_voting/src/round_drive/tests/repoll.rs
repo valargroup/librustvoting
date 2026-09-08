@@ -150,10 +150,11 @@ async fn confirmed_chain_work_pending_on_helpers_is_replanned_not_stalled() {
     let control = ChainSubmissionControl::new(1);
     let step = NextStep::AdvanceImportedDelegation { bundle_index: 0 };
     let mut outcome = executor
-        .advance_step(
+        .advance_step_in_epoch(
             step.clone(),
             &SinglePassHost.host_context(),
             &control,
+            control.operation_epoch(),
             &crate::NoopRoundStepProgressReporter {},
         )
         .await

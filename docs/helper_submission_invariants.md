@@ -1258,9 +1258,9 @@ A share row with no accepted, ambiguous, or attempting helper (every initial
 POST failed definitely, or a reservation was cleared before dispatch) is
 `RoundPlan::blocking_share_work`. The planner still lists it as
 `NextStep::ConfirmShare` but classifies it as `SubmitShares` recovery work,
-and `RoundExecutor::advance_step` runs that delivery from the durable plan
-instead of the focused confirmation poll, which could never confirm a share
-no helper holds (regression test
+and the executor runs that delivery from the durable plan instead of the
+focused confirmation poll, which could never confirm a share no helper holds
+(regression test
 `a_blocking_confirm_share_step_delivers_before_polling`).
 
 `RoundDriver` dispatches only that safely repeatable share work in the
@@ -1703,9 +1703,11 @@ host wallet:
    `RoundExecutor` to the complete proposal roster from the authenticated round
    configuration and drive it with `RoundDriver::run`, which supplies the
    complete current configured fleet, timing, and cancellation once per
-   dispatch through `RoundHostSource`. An integration that runs one obligation
-   at a time calls `advance_step` with a step it selected from a plan it read.
-   The executor obtains
+   dispatch through `RoundHostSource`. Running the round's steps is the
+   driver's: it carries the epoch it dispatched under into each step, which an
+   integration selecting one step at a time could not do. An integration that
+   needs per-obligation visibility reads it from `RoundDriveReporter` events
+   rather than by driving steps itself. The executor obtains
    `HelperFleetPreflight`, prepares every affected delivery plan, advances the
    chain until confirmation is durable, recovers fresh `CommittedVote` handles,
    converts them to `ConfirmedVote`, and submits the prepared shares. Lower-level

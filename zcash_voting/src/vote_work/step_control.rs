@@ -16,22 +16,14 @@ pub(super) struct StepControl<'a> {
 }
 
 impl<'a> StepControl<'a> {
-    /// Captures the epoch the step starts under.
-    pub(super) fn capture(control: &'a ChainSubmissionControl) -> Self {
-        Self {
-            control,
-            entry_epoch: control.operation_epoch(),
-        }
-    }
-
-    /// Binds the step to an epoch a caller already captured.
+    /// Binds the step to an epoch its caller already captured.
     ///
     /// A driver decides to dispatch, then plans, builds a host context and
-    /// reads stored signing material before the step actually begins. If the
-    /// host switched epoch across that gap, [`Self::capture`] would adopt the
-    /// *new* epoch and let the stale dispatch prove, persist and broadcast for
-    /// a session the host has already left. Inheriting the caller's epoch
-    /// makes the step observe the switch at its first boundary instead.
+    /// reads stored signing material before the step actually begins. Reading
+    /// the epoch here instead would adopt the *new* epoch after a switch
+    /// across that gap, and let the stale dispatch prove, persist and
+    /// broadcast for a session the host has already left. Inheriting the
+    /// caller's epoch makes the step observe the switch at its first boundary.
     pub(super) fn in_epoch(control: &'a ChainSubmissionControl, entry_epoch: u64) -> Self {
         Self {
             control,

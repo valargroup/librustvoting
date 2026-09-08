@@ -46,7 +46,7 @@ async fn a_failure_and_a_cancellation_carry_the_chain_outcome_and_deliveries_so_
             proposal_id: 1,
         },
         &host,
-        StepControl::capture(&control),
+        StepControl::in_epoch(&control, control.operation_epoch()),
     )
     .unwrap();
     let mut ledger = StepLedger::default();

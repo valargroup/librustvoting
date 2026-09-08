@@ -10,10 +10,11 @@ async fn a_driver_scoped_to_another_wallet_is_refused_before_proving() {
     let step = NextStep::Delegate { bundle_index: 0 };
 
     let failure = executor
-        .advance_step(
+        .advance_step_in_epoch(
             step.clone(),
             &host_with_delegation(&control, "other-wallet", &executor.database()),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await
@@ -39,10 +40,11 @@ async fn a_driver_over_another_database_is_refused_before_proving() {
     let foreign = host_database_for("wallet");
 
     let failure = executor
-        .advance_step(
+        .advance_step_in_epoch(
             NextStep::Delegate { bundle_index: 0 },
             &host_with_delegation(&control, "wallet", &foreign),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await
@@ -64,7 +66,7 @@ async fn a_driver_for_another_network_is_refused_before_proving() {
     let control = ChainSubmissionControl::new(1);
 
     let failure = executor
-        .advance_step(
+        .advance_step_in_epoch(
             NextStep::Delegate { bundle_index: 0 },
             &host_with_driver(
                 &control,
@@ -74,6 +76,7 @@ async fn a_driver_for_another_network_is_refused_before_proving() {
                 &executor.database(),
             ),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await
@@ -98,7 +101,7 @@ async fn a_driver_for_another_hotkey_than_the_binding_is_refused_before_proving(
     let control = ChainSubmissionControl::new(1);
 
     let failure = executor
-        .advance_step(
+        .advance_step_in_epoch(
             NextStep::Delegate { bundle_index: 0 },
             &host_with_driver_target(
                 &control,
@@ -109,6 +112,7 @@ async fn a_driver_for_another_hotkey_than_the_binding_is_refused_before_proving(
                 &executor.database(),
             ),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await
@@ -127,7 +131,7 @@ async fn a_driver_for_another_hotkey_than_the_binding_is_refused_before_proving(
     // The matching hotkey proceeds to the driver.
     let control = ChainSubmissionControl::new(1);
     let outcome = executor
-        .advance_step(
+        .advance_step_in_epoch(
             NextStep::Delegate { bundle_index: 0 },
             &host_with_driver_target(
                 &control,
@@ -138,6 +142,7 @@ async fn a_driver_for_another_hotkey_than_the_binding_is_refused_before_proving(
                 &executor.database(),
             ),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await

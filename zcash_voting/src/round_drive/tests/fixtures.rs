@@ -613,7 +613,7 @@ pub(super) fn executor_over_chain(
 
 /// A host whose chain episodes end after one pass.
 ///
-/// `ChainAdvancePolicy::max_passes` bounds one `advance_step` call, and its
+/// `ChainAdvancePolicy::max_passes` bounds one step, and its
 /// default of 45 lets a submission confirm inside a single dispatch. Capping
 /// it at one pass is what makes the driver's own re-poll — the wait *between*
 /// episodes — observable at all.

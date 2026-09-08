@@ -52,7 +52,13 @@ async fn a_blocking_confirm_share_step_delivers_before_polling() {
     let progress = RecordingProgress::default();
     let control = ChainSubmissionControl::new(1);
     let _ = executor
-        .advance_step(step, &host(), &control, &progress)
+        .advance_step_in_epoch(
+            step,
+            &host(),
+            &control,
+            control.operation_epoch(),
+            &progress,
+        )
         .await;
 
     let events = progress.events.lock().unwrap();
@@ -137,7 +143,13 @@ async fn a_committed_vote_never_dispatched_prepares_its_plan_before_the_chain() 
 
     let progress = RecordingProgress::default();
     let _ = executor
-        .advance_step(step, &host(), &control, &progress)
+        .advance_step_in_epoch(
+            step,
+            &host(),
+            &control,
+            control.operation_epoch(),
+            &progress,
+        )
         .await;
 
     let events = progress.events.lock().unwrap();
@@ -227,7 +239,13 @@ async fn a_dispatched_vote_is_reconciled_before_its_ballot_is_terminal() {
 
     let progress = RecordingProgress::default();
     let result = executor
-        .advance_step(step, &host(), &control, &progress)
+        .advance_step_in_epoch(
+            step,
+            &host(),
+            &control,
+            control.operation_epoch(),
+            &progress,
+        )
         .await;
 
     assert!(

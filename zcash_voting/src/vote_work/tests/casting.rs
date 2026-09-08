@@ -27,10 +27,11 @@ async fn empty_plan_and_stale_steps_return_no_work_without_network_io() {
         proposal_id: 1,
     };
     let outcome = executor
-        .advance_step(
+        .advance_step_in_epoch(
             stale.clone(),
             &host(),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await
@@ -69,10 +70,11 @@ async fn a_cast_vote_selected_ahead_of_its_delegation_is_rejected_before_any_wor
     // with a transport error rather than InvalidInput.
     let control = ChainSubmissionControl::new(1);
     let failure = executor
-        .advance_step(
+        .advance_step_in_epoch(
             cast.clone(),
             &host(),
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await
@@ -120,7 +122,13 @@ async fn a_bound_hotkey_that_is_not_the_delegation_target_is_refused_before_tree
     let control = ChainSubmissionControl::new(1);
 
     let failure = executor
-        .advance_step(cast, &host(), &control, &NoopRoundStepProgressReporter {})
+        .advance_step_in_epoch(
+            cast,
+            &host(),
+            &control,
+            control.operation_epoch(),
+            &NoopRoundStepProgressReporter {},
+        )
         .await
         .expect_err("hotkey 0x22 cannot spend a delegation made for 0x21");
 
@@ -152,10 +160,11 @@ async fn a_cast_after_the_authenticated_vote_end_is_refused_before_tree_io() {
     after_end.now_seconds = after_end.vote_end_time_seconds.unwrap();
 
     let failure = executor
-        .advance_step(
+        .advance_step_in_epoch(
             cast,
             &after_end,
             &control,
+            control.operation_epoch(),
             &NoopRoundStepProgressReporter {},
         )
         .await

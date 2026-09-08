@@ -6,8 +6,7 @@ use std::{num::NonZeroUsize, time::Duration};
 ///
 /// The driver never overrides a step's own policy. `ChainAdvancePolicy` still
 /// bounds one advancement episode: its `pending_repoll` and `max_passes` apply
-/// *inside* an `advance_step` call. This policy governs what happens between
-/// calls.
+/// *inside* one step. This policy governs what happens between steps.
 #[derive(Clone, Debug)]
 pub struct RoundDrivePolicy {
     /// Wait between two attempts at the same unfinished obligation.
