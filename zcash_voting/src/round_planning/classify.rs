@@ -136,6 +136,24 @@ pub(crate) struct RoundObligations {
     /// The round holds a ballot choice but no bundle rows, so the host must
     /// persist the bundle plan before any vote work can be planned.
     pub(crate) needs_bundle_setup: bool,
+    /// Rostered proposals that still owe a cast this pass could not plan:
+    /// the ballot is not yet terminal, the bundle is held by a vote already
+    /// on the wire, the round has no bundle rows at all, or the proposal's
+    /// undispatched batch is waiting on a member the ballot has not decided.
+    ///
+    /// They own no obligation, so nothing else names them. A progress measure
+    /// that reads completion as "no obligation covers it" needs them to tell
+    /// a finished choice from one whose cast has not been planned yet.
+    pub(crate) withheld_casts: BTreeSet<u32>,
+    /// Choices for proposals the roster no longer lists whose vote the chain
+    /// lifecycle owns, so `clear_ballot_intent` refuses them and their vote
+    /// work outlives the roster change.
+    ///
+    /// They are in neither `choice_proposals` (roster only) nor
+    /// `unrostered_intents` (which reports only what the host can clear), so a
+    /// measure counting the whole durable ballot has to name them separately
+    /// or its total moves when the roster does.
+    pub(crate) lifecycle_owned_choices: BTreeSet<u32>,
 }
 
 /// Classifies `units` against `ballot` (the roster and intents already
@@ -161,15 +179,20 @@ pub(crate) fn classify(
     // cleared (`clear_ballot_intent` refuses it), so it is not something the
     // host can resolve: it is neither reported nor allowed to withhold
     // casting. Helper-plan derivation applies the same rule.
-    let unrostered_intents: Vec<u32> = ballot
-        .unrostered_intents
-        .into_iter()
-        .filter(|proposal_id| {
-            !snapshot.votes.iter().any(|(&(_, vote_proposal_id), vote)| {
-                vote_proposal_id == *proposal_id && vote_phase_is_lifecycle_owned(vote.phase)
-            })
-        })
-        .collect();
+    let mut unrostered_intents: Vec<u32> = Vec::new();
+    let mut lifecycle_owned_choices: BTreeSet<u32> = BTreeSet::new();
+    for proposal_id in ballot.unrostered_intents {
+        let lifecycle_owned = snapshot.votes.iter().any(|(&(_, vote_proposal_id), vote)| {
+            vote_proposal_id == proposal_id && vote_phase_is_lifecycle_owned(vote.phase)
+        });
+        if !lifecycle_owned {
+            unrostered_intents.push(proposal_id);
+        } else if matches!(intents.get(&proposal_id), Some(Decision::Choice(_))) {
+            // The vote is the wallet's to drive whatever the roster now says,
+            // so this remains a question the durable ballot answered.
+            lifecycle_owned_choices.insert(proposal_id);
+        }
+    }
     // Casting derives the round's single immediate helper share from the
     // complete set of choices, so helper-plan derivation rejects a roster
     // that still holds an undecided proposal, and equally a durable intent
@@ -317,6 +340,7 @@ pub(crate) fn classify(
     let mut bundles_needing_delegation = BTreeSet::new();
     let mut drafts: BTreeMap<u32, Vec<CastDraft>> = BTreeMap::new();
     let mut blocked: BTreeSet<u32> = BTreeSet::new();
+    let mut withheld_casts: BTreeSet<u32> = BTreeSet::new();
     for &proposal_id in &choice_proposals {
         let intent_choice = match intents.get(&proposal_id) {
             Some(Decision::Choice(choice)) => *choice,
@@ -336,6 +360,7 @@ pub(crate) fn classify(
             };
             if cast_due {
                 if held_bundles.contains(&bundle_index) {
+                    withheld_casts.insert(proposal_id);
                     continue;
                 }
                 // Delegation is a prerequisite either way, so it is still
@@ -348,6 +373,7 @@ pub(crate) fn classify(
                     });
                 } else {
                     blocked.insert(bundle_index);
+                    withheld_casts.insert(proposal_id);
                 }
                 continue;
             }
@@ -360,7 +386,10 @@ pub(crate) fn classify(
                     // A unit is dispatched whole, so it is dispatched only
                     // when the ballot agrees with every member. A batch a
                     // member of which is still undecided holds its bundle and
-                    // waits; the on-wire pass below owns nothing here.
+                    // waits; the on-wire pass below owns nothing here. The
+                    // members the ballot has decided are withheld while it
+                    // waits: nothing has been dispatched for them, and no
+                    // obligation names them until the batch agrees.
                     let unit = unit_of(bundle_index, proposal_id);
                     let every_member_agrees = unit.members.iter().all(|member| {
                         roster.contains(&member.proposal_id)
@@ -374,6 +403,8 @@ pub(crate) fn classify(
                     });
                     if every_member_agrees {
                         reconcile(&mut obligations, unit)?
+                    } else {
+                        withheld_casts.insert(proposal_id);
                     }
                 }
                 LifecyclePosition::OnWire => {
@@ -529,6 +560,8 @@ pub(crate) fn classify(
         unrostered_intents,
         stale_vote_keys,
         needs_bundle_setup: false,
+        withheld_casts,
+        lifecycle_owned_choices,
     })
 }
 

@@ -3,11 +3,15 @@
 
 use super::fixtures::*;
 use crate::phases::{DelegationPhase, VotePhase};
-use crate::round_planning::{classify_round, Obligation, VoteUnitId};
+use crate::round_planning::{classify_round, Obligation, RoundObligations, VoteUnitId};
 use crate::session::Decision;
 
+fn plan_of(snapshot: &crate::round_planning::RoundSnapshot, roster: &[u32]) -> RoundObligations {
+    classify_round(snapshot, roster).unwrap()
+}
+
 fn classified(snapshot: &crate::round_planning::RoundSnapshot, roster: &[u32]) -> Vec<Obligation> {
-    classify_round(snapshot, roster).unwrap().obligations
+    plan_of(snapshot, roster).obligations
 }
 
 fn reconciles(obligations: &[Obligation]) -> Vec<VoteUnitId> {
@@ -184,6 +188,96 @@ fn an_undispatched_batch_holds_until_the_ballot_agrees_with_every_member() {
         .intent(2, Decision::Choice(1))
         .build();
     assert_eq!(reconciles(&classified(&decided, &[1, 2])).len(), 1);
+}
+
+#[test]
+fn a_held_batch_withholds_the_members_the_ballot_already_decided() {
+    // Proposal 1 is decided and its committed vote agrees, but the batch is
+    // one envelope and proposal 2 is still open, so nothing is planned for
+    // either. Proposal 1 owns no obligation and has had nothing dispatched, so
+    // the plan must name it as still owing a cast: a progress measure reading
+    // completion as "no obligation covers it" would otherwise call the ballot
+    // finished before the batch was sent, then take that back once deciding
+    // proposal 2 produces the `ReconcileChain`.
+    let partly_decided = snapshot()
+        .bundle(0, DelegationPhase::Confirmed)
+        .batch(0, &[(1, 0), (2, 1)], VotePhase::Committed)
+        .intent(1, Decision::Choice(0))
+        .build();
+    let plan = plan_of(&partly_decided, &[1, 2]);
+    assert_eq!(
+        plan.withheld_casts,
+        [1].into_iter().collect(),
+        "the undecided member is not a choice, and owes nothing yet"
+    );
+
+    // Once the ballot agrees with every member the batch is dispatched, and
+    // the `ReconcileChain` owns the work instead.
+    let decided = snapshot()
+        .bundle(0, DelegationPhase::Confirmed)
+        .batch(0, &[(1, 0), (2, 1)], VotePhase::Committed)
+        .intent(1, Decision::Choice(0))
+        .intent(2, Decision::Choice(1))
+        .build();
+    let plan = plan_of(&decided, &[1, 2]);
+    assert!(
+        plan.withheld_casts.is_empty(),
+        "an obligation names both members: {plan:?}"
+    );
+}
+
+#[test]
+fn a_lifecycle_owned_unrostered_choice_stays_selected() {
+    // The roster dropped proposal 1 after its vote reached the chain. The
+    // intent cannot be cleared and the vote is still driven to resolution, so
+    // the choice is neither reported to the host nor forgotten: it is in
+    // neither `choice_proposals` (roster only) nor `unrostered_intents` (what
+    // the host must clear), and a measure counting the durable ballot reads it
+    // from `lifecycle_owned_choices`.
+    for phase in [
+        VotePhase::Submitted,
+        VotePhase::SubmissionManaged,
+        VotePhase::Confirmed,
+    ] {
+        let unrostered = snapshot()
+            .bundle(0, DelegationPhase::Confirmed)
+            .vote(0, 1, 2, phase)
+            .intent(1, Decision::Choice(2))
+            .build();
+        let plan = plan_of(&unrostered, &[2]);
+        assert_eq!(
+            plan.lifecycle_owned_choices,
+            [1].into_iter().collect(),
+            "{phase:?}: {plan:?}"
+        );
+        assert!(
+            plan.unrostered_intents.is_empty(),
+            "{phase:?}: the host cannot clear it, so it is not reported: {plan:?}"
+        );
+        assert!(
+            !plan.choice_proposals.contains(&1),
+            "{phase:?}: the roster no longer lists it: {plan:?}"
+        );
+    }
+}
+
+#[test]
+fn a_clearable_unrostered_intent_is_not_a_selected_choice() {
+    // The same roster change over an undispatched vote. Nothing reached the
+    // chain, so the unit is retired and the intent is the host's to clear;
+    // the durable ballot does not keep it, because the recast that may follow
+    // is planned fresh against whatever roster is authenticated then.
+    let unrostered = snapshot()
+        .bundle(0, DelegationPhase::Confirmed)
+        .vote(0, 1, 2, VotePhase::Committed)
+        .intent(1, Decision::Choice(2))
+        .build();
+    let plan = plan_of(&unrostered, &[2]);
+    assert_eq!(plan.unrostered_intents, vec![1]);
+    assert!(
+        plan.lifecycle_owned_choices.is_empty(),
+        "an undispatched vote locks nothing: {plan:?}"
+    );
 }
 
 #[test]

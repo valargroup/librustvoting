@@ -20,9 +20,9 @@ This release is `zcash_voting` 4.0.0.
   supplies the host context once per dispatch rather than once per run, so a
   long proof cannot leave the following step planning against a stale clock,
   and `RoundDriveEvent` names the step every observation came from, which a
-  bare `RoundStepProgress` does not. `RoundWorkTally` reports run-relative
-  ballot progress from obligation membership, so an atomic batch counts as
-  every proposal in it rather than as its anchor alone. Independent
+  bare `RoundStepProgress` does not. `RoundWorkTally` reports selected-vote
+  submission progress from obligation membership, so an atomic batch counts
+  as every proposal in it rather than as its anchor alone. Independent
   bundle-locked delegation work runs up to
   `RoundDrivePolicy::max_bundle_concurrency`, while round-locked work and
   `StopRound` failure isolation remain serial. Dispatch-budget reports are
@@ -56,6 +56,19 @@ This release is `zcash_voting` 4.0.0.
   cross-language binding sees what a native caller sees. The prelude exports
   the driver types. `RoundRunReport` and `RoundStepFailureRecord` are
   `#[non_exhaustive]`: hosts read a report, never build one.
+- `RoundDrivePolicy::progress_baseline` chooses what a run's progress total is
+  measured against. `ProgressBaseline::Run`, the default, keeps the historical
+  run-relative total: a round resumed with two questions left reports two.
+  `ProgressBaseline::SelectedChoices` counts every durable selected choice
+  whose vote belongs to the current roster or chain lifecycle. Skips and
+  clearable stale choices are excluded because they owe no vote submission.
+  With unchanged selections and roster, this keeps the selected-vote total
+  across a quit and reopen. Both baselines are captured from the run's first
+  plan and share one completion measure — a proposal is done once no `Cast`
+  and no `ReconcileChain` obligation covers it and the plan did not have to
+  withhold its cast — so only the denominator differs.
+  The choice belongs to the host because it depends on what the host's label
+  claims to be counting, which the driver cannot know.
 - `RoundPlan::needs_bundle_setup` reports a round that holds a ballot choice
   but has no bundle rows yet. Eligibility checks do not persist a bundle
   plan, so a host that records a ballot before running setup previously made

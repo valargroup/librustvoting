@@ -13,12 +13,12 @@ use crate::{
 
 use super::{
     dispatch,
-    policy::FailureIsolation,
+    policy::{FailureIsolation, ProgressBaseline},
     progress::{RoundDriveEvent, RoundDriveReporter},
     quiescence::{quiesce_before_dispatch, requires_background_tracking, RoundQuiescence},
     run_ledger::Run,
     selection, signing,
-    tally::BallotBaseline,
+    tally::VoteProgressBaseline,
     RoundDriver, RoundHostSource, RoundRunReport,
 };
 
@@ -101,9 +101,18 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
                     return run.finish(RoundQuiescence::Failures);
                 }
             };
-            let baseline = run
-                .baseline
-                .get_or_insert_with(|| BallotBaseline::capture(&classified.obligations));
+            // Captured from the first plan of the run either way; the policy
+            // only decides what the total counts.
+            let baseline =
+                run.baseline
+                    .get_or_insert_with(|| match self.policy.progress_baseline {
+                        ProgressBaseline::Run => {
+                            VoteProgressBaseline::for_run(&classified.obligations)
+                        }
+                        ProgressBaseline::SelectedChoices => {
+                            VoteProgressBaseline::for_selected_choices(&classified.obligations)
+                        }
+                    });
             run.tally = baseline.tally(&classified.obligations);
             run.plan = Some(classified.plan.clone());
             events.report(RoundDriveEvent::PlanRefreshed {

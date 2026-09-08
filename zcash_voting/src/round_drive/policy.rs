@@ -53,6 +53,9 @@ pub struct RoundDrivePolicy {
     /// the executor already refuses a step its own locked plan still lists but
     /// cannot resolve, so the ordinary livelock is impossible.
     pub max_dispatches: usize,
+
+    /// What [`RoundWorkTally`](super::RoundWorkTally) counts its total against.
+    pub progress_baseline: ProgressBaseline,
 }
 
 impl Default for RoundDrivePolicy {
@@ -62,8 +65,28 @@ impl Default for RoundDrivePolicy {
             max_bundle_concurrency: NonZeroUsize::new(3).expect("3 is not zero"),
             failure_isolation: FailureIsolation::SkipBundle,
             max_dispatches: 512,
+            progress_baseline: ProgressBaseline::Run,
         }
     }
+}
+
+/// What a run's progress total is measured against.
+///
+/// Only the denominator differs; both baselines call a proposal complete once
+/// no vote obligation covers it. The choice belongs to the host because it
+/// depends on what the host's progress label claims to be counting, which the
+/// driver cannot know.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProgressBaseline {
+    /// The vote work the run's first plan owed. A resume that picks up two
+    /// remaining questions reports a total of two.
+    #[default]
+    Run,
+    /// Every durable selected choice whose vote belongs to the current roster
+    /// or chain lifecycle. Skips and clearable stale choices are excluded
+    /// because they owe no vote submission.
+    SelectedChoices,
 }
 
 /// What the driver does with the rest of the round after one failure.

@@ -145,7 +145,7 @@ It has no clock and no network. The per-unit rule is one exhaustive match:
 | Lifecycle | Roster | Ballot | Obligation |
 |---|---|---|---|
 | Undispatched | Rostered | Agrees | `ReconcileChain` |
-| Undispatched | Rostered | Unrecorded | none; the unit holds its bundle. For a batch, `Agrees` means every member agrees: one undecided member holds the whole batch (`an_undispatched_batch_holds_until_the_ballot_agrees_with_every_member`) |
+| Undispatched | Rostered | Unrecorded | none; the unit holds its bundle. For a batch, `Agrees` means every member agrees: one undecided member holds the whole batch (`an_undispatched_batch_holds_until_the_ballot_agrees_with_every_member`), and its already-decided members are `withheld_casts` because nothing has been dispatched for them either (`a_held_batch_withholds_the_members_the_ballot_already_decided`) |
 | Undispatched | Rostered | Conflicts | singleton: none, and it holds nothing; the cast pass recasts and the persisted cast replaces the row. Batch: invariant violation, since the intent write path clears an unsubmitted batch whole |
 | Undispatched | LeftRoster | any | `Retire` for the whole unit; the cast pass recasts the rostered members |
 | OnWire | any | Agrees, Unrecorded | `ReconcileChain` |
@@ -620,15 +620,60 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   several device rounds, and delegations would already be on the wire before
   the first of them. Absence yields `NeedsDelegationSignatures` before anything
   is dispatched; malformed stored material remains an executor failure.
-- **Progress is run-relative and exact.** A proposal is complete when no `Cast`
-  and no `ReconcileChain` obligation covers it, measured against the vote work
-  the run's first plan owed. `remaining_obligations` counts only what this
-  layer can execute: `Blocked` and `Retire` are both excluded, because neither
-  is ever dispatched on its own and a `Retire` without a surviving `Cast` would
-  otherwise report work owed beside a `NoWorkLeft` quiescence
-  (`a_retire_is_not_work_the_tally_reports_as_owed`). Obligation membership names every member of an
-  atomic batch, which a host counting `NextStep`s cannot see: a batch projects
-  to one `AdvanceVoteBatch` carrying only its first member's id.
+- **Progress is exact, and measured against a baseline the host selects.** A
+  proposal is complete when no `Cast` and no `ReconcileChain` obligation covers
+  it **and it is not one of the plan's `withheld_casts`** — the rostered choices
+  that still owe a cast this pass could not draw up, because the ballot is not
+  yet terminal, the bundle is held by a vote already on the wire, the round has
+  no bundle rows at all, or the choice's undispatched batch is still waiting on
+  a member the ballot has not decided. Those choices own no obligation, so
+  absence alone does not mean done: a ballot recorded before bundle setup — the
+  supported ordering — would otherwise read as fully complete beside a
+  `NeedsBundleSetup` quiescence and no vote at all, and a decided member of a
+  held batch would read as complete before the batch was sent and then regress
+  once deciding the rest of it produced the `ReconcileChain`
+  (`a_ballot_recorded_before_bundle_setup_completes_nothing`,
+  `a_withheld_cast_is_not_a_completed_selected_choice`,
+  `a_decided_member_of_a_held_batch_is_not_a_completed_selected_choice`). Obligation membership
+  names every member of an atomic batch, which a host
+  counting `NextStep`s cannot see: a batch projects to one `AdvanceVoteBatch`
+  carrying only its first member's id, so a host counting steps reads a
+  six-proposal batch as one question.
+
+  `remaining_obligations` counts only what this layer can execute: `Blocked`
+  and `Retire` are both excluded, because neither is ever dispatched on its own
+  and a `Retire` without a surviving `Cast` would otherwise report work owed
+  beside a `NoWorkLeft` quiescence
+  (`a_retire_is_not_work_the_tally_reports_as_owed`).
+
+  `RoundDrivePolicy::progress_baseline` chooses only what the *total* counts.
+  Both baselines are captured from the run's first plan and share the same
+  completion measure.
+
+  - `ProgressBaseline::Run` (the default, and the historical behavior) counts
+    the vote work that first plan owed. A round resumed with two questions left
+    reports a total of two.
+  - `ProgressBaseline::SelectedChoices` counts every durable selected choice
+    whose vote belongs to the current roster or chain lifecycle, read from
+    `RoundObligations::choice_proposals` together with
+    `lifecycle_owned_choices`.
+    It is the baseline that can hold a choice no obligation names, which is why
+    completion reads `withheld_casts`; a run baseline holds only what its first
+    plan already owed.
+    Skipped proposals are excluded because they owe no vote submission.
+    A choice whose proposal left the roster after its vote reached the chain is
+    **kept**: the host cannot clear that intent and its work deliberately
+    outlives the roster change, so it is in neither `choice_proposals` nor the
+    clearable `unrostered_intents` and has to be named separately. Dropping it
+    would move the selected-choice total and hide a vote still on the wire. A clearable
+    unrostered intent is not kept — the host resolves it and any recast is
+    planned fresh — and neither is a vote with no durable choice at all, which
+    the wallet drives to resolution but the voter did not select. With
+    unchanged selections and roster, the same resume reports the same
+    selected-choice total.
+
+  The choice belongs to the host because it depends on what the host's progress
+  label claims to be counting, which the driver cannot know.
 - **Every event names the step it came from.** `RoundStepProgress::ChainOutcome`
   and `TreeSynced` carry no subject of their own, so a run that interleaves
   bundles must attribute them or a host will misread per-bundle progress.
@@ -775,6 +820,27 @@ Conformance is demonstrated by behavior. Tests cover:
   progress is measured against what the run started owing
   (`a_batch_counts_every_ordered_member_not_just_its_anchor`,
   `progress_is_measured_against_what_the_run_started_owing`);
+- the selected-choices baseline keeps its total across a resume, counts every
+  member of an atomic batch, and excludes a skipped proposal, while the default
+  baseline stays run-relative
+  (`the_selected_choices_baseline_keeps_its_total_across_a_resume`,
+  `the_selected_choices_baseline_counts_every_member_of_an_atomic_batch`,
+  `a_skipped_proposal_is_not_a_selected_choice`,
+  `selecting_a_baseline_does_not_disturb_a_round_both_agree_on`,
+  `the_default_baseline_is_the_run_so_existing_hosts_are_unchanged`);
+- a choice whose cast the plan could not draw up counts as owed, not as done,
+  for a ballot recorded before bundle setup, for a cast withheld while the
+  ballot is open, and for a decided member of a batch still waiting on the rest
+  of itself
+  (`a_ballot_recorded_before_bundle_setup_completes_nothing`,
+  `a_withheld_cast_is_not_a_completed_selected_choice`,
+  `a_held_batch_withholds_the_members_the_ballot_already_decided`,
+  `a_decided_member_of_a_held_batch_is_not_a_completed_selected_choice`);
+- the selected-choices baseline keeps a choice whose vote the chain lifecycle
+  owns after its proposal left the roster, and drops one the host can still clear
+  (`a_lifecycle_owned_unrostered_choice_stays_selected`,
+  `a_clearable_unrostered_intent_is_not_a_selected_choice`,
+  `the_selected_choices_baseline_holds_a_choice_the_chain_lifecycle_owns`);
 - a share a helper accepted or may hold is left to the host's background
   tracking, and neither can outrank a later share the foreground can deliver
   (`a_share_a_helper_already_holds_is_left_to_background_tracking`,
