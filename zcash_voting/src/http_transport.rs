@@ -678,7 +678,7 @@ impl RouteHttp for DirectRoute {
                     // reclassified as pre-dispatch below.
                     on_dispatch();
                     let response = self.client.request(hyper_request).await.map_err(|error| {
-                        let message = format!("send HTTP request: {error}");
+                        let message = format!("send HTTP request: {}", error_chain(&error));
                         if error.is_connect() {
                             RouteError::before_dispatch(message)
                         } else {
@@ -737,6 +737,31 @@ impl RouteHttp for DirectRoute {
     }
 }
 
+/// Renders an error together with its `source()` chain.
+///
+/// Hyper names only the top layer in `Display`: anything that fails after the
+/// connection has been handed the request is `client error (SendRequest)`,
+/// and the cause that actually explains it — a reset peer, an unexpected end
+/// of file — sits one `source()` hop away. Keeping only the top layer makes a
+/// severed upload read exactly like a dead endpoint, so every layer is joined
+/// here. The walk is bounded because a malformed chain must not be able to
+/// build an unbounded string, and a layer already quoted by the one above it
+/// is not repeated.
+fn error_chain<E: std::error::Error>(error: &E) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    for _ in 0..8 {
+        let Some(cause) = source else { break };
+        let text = cause.to_string();
+        if !rendered.contains(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        source = cause.source();
+    }
+    rendered
+}
+
 /// Failure of one routed request with the SDK's own dispatch observation.
 struct RoutedFailure {
     /// Whether the executor called the dispatch hook before failing.
@@ -750,6 +775,34 @@ struct RoutedFailure {
     /// the request can treat this as "no answer yet" rather than an answer.
     connect_deadline_expired: bool,
     error: RouteError,
+}
+
+/// Whether a failed PIR attempt is worth repeating inside the shared budget.
+///
+/// Repeatable: the whole-request backstop, the connect deadline, and any
+/// failure after dispatch. That last case is why this is a predicate rather
+/// than a pair of flags. `AfterDispatch` means the request may have been
+/// delivered and no response header came back — a transfer that stalled or
+/// was severed, which says nothing about the endpoint. A multi-megabyte
+/// tier-1 query dying mid-body on a degraded local link presents exactly this
+/// way while the server stays idle and answers its next request in
+/// milliseconds; counting it as a definite answer ended whole delegation runs
+/// that a second attempt would have completed.
+///
+/// Not repeatable: `BeforeDispatch` without an expired connect deadline, which
+/// is a real answer about this endpoint — a refusal, a TLS rejection, a host
+/// that does not resolve. Nor `ResponseRead`, whose likeliest cause is a
+/// response above `MAX_PIR_RESPONSE_BYTES` that would exceed it again.
+///
+/// Repeating is safe here in a way it is not for helper or chain POSTs: a PIR
+/// query is an idempotent read, so even a first attempt that did arrive cannot
+/// double an effect, and re-sending the identical encrypted query tells the
+/// server nothing it did not already have — which item is being fetched is
+/// exactly what PIR hides.
+fn pir_attempt_is_repeatable(failure: &RoutedFailure) -> bool {
+    failure.timed_out
+        || failure.connect_deadline_expired
+        || failure.error.phase == RoutePhase::AfterDispatch
 }
 
 /// HTTP transport for client-side network requests.
@@ -932,18 +985,9 @@ impl<R: RouteHttp> HyperTransport<R> {
             }
             .wrap(format!("build PIR request URL {url:?}: {error}")));
         }
-        // Two attempts share one budget. Only a request that ran out of time
-        // is repeated — either the whole-request backstop or the connect
-        // deadline. Every other failure is a definite answer about this
-        // endpoint: a refused connection, a protocol error, a non-success
-        // status. Repeating one would neither change it nor be free.
-        //
-        // Repeating is safe here in a way it is not for helper or chain POSTs.
-        // A PIR query is an idempotent read, so a second attempt cannot double
-        // an effect, and re-sending the identical encrypted query tells the
-        // server nothing it did not already have — which item is being fetched
-        // is exactly what PIR hides. A connect timeout is definitely unsent,
-        // and the backstop case only repeats a read.
+        // Two attempts share one budget. `pir_attempt_is_repeatable` decides
+        // which failures earn the second one, and carries the reasoning for
+        // both the cases it admits and the cases it refuses.
         let started = tokio::time::Instant::now();
         // The first attempt gets the only copy of the body the retry needs;
         // the final attempt takes ownership, so one clone covers both.
@@ -963,7 +1007,7 @@ impl<R: RouteHttp> HyperTransport<R> {
             .await;
         let response = match first {
             Ok(response) => Ok(response),
-            Err(failure) if failure.timed_out || failure.connect_deadline_expired => {
+            Err(failure) if pir_attempt_is_repeatable(&failure) => {
                 let remaining = PIR_REQUEST_BUDGET.saturating_sub(started.elapsed());
                 if remaining < PIR_MIN_RETRY_BUDGET {
                     Err(failure)
@@ -996,7 +1040,21 @@ impl<R: RouteHttp> HyperTransport<R> {
                 }
             };
             let message = if failure.timed_out {
-                "PIR HTTP request timed out".to_string()
+                // The backstop cancels the request future, so there is no
+                // underlying cause left to keep. The phase is: it separates
+                // "never got a connection" from "connected, then the transfer
+                // stalled", which is the whole difference between an endpoint
+                // that is down and a link that cannot carry the query. The
+                // bare string this replaces could express neither.
+                let stage = match failure.error.phase {
+                    RoutePhase::BeforeDispatch => "before dispatch",
+                    RoutePhase::AfterDispatch => "after dispatch",
+                    RoutePhase::ResponseRead => "while reading the response",
+                };
+                format!(
+                    "PIR HTTP request timed out {stage} after {:.1}s",
+                    started.elapsed().as_secs_f32()
+                )
             } else {
                 failure.error.message
             };
