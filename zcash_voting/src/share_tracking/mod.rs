@@ -475,6 +475,17 @@ pub struct ShareTrackingParams<'a> {
     pub(crate) random_bytes: &'a (dyn Fn(usize) -> Vec<u8> + Send + Sync),
 }
 
+impl ShareTrackingParams<'_> {
+    /// What the round still permits, for every question in a pass that
+    /// depends on it.
+    ///
+    /// One expression, so the recovery loop's cutoff check and the pass's own
+    /// scheduling cannot come to different conclusions about the same round.
+    pub(crate) fn round_window(&self) -> RoundWindow {
+        RoundWindow::new(self.vote_end_time_seconds, self.policy)
+    }
+}
+
 /// Fills `len` bytes from the operating system CSPRNG.
 pub(crate) fn os_random_bytes(len: usize) -> Vec<u8> {
     use rand::RngCore as _;
@@ -702,7 +713,7 @@ async fn track_pending_shares_with_elapsed(
     let mut unrecoverable_generations = Vec::new();
     // One reading of what this round still permits, for every question below
     // that depends on it.
-    let window = RoundWindow::new(params.vote_end_time_seconds, params.policy);
+    let window = params.round_window();
 
     for loaded_share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
         if cancel() {

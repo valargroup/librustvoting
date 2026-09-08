@@ -5,10 +5,7 @@ use crate::{
     helper::client::{HelperClient, HelperError},
     round::VotingDb,
     share,
-    share_policy::{
-        is_share_resubmission_window_open, resubmission_server_order,
-        resubmission_server_order_random_bytes_required,
-    },
+    share_policy::{resubmission_server_order, resubmission_server_order_random_bytes_required},
     types::{ShareDelegationRecord, VotingError},
 };
 
@@ -315,9 +312,7 @@ pub(super) async fn resubmit_to_next_helper(
             });
         }
         let current_time = params.now_seconds.saturating_add(elapsed_seconds());
-        if params.vote_end_time_seconds.is_some_and(|vote_end| {
-            !is_share_resubmission_window_open(current_time, vote_end, params.policy)
-        }) {
+        if !params.round_window().can_resubmit_at(current_time) {
             return Ok(ResubmitReport {
                 outcome: ResubmitOutcome::CutoffReached,
                 outcome_unknown_urls: newly_outcome_unknown_urls,

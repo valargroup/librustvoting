@@ -130,10 +130,16 @@ fn resubmission_window_closes_exactly_at_the_cutoff() {
     let policy = ShareTimingPolicy::default();
     let vote_end = 200;
 
-    assert!(is_share_resubmission_window_open(189, vote_end, policy));
-    assert!(!is_share_resubmission_window_open(190, vote_end, policy));
-    assert!(!is_share_resubmission_window_open(200, vote_end, policy));
-    assert!(!is_share_resubmission_window_open(
+    assert!(timing::is_share_resubmission_window_open(
+        189, vote_end, policy
+    ));
+    assert!(!timing::is_share_resubmission_window_open(
+        190, vote_end, policy
+    ));
+    assert!(!timing::is_share_resubmission_window_open(
+        200, vote_end, policy
+    ));
+    assert!(!timing::is_share_resubmission_window_open(
         u64::MAX,
         vote_end,
         policy
@@ -149,10 +155,10 @@ fn the_last_open_resubmission_second_is_open_and_the_next_is_not() {
         crate::share_policy::timing::last_open_resubmission_second(vote_end, policy).unwrap();
 
     assert_eq!(last_open, 189);
-    assert!(is_share_resubmission_window_open(
+    assert!(timing::is_share_resubmission_window_open(
         last_open, vote_end, policy
     ));
-    assert!(!is_share_resubmission_window_open(
+    assert!(!timing::is_share_resubmission_window_open(
         last_open + 1,
         vote_end,
         policy
@@ -172,7 +178,7 @@ fn a_round_shorter_than_the_cutoff_has_no_open_resubmission_second() {
         crate::share_policy::timing::last_open_resubmission_second(0, policy),
         None
     );
-    assert!(!is_share_resubmission_window_open(0, 10, policy));
+    assert!(!timing::is_share_resubmission_window_open(0, 10, policy));
 }
 
 #[test]

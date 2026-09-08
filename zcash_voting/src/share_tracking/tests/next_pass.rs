@@ -103,11 +103,10 @@ fn a_round_too_close_to_fit_a_status_walk_wakes_for_the_vote_end() {
     // no recovery wake worth scheduling, so the vote end is the boundary and
     // only the pass already running can still resubmit.
     assert_eq!(capped(15, 1_000, Some(1_020)), 15);
-    assert!(crate::share_policy::is_share_resubmission_window_open(
-        1_000,
-        1_020,
-        ShareTimingPolicy::default()
-    ));
+    assert!(
+        crate::share_policy::RoundWindow::new(Some(1_020), ShareTimingPolicy::default())
+            .can_resubmit_at(1_000)
+    );
 }
 
 #[test]
@@ -117,16 +116,14 @@ fn a_pass_on_the_last_open_second_waits_for_the_vote_end_not_for_itself() {
     // left. Treating the current second as the boundary would cap the delay to
     // zero and spend a pass re-waking on the second it is already inside.
     assert_eq!(capped(15, 1_000, Some(1_011)), 11);
-    assert!(crate::share_policy::is_share_resubmission_window_open(
-        1_000,
-        1_011,
-        ShareTimingPolicy::default()
-    ));
-    assert!(!crate::share_policy::is_share_resubmission_window_open(
-        1_001,
-        1_011,
-        ShareTimingPolicy::default()
-    ));
+    assert!(
+        crate::share_policy::RoundWindow::new(Some(1_011), ShareTimingPolicy::default())
+            .can_resubmit_at(1_000)
+    );
+    assert!(
+        !crate::share_policy::RoundWindow::new(Some(1_011), ShareTimingPolicy::default())
+            .can_resubmit_at(1_001)
+    );
 }
 
 #[test]

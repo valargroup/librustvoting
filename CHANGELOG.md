@@ -612,10 +612,10 @@ This release is `zcash_voting` 4.0.0.
 
 - `RoundWindow` is the single answer to what a round still permits. Whether a
   share may be resubmitted now, whether it is beyond help, when to wake next,
-  and whether a pass has reached its cutoff all follow from two facts — when
-  recovery shuts and when confirmation does — and each was derived
-  independently at its own call site, from its own reading of the clock. They
-  could and did disagree.
+  whether a pass has reached its cutoff, and whether the resubmission loop may
+  try one more helper all follow from two facts — when recovery shuts and when
+  confirmation does — and each was derived independently at its own call site,
+  from its own reading of the clock. They could and did disagree.
 
 - A share no helper holds is reported in `terminal_unconfirmed` once recovery
   is shut for the round, not only when its material is beyond rebuilding. Its

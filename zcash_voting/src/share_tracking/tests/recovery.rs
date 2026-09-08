@@ -1991,11 +1991,10 @@ async fn missing_recovery_after_the_resubmission_cutoff_is_still_terminal() {
     // change because the window happens to be shut.
     let now = overdue();
     let vote_end = now + ShareTimingPolicy::default().resubmit_cutoff_seconds;
-    assert!(!crate::share_policy::is_share_resubmission_window_open(
-        now,
-        vote_end,
-        ShareTimingPolicy::default()
-    ));
+    assert!(
+        !crate::share_policy::RoundWindow::new(Some(vote_end), ShareTimingPolicy::default())
+            .can_resubmit_at(now)
+    );
 
     let report = track_pending_shares(
         &db,
@@ -2209,11 +2208,10 @@ async fn a_share_no_helper_holds_is_terminal_once_recovery_is_shut_for_good() {
 
     let now = overdue();
     let vote_end = now + ShareTimingPolicy::default().resubmit_cutoff_seconds;
-    assert!(!crate::share_policy::is_share_resubmission_window_open(
-        now,
-        vote_end,
-        ShareTimingPolicy::default()
-    ));
+    assert!(
+        !crate::share_policy::RoundWindow::new(Some(vote_end), ShareTimingPolicy::default())
+            .can_resubmit_at(now)
+    );
 
     let report = track_pending_shares(
         &db,

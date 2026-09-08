@@ -139,7 +139,7 @@ pub use timing::{
 };
 
 pub(crate) use server_order::effective_share_submission_target_count;
-pub(crate) use timing::{is_share_resubmission_window_open, RoundWindow};
+pub(crate) use timing::RoundWindow;
 
 #[cfg(test)]
 mod tests;

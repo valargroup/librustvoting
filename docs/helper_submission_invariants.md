@@ -593,13 +593,16 @@ delay is at least three seconds. No unconfirmed shares yields no next delay.
 
 **One place answers what the round still permits.** Recovery shuts a
 `resubmit_cutoff_seconds` before the vote end and confirmation shuts at the
-vote end itself, and four separate questions depend on those two facts: whether
-this share may be resubmitted now, whether it is beyond help, when to wake
-next, and whether the pass has reached its cutoff. They must agree, so
-`RoundWindow` owns them and every caller asks it rather than re-deriving the
-algebra from `(now, vote_end, policy)` at its own call site. Deriving them
-independently is what let a wake boundary be computed for one moment while the
-permission it was protecting was evaluated at another.
+vote end itself, and five questions depend on those two facts: whether this
+share may be resubmitted now, whether it is beyond help, when to wake next,
+whether the pass has reached its cutoff, and whether the resubmission loop may
+try one more helper. They must agree, so `RoundWindow` owns them all and every
+caller asks it rather than re-deriving the algebra from
+`(now, vote_end, policy)` at its own call site. `ShareTrackingParams::round_window`
+is the single construction, so a pass and the recovery loop inside it cannot
+reach different conclusions about the same round. Deriving these independently
+is what let a wake boundary be computed for one moment while the permission it
+was protecting was evaluated at another.
 
 The delay is then shortened so it never steps over a boundary that closes what
 a pass can still do, bounded by whichever is still ahead. That boundary is not
