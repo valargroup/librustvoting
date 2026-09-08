@@ -586,3 +586,5 @@ mod delivery_plan;
 mod initial_delivery;
 mod recovery;
 mod timing_policy;
+
+mod observability;

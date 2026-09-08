@@ -1130,6 +1130,27 @@ are `stale_handle_cannot_prepare_same_commitment_replacement`,
 `global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`.
 These replace the former wallet-example planner and per-share delivery tests.
 
+### Delivery diagnostics
+
+`share_tracking::delivery_progress` is the shared placement-evidence classifier
+used by vote completion and observability. Completed tasks do not imply accepted
+placement: after errors, cancellation, and unprocessed shares are accounted for,
+a share with no accepted or ambiguous helper reports diagnostic failure; a share
+with only ambiguous helpers reports pending. At least one definite acceptance
+per share suffices for initial-delivery success, independently of redundancy and
+confirmation. Diagnostics never change durable state or the returned domain
+result.
+
+The common committed-share delivery boundary binds the actual round, bundle,
+proposal, and share identity to its local observation client before fallible
+work. Concurrent shares and atomic-batch members retain their own identities
+through HTTP retries without changing the parent step's identity.
+
+Regression tests in `share_tracking/tests/observability.rs`:
+`delivery_diagnostics_classify_evidence_and_boundary_precedence`,
+`reported_delivery_preserves_results_and_classifies_completed_tasks`, and
+`atomic_round_delivery_attributes_every_proposal_share_and_retry`.
+
 ## Confirmation and health invariants
 
 ### Status interpretation

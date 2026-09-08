@@ -11,7 +11,8 @@ mod format;
 pub(crate) mod wire;
 pub(crate) use classification::{
     chain_episode_outcome, chain_error_kind, chain_result_outcome, delegation_proof_outcome,
-    helper_error_kind, round_run_outcome, step_attribution, step_result_outcome, voting_error_kind,
+    helper_error_kind, round_run_outcome, share_delivery_outcome, step_attribution,
+    step_result_outcome, voting_error_kind,
 };
 mod scope;
 mod types;

@@ -907,14 +907,7 @@ impl ConfirmedVote {
                     .map_err(|failure| failure.error)
             }
             .await;
-        let outcome = match &operation_result {
-            Err(_) => crate::ObservationOutcome::Failed,
-            Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
-            Ok(report) if !report.pending_share_indices.is_empty() => {
-                crate::ObservationOutcome::Pending
-            }
-            Ok(_) => crate::ObservationOutcome::Succeeded,
-        };
+        let outcome = crate::observability::share_delivery_outcome(&operation_result);
         stage.finish(
             outcome,
             operation_result
@@ -926,6 +919,12 @@ impl ConfirmedVote {
     }
 
     /// Runs this workflow with optional per-call diagnostics, including on errors.
+    ///
+    /// Diagnostics report success once every share has a definite acceptance,
+    /// pending while shares are unprocessed or only ambiguously delivered, and
+    /// failure when a processed share has neither accepted nor ambiguous helpers.
+    /// Errors and cancellation take precedence. The domain result is unchanged:
+    /// an unsuccessful delivery pass can still return `Ok(report)`.
     pub async fn submit_prepared_shares_with_report(
         &self,
         db: &VotingDb,
@@ -940,14 +939,7 @@ impl ConfirmedVote {
         let operation_result = self
             .observe_submit_prepared_shares(db, &observed_client, params, cancel)
             .await;
-        let outcome = match &operation_result {
-            Err(_) => crate::ObservationOutcome::Failed,
-            Ok(report) if report.cancelled => crate::ObservationOutcome::Cancelled,
-            Ok(report) if !report.pending_share_indices.is_empty() => {
-                crate::ObservationOutcome::Pending
-            }
-            Ok(_) => crate::ObservationOutcome::Succeeded,
-        };
+        let outcome = crate::observability::share_delivery_outcome(&operation_result);
         invocation.complete("submit_prepared_shares", outcome, operation_result)
     }
 

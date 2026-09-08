@@ -166,3 +166,22 @@ pub(crate) fn delegation_proof_outcome(
         Err(_) => ObservationOutcome::Failed,
     }
 }
+
+/// Projects initial delivery evidence without changing the authoritative result.
+/// Errors and cancellation take precedence over unprocessed shares. Completed
+/// shares need at least one definite acceptance, not the full redundancy target.
+pub(crate) fn share_delivery_outcome(
+    result: &Result<crate::share_tracking::ShareBatchDeliveryReport, crate::VotingError>,
+) -> ObservationOutcome {
+    use crate::share_tracking::{delivery_progress, DeliveryProgress};
+    match result {
+        Err(_) => ObservationOutcome::Failed,
+        Ok(report) if report.cancelled => ObservationOutcome::Cancelled,
+        Ok(report) if !report.pending_share_indices.is_empty() => ObservationOutcome::Pending,
+        Ok(report) => match delivery_progress(report) {
+            DeliveryProgress::Complete => ObservationOutcome::Succeeded,
+            DeliveryProgress::AwaitingAmbiguousHelpers => ObservationOutcome::Pending,
+            DeliveryProgress::Incomplete => ObservationOutcome::Failed,
+        },
+    }
+}

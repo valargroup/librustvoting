@@ -8,6 +8,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 This release is `zcash_voting` 4.0.0.
 
+### Fixed
+
+- Helper-delivery diagnostics classify definite acceptance, ambiguous delivery,
+  and definitely-unsent shares consistently at stage and invocation boundaries.
+  Atomic-batch helper attempts and retries carry their actual bundle, proposal,
+  and share identity.
+
 ### Added
 
 - Pipeline cached-proof diagnostics consistently report `Reused` at both stage

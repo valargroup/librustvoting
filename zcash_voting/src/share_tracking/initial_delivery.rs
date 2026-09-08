@@ -423,6 +423,17 @@ pub(crate) async fn submit_committed_share_to_helpers(
     scope: &share::ShareOperationScope,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
+    // Batch steps name an anchor proposal, but each concurrent share must
+    // override that inherited identity before any of its transport work.
+    let observations = client.observation_scope();
+    observations.bind_round_id(round_id);
+    let observations = observations.attributed(crate::ObservationAttribution {
+        bundle_index: Some(bundle_index),
+        proposal_id: Some(proposal_id),
+        share_index: Some(request.share_index),
+    });
+    let observed_client = client.observing(&observations);
+    let client = &observed_client;
     let configured = ConfiguredHelperFleet::new(request.configured_server_urls)?;
     let planning_fleet = ConfiguredHelperFleet::new(request.planning_server_urls)?;
     let planned = canonical_helper_url_list(&request.plan.target_servers)?;

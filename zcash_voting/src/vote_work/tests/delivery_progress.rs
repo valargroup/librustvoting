@@ -1,12 +1,9 @@
 //! A delivery report decides whether a step advanced, must wait for
 //! tracking, or failed to place a share.
 
-use crate::{
-    share_tracking::{
-        ShareBatchDeliveryReport, ShareDeliveryOutcome, SharePlacementGuarantee,
-        ShareSubmissionReport,
-    },
-    vote_work::vote_completion::{delivery_progress, DeliveryProgress},
+use crate::share_tracking::{
+    delivery_progress, DeliveryProgress, ShareBatchDeliveryReport, ShareDeliveryOutcome,
+    SharePlacementGuarantee, ShareSubmissionReport,
 };
 
 fn report(outcomes: &[(&[&str], &[&str])], pending: &[u32]) -> ShareBatchDeliveryReport {

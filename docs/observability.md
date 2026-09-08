@@ -78,6 +78,21 @@ shares are not confirmed, and hashless chain submissions remain
 domain result for retry and recovery decisions. Diagnostics are explanatory and
 are never persisted as lifecycle state.
 
+Initial share-delivery stages and invocation summaries use the same placement
+classification. Errors report `failed`, cancellation reports `cancelled`, and
+unprocessed shares report `pending`, in that order. Once every share task has
+completed, a share with neither accepted nor ambiguous helpers makes the pass
+`failed`; otherwise a share with only ambiguous helpers makes it `pending`.
+Success requires at least one definite acceptance per share, not the full
+redundancy target or chain confirmation. A completed task alone is not evidence
+of acceptance. These diagnostics do not turn an authoritative `Ok(report)` into
+an error.
+
+Each initial-delivery HTTP attempt and retry carries the actual bundle,
+proposal, and share index, including when one atomic batch step delivers several
+proposals. The enclosing step may name the batch's anchor proposal; its child
+share attempts override that identity locally.
+
 Snapshots are frozen on return. Work still running is `unfinished`, with elapsed
 time clipped at that boundary. Detached workers cannot mutate returned reports.
 Parent and child durations overlap; summing records does not give wall time.

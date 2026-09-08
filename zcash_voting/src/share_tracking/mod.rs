@@ -268,7 +268,9 @@ pub struct ShareDeliveryOutcome {
 /// Results of one commitment-wide initial-delivery pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareBatchDeliveryReport {
+    /// Processed shares, including those without any definite acceptance.
     pub deliveries: Vec<ShareDeliveryOutcome>,
+    /// Shares without a completed task; this is not a placement-success measure.
     pub pending_share_indices: Vec<u32>,
     pub cancelled: bool,
     pub placement_guarantee: SharePlacementGuarantee,
@@ -485,11 +487,13 @@ pub(crate) fn os_random_bytes(len: usize) -> Vec<u8> {
 mod configured_fleet;
 mod confirmation;
 mod delivery_plan;
+mod delivery_progress;
 mod immediate_designation;
 mod initial_delivery;
 mod recovery;
 
 pub(crate) use delivery_plan::{load_share_delivery_plan, prepare_share_delivery_plan};
+pub(crate) use delivery_progress::{delivery_progress, DeliveryProgress};
 
 use configured_fleet::ConfiguredHelperFleet;
 #[cfg(test)]
