@@ -228,6 +228,8 @@ pub(crate) fn project(
         primary_action,
         needs_delegation_signing: work_summary.needs_delegation_signing,
         has_in_flight_delegation: work_summary.has_in_flight_delegation,
+        delegation_bundles_needing_work: work_summary.delegation_bundles_needing_work,
+        delegation_bundles_needing_signing: work_summary.delegation_bundles_needing_signing,
         needs_vote_polling: work_summary.needs_vote_polling,
         has_remaining_vote_or_share_work: work_summary.has_remaining_vote_or_share_work,
         has_recoverable_vote_or_share_work: work_summary.has_recoverable_vote_or_share_work,
@@ -781,6 +783,8 @@ fn push_submit_share_work(
 pub(crate) struct PlanWorkSummary {
     pub(crate) needs_delegation_signing: bool,
     pub(crate) has_in_flight_delegation: bool,
+    pub(crate) delegation_bundles_needing_work: Vec<u32>,
+    pub(crate) delegation_bundles_needing_signing: Vec<u32>,
     pub(crate) needs_vote_polling: bool,
     pub(crate) has_remaining_vote_or_share_work: bool,
     pub(crate) has_recoverable_vote_or_share_work: bool,
@@ -790,22 +794,44 @@ pub(crate) fn summarize_plan_work(
     steps: &[NextStep],
     blocking_share_work: bool,
 ) -> PlanWorkSummary {
+    // Collected as sets so a bundle with several delegation steps is named
+    // once, and reported ascending so a host can compare two plans directly.
+    let mut needing_work = std::collections::BTreeSet::new();
+    let mut needing_signing = std::collections::BTreeSet::new();
     let mut summary = PlanWorkSummary {
         needs_delegation_signing: false,
         has_in_flight_delegation: false,
+        delegation_bundles_needing_work: Vec::new(),
+        delegation_bundles_needing_signing: Vec::new(),
         needs_vote_polling: false,
         has_remaining_vote_or_share_work: false,
         has_recoverable_vote_or_share_work: false,
     };
     for step in steps {
         match step {
-            NextStep::Delegate { .. } => summary.needs_delegation_signing = true,
-            NextStep::AdvanceDelegation { .. } => {
+            NextStep::Delegate { bundle_index, .. } => {
+                summary.needs_delegation_signing = true;
+                needing_work.insert(*bundle_index);
+                // Nothing is on the chain for this bundle yet, so producing a
+                // delegation needs the voter's signature.
+                needing_signing.insert(*bundle_index);
+            }
+            NextStep::AdvanceDelegation { bundle_index, .. } => {
                 summary.needs_delegation_signing = true;
                 summary.has_in_flight_delegation = true;
+                needing_work.insert(*bundle_index);
+                // In flight is not signed and done: advancing one re-signs the
+                // locked generation, so the bundle still needs the voter's
+                // signing material. Leaving it out here would disagree with
+                // the flag set on the line above.
+                needing_signing.insert(*bundle_index);
             }
-            NextStep::AdvanceImportedDelegation { .. } => {
+            NextStep::AdvanceImportedDelegation { bundle_index, .. } => {
                 summary.has_in_flight_delegation = true;
+                needing_work.insert(*bundle_index);
+                // The one delegation step that never asks the voter for a
+                // signer: an imported capability is already broadcast, so this
+                // adopts its package hash and polls.
             }
             NextStep::CastVote { .. }
             | NextStep::AdvanceVote { .. }
@@ -823,5 +849,7 @@ pub(crate) fn summarize_plan_work(
             }
         }
     }
+    summary.delegation_bundles_needing_work = needing_work.into_iter().collect();
+    summary.delegation_bundles_needing_signing = needing_signing.into_iter().collect();
     summary
 }
