@@ -1690,11 +1690,15 @@ host wallet:
    that schedule for itself — the values a host-side loop was assembled from
    are crate-private.
 
-   A host may still run a single pass with `track_pending_shares`. The pass
+   A host may still run a single pass with `track_pending_shares`, and the pass
    reports its own `next_delay_seconds`, so a host scheduling by hand follows
-   the schedule the SDK computed rather than one it derived; but that delay is
-   computed from share rows alone, so such a host owns the vote-end boundary
-   again.
+   the schedule the SDK computed rather than one it derived. What it takes back
+   is narrower than the whole vote-end boundary: the pass still enforces the
+   recovery cutoff itself, refusing to resubmit within `resubmit_cutoff_seconds`
+   of vote end. What it does not do is bound its own delay — that is computed
+   from share rows alone — or stop polling once the round closes. So a host
+   driving passes by hand owns not sleeping past vote end, and ending the loop
+   there.
 5. **Initial delivery invocation.** Supported wallet integrations bind a
    `RoundExecutor` to the complete proposal roster from the authenticated round
    configuration and drive it with `RoundDriver::run`, which supplies the
