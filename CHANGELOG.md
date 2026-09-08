@@ -766,6 +766,23 @@ This release is `zcash_voting` 4.0.0.
 
 ### Removed
 
+- **Breaking:** removed `share::pending_rounds` and `share::PendingShareRound`.
+  `share::pending_rounds_for_accounts` returns the same rounds with the wallet
+  each belongs to, which is what a multi-account host needs to act on one.
+- **Breaking:** removed `share::next_tracking_delay_for_round`,
+  `share::policy::next_tracking_delay_seconds` and
+  `share::policy::is_share_ready_for_status_check` from the public API, along
+  with the four constants only they read:
+  `SHARE_STATUS_CHECK_GRACE_SECONDS`, `SHARE_READY_POLL_INTERVAL_SECONDS`,
+  `SHARE_FUTURE_CHECK_MAX_DELAY_SECONDS`, and
+  `SHARE_MIN_TRACKING_DELAY_SECONDS`. Pass cadence is `ShareTrackingDriver`'s:
+  it repeats a pass on the delay each pass computes, caps that delay at the
+  round's boundaries, and reports why it stopped through
+  `ShareTrackingQuiescence`. A host that scheduled passes itself should run the
+  driver and observe its events; one that needs a default value reads it from
+  `ShareTimingPolicy::default()`, which is still public and is what the
+  driver's policy is built from.
+
 - **Breaking:** removed the persisted-vote recovery driver
   `VoteRecoveryExecutor::advance` with `VoteRecoveryRequest`,
   `VoteRecoveryAdvance`, `VoteRecoveryDisposition`, `VoteRecoveryFailure`,

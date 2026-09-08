@@ -3,7 +3,7 @@ use crate::types::ShareDelegationRecord;
 use super::{ShareTimingPolicy, ShareTrackingSummary};
 
 /// Seconds to wait after helper submission time before polling share status.
-pub const SHARE_STATUS_CHECK_GRACE_SECONDS: u64 = 10;
+pub(crate) const SHARE_STATUS_CHECK_GRACE_SECONDS: u64 = 10;
 /// Minimum seconds before an unconfirmed share is considered overdue.
 pub const SHARE_MIN_OVERDUE_THRESHOLD_SECONDS: u64 = 30;
 /// Maximum seconds before an unconfirmed share is considered overdue.
@@ -11,11 +11,11 @@ pub const SHARE_MAX_OVERDUE_THRESHOLD_SECONDS: u64 = 60 * 60;
 /// Seconds near the vote end when resubmission should stop.
 pub const SHARE_RESUBMIT_CUTOFF_SECONDS: u64 = 10;
 /// Seconds between polls when all remaining shares are ready but unconfirmed.
-pub const SHARE_READY_POLL_INTERVAL_SECONDS: u64 = 15;
+pub(crate) const SHARE_READY_POLL_INTERVAL_SECONDS: u64 = 15;
 /// Maximum seconds to wait for a future share to become ready.
-pub const SHARE_FUTURE_CHECK_MAX_DELAY_SECONDS: u64 = 30;
+pub(crate) const SHARE_FUTURE_CHECK_MAX_DELAY_SECONDS: u64 = 30;
 /// Minimum seconds to sleep before the next tracking poll.
-pub const SHARE_MIN_TRACKING_DELAY_SECONDS: u64 = 3;
+pub(crate) const SHARE_MIN_TRACKING_DELAY_SECONDS: u64 = 3;
 /// Numerator for the last-moment share window fraction.
 pub const LAST_MOMENT_BUFFER_FRACTION_NUMERATOR: u64 = 2;
 /// Denominator for the last-moment share window fraction.
@@ -79,7 +79,7 @@ pub fn share_recovery_base_time(share: &ShareDelegationRecord) -> u64 {
 }
 
 /// Return true once a helper has had enough time to process this share.
-pub fn is_share_ready_for_status_check(
+pub(crate) fn is_share_ready_for_status_check(
     share: &ShareDelegationRecord,
     now_seconds: u64,
     policy: ShareTimingPolicy,
@@ -153,7 +153,7 @@ pub(crate) fn is_share_resubmission_window_open(
 /// share must not queue behind an unrelated share whose check is further out.
 /// The returned delay is always at least `min_tracking_delay_seconds`, and
 /// `None` means no unconfirmed share remains — the signal to stop tracking.
-pub fn next_tracking_delay_seconds(
+pub(crate) fn next_tracking_delay_seconds(
     shares: &[ShareDelegationRecord],
     now_seconds: u64,
     policy: ShareTimingPolicy,

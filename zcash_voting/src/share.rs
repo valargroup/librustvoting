@@ -226,32 +226,23 @@ use rusqlite::TransactionBehavior;
 
 pub use crate::types::ShareDelegationRecord as ShareRecord;
 
-/// One persisted round that still has unconfirmed helper shares.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingShareRound {
-    /// Stable vote-round identifier.
-    pub round_id: String,
-    /// Opaque caller context stored when the round was first created.
-    pub session_json: Option<String>,
-}
-
 /// Share scheduling and retry policy helpers.
 pub mod policy {
     pub use crate::share_policy::{
-        is_last_moment, is_share_ready_for_status_check, last_moment_buffer_seconds,
-        last_moment_deadline_seconds, next_tracking_delay_seconds, overdue_threshold_seconds,
-        plan_share_submission, plan_share_submission_from_order, plan_share_submissions,
-        plan_share_submissions_with_preferred_servers, resubmission_server_order,
-        resubmission_server_order_from_configured_order, resubmission_server_order_from_groups,
-        resubmission_server_order_random_bytes_required, scheduled_share_submit_at_from_entropy,
-        scheduled_share_submit_at_from_random_unit, select_share_submission_targets,
-        select_share_submission_targets_from_order, share_recovery_base_time,
-        share_server_order_random_bytes_required, share_server_selection_policy,
-        share_submission_random_bytes_required, share_submission_target_count,
-        share_submit_at_random_bytes_required, should_resubmit_share, shuffled_share_server_order,
-        summarize_share_tracking, ImmediateShareKey, ShareServerSelectionPolicy,
-        ShareSubmissionPlan, ShareSubmissionRandomBytesRequired, ShareTimingPolicy,
-        ShareTrackingSummary, IMMEDIATE_SHARE_INDEX, LAST_MOMENT_BUFFER_FRACTION_DENOMINATOR,
+        is_last_moment, last_moment_buffer_seconds, last_moment_deadline_seconds,
+        overdue_threshold_seconds, plan_share_submission, plan_share_submission_from_order,
+        plan_share_submissions, plan_share_submissions_with_preferred_servers,
+        resubmission_server_order, resubmission_server_order_from_configured_order,
+        resubmission_server_order_from_groups, resubmission_server_order_random_bytes_required,
+        scheduled_share_submit_at_from_entropy, scheduled_share_submit_at_from_random_unit,
+        select_share_submission_targets, select_share_submission_targets_from_order,
+        share_recovery_base_time, share_server_order_random_bytes_required,
+        share_server_selection_policy, share_submission_random_bytes_required,
+        share_submission_target_count, share_submit_at_random_bytes_required,
+        should_resubmit_share, shuffled_share_server_order, summarize_share_tracking,
+        ImmediateShareKey, ShareServerSelectionPolicy, ShareSubmissionPlan,
+        ShareSubmissionRandomBytesRequired, ShareTimingPolicy, ShareTrackingSummary,
+        IMMEDIATE_SHARE_INDEX, LAST_MOMENT_BUFFER_FRACTION_DENOMINATOR,
         LAST_MOMENT_BUFFER_FRACTION_NUMERATOR, LAST_MOMENT_BUFFER_MAX_SECONDS,
         SHARE_HELPER_INITIAL_MAX_FRACTION_DENOMINATOR, SHARE_HELPER_INITIAL_MAX_FRACTION_NUMERATOR,
         SHARE_HELPER_MAX_CONCURRENT_POSTS, SHARE_HELPER_MAX_INITIAL_SHARES_PER_SERVER,
@@ -799,12 +790,25 @@ pub(crate) fn unconfirmed_for_scope(
     db.get_unconfirmed_delegations_for_wallet(round_id, scope.wallet_id())
 }
 
-/// Lists rounds with at least one unconfirmed helper share.
+/// One persisted round that still has unconfirmed helper shares.
 ///
-/// Each round is returned once in newest-first order. The persisted
-/// `session_json` lets wallet integrations restore caller-owned round timing
-/// without reading the voting database schema directly.
-pub fn pending_rounds(db: &VotingDb) -> Result<Vec<PendingShareRound>, VotingError> {
+/// Private: [`pending_rounds_for_accounts`] is the crate's only reader, and a
+/// round without the wallet it belongs to is not something a multi-account
+/// host can act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingShareRound {
+    /// Stable vote-round identifier.
+    round_id: String,
+    /// Opaque caller context stored when the round was first created.
+    session_json: Option<String>,
+}
+
+/// Lists rounds with at least one unconfirmed helper share, newest first.
+///
+/// Scoped to whatever wallet `db` is already scoped to; the persisted
+/// `session_json` carries caller-owned round timing without exposing the
+/// voting database schema.
+fn pending_rounds(db: &VotingDb) -> Result<Vec<PendingShareRound>, VotingError> {
     db.pending_share_rounds().map(|rounds| {
         rounds
             .into_iter()
@@ -830,8 +834,8 @@ pub struct PendingShareRoundForAccount {
 /// Lists pending share rounds for several wallets through one open sidecar.
 ///
 /// `wallet_ids` are deduplicated and visited in sorted order; within one
-/// wallet rounds keep the newest-first order of [`pending_rounds`]. The
-/// handle's own wallet id is not consulted.
+/// wallet rounds keep their newest-first order. The handle's own wallet id is
+/// not consulted.
 pub fn pending_rounds_for_accounts(
     db: &VotingDb,
     wallet_ids: &[&str],
@@ -855,26 +859,6 @@ pub fn pending_rounds_for_accounts(
         }
     }
     Ok(rounds)
-}
-
-/// Seconds until this round's next helper-share tracking pass should run.
-///
-/// Returns `None` when the round has no unconfirmed shares left, which is also
-/// the signal to stop background tracking. Reading the rows here keeps durable
-/// share records inside the crate: a host that computed this itself would have
-/// to carry them across its boundary just to hand them back.
-pub fn next_tracking_delay_for_round(
-    db: &VotingDb,
-    round_id: &str,
-    now_seconds: u64,
-    policy: ShareTimingPolicy,
-) -> Result<Option<u64>, VotingError> {
-    let shares = db.get_unconfirmed_delegations(round_id)?;
-    Ok(policy::next_tracking_delay_seconds(
-        &shares,
-        now_seconds,
-        policy,
-    ))
 }
 
 /// Re-reads whether one helper-share record is durably confirmed.
