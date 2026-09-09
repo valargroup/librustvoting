@@ -609,7 +609,7 @@ impl HelperClient {
         now_seconds: u64,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ShareStatus, HelperError> {
-        let observations = self.observation_scope();
+        let observations = self.observation_scope().for_helper(server_url);
         observations.bind_round_id(round_id);
         let stage = observations.stage("helper::share_status");
         let client = self.observing(stage.scope());
@@ -722,7 +722,7 @@ impl HelperClient {
         now_seconds: u64,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ShareSubmissionStatus, HelperError> {
-        let observations = self.observation_scope();
+        let observations = self.observation_scope().for_helper(server_url);
         let stage = observations.stage("helper::submit_share");
         let client = self.observing(stage.scope());
         let result = client
@@ -803,25 +803,46 @@ impl HelperClient {
         timeout: Duration,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<ShareSubmissionStatus, HelperError> {
-        if timeout.is_zero() {
-            return Err(HelperError::InvalidRequest {
-                message: "share submission timeout must be nonzero".to_string(),
-            });
+        let observations = self.observation_scope().for_helper(server_url);
+        let stage = observations.stage("helper::post_share");
+        let observed_client = self.observing(stage.scope());
+        let result = async {
+            if timeout.is_zero() {
+                return Err(HelperError::InvalidRequest {
+                    message: "share submission timeout must be nonzero".to_string(),
+                });
+            }
+            let server_url = canonicalize_helper_base_url(server_url).map_err(invalid_request)?;
+            let body = validate_share_body(share_wire_json)?;
+            let request_started = tokio::time::Instant::now();
+            let result = observed_client
+                .post_share(
+                    &server_url,
+                    body,
+                    cancel,
+                    false,
+                    timeout.min(self.config.post_timeout),
+                    deadline,
+                )
+                .await;
+            self.score(&server_url, &result, now_seconds, request_started);
+            result
         }
-        let server_url = canonicalize_helper_base_url(server_url).map_err(invalid_request)?;
-        let body = validate_share_body(share_wire_json)?;
-        let request_started = tokio::time::Instant::now();
-        let result = self
-            .post_share(
-                &server_url,
-                body,
-                cancel,
-                false,
-                timeout.min(self.config.post_timeout),
-                deadline,
-            )
-            .await;
-        self.score(&server_url, &result, now_seconds, request_started);
+        .await;
+        let outcome = match &result {
+            Ok(ShareSubmissionStatus::Queued) => crate::ObservationOutcome::Pending,
+            Ok(ShareSubmissionStatus::Duplicate) => crate::ObservationOutcome::Reused,
+            Err(HelperError::Cancelled) => crate::ObservationOutcome::Cancelled,
+            Err(error) if error.is_ambiguous() => crate::ObservationOutcome::PossiblyDispatched,
+            Err(_) => crate::ObservationOutcome::Failed,
+        };
+        stage.finish(
+            outcome,
+            result
+                .as_ref()
+                .err()
+                .map(crate::observability::helper_error_kind),
+        );
         result
     }
 
@@ -853,7 +874,7 @@ impl HelperClient {
         now_seconds: u64,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ShareSubmissionStatus, HelperError> {
-        let observations = self.observation_scope();
+        let observations = self.observation_scope().for_helper(server_url);
         let stage = observations.stage("helper::resubmit_share");
         let client = self.observing(stage.scope());
         let result = client

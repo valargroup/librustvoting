@@ -10,6 +10,11 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Helper diagnostics distinguish queue residence, active delivery, permit/lock
+  waits, parsed acceptance, durable acceptance, confirmation quorum and persistence,
+  and tracking cadence. Configured endpoint ordinals survive health reordering
+  and retries; the benchmark guide documents client/server correlation limits.
+
 - Preserve combined-vote recovery records when upgrading version-22 preview
   databases, including previews missing the delegation PCZT column. Unknown
   preview schemas fail without changing stored state.

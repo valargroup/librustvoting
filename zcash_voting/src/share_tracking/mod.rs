@@ -108,22 +108,39 @@ async fn lock_share_operation_or_cancel(
     proposal_id: u32,
     share_index: u32,
     cancel: &(dyn Fn() -> bool + Send + Sync),
+    observations: &crate::ObservationScope,
 ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, VotingError> {
-    let lock = lock_share_operation(scope, round_id, bundle_index, proposal_id, share_index);
-    tokio::pin!(lock);
+    let wait = observations.stage("helper::share_lock_wait");
+    let admission = async {
+        let lock = lock_share_operation(scope, round_id, bundle_index, proposal_id, share_index);
+        tokio::pin!(lock);
 
-    loop {
-        if cancel() {
-            return Ok(None);
-        }
-        tokio::select! {
-            biased;
-            result = &mut lock => return result.map(Some),
-            _ = tokio::time::sleep(Duration::from_millis(
-                SHARE_OPERATION_LOCK_CANCEL_CHECK_MILLISECONDS,
-            )) => {}
+        loop {
+            if cancel() {
+                return Ok(None);
+            }
+            tokio::select! {
+                biased;
+                result = &mut lock => return result.map(Some),
+                _ = tokio::time::sleep(Duration::from_millis(
+                    SHARE_OPERATION_LOCK_CANCEL_CHECK_MILLISECONDS,
+                )) => {}
+            }
         }
     }
+    .await;
+    wait.finish(
+        match &admission {
+            Ok(Some(_)) => crate::ObservationOutcome::Succeeded,
+            Ok(None) => crate::ObservationOutcome::Cancelled,
+            Err(_) => crate::ObservationOutcome::Failed,
+        },
+        admission
+            .as_ref()
+            .err()
+            .map(crate::observability::voting_error_kind),
+    );
+    admission
 }
 
 /// Identifies one helper share within a round.
@@ -552,6 +569,12 @@ pub(crate) async fn observe_confirm_pending_share(
     let operation_result: Result<ShareConfirmationReport, VotingError> = async {
         let scope = share::ShareOperationScope::capture(db);
         let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
+        let observed_client = client.observing(
+            &client
+                .observation_scope()
+                .with_helper_fleet(configured_fleet.urls()),
+        );
+        let client = &observed_client;
         let loaded_share = share::get_delegation_for_scope(
             db,
             &scope,
@@ -577,6 +600,7 @@ pub(crate) async fn observe_confirm_pending_share(
             params.share.proposal_id,
             params.share.share_index,
             cancel,
+            &client.observation_scope(),
         )
         .await?
         else {
@@ -658,7 +682,11 @@ async fn poll_and_confirm_share(
     now_seconds: u64,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareConfirmationReport, VotingError> {
+    let observations = client.observation_scope();
     if share.confirmed {
+        observations
+            .stage("helper::confirmation_reused")
+            .finish(crate::ObservationOutcome::Reused, None);
         return Ok(ShareConfirmationReport {
             confirmed: true,
             cancelled: false,
@@ -666,16 +694,30 @@ async fn poll_and_confirm_share(
     }
 
     let share_id = hex::encode(&share.nullifier);
-    match poll_share_helpers(
-        client,
+    let quorum = observations.stage("helper::confirmation_quorum");
+    let observed_client = client.observing(quorum.scope());
+    let polled = poll_share_helpers(
+        &observed_client,
         round_id,
         &share_id,
         configured_urls,
         now_seconds,
         cancel,
     )
-    .await
-    {
+    .await;
+    quorum.finish(
+        match polled {
+            ShareStatusOutcome::ConfiguredHelperQuorumObserved => {
+                crate::ObservationOutcome::Succeeded
+            }
+            ShareStatusOutcome::ConfiguredHelperQuorumNotObserved => {
+                crate::ObservationOutcome::Pending
+            }
+            ShareStatusOutcome::Cancelled => crate::ObservationOutcome::Cancelled,
+        },
+        None,
+    );
+    match polled {
         ShareStatusOutcome::Cancelled => Ok(ShareConfirmationReport {
             confirmed: false,
             cancelled: true,
@@ -685,6 +727,7 @@ async fn poll_and_confirm_share(
         }
         ShareStatusOutcome::ConfiguredHelperQuorumObserved => {
             let generation = share::ShareGeneration::new(scope, &share.nullifier);
+            let persistence = observations.stage("helper::persist_confirmation");
             let confirmed = share::confirm_for_generation(
                 db,
                 round_id,
@@ -692,7 +735,19 @@ async fn poll_and_confirm_share(
                 share.proposal_id,
                 share.share_index,
                 generation,
-            )?;
+            );
+            persistence.finish(
+                match &confirmed {
+                    Ok(true) => crate::ObservationOutcome::Succeeded,
+                    Ok(false) => crate::ObservationOutcome::Pending,
+                    Err(_) => crate::ObservationOutcome::Failed,
+                },
+                confirmed
+                    .as_ref()
+                    .err()
+                    .map(crate::observability::voting_error_kind),
+            );
+            let confirmed = confirmed?;
             Ok(ShareConfirmationReport {
                 confirmed,
                 cancelled: false,
@@ -875,6 +930,12 @@ async fn walk_pending_shares(
     // and before dispatching any helper request.
     let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
     let configured_urls = configured_fleet.urls();
+    let observed_client = client.observing(
+        &client
+            .observation_scope()
+            .with_helper_fleet(configured_urls),
+    );
+    let client = &observed_client;
 
     let pending_shares = share::unconfirmed_for_scope(db, &scope, params.round_id)?;
     report.unconfirmed_at_entry = Some(u32::try_from(pending_shares.len()).unwrap_or(u32::MAX));
@@ -900,6 +961,7 @@ async fn walk_pending_shares(
             loaded_share.proposal_id,
             loaded_share.share_index,
             cancel,
+            &client.observation_scope(),
         )
         .await?
         else {

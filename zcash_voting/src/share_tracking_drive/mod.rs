@@ -415,7 +415,20 @@ impl<'a> ShareTrackingDriver<'a> {
                 return run.finish_exhausted();
             }
             events.report(ShareTrackingEvent::AwaitingNextPass { delay });
-            if !sleep_until_interrupted(delay, control, entry_epoch).await {
+            let wait = self
+                .client
+                .observation_scope()
+                .stage("helper::tracking_wait");
+            let completed = sleep_until_interrupted(delay, control, entry_epoch).await;
+            wait.finish(
+                if completed {
+                    crate::ObservationOutcome::Succeeded
+                } else {
+                    crate::ObservationOutcome::Cancelled
+                },
+                None,
+            );
+            if !completed {
                 return run.finish(ShareTrackingQuiescence::Cancelled);
             }
         }

@@ -180,3 +180,28 @@ before a round exists, independently of `DelegationPipeline::precompute_pir_with
 `DelegationDriver::resign_blocking_observed` extension hooks. Those public
 signatures require a publicly reachable type. Clients neither construct nor
 finalize it; normal reported operations accept options instead.
+
+## Helper delivery and confirmation timing
+
+Initial delivery reports now separate queue residence (`helper::delivery_queue_wait`),
+active share execution (`helper::active_delivery`), per-share lock wait, POST permit
+wait, parsed POST outcome, and durable acceptance. Queue timing begins when a
+validated job is enqueued, including jobs not yet polled. Active timing ends after
+outcomes are journaled, before releasing the share permit. Queue admission stays
+outside the fan-out deadline; POST-capacity waiting stays inside it.
+
+Validated helper workflows preserve configured-fleet ordinals in `endpoint_index`
+through health ordering, retries, and status polls. These zero-based ordinals refer
+to the current invocation/pass configuration; no endpoint URLs enter snapshots.
+Direct calls without a fleet retain `None`.
+
+Confirmation separates lock wait, quorum search, and generation-qualified
+persistence. Already-persisted confirmation is `helper::confirmation_reused` with
+`reused`; it does not invent a new confirmation timestamp. A quorum may succeed
+while its persistence is `pending` (generation replaced) or `failed` (storage
+error). Background tracking also records `helper::tracking_wait`, including
+cancelled waits. These diagnostics do not change timing policies or trust rules.
+
+See [the benchmark and correlation procedure](helper_delivery_benchmark.md) for
+capture limits, stage meanings, occupancy calculations, and the evidence needed
+to join SDK reports to helper processing and chain inclusion.

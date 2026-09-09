@@ -5,4 +5,5 @@ mod executor;
 mod failures;
 mod fixtures;
 mod lifecycle;
+mod observability;
 mod scheduling;

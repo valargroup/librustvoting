@@ -1220,6 +1220,24 @@ Regression tests in `share_tracking/tests/observability.rs`:
 `reported_delivery_preserves_results_and_classifies_completed_tasks`, and
 `atomic_round_delivery_attributes_every_proposal_share_and_retry`.
 
+Diagnostics additionally distinguish queue residence, active share execution,
+POST-capacity and per-share lock waits, parsed acceptance, and durable acceptance.
+Queue residence begins at enqueue, before admission; measuring it does not move
+the fan-out deadline. Confirmation reports distinguish quorum observation,
+generation-qualified persistence, and reuse of an existing confirmation.
+Validated-fleet endpoint ordinals retain configured order through health sorting
+and retries. Background driver waits are measured without changing cadence.
+No diagnostic grants placement, confirmation, or permission to retry.
+
+These boundaries are covered by
+`queue_residence_precedes_admission_and_active_delivery_includes_journaling`,
+`confirmation_diagnostics_distinguish_quorum_persistence_and_reuse`,
+`status_endpoint_ordinals_survive_health_order_and_keep_pending_semantics`,
+`cancelled_confirmation_reports_lock_wait_without_polling`, and
+`reported_tracking_waits_preserve_cadence_and_cancellation`.
+See [the benchmark procedure](helper_delivery_benchmark.md) for correlation
+limitations and the difference between helper acceptance and chain inclusion.
+
 ## Confirmation and health invariants
 
 ### Status interpretation
