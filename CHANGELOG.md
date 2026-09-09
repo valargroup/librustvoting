@@ -25,6 +25,16 @@ This release is `zcash_voting` 4.0.0.
   members: it provisions real rounds over the network and never runs under
   `make check` or `make test`.
 
+### Changed
+
+- Updated the release dependency stack to `voting-crypto-deps 0.2.3`,
+  `voting-circuits 0.12.0-rc.2`, `imt-tree 0.5.3`, `pir-types 0.6.3`, and
+  `pir-client 0.7.3`, together with the compatible
+  `zakura-wallet-lib 0.1.0-rc5` stack.
+- Prepared `vote-commitment-tree 0.6.1` and
+  `vote-commitment-tree-client 0.8.1` with the updated exact pins; publish them
+  in that order before `zcash_voting 4.0.0`.
+
 ### Fixed
 
 - Raise the continuous helper queue to up to 32 process-wide active share deliveries,
