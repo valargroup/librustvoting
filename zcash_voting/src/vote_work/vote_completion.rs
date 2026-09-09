@@ -289,20 +289,28 @@ impl<T: ChainTransport> RoundExecutor<T> {
             }
         }
 
-        for vote in votes {
+        let vote_order = votes.iter().map(vote_key).collect::<Vec<_>>();
+        let mut confirmed_votes = Vec::with_capacity(votes.len());
+        let mut delivery_errors = std::collections::BTreeMap::new();
+        for (vote_position, vote) in votes.into_iter().enumerate() {
             if scope.interrupted() {
-                return self.step_cancelled(scope, ledger);
+                break;
             }
             // Confirmation updates the durable recovery generation, so recover
             // a fresh handle and let the type system prove it is confirmed.
-            let vote = CommittedVote::observe_recover(
+            let vote = match CommittedVote::observe_recover(
                 &self.database,
                 round_id,
                 vote.bundle_index(),
                 vote.proposal_id(),
                 &scope.observations,
-            )
-            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
+            ) {
+                Ok(vote) => vote,
+                Err(error) => {
+                    delivery_errors.insert(vote_position, error);
+                    continue;
+                }
+            };
             if !plans_before_chain {
                 // Resumed work: load the plan made at cast time, or create
                 // one now for a vote that predates plans.
@@ -318,101 +326,104 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     // a plan (and the round's immutable designation) must not
                     // be written for a step the host has since left.
                     if scope.interrupted() {
-                        return self.step_cancelled(scope, ledger);
+                        break;
                     }
                     fleet_preflight = Some(preflight);
                 }
                 let preflight = fleet_preflight
                     .as_ref()
                     .expect("preflight was just taken for resumed work");
-                vote.observe_prepare_share_delivery(
+                if let Err(error) = vote.observe_prepare_share_delivery(
                     &self.database,
                     planning_params(preflight, host, &proposal_ids),
                     &scope.observations,
-                )
-                .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
+                ) {
+                    delivery_errors.insert(vote_position, error);
+                    continue;
+                }
                 progress.report(RoundStepProgress::HelperPlansPrepared(vec![vote_key(
                     &vote,
                 )]));
             }
-            let vote = vote
-                .confirmed(&self.database)
-                .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?
-                .ok_or_else(|| {
-                    self.step_failure(
-                        RoundStepFailureKind::InvariantViolation,
-                        Some(&scope.step),
-                        None,
-                        &ledger,
-                        "vote was reported confirmed but its recovery material has no tree position",
-                    )
-                })?;
-            let cancel = || scope.interrupted();
-            // Reports of the votes delivered so far ride on every failure
-            // from here on: their network effects happened and are otherwise
-            // visible only to a progress reporter.
-            let delivery = match vote
-                .submit_prepared_shares_keeping_partial_report(
-                    &self.database,
-                    &helper_client,
-                    ShareDeliverySubmissionParams {
-                        configured_server_urls: &host.configured_helper_urls,
-                        now_seconds: host.now_seconds,
-                    },
-                    &cancel,
-                )
-                .await
-            {
-                Ok(delivery) => delivery,
-                Err(failure) => {
-                    // Sibling shares of the failing vote may already have
-                    // reached the helpers; their report rides on the failure.
-                    if let Some(partial) = failure.partial {
-                        let report = VoteShareDeliveryReport {
-                            vote: vote_key(vote.vote()),
-                            delivery: partial,
-                        };
-                        progress.report(RoundStepProgress::ShareOutcome(report.clone()));
-                        ledger.record_delivery(report);
-                    }
-                    return Err(self.step_voting_failure(
-                        failure.error,
-                        Some(&scope.step),
-                        &ledger,
-                    ));
+            match vote.confirmed(&self.database) {
+                Ok(Some(vote)) => confirmed_votes.push(vote),
+                Ok(None) => {
+                    delivery_errors.insert(vote_position, VotingError::Internal {
+                        message: "vote was reported confirmed but its recovery material has no tree position".to_string(),
+                    });
                 }
-            };
-            let report = VoteShareDeliveryReport {
-                vote: vote_key(vote.vote()),
-                delivery,
-            };
-            progress.report(RoundStepProgress::ShareOutcome(report.clone()));
-            let cancelled = report.delivery.cancelled;
-            let delivery_progress = delivery_progress(&report.delivery);
-            ledger.record_delivery(report);
-            if cancelled {
-                return self.step_cancelled(scope, ledger);
-            }
-            match delivery_progress {
-                DeliveryProgress::Complete => {}
-                DeliveryProgress::AwaitingAmbiguousHelpers => {
-                    // The step made no definite placement it could repeat:
-                    // only tracking can classify those attempts. Report
-                    // pending so the host schedules again instead of
-                    // rerunning delivery at once.
-                    return self.outcome(scope, RoundStepDisposition::Pending, ledger);
-                }
-                DeliveryProgress::Incomplete => {
-                    return Err(self.step_failure(
-                        RoundStepFailureKind::HelperDeliveryIncomplete,
-                        Some(&scope.step),
-                        None,
-                        &ledger,
-                        "helper delivery ended with pending shares",
-                    ));
+                Err(error) => {
+                    delivery_errors.insert(vote_position, error);
                 }
             }
         }
-        self.outcome(scope, RoundStepDisposition::Advanced, ledger)
+        let cancel = || scope.interrupted();
+        let deliveries = crate::vote::submit_confirmed_vote_shares(
+            &confirmed_votes,
+            &self.database,
+            &helper_client,
+            ShareDeliverySubmissionParams {
+                configured_server_urls: &host.configured_helper_urls,
+                now_seconds: host.now_seconds,
+            },
+            &cancel,
+            &mut |vote, delivery| {
+                let report = VoteShareDeliveryReport {
+                    vote: vote_key(vote),
+                    delivery: delivery.clone(),
+                };
+                // Keep the durable effects before entering arbitrary host code.
+                ledger.record_delivery(report.clone());
+                progress.report(RoundStepProgress::ShareOutcome(report));
+            },
+        )
+        .await;
+        // Events follow completion, but the final ledger keeps the unit's order.
+        ledger
+            .share_deliveries
+            .sort_by_key(|report| vote_order.iter().position(|vote| vote == &report.vote));
+        let mut cancelled = scope.interrupted();
+        let mut incomplete = false;
+        let mut awaiting_ambiguous = false;
+        for delivery in deliveries {
+            match delivery.delivery {
+                Err(failure) => {
+                    let position = vote_order
+                        .iter()
+                        .position(|vote| vote == &vote_key(delivery.vote))
+                        .expect("delivery belongs to the completed vote unit");
+                    delivery_errors.insert(position, failure.error);
+                }
+                Ok(report) => {
+                    cancelled |= report.cancelled;
+                    match delivery_progress(&report) {
+                        DeliveryProgress::Complete => {}
+                        DeliveryProgress::AwaitingAmbiguousHelpers => awaiting_ambiguous = true,
+                        DeliveryProgress::Incomplete => incomplete = true,
+                    }
+                }
+            }
+        }
+        if let Some((_, error)) = delivery_errors.into_iter().next() {
+            return Err(self.step_voting_failure(error, Some(&scope.step), &ledger));
+        }
+        if cancelled {
+            return self.step_cancelled(scope, ledger);
+        }
+        if incomplete {
+            return Err(self.step_failure(
+                RoundStepFailureKind::HelperDeliveryIncomplete,
+                Some(&scope.step),
+                None,
+                &ledger,
+                "helper delivery ended with pending shares",
+            ));
+        }
+        let disposition = if awaiting_ambiguous {
+            RoundStepDisposition::Pending
+        } else {
+            RoundStepDisposition::Advanced
+        };
+        self.outcome(scope, disposition, ledger)
     }
 }

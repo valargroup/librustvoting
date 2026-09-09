@@ -13,7 +13,8 @@ use super::VoteShareDeliveryReport;
 pub(super) struct StepLedger {
     /// The authoritative outcome of the step's chain episode, once it ran.
     pub(super) chain_outcome: Option<ChainSubmissionResult>,
-    /// Helper delivery reports in the order the votes were delivered.
+    /// Helper delivery reports; vote completion normalizes these to unit order
+    /// after the queue drains, independently of progress-event order.
     pub(super) share_deliveries: Vec<VoteShareDeliveryReport>,
     /// The signed delegation a `Delegate` step produced.
     pub(super) delegation: Option<SignedDelegationBundle>,

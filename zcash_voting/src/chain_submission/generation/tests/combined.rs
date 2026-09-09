@@ -9,6 +9,9 @@ use crate::{chain_submission::*, round::VotingDb, vote::VoteBatchRecovery};
 const ROUND: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+#[path = "combined/helper_delivery.rs"]
+mod helper_delivery;
+
 #[path = "combined/recovery_boundaries.rs"]
 mod recovery_boundaries;
 

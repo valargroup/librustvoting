@@ -999,6 +999,32 @@ immediate share, or a missing confirmed VC position fail before network I/O.
 The raw per-share executor is
 crate-private, and there is no public post-hoc delivery mutator.
 
+The private `vote/share_delivery` package owns the shared initial-delivery
+queue. Both singleton `ConfirmedVote` submission and completion of a confirmed
+atomic unit use this implementation and the same admission semaphore. Unit
+completion validates each member's complete plan before admitting any of its
+shares, then queues share jobs in member order and persisted payload order.
+Completed slots are refilled across proposal boundaries: the final slow share
+of one proposal does not hold the next proposal's remaining work behind it.
+Jobs retain one immutable validated plan per proposal and the wallet scope
+captured before the queue's asynchronous work; the per-share executor still
+revalidates the exact generation before durable preparation and dispatch.
+
+A proposal-local plan or payload validation error prevents every POST for that
+proposal while other valid proposals continue. A share execution error does
+not abort sibling futures or stop independent proposals. Cancellation or an
+operation-epoch change suppresses further admission and drains admitted
+workflows under the existing transport cancellation rules below. Waiting for
+share capacity does not consume the 60-second fan-out budget: that budget
+still begins inside per-share fan-out, after its operation lock is acquired.
+The lower-level POST-capacity wait remains inside that budget.
+
+Reports finalize per proposal, including partial reports after share errors.
+The primary share error is selected in persisted payload order, independently
+of completion timing. Unprocessed and failed shares remain pending; completed
+shares retain their durable acceptance or ambiguity. Existing public singleton
+submission APIs and report shapes are unchanged.
+
 Up to 16 share tasks across all wallets and committed votes in the process may
 hold a delivery permit at once. Separately, a process-wide semaphore limits
 initial POST operations across those tasks to 128. Waiting for a POST permit
@@ -1148,6 +1174,30 @@ are `stale_handle_cannot_prepare_same_commitment_replacement`,
 `delayed_immediate_plan_is_rejected_before_network`, and
 `share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`.
 These replace the former wallet-example planner and per-share delivery tests.
+
+Cross-proposal queue regressions live in
+`share_tracking/tests/delivery_queue/`:
+
+- `completed_slots_refill_across_three_proposals_without_a_barrier` and
+  `batch_and_singleton_calls_share_the_process_wide_sixteen_slots` pin refill
+  and shared admission;
+- `thirty_seven_proposals_finish_faster_with_identical_durable_results`
+  compares the production queue to sequential singleton calls under identical
+  scripted latency and requires the same reports and durable placements;
+- `invalid_proposal_plan_does_not_send_that_proposal_or_block_later_ones`,
+  `reservation_failure_keeps_siblings_and_later_proposals`, and
+  `outcome_write_failure_keeps_interrupted_marker_and_other_proposals` pin
+  validation isolation, retained partial reports, and deterministic errors;
+- `cancellation_before_admission_keeps_every_share_pending`,
+  `cancellation_and_epoch_changes_drain_live_posts_and_release_capacity`, and
+  `cancellation_from_report_callback_stops_further_admission` pin cancellation;
+- `queued_replaced_generation_is_not_posted_or_mutated`,
+  `queued_work_retains_its_wallet_even_after_active_wallet_switches`,
+  `waiting_in_queue_does_not_spend_the_next_shares_fanout_budget`, and
+  `reopened_database_reuses_plans_and_only_delivers_unsent_proposals` pin
+  identity, timeouts, and restart safety; and
+- `reports_complete_out_of_order_but_return_in_proposal_and_share_order`
+  distinguishes callback completion order from deterministic returned order.
 
 ### Delivery diagnostics
 
@@ -1902,6 +1952,11 @@ combined POST. A recovered unit already owned by the chain lifecycle reconciles
 that lifecycle first. Helper delivery starts only after the unit's complete
 confirmation records the final VAN and every VC position. The existing timeout,
 placement, ambiguous-POST and durable delivery rules apply unchanged.
+
+`combined_reconciliation_delivers_later_proposals_while_the_first_is_unfinished`
+exercises combined reconciliation with full helper payloads: every helper POST
+sees the confirmed delegation and both VC positions, and the later proposal
+finishes while the first proposal's slow share remains in flight.
 
 A definite first-POST rejection of the combined unit retires it: the members'
 recovery JSON is cleared, which the existing generation-change triggers turn

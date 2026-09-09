@@ -55,7 +55,7 @@ fn delivery_diagnostics_classify_evidence_and_boundary_precedence() {
 }
 
 /// Complete, valid share payloads without invoking the prover.
-fn complete_recovery(proposal_id: u32) -> VoteRecoveryBundle {
+pub(super) fn complete_recovery(proposal_id: u32) -> VoteRecoveryBundle {
     let mut recovery = recovery_bundle_fixture();
     recovery.proposal_id = proposal_id;
     recovery.encrypted_shares = (0..crate::share_policy::VOTE_COMMITMENT_SHARE_COUNT)
@@ -73,7 +73,7 @@ fn complete_recovery(proposal_id: u32) -> VoteRecoveryBundle {
     recovery
 }
 
-fn store_recovery(db: &VotingDb, recovery: &VoteRecoveryBundle, confirmed: bool) {
+pub(super) fn store_recovery(db: &VotingDb, recovery: &VoteRecoveryBundle, confirmed: bool) {
     db.set_ballot_intent(
         ROUND_ID,
         recovery.proposal_id,
@@ -230,7 +230,7 @@ async fn reported_delivery_preserves_results_and_classifies_completed_tasks() {
 }
 
 /// A persisted atomic batch is submitted once and confirms on its first poll.
-struct ConfirmingBatchChain {
+pub(super) struct ConfirmingBatchChain {
     confirmation: Mutex<Option<Vec<u8>>>,
     submitted: Mutex<bool>,
     digest: [u8; 32],
@@ -274,7 +274,7 @@ impl crate::ChainTransport for ConfirmingBatchChain {
     }
 }
 
-struct DeliveryHost;
+pub(super) struct DeliveryHost;
 
 impl crate::RoundHostSource for DeliveryHost {
     fn host_context(&self) -> crate::RoundHostContext {
@@ -293,73 +293,6 @@ impl crate::RoundHostSource for DeliveryHost {
 
 #[tokio::test(start_paused = true)]
 async fn atomic_round_delivery_attributes_every_proposal_share_and_retry() {
-    let db = Arc::new(db_with_round_and_bundle());
-    db.store_delegation_tx_hash(ROUND_ID, 0, &hex::encode([0x41; 32]))
-        .unwrap();
-    db.store_van_position(ROUND_ID, 0, 7).unwrap();
-    let mut recoveries = [complete_recovery(1), complete_recovery(2)];
-    recoveries[0].vc_tree_position = 0;
-    recoveries[1].vc_tree_position = 0;
-    recoveries[1].van_nullifier = recoveries[0].vote_authority_note_new;
-    recoveries[1].vote_authority_note_new = [0x22; 32];
-    recoveries[1].vote_commitment = [0x23; 32];
-    let actions = recoveries
-        .iter()
-        .map(
-            |recovery| crate::vote_commitment::CastVoteBatchSighashAction {
-                r_vpk: &recovery.r_vpk,
-                van_nullifier: &recovery.van_nullifier,
-                vote_authority_note_new: &recovery.vote_authority_note_new,
-                vote_commitment: &recovery.vote_commitment,
-                proposal_id: recovery.proposal_id,
-            },
-        )
-        .collect::<Vec<_>>();
-    let digest = crate::vote_commitment::cast_vote_batch_sighash(
-        ROUND_ID,
-        recoveries[0].anchor_height as u64,
-        &actions,
-    )
-    .unwrap();
-    for (index, recovery) in recoveries.iter_mut().enumerate() {
-        recovery.batch = Some(crate::vote::VoteBatchRecovery {
-            delegation_van: None,
-            digest,
-            index: index as u32,
-            size: 2,
-        });
-        store_recovery(&db, recovery, false);
-    }
-    let attributes = [
-        ("vote_round_id", ROUND_ID.to_string()),
-        ("batch_digest", hex::encode(digest)),
-        ("batch_size", "2".into()),
-        ("final_van_leaf_index", "7".into()),
-        ("vote_commitment_leaf_indices", "8,9".into()),
-        ("proposal_ids", "1,2".into()),
-        (
-            "van_nullifiers",
-            recoveries
-                .iter()
-                .map(|recovery| hex::encode(recovery.van_nullifier))
-                .collect::<Vec<_>>()
-                .join(","),
-        ),
-    ]
-    .into_iter()
-    .map(|(key, value)| serde_json::json!({"key": key, "value": value}))
-    .collect::<Vec<_>>();
-    let chain = ConfirmingBatchChain {
-        digest,
-        submitted: Mutex::new(false),
-        confirmation: Mutex::new(Some(
-            serde_json::to_vec(&serde_json::json!({
-                "height": "9", "code": 0, "log": "",
-                "events": [{"type": "cast_vote_batch", "attributes": attributes}],
-            }))
-            .unwrap(),
-        )),
-    };
     let transport = Arc::new(MockTransport::default());
     transport.queue_get(
         &format!("{}/shielded-vote/v1/status", helper(1)),
@@ -371,32 +304,8 @@ async fn atomic_round_delivery_attributes_every_proposal_share_and_retry() {
     for _ in 0..32 {
         transport.queue_post(&post_url, json_status("queued"));
     }
-    let executor = crate::RoundExecutor::with_transport(
-        db.clone(),
-        chain,
-        crate::ChainSubmissionClientConfig::for_network(
-            crate::Network::Testnet,
-            vec!["https://chain.example".into()],
-        ),
-        client_with(transport.clone()),
-    )
-    .unwrap()
-    .with_binding(crate::RoundBinding {
-        round_id: ROUND_ID.into(),
-        network: crate::Network::Testnet,
-        proposals: vec![
-            crate::ProposalRosterEntry {
-                proposal_id: 1,
-                num_options: 3,
-            },
-            crate::ProposalRosterEntry {
-                proposal_id: 2,
-                num_options: 3,
-            },
-        ],
-        hotkey_secret: None,
-    })
-    .unwrap();
+    let executor =
+        atomic_delivery_executor(Arc::new(db_with_round_and_bundle()), transport.clone());
     assert!(matches!(
         executor.plan().unwrap().next_steps[0],
         crate::session::NextStep::AdvanceVoteBatch {
@@ -470,5 +379,108 @@ async fn atomic_round_delivery_attributes_every_proposal_share_and_retry() {
     assert_eq!(failed.attempt, Some(1));
     assert_eq!(retried.http_status, Some(200));
     assert_eq!(transport.call_count(&post_url), 33);
-    assert_eq!(share::list(&db, ROUND_ID).unwrap().len(), 32);
+    assert_eq!(
+        share::list(&executor.database(), ROUND_ID).unwrap().len(),
+        32
+    );
+}
+
+/// Persisted two-member unit driven through the real chain coordinator and
+/// round completion path, with scripted transport and no proof generation.
+pub(super) fn atomic_delivery_executor(
+    db: Arc<VotingDb>,
+    transport: Arc<dyn HelperTransport>,
+) -> crate::RoundExecutor<ConfirmingBatchChain> {
+    db.store_delegation_tx_hash(ROUND_ID, 0, &hex::encode([0x41; 32]))
+        .unwrap();
+    db.store_van_position(ROUND_ID, 0, 7).unwrap();
+    let mut recoveries = [complete_recovery(1), complete_recovery(2)];
+    recoveries[0].vc_tree_position = 0;
+    recoveries[1].vc_tree_position = 0;
+    recoveries[1].van_nullifier = recoveries[0].vote_authority_note_new;
+    recoveries[1].vote_authority_note_new = [0x22; 32];
+    recoveries[1].vote_commitment = [0x23; 32];
+    let actions = recoveries
+        .iter()
+        .map(
+            |recovery| crate::vote_commitment::CastVoteBatchSighashAction {
+                r_vpk: &recovery.r_vpk,
+                van_nullifier: &recovery.van_nullifier,
+                vote_authority_note_new: &recovery.vote_authority_note_new,
+                vote_commitment: &recovery.vote_commitment,
+                proposal_id: recovery.proposal_id,
+            },
+        )
+        .collect::<Vec<_>>();
+    let digest = crate::vote_commitment::cast_vote_batch_sighash(
+        ROUND_ID,
+        recoveries[0].anchor_height as u64,
+        &actions,
+    )
+    .unwrap();
+    for (index, recovery) in recoveries.iter_mut().enumerate() {
+        recovery.batch = Some(crate::vote::VoteBatchRecovery {
+            delegation_van: None,
+            digest,
+            index: index as u32,
+            size: 2,
+        });
+        store_recovery(&db, recovery, false);
+    }
+    let attributes = [
+        ("vote_round_id", ROUND_ID.to_string()),
+        ("batch_digest", hex::encode(digest)),
+        ("batch_size", "2".into()),
+        ("final_van_leaf_index", "7".into()),
+        ("vote_commitment_leaf_indices", "8,9".into()),
+        ("proposal_ids", "1,2".into()),
+        (
+            "van_nullifiers",
+            recoveries
+                .iter()
+                .map(|recovery| hex::encode(recovery.van_nullifier))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, value)| serde_json::json!({"key": key, "value": value}))
+    .collect::<Vec<_>>();
+    let chain = ConfirmingBatchChain {
+        digest,
+        submitted: Mutex::new(false),
+        confirmation: Mutex::new(Some(
+            serde_json::to_vec(&serde_json::json!({
+                "height": "9", "code": 0, "log": "",
+                "events": [{"type": "cast_vote_batch", "attributes": attributes}],
+            }))
+            .unwrap(),
+        )),
+    };
+    crate::RoundExecutor::with_transport(
+        db.clone(),
+        chain,
+        crate::ChainSubmissionClientConfig::for_network(
+            crate::Network::Testnet,
+            vec!["https://chain.example".into()],
+        ),
+        HelperClient::new(transport, HelperHealth::default()),
+    )
+    .unwrap()
+    .with_binding(crate::RoundBinding {
+        round_id: ROUND_ID.into(),
+        network: crate::Network::Testnet,
+        proposals: vec![
+            crate::ProposalRosterEntry {
+                proposal_id: 1,
+                num_options: 3,
+            },
+            crate::ProposalRosterEntry {
+                proposal_id: 2,
+                num_options: 3,
+            },
+        ],
+        hotkey_secret: None,
+    })
+    .unwrap()
 }
