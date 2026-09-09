@@ -9,22 +9,19 @@ use crate::{
 static GLOBAL_BATCH_LIMIT_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// A full commitment offers 160 POSTs, so the transport must queue requests above 128.
+/// Sixteen shares with eight targets exactly fill the 128-unit admission budget.
 #[tokio::test(start_paused = true)]
 async fn full_commitment_reaches_but_never_exceeds_128_posts() {
     let _global_limit_guard = GLOBAL_BATCH_LIMIT_TEST_LOCK.lock().await;
     let db = db_with_unique_recoverable_vote();
     set_recovery_share_count(&db, 16);
-    let configured = helpers(20);
+    let configured = helpers(16);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
     let vote = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let plan = vote
         .prepare_share_delivery(&db, planning_params(&fleet))
         .unwrap();
-    assert!(plan
-        .share_plans
-        .iter()
-        .all(|share| share.target_count == 10));
+    assert!(plan.share_plans.iter().all(|share| share.target_count == 8));
     let transport = Arc::new(MockTransport::default());
     for helper in &configured {
         for _ in 0..16 {
@@ -45,10 +42,10 @@ async fn full_commitment_reaches_but_never_exceeds_128_posts() {
         .await
         .unwrap();
     assert_eq!(transport.peak_posts_in_flight(), 128);
-    assert_eq!(transport.call_count("/shares"), 160);
+    assert_eq!(transport.call_count("/shares"), 128);
     assert_eq!(report.deliveries.len(), 16);
     assert!(report.deliveries.iter().all(|delivery| {
-        delivery.submission.accepted_urls.len() == 10
+        delivery.submission.accepted_urls.len() == 8
             && delivery.submission.ambiguous_urls.is_empty()
     }));
     assert!(share::list(&db, ROUND_ID)

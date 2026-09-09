@@ -2,6 +2,31 @@ use super::{fixtures::*, *};
 use tokio::sync::Semaphore;
 
 #[tokio::test(start_paused = true)]
+async fn slow_successful_fanout_keeps_queued_shares_outside_the_deadline() {
+    let fixture = Fixture::with_helpers(2, 20);
+    let transport = ScriptedTransport::new(|_| ReplyPlan {
+        delay: Duration::from_secs(25),
+        ..Default::default()
+    });
+    let reports = fixture.deliver(transport.clone(), &uncancelled).await;
+    for report in reports {
+        let report = report.unwrap();
+        assert!(report.pending_share_indices.is_empty());
+        assert_eq!(report.deliveries.len(), SHARE_COUNT);
+        for delivery in report.deliveries {
+            assert_eq!(delivery.submission.accepted_urls.len(), 10);
+            assert!(delivery.submission.ambiguous_urls.is_empty());
+        }
+    }
+    assert_eq!(transport.count(), 320);
+    let persisted = share::list(&fixture.db, ROUND_ID).unwrap();
+    assert_eq!(persisted.len(), 32);
+    assert!(persisted.iter().all(|share| share.sent_to_urls.len() == 10
+        && share.ambiguous_urls.is_empty()
+        && share.attempting_urls.is_empty()));
+}
+
+#[tokio::test(start_paused = true)]
 async fn completed_slots_refill_across_three_proposals_without_a_barrier() {
     let fixture = Fixture::new(3);
     let gate = Arc::new(Semaphore::new(0));
@@ -166,59 +191,54 @@ async fn thirty_seven_proposals_finish_faster_with_identical_durable_results() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn thirty_two_share_workflows_never_exceed_the_128_post_ceiling() {
-    let fixture = Fixture::with_helpers(2, 20);
-    let gate = Arc::new(Semaphore::new(0));
-    let transport = ScriptedTransport::new({
-        let gate = gate.clone();
-        let db = fixture.db.clone();
-        move |wire| {
-            let rows = share::list(&db, ROUND_ID).unwrap();
-            let row = rows
-                .iter()
-                .find(|row| {
-                    row.proposal_id == wire.proposal_id && row.share_index == wire.share_index
-                })
-                .unwrap();
-            assert!(
-                !row.attempting_urls.is_empty(),
-                "POST follows durable reservation"
-            );
-            ReplyPlan {
-                gate: Some(gate.clone()),
-                ..Default::default()
+async fn helper_fanout_bounds_admitted_workflows() {
+    for (helpers, admitted, peak_posts, target) in [(8, 32, 128, 4), (20, 12, 120, 10)] {
+        let fixture = Fixture::with_helpers(2, helpers);
+        let gate = Arc::new(Semaphore::new(0));
+        let transport = ScriptedTransport::new({
+            let gate = gate.clone();
+            let db = fixture.db.clone();
+            move |wire| {
+                let rows = share::list(&db, ROUND_ID).unwrap();
+                let row = rows
+                    .iter()
+                    .find(|row| {
+                        row.proposal_id == wire.proposal_id && row.share_index == wire.share_index
+                    })
+                    .unwrap();
+                assert!(
+                    !row.attempting_urls.is_empty(),
+                    "POST follows durable reservation"
+                );
+                ReplyPlan {
+                    gate: Some(gate.clone()),
+                    ..Default::default()
+                }
+            }
+        });
+        let observe = async {
+            transport.wait_for(peak_posts).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(transport.count(), peak_posts);
+            assert_eq!(transport.active.load(Ordering::SeqCst), peak_posts);
+            // Excess shares wait before durable preparation and their deadline.
+            assert_eq!(share::list(&fixture.db, ROUND_ID).unwrap().len(), admitted);
+            gate.add_permits(32 * target);
+        };
+        let (reports, ()) = tokio::join!(fixture.deliver(transport.clone(), &uncancelled), observe);
+        assert_eq!(reports.len(), 2);
+        for report in reports {
+            let report = report.unwrap();
+            assert!(report.pending_share_indices.is_empty());
+            assert_eq!(report.deliveries.len(), SHARE_COUNT);
+            for delivery in report.deliveries {
+                assert_eq!(delivery.submission.target_count, target);
+                assert_eq!(delivery.submission.accepted_urls.len(), target);
+                assert!(delivery.submission.ambiguous_urls.is_empty());
             }
         }
-    });
-    let observe = async {
-        transport.wait_for(128).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while share::list(&fixture.db, ROUND_ID).unwrap().len() < 32 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(transport.count(), 128);
-        assert_eq!(transport.active.load(Ordering::SeqCst), 128);
-        // All 32 workflows have been admitted; excess POSTs wait behind the
-        // separate semaphore without starting transport work.
-        assert_eq!(share::list(&fixture.db, ROUND_ID).unwrap().len(), 32);
-        gate.add_permits(320);
-    };
-    let (reports, ()) = tokio::join!(fixture.deliver(transport.clone(), &uncancelled), observe);
-    assert_eq!(reports.len(), 2);
-    for report in reports {
-        let report = report.unwrap();
-        assert!(report.pending_share_indices.is_empty());
-        assert_eq!(report.deliveries.len(), SHARE_COUNT);
-        for share in report.deliveries {
-            assert_eq!(share.submission.target_count, 10);
-            assert_eq!(share.submission.accepted_urls.len(), 10);
-            assert!(share.submission.ambiguous_urls.is_empty());
-        }
+        assert_eq!(transport.count(), 32 * target);
+        assert_eq!(transport.peak.load(Ordering::SeqCst), peak_posts);
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
     }
-    assert_eq!(transport.count(), 320);
-    assert_eq!(transport.peak.load(Ordering::SeqCst), 128);
-    assert_eq!(transport.active.load(Ordering::SeqCst), 0);
 }

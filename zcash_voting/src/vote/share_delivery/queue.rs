@@ -44,7 +44,8 @@ impl ShareJob<'_> {
         params: &ShareDeliverySubmissionParams<'_>,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> ShareResult {
-        let admission = capacity::acquire(cancel).await;
+        let planned_target = self.prepared.plan.share_plans[self.payload_position].target_count;
+        let admission = capacity::acquire(planned_target, cancel).await;
         self.queued.finish(
             match &admission {
                 Ok(Some(_)) => crate::ObservationOutcome::Succeeded,

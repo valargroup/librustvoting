@@ -486,8 +486,9 @@ returned on an outcome is a host-facing projection, not a control input.
   before durable chain confirmation. Already-confirmed `Deliver` obligations
   remain per proposal and invoke the same queue with one vote; this does not
   change planning, step selection, or lock scope.
-  The shared queue admits at most 32 active share workflows process-wide;
-  the independent initial-POST ceiling remains 128. These ceilings do not
+  The shared queue admits at most 32 active share workflows process-wide,
+  with aggregate planned fan-out bounded by the helper specification's weighted
+  admission budget. The independent initial-POST ceiling remains 128. These ceilings do not
   change unit grouping, proposal order, or per-share placement and recovery.
 - **Every finalized delivery report is retained before deciding the step.**
   `ShareOutcome` events are emitted once per available report in completion

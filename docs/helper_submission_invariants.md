@@ -1027,9 +1027,17 @@ shares retain their durable acceptance or ambiguity. Existing public singleton
 submission APIs and report shapes are unchanged.
 
 Up to 32 share tasks across all wallets and committed votes in the process may
-hold a delivery permit at once. Separately, a process-wide semaphore limits
-initial POST operations across those tasks to 128. Waiting for a POST permit
-observes cancellation every 50 milliseconds and stops when one second or less
+hold a delivery permit at once. Admission uses one process-wide budget of 128
+units, charging each share `max(4, planned target_count)` units atomically. Thus
+up to 32 shares with targets of four or fewer, or 12 shares with targets of ten,
+can run at once; mixed fleets share the same budget. The charge uses the validated
+persisted plan and is retained until outcomes are journaled, including across
+fallback waves. Waiting for this budget occurs before share preparation and the
+fan-out deadline, and cancellation releases the complete charge. This bounds the
+aggregate planned fan-out of admitted queue workflows to 128 without changing
+placement targets. Separately, a process-wide semaphore limits initial POST
+operations to 128, including lower-level delivery calls outside this queue.
+Waiting for a POST permit observes cancellation every 50 milliseconds and stops when one second or less
 remains in the fan-out budget. An unsent reservation is cleared as a
 definite failure on cancellation or budget exhaustion. After admission, the
 executor re-reads the starting wallet's exact share nullifier and requires the
@@ -1865,9 +1873,13 @@ is covered by `queued_delivery_rejects_a_deleted_round_before_posting`,
 `queued_delivery_leaves_a_replacement_generation_untouched`,
 `queued_delivery_requires_its_attempt_reservation`, and
 `queued_delivery_does_not_validate_against_a_different_wallet`.
-`thirty_two_share_workflows_never_exceed_the_128_post_ceiling` additionally
-saturates 32 workflows across two commitments and a 20-helper fleet, checking
-that all 320 accepted placements retain the separate 128-POST ceiling.
+`helper_fanout_bounds_admitted_workflows` covers both the 32-share/four-target
+boundary and the 12-share/ten-target boundary across two commitments.
+`slow_successful_fanout_keeps_queued_shares_outside_the_deadline` delivers all
+320 placements through 25-second successful POSTs without generating ambiguity.
+`mixed_fleet_admission_cancellation_releases_the_full_charge` covers shared
+admission across wallets with different targets, cancellation while capacity is
+occupied, durable accepted outcomes, and resumption of unsent shares.
 These are enforced behavior, not host integration metadata.
 
 `SHARE_STATUS_MAX_CONCURRENT_POLLS` and

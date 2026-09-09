@@ -1,15 +1,21 @@
 # Helper delivery and immediate-share confirmation benchmark
 
-This procedure compares the continuous queue at 16 and 32 active share workflows.
-The initial POST ceiling stays 128. It also separates SDK waits from the time
-between helper acceptance and visible chain confirmation. Run the wallet yourself;
+This procedure compares the continuous queue at 16 and up to 32 active share workflows.
+The initial POST ceiling stays 128. The candidate also bounds aggregate planned
+fan-out at admission: each share consumes `max(4, target_count)` of 128 shared
+units. This permits 32 active workflows for targets up to four and 12 for targets
+of ten. Mixed fleets share that budget; excess workflows wait outside their
+fan-out deadline. Record this admission policy with each benchmark revision.
+The procedure also separates SDK waits from the time between helper acceptance
+and visible chain confirmation. Run the wallet yourself;
 no helper deployment or live wallet operation is part of the SDK test suite.
 
 ## Revisions and workload
 
 Use the commit `feat: trace helper delivery and confirmation boundaries` as the
-instrumented 16-slot baseline and its successor
-`perf: admit 32 concurrent helper share deliveries` as the candidate. Record full
+instrumented 16-slot baseline. The candidate must include both
+`perf: admit 32 concurrent helper share deliveries` and the subsequent weighted
+admission fix. Record full
 commit hashes, SDK and wallet versions, release build settings, network/round,
 helper fleet in configured order, and UTC start/end times with each capture.
 Both revisions must use the same wallet build configuration and report options.

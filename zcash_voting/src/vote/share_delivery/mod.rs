@@ -1,7 +1,7 @@
 //! Initial delivery of complete, confirmed commitments through one bounded
 //! queue. Preparation owns commitment-wide validation; admission owns the
-//! process-wide share ceiling; the existing per-share executor owns every
-//! durable attempt and transport outcome.
+//! process-wide share and aggregate fan-out ceilings; the per-share executor
+//! owns every durable attempt and transport outcome.
 
 mod capacity;
 mod preparation;
