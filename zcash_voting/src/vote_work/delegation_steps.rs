@@ -30,7 +30,6 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let driver = Arc::clone(&inputs.driver);
-        let signer = inputs.signer.clone();
         let pir = Arc::clone(&inputs.pir);
         // The prover keeps the bundle lock until it has finished persisting,
         // even if this future is dropped, so no second pass can start a
@@ -45,10 +44,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 let reporter = DelegationProgressBridge::new(move |progress| {
                     let _ = progress_tx.send(progress);
                 });
-                let driver_stage = observations.stage("delegation::driver_prove_and_sign");
-                let result = driver.prove_and_sign_blocking_observed(
+                let driver_stage = observations.stage("delegation::driver_prepare");
+                let result = driver.prepare_blocking_observed(
                     bundle_index,
-                    &signer,
                     &pir,
                     &reporter,
                     driver_stage.scope(),
@@ -76,7 +74,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 )
             })?;
         tokio::pin!(done_rx);
-        let signed = loop {
+        let proof_status = loop {
             tokio::select! {
                 Some(update) = progress_rx.recv() => {
                     progress.report(RoundStepProgress::Delegation { bundle_index, progress: update });
@@ -100,34 +98,12 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 progress: update,
             });
         }
-        // The driver emits `PayloadReady` itself and the drain above forwards
-        // it, so reporting one here would deliver the terminal event twice.
-        let signed =
-            signed.map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
+        proof_status
+            .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
         if scope.interrupted() {
-            // Proof, setup, and a provided Keystone signature are durable by
-            // now, so the next pass re-dispatches through AdvanceDelegation
-            // without proving or asking the device again. The signed bundle
-            // is still returned so an in-process host can submit it directly.
-            return self.step_cancelled(scope, StepLedger::with_delegation(signed));
+            return self.step_cancelled(scope, ledger);
         }
-        let request = AdvanceDelegation {
-            vote_round_id: scope.round_id_bytes,
-            bundle_index,
-            spend_auth_signature: signed.submission.spend_auth_sig,
-        };
-        let ledger = StepLedger::with_delegation(signed);
-        let outcome = self
-            .chain_client
-            .advance_until_terminal_in_epoch(
-                ChainAdvanceRequest::Delegation(request),
-                &scope.host.chain_policy,
-                scope.chain(),
-                scope.entry_epoch(),
-            )
-            .await
-            .map_err(|failure| self.step_chain_failure(failure, Some(&scope.step), &ledger))?;
-        self.chain_step_outcome(scope, outcome, ledger, progress)
+        self.outcome(scope, super::RoundStepDisposition::Advanced, ledger)
     }
 
     pub(super) async fn run_advance_delegation(

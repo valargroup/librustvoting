@@ -102,9 +102,7 @@ impl StoreAdvancementRequest {
         identity: ChainSubmissionIdentity,
         ordered_proposal_ids: Vec<u32>,
     ) -> Result<Self, ChainSubmissionFailure> {
-        if !matches!(identity.target(), ChainSubmissionTarget::VoteBatch { .. })
-            || ordered_proposal_ids.is_empty()
-        {
+        if identity.target().batch_digest().is_none() || ordered_proposal_ids.is_empty() {
             return Err(ChainSubmissionFailure::without_state(
                 ChainSubmissionFailureKind::InvalidInput,
                 "vote-batch requests require a batch identity and a non-empty ordered proposal roster",
@@ -139,6 +137,23 @@ impl StoreAdvancementRequest {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if identity.target().is_combined() {
+            member_identities.push(
+                ChainSubmissionIdentity::new(
+                    identity.wallet_id(),
+                    identity.network(),
+                    *identity.vote_round_id(),
+                    identity.bundle_index(),
+                    ChainSubmissionTarget::Delegation,
+                )
+                .map_err(|error| {
+                    ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvalidInput,
+                        error.to_string(),
+                    )
+                })?,
+            );
+        }
         member_identities.sort_by_key(SubmissionOperationKey::from_identity);
         let original_len = member_identities.len();
         member_identities.dedup();
@@ -215,6 +230,7 @@ impl StoreAdvancementRequest {
             ) | (
                 SubmissionDerivationRequest::VoteBatch { .. },
                 ChainSubmissionTarget::VoteBatch { .. }
+                    | ChainSubmissionTarget::DelegateAndVoteBatch { .. }
             )
         );
         if valid {
@@ -282,6 +298,19 @@ impl StoredChainSubmission {
             self.tracking_started_at = Some(effective_now);
         }
         self.updated_at = effective_now;
+    }
+
+    /// Whether this transition retires a combined generation: the row has just
+    /// become terminally rejected and must leave no durable trace, so the
+    /// bundle's delegation reads `Proved` and can be cast afresh.
+    ///
+    /// The single owner of that rule. Every store applies it at every path a
+    /// row can reach `Rejected` by, so a new observation or target kind cannot
+    /// retire on one path and persist on another.
+    pub(super) fn retires_combined_generation(&self, previous: ChainSubmissionState) -> bool {
+        matches!(self.state, SubmissionRecordState::Rejected(_))
+            && previous != ChainSubmissionState::Rejected
+            && self.identity.target().is_combined()
     }
 
     fn fresh(
@@ -574,6 +603,9 @@ pub(super) mod memory {
         derivations: HashMap<ChainSubmissionIdentity, DerivedChainSubmission>,
         batch_rosters: HashMap<ChainSubmissionIdentity, Vec<u32>>,
         projections: HashMap<ChainSubmissionIdentity, super::super::ChainSubmissionConfirmation>,
+        /// How often each combined generation has been retired. The double has
+        /// no delegation setup to retire, so it records that the rule fired.
+        combined_retirements: HashMap<ChainSubmissionIdentity, u32>,
         fail_before_commit: bool,
         fail_before_commit_without_state: bool,
     }
@@ -608,6 +640,7 @@ pub(super) mod memory {
             if matches!(
                 derived.generation().identity().target(),
                 ChainSubmissionTarget::VoteBatch { .. }
+                    | ChainSubmissionTarget::DelegateAndVoteBatch { .. }
             ) {
                 state.batch_rosters.insert(
                     derived.generation().identity().clone(),
@@ -655,6 +688,21 @@ pub(super) mod memory {
             identity: &ChainSubmissionIdentity,
         ) -> Option<StoredChainSubmission> {
             self.state.lock().unwrap().records.get(identity).cloned()
+        }
+
+        /// How often `identity` has been retired as a terminally rejected
+        /// combined generation.
+        pub(in crate::chain_submission) fn combined_retirements(
+            &self,
+            identity: &ChainSubmissionIdentity,
+        ) -> u32 {
+            self.state
+                .lock()
+                .unwrap()
+                .combined_retirements
+                .get(identity)
+                .copied()
+                .unwrap_or(0)
         }
 
         pub(in crate::chain_submission) fn projection(
@@ -789,6 +837,7 @@ pub(super) mod memory {
                             successor.identity().target(),
                             ChainSubmissionTarget::Vote { .. }
                                 | ChainSubmissionTarget::VoteBatch { .. }
+                                | ChainSubmissionTarget::DelegateAndVoteBatch { .. }
                         )
                         && matches!(successor.state(), SubmissionRecordState::Confirmed(_))
                 })
@@ -1091,6 +1140,18 @@ pub(super) mod memory {
                         )
                     })?;
                 record.settle_after_transition(previous_state, None, now);
+                // Parity with the SQLite store's row removal. The double holds
+                // no delegation setup or members, so it counts the retirement
+                // rather than performing it: an absent row alone cannot tell a
+                // test that this rule is what removed it.
+                if record.retires_combined_generation(previous_state) {
+                    state.records.remove(generation.identity());
+                    *state
+                        .combined_retirements
+                        .entry(generation.identity().clone())
+                        .or_insert(0) += 1;
+                    return Ok(record);
+                }
                 state
                     .records
                     .insert(generation.identity().clone(), record.clone());
@@ -1171,6 +1232,14 @@ pub(super) mod memory {
                     .map_err(|error| transition_failure(previous_state, error))?
                     .expect("reconciliation cannot remove a row");
                 record.settle_after_transition(previous_state, diagnostic, now);
+                if record.retires_combined_generation(previous_state) {
+                    state.records.remove(generation.identity());
+                    *state
+                        .combined_retirements
+                        .entry(generation.identity().clone())
+                        .or_insert(0) += 1;
+                    return Ok(record);
+                }
                 state
                     .records
                     .insert(generation.identity().clone(), record.clone());

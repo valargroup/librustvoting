@@ -285,6 +285,33 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         .await
     }
 
+    pub(super) async fn submit_delegate_and_vote_batch_with_dispatch(
+        &self,
+        endpoint_index: usize,
+        submission: &crate::wire::DelegateAndVoteBatchWire,
+        expected_batch_digest: [u8; 32],
+        dispatch: ChainPostDispatch,
+        observations: &crate::ObservationScope,
+    ) -> PostAttemptOutcome {
+        let body = match submission.to_json() {
+            Ok(json) => json.into_bytes(),
+            Err(error) => {
+                return PostAttemptOutcome::LocalFailure(invalid_protocol(format!(
+                    "serialize combined request failed: {error}"
+                )))
+            }
+        };
+        self.post(
+            endpoint_index,
+            "delegate-and-cast-vote-batch",
+            body,
+            Some(expected_batch_digest),
+            dispatch,
+            observations,
+        )
+        .await
+    }
+
     async fn post(
         &self,
         endpoint_index: usize,
@@ -338,7 +365,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                     "vote-chain submission timed out",
                 ),
             ),
-            Ok(Ok(response)) => parse_post_response(response, expected_batch_digest),
+            Ok(Ok(response)) => parse_post_response(response, endpoint, expected_batch_digest),
             Ok(Err(error)) if error.kind() == ChainTransportFailureKind::DefinitelyUnsent => {
                 PostAttemptOutcome::DefinitelyUnsent(error)
             }
@@ -473,8 +500,15 @@ fn chain_request(url: String, has_json_body: bool, timeout: Duration) -> ChainHt
 
 fn parse_post_response(
     response: ChainHttpResponse,
+    endpoint: &str,
     expected_batch_digest: Option<[u8; 32]>,
 ) -> PostAttemptOutcome {
+    if let Some(diagnostic) = gateway_shaped_route_answer(&response, endpoint) {
+        return PostAttemptOutcome::PossiblyDispatched(diagnostic);
+    }
+    if let Some(diagnostic) = replaced_route_answer(&response, endpoint) {
+        return PostAttemptOutcome::PossiblyDispatched(diagnostic);
+    }
     if let Err(diagnostic) = validate_json_response(&response) {
         return PostAttemptOutcome::PossiblyDispatched(diagnostic);
     }
@@ -570,7 +604,7 @@ fn parse_status_response(
 ) -> Result<TransactionStatusObservation, ChainSubmissionDiagnostic> {
     validate_json_response(&response)?;
     if response.status() == 404 {
-        let pending: PendingTransactionJson = serde_json::from_slice(response.body())
+        let pending: GatewayErrorJson = serde_json::from_slice(response.body())
             .map_err(|_| invalid_protocol("vote-chain pending response is malformed JSON"))?;
         if pending.error != "tx not found" {
             return Err(invalid_protocol(
@@ -610,19 +644,97 @@ fn parse_status_response(
     }
 }
 
+/// Recognizes a mutation answer shaped like the vote-chain gateway's error.
+///
+/// The gateway uses this shape for an unmounted route, but the shape does not
+/// authenticate its writer: a forwarding proxy can reproduce it after the
+/// upstream chain accepted the POST. The answer therefore identifies a likely
+/// unsupported endpoint for diagnostics while preserving dispatch ambiguity.
+///
+/// Oversized bodies return `None` so the ordinary response-limit diagnostic
+/// still owns them.
+fn gateway_shaped_route_answer(
+    response: &ChainHttpResponse,
+    endpoint: &str,
+) -> Option<ChainSubmissionDiagnostic> {
+    if response.body().len() > MAX_CHAIN_HTTP_RESPONSE_BYTES {
+        return None;
+    }
+    let status = response.status();
+    if !matches!(status, 404 | 405) || !is_json_content_type(response) {
+        return None;
+    }
+    serde_json::from_slice::<GatewayErrorJson>(response.body()).ok()?;
+    Some(ChainSubmissionDiagnostic::from_redacted_message(
+        ChainSubmissionDiagnosticKind::EndpointUnsupported,
+        format!(
+            "vote-chain endpoint may not serve /{}/{endpoint} \
+             (HTTP {status}, gateway-shaped error envelope); the POST may have reached the \
+             chain; check the gateway route and vote-sdk release",
+            API_PREFIX.join("/")
+        ),
+    ))
+}
+
+/// Explains a possible route mismatch that cannot be attributed to the router.
+///
+/// An HTML body with status 200 is a front end's fallback page, and a 404 or
+/// 405 without the gateway's error envelope came from something that is not the
+/// gateway. Either can be a proxy replacing an answer after it already
+/// forwarded the POST upstream, so these preserve dispatch ambiguity. Every
+/// other non-JSON or unexpected-status answer reaches the ordinary ambiguous
+/// diagnostics unchanged.
+///
+/// Oversized bodies return `None` so the ordinary response-limit diagnostic
+/// still owns them.
+fn replaced_route_answer(
+    response: &ChainHttpResponse,
+    endpoint: &str,
+) -> Option<ChainSubmissionDiagnostic> {
+    if response.body().len() > MAX_CHAIN_HTTP_RESPONSE_BYTES {
+        return None;
+    }
+    let status = response.status();
+    let possible_route_mismatch = match status {
+        404 | 405 => true,
+        200 => has_media_type(response, "text/html"),
+        _ => false,
+    };
+    if !possible_route_mismatch {
+        return None;
+    }
+    let observed = response.content_type().unwrap_or("(absent)");
+    Some(ChainSubmissionDiagnostic::from_redacted_message(
+        ChainSubmissionDiagnosticKind::RouteAnswerReplaced,
+        format!(
+            "vote-chain endpoint may not serve /{}/{endpoint} \
+             (HTTP {status}, Content-Type {observed}); the POST may have reached the chain; \
+             check the gateway route and vote-sdk release",
+            API_PREFIX.join("/")
+        ),
+    ))
+}
+
+fn is_json_content_type(response: &ChainHttpResponse) -> bool {
+    has_media_type(response, "application/json")
+}
+
+fn has_media_type(response: &ChainHttpResponse, media_type: &str) -> bool {
+    response.content_type().is_some_and(|content_type| {
+        content_type
+            .split(';')
+            .next()
+            .is_some_and(|observed| observed.trim().eq_ignore_ascii_case(media_type))
+    })
+}
+
 fn validate_json_response(response: &ChainHttpResponse) -> Result<(), ChainSubmissionDiagnostic> {
     if response.body().len() > MAX_CHAIN_HTTP_RESPONSE_BYTES {
         return Err(invalid_protocol(format!(
             "vote-chain response exceeds {MAX_CHAIN_HTTP_RESPONSE_BYTES} byte limit"
         )));
     }
-    let is_json = response.content_type().is_some_and(|content_type| {
-        content_type
-            .split(';')
-            .next()
-            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
-    });
-    if !is_json {
+    if !is_json_content_type(response) {
         // Report what actually arrived. The gateway sets `application/json` on
         // every response it writes, including its errors, so a different type
         // means the answer came from somewhere else — a proxy error page, a
@@ -689,9 +801,13 @@ struct TransactionStatusJson {
     events: Vec<TxEvent>,
 }
 
+/// The gateway's error envelope: a lone `error` field and nothing else.
+///
+/// `deny_unknown_fields` identifies the expected shape but does not authenticate
+/// which network component wrote it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PendingTransactionJson {
+struct GatewayErrorJson {
     error: String,
 }
 

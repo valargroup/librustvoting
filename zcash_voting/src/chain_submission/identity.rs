@@ -15,8 +15,35 @@ const CANONICAL_HASH_HEX_BYTES: usize = DIGEST_BYTES * 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChainSubmissionTarget {
     Delegation,
-    Vote { proposal_id: u32 },
-    VoteBatch { ordered_batch_digest: [u8; 32] },
+    Vote {
+        proposal_id: u32,
+    },
+    VoteBatch {
+        ordered_batch_digest: [u8; 32],
+    },
+    /// One delegation and its dependent ordered casts, committed atomically.
+    DelegateAndVoteBatch {
+        ordered_batch_digest: [u8; 32],
+    },
+}
+
+impl ChainSubmissionTarget {
+    /// Digest of the complete ordered cast set, when this is a batch target.
+    pub(crate) fn batch_digest(self) -> Option<[u8; 32]> {
+        match self {
+            Self::VoteBatch {
+                ordered_batch_digest,
+            }
+            | Self::DelegateAndVoteBatch {
+                ordered_batch_digest,
+            } => Some(ordered_batch_digest),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_combined(self) -> bool {
+        matches!(self, Self::DelegateAndVoteBatch { .. })
+    }
 }
 
 /// Stable identity shared by all attempts for one submission meaning.
@@ -130,8 +157,15 @@ pub(crate) fn submission_identity_key(identity: &ChainSubmissionIdentity) -> Vec
         }
         ChainSubmissionTarget::VoteBatch {
             ordered_batch_digest,
+        }
+        | ChainSubmissionTarget::DelegateAndVoteBatch {
+            ordered_batch_digest,
         } => {
-            key.push(2);
+            key.push(if identity.target().is_combined() {
+                3
+            } else {
+                2
+            });
             key.extend_from_slice(&ordered_batch_digest);
         }
     }

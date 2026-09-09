@@ -9,8 +9,8 @@ use crate::{
         ShareDeliverySubmissionParams,
     },
     vote::{CommittedVote, SignedVoteBatch},
-    AdvanceVote, AdvanceVoteBatch, ChainAdvanceOutcome, ChainAdvancePolicy, ChainAdvanceRequest,
-    ChainTransport, VotingError,
+    AdvanceVote, ChainAdvanceOutcome, ChainAdvancePolicy, ChainAdvanceRequest, ChainTransport,
+    VotingError,
 };
 
 use super::{
@@ -253,16 +253,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
 
         if advance_chain {
             let request = match &batch {
-                Some(batch) => ChainAdvanceRequest::VoteBatch(AdvanceVoteBatch {
-                    vote_round_id: scope.round_id_bytes,
-                    bundle_index,
-                    ordered_batch_digest: batch.batch_digest,
-                    ordered_proposal_ids: batch
-                        .commitments
-                        .iter()
-                        .map(|commitment| commitment.proposal_id)
-                        .collect(),
-                }),
+                Some(batch) => batch
+                    .advance_request()
+                    .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?,
                 None => ChainAdvanceRequest::Vote(AdvanceVote {
                     vote_round_id: scope.round_id_bytes,
                     bundle_index,

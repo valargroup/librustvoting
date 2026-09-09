@@ -17,6 +17,7 @@ use crate::share_tracking::round_immediate_share;
 use crate::storage::queries;
 use crate::types::{ShareDelegationRecord, VotingError};
 use crate::vote::{parse_recovery, VoteRecoveryBundle};
+use crate::ChainSubmissionDiagnostic;
 
 /// One bundle's durable facts that planning reads beside its delegation
 /// phase.
@@ -62,6 +63,11 @@ pub(crate) struct RoundSnapshot {
     pub(crate) lifecycle_hashes: LifecycleTransactionHashes,
     /// The round's durable immediate-share designation, if made.
     pub(crate) persisted_immediate_share: Option<ImmediateShareKey>,
+    /// Bundles whose combined cast the wallet will not plan again on its own,
+    /// with the chain's last rejection. The streak is counted against one
+    /// delegation generation, so a rebuilt or re-proved delegation is a new
+    /// generation and is absent here even while the ledger row survives.
+    pub(crate) rejection_blocked_bundles: BTreeMap<u32, ChainSubmissionDiagnostic>,
 }
 
 /// Reads the round's durable state on `tx`.
@@ -74,6 +80,7 @@ pub(crate) fn load_round_snapshot(
     round_id: &str,
 ) -> Result<RoundSnapshot, VotingError> {
     let delegations = delegation_submission_statuses_on(tx, wallet_id, round_id)?;
+    let rejection_blocked_bundles = rejection_blocked_bundles(tx, wallet_id, round_id)?;
     let bundles = queries::bundle_planning_rows(tx, round_id, wallet_id)?
         .into_iter()
         .map(|row| {
@@ -136,7 +143,66 @@ pub(crate) fn load_round_snapshot(
         intents,
         lifecycle_hashes,
         persisted_immediate_share,
+        rejection_blocked_bundles,
     })
+}
+
+/// Bundles at the combined-rejection cap whose delegation generation still
+/// matches the one the rejections were counted against.
+///
+/// The comparison is what makes the block self-healing: rebuilding or
+/// re-proving the delegation produces a different generation, and the stale
+/// count stops describing anything. A bundle whose setup is gone entirely is
+/// likewise not blocked.
+///
+/// Malformed durable state is an error rather than an absent block. This gate
+/// exists to stop a delegation the chain keeps refusing from being re-proved
+/// and re-POSTed forever, so failing to evaluate it must not silently read as
+/// "not blocked".
+fn rejection_blocked_bundles(
+    tx: &Transaction<'_>,
+    wallet_id: &str,
+    round_id: &str,
+) -> Result<BTreeMap<u32, ChainSubmissionDiagnostic>, VotingError> {
+    let ledger = queries::combined_rejection_ledger_rows(tx, round_id, wallet_id)?;
+    let capped: Vec<_> = ledger
+        .into_iter()
+        .filter(|row| {
+            super::lifecycle::combined_rejections_block_bundle(row.consecutive_rejections)
+        })
+        .collect();
+    if capped.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let round_bytes: [u8; 32] = hex::decode(round_id)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| VotingError::Internal {
+            message: "combined rejection ledger belongs to a malformed round id".to_string(),
+        })?;
+    let network = queries::load_round_network(tx, round_id, wallet_id)?;
+    let mut blocked = BTreeMap::new();
+    for row in capped {
+        let identity = crate::chain_submission::ChainSubmissionIdentity::new(
+            wallet_id,
+            network,
+            round_bytes,
+            row.bundle_index,
+            crate::chain_submission::ChainSubmissionTarget::Delegation,
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!("combined rejection ledger names an unusable identity: {error}"),
+        })?;
+        let current = crate::chain_submission::complete_generation_for_delegation(tx, &identity)?;
+        let still_the_same = current.is_some_and(|bound| {
+            bound.generation().digest().as_bytes().as_slice()
+                == row.delegation_generation_digest.as_slice()
+        });
+        if still_the_same {
+            blocked.insert(row.bundle_index, row.diagnostic);
+        }
+    }
+    Ok(blocked)
 }
 
 impl RoundSnapshot {

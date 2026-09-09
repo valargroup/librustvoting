@@ -162,6 +162,7 @@ pub use client::{
 #[cfg(test)]
 pub(crate) use generation::generation_for_vote;
 pub(crate) use generation::generation_for_vote_batch;
+pub(crate) use generation::{complete_generation_for_delegation, generation_for_delegation};
 #[cfg(test)]
 pub(crate) use identity::submission_identity_key;
 pub use identity::{

@@ -104,6 +104,7 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
         "pending",
         "rejected",
         "missing_route",
+        "replaced_route",
         "cancelled",
         "invalid",
     ] {
@@ -132,6 +133,18 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                         .push_back(ChainHttpResponse::json(
                             404,
                             br#"{"error":"missing route"}"#.to_vec(),
+                        ))
+                }
+                "replaced_route" => {
+                    transport
+                        .responses
+                        .lock()
+                        .unwrap()
+                        .push_back(ChainHttpResponse::new(
+                            200,
+                            b"<!doctype html><html></html>".to_vec(),
+                            Some("text/html; charset=utf-8".to_string()),
+                            Vec::new(),
                         ))
                 }
                 _ => {
@@ -191,15 +204,32 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                     ObservationOutcome::Pending
                 }
                 "missing_route" => {
+                    // The gateway-shaped response suggests an unsupported
+                    // route, but a proxy could have produced it after
+                    // forwarding the POST. Plain and reported calls must both
+                    // preserve recovery.
                     assert!(
                         matches!(
                             &result,
-                            Ok(ChainSubmissionResult::Pending(
-                                crate::ChainSubmissionPending::Recovering {
-                                    candidate_transaction_hash: None,
-                                    ..
-                                }
-                            ))
+                            Ok(ChainSubmissionResult::Pending(crate::ChainSubmissionPending::Recovering {
+                                candidate_transaction_hash: None, diagnostic,
+                            })) if diagnostic.kind() == crate::ChainSubmissionDiagnosticKind::EndpointUnsupported
+                                && diagnostic.message().contains("may not serve /shielded-vote/v1/cast-vote-batch")
+                        ),
+                        "{result:?}"
+                    );
+                    ObservationOutcome::Pending
+                }
+                "replaced_route" => {
+                    // A proxy may replace the response after forwarding the
+                    // POST. Plain and reported calls must preserve recovery.
+                    assert!(
+                        matches!(
+                            &result,
+                            Ok(ChainSubmissionResult::Pending(crate::ChainSubmissionPending::Recovering {
+                                candidate_transaction_hash: None, diagnostic,
+                            })) if diagnostic.kind() == crate::ChainSubmissionDiagnosticKind::RouteAnswerReplaced
+                                && diagnostic.message().contains("may not serve /shielded-vote/v1/cast-vote-batch")
                         ),
                         "{result:?}"
                     );
@@ -278,11 +308,22 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                     .iter()
                     .any(|r| r.outcome == ObservationOutcome::Rejected));
             }
+            // Both route-shaped answers preserve dispatch ambiguity. Their
+            // diagnostic kinds still distinguish a gateway-shaped response
+            // from a generic replacement for operator troubleshooting.
             if scenario == "missing_route" {
                 assert!(diagnostics
                     .records
                     .iter()
-                    .any(|r| r.outcome == ObservationOutcome::PossiblyDispatched));
+                    .any(|r| r.outcome == ObservationOutcome::PossiblyDispatched
+                        && r.error_kind.as_deref() == Some("PossiblyDispatched")));
+            }
+            if scenario == "replaced_route" {
+                assert!(diagnostics
+                    .records
+                    .iter()
+                    .any(|r| r.outcome == ObservationOutcome::PossiblyDispatched
+                        && r.error_kind.as_deref() == Some("PossiblyDispatched")));
             }
             let serialized = serde_json::to_string(&diagnostics).unwrap();
             assert!(!serialized.contains("vote.example"));

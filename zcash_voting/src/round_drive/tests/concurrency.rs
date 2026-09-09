@@ -62,6 +62,23 @@ impl crate::DelegationDriver for GatedSigningDriver {
         self.database.shares_connection_with(database)
     }
 
+    fn prepare_blocking(
+        &self,
+        bundle_index: u32,
+        pir: &crate::PirFleet,
+        progress: &dyn crate::types::DelegationProgressReporter,
+    ) -> Result<crate::delegate::DelegationProofStatus, crate::VotingError> {
+        self.probe.enter(bundle_index);
+        crate::DelegationDriver::prepare_blocking(
+            &SigningDriver {
+                database: Arc::clone(&self.database),
+            },
+            bundle_index,
+            pir,
+            progress,
+        )
+    }
+
     fn prove_and_sign_blocking(
         &self,
         bundle_index: u32,
@@ -174,7 +191,7 @@ async fn bundle_steps_run_up_to_the_configured_limit() {
     entered.sort_unstable();
     assert_eq!(entered, vec![0, 1]);
     assert_eq!(maximum, 2);
-    assert_eq!(report.failures.len(), 2);
+    assert!(report.failures.is_empty());
 }
 
 #[tokio::test]
@@ -182,12 +199,12 @@ async fn one_bundle_slot_keeps_bundle_steps_serial() {
     let (report, maximum, entered) = observe_wave(2, 1, 1).await;
     assert_eq!(entered, vec![0]);
     assert_eq!(maximum, 1);
-    assert_eq!(report.failures.len(), 1);
+    assert!(report.failures.is_empty());
 }
 
 #[tokio::test]
 async fn dispatch_budget_is_not_overshot_by_concurrent_launches() {
     let (report, _, entered) = observe_wave(3, 3, 2).await;
     assert_eq!(entered.len(), 2);
-    assert_eq!(report.failures.len(), 2);
+    assert!(report.failures.is_empty());
 }

@@ -20,6 +20,7 @@ const FINAL_VAN_LEAF_INDEX_ATTRIBUTE: &str = "final_van_leaf_index";
 const VC_LEAF_INDICES_ATTRIBUTE: &str = "vote_commitment_leaf_indices";
 const PROPOSAL_IDS_ATTRIBUTE: &str = "proposal_ids";
 const VAN_NULLIFIERS_ATTRIBUTE: &str = "van_nullifiers";
+const NULLIFIER_COUNT_ATTRIBUTE: &str = "nullifier_count";
 const ROUND_ID_ATTRIBUTES: [&str; 2] = ["vote_round_id", "round_id"];
 
 /// Validates committed hash evidence against one locked generation.
@@ -73,14 +74,33 @@ pub(super) fn validate_hash_confirmation(
         (
             ChainSubmissionTarget::VoteBatch {
                 ordered_batch_digest,
+            }
+            | ChainSubmissionTarget::DelegateAndVoteBatch {
+                ordered_batch_digest,
             },
             ExpectedTreeLayout::VoteBatch {
                 vote_commitments, ..
             },
         ) => {
-            let event = required_event_for_round(events, CAST_VOTE_BATCH_EVENT, &round_id)?;
+            let batch_event = if identity.target().is_combined() {
+                "delegate_and_cast_vote_batch"
+            } else {
+                CAST_VOTE_BATCH_EVENT
+            };
+            let event = required_event_for_round(events, batch_event, &round_id)?;
+            if let super::generation::ChainSubmissionRequest::DelegateAndVoteBatch(combined) =
+                derived.request()
+            {
+                let nullifiers = parse_compat_u64(
+                    required_attribute(event, batch_event, NULLIFIER_COUNT_ATTRIBUTE)?,
+                    "combined delegation nullifier count",
+                )?;
+                if nullifiers != combined.delegation.gov_nullifiers.len() as u64 {
+                    return Err(VotingError::InvalidInput { message: "combined delegation nullifier count does not match the locked generation".to_owned() });
+                }
+            }
             let event_digest = parse_canonical_hex32(
-                required_attribute(event, CAST_VOTE_BATCH_EVENT, BATCH_DIGEST_ATTRIBUTE)?,
+                required_attribute(event, batch_event, BATCH_DIGEST_ATTRIBUTE)?,
                 "cast_vote_batch batch_digest",
             )?;
             if event_digest != ordered_batch_digest {
@@ -90,7 +110,7 @@ pub(super) fn validate_hash_confirmation(
                 });
             }
             let batch_size = parse_compat_u64(
-                required_attribute(event, CAST_VOTE_BATCH_EVENT, BATCH_SIZE_ATTRIBUTE)?,
+                required_attribute(event, batch_event, BATCH_SIZE_ATTRIBUTE)?,
                 "cast_vote_batch batch_size",
             )?;
             let batch_size =
@@ -108,7 +128,7 @@ pub(super) fn validate_hash_confirmation(
             }
             let proposal_ids = parse_csv_u32(required_attribute(
                 event,
-                CAST_VOTE_BATCH_EVENT,
+                batch_event,
                 PROPOSAL_IDS_ATTRIBUTE,
             )?)?;
             if proposal_ids != derived.ordered_proposal_ids() {
@@ -117,30 +137,32 @@ pub(super) fn validate_hash_confirmation(
                         .to_string(),
                 });
             }
-            let expected_nullifiers = match derived.request() {
-                super::generation::ChainSubmissionRequest::VoteBatch(batch) => batch
-                    .votes
-                    .iter()
-                    .map(|vote| {
-                        let bytes = BASE64_STANDARD.decode(&vote.van_nullifier).map_err(|_| {
-                            VotingError::Internal {
-                                message: "derived batch nullifier is not canonical base64"
-                                    .to_string(),
-                            }
-                        })?;
-                        if bytes.len() != 32 {
-                            return Err(VotingError::Internal {
-                                message: "derived batch nullifier has invalid length".to_string(),
-                            });
-                        }
-                        Ok(hex::encode(bytes))
-                    })
-                    .collect::<Result<Vec<_>, VotingError>>()?,
+            let batch_votes = match derived.request() {
+                super::generation::ChainSubmissionRequest::VoteBatch(batch) => &batch.votes,
+                super::generation::ChainSubmissionRequest::DelegateAndVoteBatch(combined) => {
+                    &combined.batch.votes
+                }
                 _ => unreachable!("batch layout has batch request"),
             };
+            let expected_nullifiers = batch_votes
+                .iter()
+                .map(|vote| {
+                    let bytes = BASE64_STANDARD.decode(&vote.van_nullifier).map_err(|_| {
+                        VotingError::Internal {
+                            message: "derived batch nullifier is not canonical base64".to_string(),
+                        }
+                    })?;
+                    if bytes.len() != 32 {
+                        return Err(VotingError::Internal {
+                            message: "derived batch nullifier has invalid length".to_string(),
+                        });
+                    }
+                    Ok(hex::encode(bytes))
+                })
+                .collect::<Result<Vec<_>, VotingError>>()?;
             let event_nullifiers = parse_csv_strings(required_attribute(
                 event,
-                CAST_VOTE_BATCH_EVENT,
+                batch_event,
                 VAN_NULLIFIERS_ATTRIBUTE,
             )?)?;
             if event_nullifiers != expected_nullifiers {
@@ -150,12 +172,12 @@ pub(super) fn validate_hash_confirmation(
                 });
             }
             let final_van_position = parse_compat_u64(
-                required_attribute(event, CAST_VOTE_BATCH_EVENT, FINAL_VAN_LEAF_INDEX_ATTRIBUTE)?,
+                required_attribute(event, batch_event, FINAL_VAN_LEAF_INDEX_ATTRIBUTE)?,
                 "cast_vote_batch final VAN position",
             )?;
             let positions = parse_csv_u64(required_attribute(
                 event,
-                CAST_VOTE_BATCH_EVENT,
+                batch_event,
                 VC_LEAF_INDICES_ATTRIBUTE,
             )?)?;
             if positions.len() != batch_size
@@ -368,6 +390,125 @@ fn confirmation_error(error: super::ChainSubmissionConfirmationError) -> VotingE
     }
 }
 
+/// Retires a terminally rejected combined generation in the caller's
+/// lifecycle transaction and records the rejection.
+///
+/// Every member vote's recovery, shares, helper plans and immediate-share
+/// designation are cleared and the bundle's combined authorization is dropped,
+/// so the delegation reads `Proved` again and a fresh combined batch may be
+/// prepared. The delegation setup itself — PCZT, sighash, proof and any stored
+/// Keystone signature — is untouched: the chain rejected this envelope, not
+/// the delegation, and the same signature authorizes the next one. A member
+/// that reached the chain makes this an error, which the caller must roll back.
+///
+/// Because that leaves no other durable trace of the rejection, the streak is
+/// recorded against the delegation generation every recast reuses, so a
+/// delegation the chain keeps refusing stops being recast forever. The streak
+/// is read back from the ledger by round planning, not returned here.
+pub(super) fn retire_rejected_combined_generation(
+    conn: &rusqlite::Transaction<'_>,
+    identity: &super::ChainSubmissionIdentity,
+    diagnostic: &super::ChainSubmissionDiagnostic,
+    now: u64,
+) -> Result<(), VotingError> {
+    let Some(digest) = identity
+        .target()
+        .batch_digest()
+        .filter(|_| identity.target().is_combined())
+    else {
+        return Err(VotingError::Internal {
+            message: "only a combined generation retires on rejection".to_string(),
+        });
+    };
+    let round_id = hex::encode(identity.vote_round_id());
+    // Read the generation the streak is counted against before retirement
+    // deletes the authorization row that carries it.
+    let delegation_generation_digest =
+        crate::delegate_and_vote_batch::DelegationAuthorization::persisted_generation_digest(
+            conn,
+            identity.wallet_id(),
+            &round_id,
+            identity.bundle_index(),
+            &digest,
+        )?
+        .ok_or_else(|| VotingError::Internal {
+            message: "rejected combined generation has no persisted authorization".to_string(),
+        })?;
+    let cleared = crate::vote::clear_vote_batch_recovery_with_conn(
+        conn,
+        identity.wallet_id(),
+        &round_id,
+        identity.bundle_index(),
+        digest,
+    )?;
+    if cleared.is_empty() {
+        return Err(VotingError::Internal {
+            message: "rejected combined generation has no persisted members".to_string(),
+        });
+    }
+    record_combined_rejection(
+        conn,
+        identity,
+        &round_id,
+        &delegation_generation_digest,
+        &digest,
+        diagnostic,
+        now,
+    )
+}
+
+/// Adds one rejection to the bundle's streak, restarting it at one whenever the
+/// delegation generation differs from the one already recorded. Within one
+/// generation, rejection timestamps never move backwards with the wall clock.
+fn record_combined_rejection(
+    conn: &rusqlite::Transaction<'_>,
+    identity: &super::ChainSubmissionIdentity,
+    round_id: &str,
+    delegation_generation_digest: &[u8; 32],
+    batch_digest: &[u8; 32],
+    diagnostic: &super::ChainSubmissionDiagnostic,
+    now: u64,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "INSERT INTO combined_cast_rejections (
+             round_id, wallet_id, bundle_index, delegation_generation_digest,
+             consecutive_rejections, last_batch_digest,
+             last_diagnostic_kind, last_diagnostic, first_rejected_at, last_rejected_at)
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?8)
+         ON CONFLICT(round_id, wallet_id, bundle_index) DO UPDATE SET
+             consecutive_rejections = CASE
+                 WHEN combined_cast_rejections.delegation_generation_digest
+                      = excluded.delegation_generation_digest
+                 THEN combined_cast_rejections.consecutive_rejections + 1 ELSE 1 END,
+             delegation_generation_digest = excluded.delegation_generation_digest,
+             last_batch_digest = excluded.last_batch_digest,
+             last_diagnostic_kind = excluded.last_diagnostic_kind,
+             last_diagnostic = excluded.last_diagnostic,
+             first_rejected_at = CASE
+                 WHEN combined_cast_rejections.delegation_generation_digest
+                      = excluded.delegation_generation_digest
+                 THEN combined_cast_rejections.first_rejected_at
+                 ELSE excluded.first_rejected_at END,
+             last_rejected_at = CASE
+                 WHEN combined_cast_rejections.delegation_generation_digest
+                      = excluded.delegation_generation_digest
+                 THEN MAX(combined_cast_rejections.last_rejected_at, excluded.last_rejected_at)
+                 ELSE excluded.last_rejected_at END",
+        rusqlite::params![
+            round_id,
+            identity.wallet_id(),
+            identity.bundle_index() as i64,
+            delegation_generation_digest.as_slice(),
+            batch_digest.as_slice(),
+            diagnostic.kind().as_str(),
+            diagnostic.message(),
+            now as i64,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| VotingError::from_sqlite("record combined cast rejection", &error))
+}
+
 /// Projects validated terminal evidence onto the rows locked by `derived`.
 ///
 /// The caller must include this connection in its lifecycle transaction. The
@@ -416,6 +557,9 @@ pub(super) fn apply_confirmed_generation(
         (
             ChainSubmissionTarget::VoteBatch {
                 ordered_batch_digest,
+            }
+            | ChainSubmissionTarget::DelegateAndVoteBatch {
+                ordered_batch_digest,
             },
             ExpectedTreeLayout::VoteBatch {
                 vote_commitments, ..
@@ -434,7 +578,27 @@ pub(super) fn apply_confirmed_generation(
                 positions,
                 Some(bound.ordered_proposal_ids()),
                 None,
-            )
+            )?;
+            if identity.target().is_combined() {
+                if let Some(hash) = transaction_hash.as_deref() {
+                    crate::storage::queries::store_delegation_tx_hash(
+                        conn,
+                        &round_id,
+                        identity.wallet_id(),
+                        identity.bundle_index(),
+                        hash,
+                    )?;
+                }
+                // A confirmed batch ends whatever rejection streak preceded it,
+                // so a later unrelated rejection starts counting from one.
+                crate::storage::queries::clear_combined_rejection_ledger(
+                    conn,
+                    identity.wallet_id(),
+                    &round_id,
+                    identity.bundle_index(),
+                )?;
+            }
+            Ok(())
         }
         _ => Err(VotingError::InvalidInput {
             message: "confirmed positions do not match the semantic generation layout".to_string(),

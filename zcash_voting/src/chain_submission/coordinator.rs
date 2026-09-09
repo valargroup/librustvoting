@@ -374,10 +374,26 @@ where
                             )
                             .await;
                     }
-                    let record = self.classify_dispatched_post(
-                        derived.generation(),
-                        SubmissionObservation::DefiniteRejection(diagnostic.clone()),
-                    )?;
+                    // A combined delegation-and-cast batch rejected on its
+                    // first POST, with no attempt possibly dispatched, is
+                    // chain evidence that nothing landed: the store retires
+                    // the generation and frees the delegation for a fresh
+                    // batch. A code-2 rejection is excluded because it says
+                    // the delegation notes are spent by something else, which
+                    // only tree recovery can explain, and a recast would fail
+                    // the same way. Standalone generations keep the recoverable
+                    // classification: their members stay locked until the
+                    // ballot decides otherwise.
+                    let terminal = !ambiguity_seen
+                        && derived.generation().identity().target().is_combined()
+                        && kind != ChainRejectionKind::NullifierAlreadySpent;
+                    let observation = if terminal {
+                        SubmissionObservation::TerminalRejection(diagnostic.clone())
+                    } else {
+                        SubmissionObservation::DefiniteRejection(diagnostic.clone())
+                    };
+                    let record =
+                        self.classify_dispatched_post(derived.generation(), observation)?;
                     if ambiguity_seen {
                         return Err(ChainSubmissionFailure::with_durable_state(
                             ChainSubmissionFailureKind::Protocol,
@@ -449,10 +465,11 @@ where
             if attempt_index + 1 == self.policy.maximum_post_attempts {
                 return reserved.public_result();
             }
+            let backoff = self.policy.retry_backoffs[attempt_index];
             if ambiguity_seen {
                 reserved = match self
                     .reserve_ambiguous_retry_after_backoff(
-                        attempt_index,
+                        backoff,
                         derived.generation(),
                         reserved,
                         operation,
@@ -467,11 +484,7 @@ where
                 };
             } else {
                 if let Some(reason) = self
-                    .wait_backoff_or_interruption(
-                        self.policy.retry_backoffs[attempt_index],
-                        operation,
-                        control,
-                    )
+                    .wait_backoff_or_interruption(backoff, operation, control)
                     .await
                 {
                     return interrupted_without_state(reason);
@@ -504,26 +517,20 @@ where
         unreachable!("validated attempt bound is nonzero")
     }
 
-    /// Waits the configured backoff that follows attempt `attempt_index`, then
-    /// durably reserves the next same-generation POST for a hashless row that
-    /// already carries dispatch ambiguity.
-    ///
+    /// Waits `backoff`, then durably reserves the next same-generation POST
+    /// for a hashless row that already carries dispatch ambiguity.
     /// Interruption during the backoff leaves the row as it is; the durable
     /// ambiguity is returned so the caller can report it.
     async fn reserve_ambiguous_retry_after_backoff(
         &self,
-        attempt_index: usize,
+        backoff: Duration,
         generation: &super::ChainSubmissionGeneration,
         reserved: StoredChainSubmission,
         operation: &CapturedSubmissionOperation,
         control: &dyn SubmissionControl,
     ) -> Result<AmbiguousRetryReservation, ChainSubmissionFailure> {
         if self
-            .wait_backoff_or_interruption(
-                self.policy.retry_backoffs[attempt_index],
-                operation,
-                control,
-            )
+            .wait_backoff_or_interruption(backoff, operation, control)
             .await
             .is_some()
         {
@@ -575,6 +582,22 @@ where
             ChainSubmissionRequest::Vote(submission) => {
                 self.protocol
                     .submit_vote_with_dispatch(endpoint_index, submission, dispatch, observations)
+                    .await
+            }
+            ChainSubmissionRequest::DelegateAndVoteBatch(submission) => {
+                self.protocol
+                    .submit_delegate_and_vote_batch_with_dispatch(
+                        endpoint_index,
+                        submission,
+                        derived
+                            .generation()
+                            .identity()
+                            .target()
+                            .batch_digest()
+                            .expect("combined identity"),
+                        dispatch,
+                        observations,
+                    )
                     .await
             }
             ChainSubmissionRequest::VoteBatch(submission) => {
@@ -737,7 +760,14 @@ where
                             ChainSubmissionDiagnosticKind::ChainRejected,
                             "tracked vote-chain transaction committed unsuccessfully",
                         );
-                        let observation = if request.is_imported_delegation() {
+                        // An imported delegation has one immutable candidate,
+                        // and a combined batch's candidate is the hash of its
+                        // one signed envelope, so a committed failure of that
+                        // hash is the generation's final word: no other
+                        // dispatch of the same bytes can have landed.
+                        let terminal = request.is_imported_delegation()
+                            || derived.generation().identity().target().is_combined();
+                        let observation = if terminal {
                             SubmissionObservation::TerminalCandidateFailure(diagnostic.clone())
                         } else {
                             SubmissionObservation::CandidateCommittedFailure(diagnostic.clone())
@@ -804,10 +834,23 @@ where
                         control,
                     }),
                     LookupProgress::Observed(TransactionStatusObservation::CommittedFailure(_)) => {
-                        if request.is_imported_delegation() {
+                        // Same terminality rule as the `Tracking` arm above: an
+                        // imported delegation has one immutable candidate, and a
+                        // combined batch's candidate is the hash of its one
+                        // signed envelope. A row reaches here rather than
+                        // `Tracking` only because its tracking window expired
+                        // inconclusively first, which changes nothing about
+                        // whose bytes the chain just reported on.
+                        let terminal = request.is_imported_delegation()
+                            || derived.generation().identity().target().is_combined();
+                        if terminal {
                             let diagnostic = ChainSubmissionDiagnostic::from_redacted_message(
                                 ChainSubmissionDiagnosticKind::ChainRejected,
-                                "imported vote-chain transaction committed unsuccessfully",
+                                if request.is_imported_delegation() {
+                                    "imported vote-chain transaction committed unsuccessfully"
+                                } else {
+                                    "combined vote-chain transaction committed unsuccessfully"
+                                },
                             );
                             return self
                                 .reconcile_with_durable_state(
@@ -1312,7 +1355,7 @@ where
         }
         let reserved = match self
             .reserve_ambiguous_retry_after_backoff(
-                post_attempts_used,
+                self.policy.retry_backoffs[post_attempts_used],
                 derived.generation(),
                 ambiguous,
                 operation,

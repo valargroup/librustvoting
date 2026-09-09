@@ -50,6 +50,16 @@ pub enum ChainSubmissionDiagnosticKind {
     ReconciliationPending,
     InvalidProtocolResponse,
     StorageFailure,
+    /// A mutation returned HTTP 404 or 405 with the gateway's `{"error": ...}`
+    /// shape. This usually means the endpoint does not serve the route, but an
+    /// intermediary can reproduce the same response after forwarding the
+    /// request, so dispatch remains ambiguous.
+    EndpointUnsupported,
+    /// A mutation answer that looks like a missing route but cannot be
+    /// attributed to the router: an HTML 200 fallback page, or a 404/405
+    /// without the gateway's error envelope. A proxy can produce either after
+    /// forwarding the POST upstream, so this does not establish non-dispatch.
+    RouteAnswerReplaced,
 }
 
 impl ChainSubmissionDiagnosticKind {
@@ -65,6 +75,8 @@ impl ChainSubmissionDiagnosticKind {
             Self::ReconciliationPending => "reconciliation_pending",
             Self::InvalidProtocolResponse => "invalid_protocol_response",
             Self::StorageFailure => "storage_failure",
+            Self::EndpointUnsupported => "endpoint_unsupported",
+            Self::RouteAnswerReplaced => "route_answer_replaced",
         }
     }
 
@@ -79,6 +91,8 @@ impl ChainSubmissionDiagnosticKind {
             "reconciliation_pending" => Some(Self::ReconciliationPending),
             "invalid_protocol_response" => Some(Self::InvalidProtocolResponse),
             "storage_failure" => Some(Self::StorageFailure),
+            "endpoint_unsupported" => Some(Self::EndpointUnsupported),
+            "route_answer_replaced" => Some(Self::RouteAnswerReplaced),
             _ => None,
         }
     }

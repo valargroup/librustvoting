@@ -6,6 +6,7 @@
 //! advancement, confirmation, and helper-share delivery.
 
 mod cast_vote;
+mod delegate_and_vote_batch;
 mod delegation_steps;
 pub(crate) mod round_lock;
 mod share_confirmation;
@@ -155,6 +156,8 @@ pub enum RoundStepProgress {
     TreeSynced { height: u32 },
     /// Vote proof and signing progress.
     VoteCommit(VoteCommitStage),
+    /// A combined delegation and all signed vote recoveries are durable.
+    DelegateAndVoteBatchPersisted { bundle_index: u32 },
     /// Complete delivery plans are durable for all listed votes.
     HelperPlansPrepared(Vec<VoteRecoveryKey>),
     /// One bounded chain advancement episode produced this outcome.

@@ -292,6 +292,31 @@ fn write_ballot_intent_in_tx(
         proposal_id,
         choice_u32,
     )?;
+    // A decision that differs from the stored one changes what the next
+    // combined batch will contain, so any rejection streak counted against the
+    // old batch stops describing it. The streak is keyed on the delegation
+    // generation, which this edit does not touch, so nothing else would lift a
+    // block whose cause was a vote member rather than the delegation. Read
+    // before the upsert below, which is what makes the decision the stored one.
+    let stored_intent: Option<(i64, Option<i64>)> = tx
+        .query_row(
+            "SELECT skipped, choice FROM ballot_intent
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND proposal_id = :proposal_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map(Some)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+        .map_err(|e| VotingError::from_sqlite("read ballot intent before update", &e))?;
+    let intent_changed = stored_intent != Some((skipped, choice));
     tx.execute(
         "INSERT INTO ballot_intent
             (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
@@ -308,6 +333,14 @@ fn write_ballot_intent_in_tx(
         },
     )
     .map_err(|e| VotingError::from_sqlite("set_ballot_intent", &e))?;
+    if intent_changed {
+        queries::clear_combined_rejection_ledger_for_proposal(
+            tx,
+            wallet_id,
+            round_id,
+            proposal_id,
+        )?;
+    }
     if skipped_bool {
         tx.execute(
             "DELETE FROM share_delegations

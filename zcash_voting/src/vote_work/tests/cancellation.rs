@@ -26,7 +26,7 @@ async fn a_cancelled_control_does_not_invent_work_for_an_idle_round() {
 }
 
 #[tokio::test]
-async fn a_delegate_step_cancelled_after_signing_returns_the_signed_bundle() {
+async fn a_delegate_step_cancelled_after_preparation_keeps_the_proof_without_signing() {
     let executor = executor();
     executor
         .set_ballot_intents(&[
@@ -57,11 +57,11 @@ async fn a_delegate_step_cancelled_after_signing_returns_the_signed_bundle() {
 
     assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
     assert_eq!(outcome.step, Some(step));
-    let signed = outcome
-        .delegation
-        .expect("a cancelled Delegate step still hands back the signed bundle");
-    assert_eq!(signed.bundle_index, 0);
-    assert_eq!(signed.submission.spend_auth_sig, [0x68; 64]);
+    assert!(outcome.delegation.is_none());
+    assert_eq!(
+        executor.database().delegation_phase(ROUND_ID, 0).unwrap(),
+        crate::phases::DelegationPhase::Proved
+    );
 }
 
 #[tokio::test]
@@ -92,7 +92,7 @@ async fn a_delegate_step_stops_when_the_host_moves_to_a_new_operation_epoch() {
     assert!(!control.is_cancelled());
     assert_eq!(control.operation_epoch(), 8);
     assert_eq!(outcome.disposition, RoundStepDisposition::Cancelled);
-    assert!(outcome.delegation.is_some());
+    assert!(outcome.delegation.is_none());
 }
 
 #[tokio::test]

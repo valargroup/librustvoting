@@ -65,6 +65,13 @@ fn record_rejected_submission_fixture(
         ChainSubmissionTarget::VoteBatch {
             ordered_batch_digest,
         } => ("vote_batch", None, Some(ordered_batch_digest.to_vec())),
+        ChainSubmissionTarget::DelegateAndVoteBatch {
+            ordered_batch_digest,
+        } => (
+            "delegate_and_cast_vote_batch",
+            None,
+            Some(ordered_batch_digest.to_vec()),
+        ),
     };
     db.conn()
         .execute(
@@ -250,11 +257,13 @@ fn store_two_action_batch_recovery_fixture_for(
     )
     .unwrap();
     first.batch = Some(VoteBatchRecovery {
+        delegation_van: None,
         digest,
         index: 0,
         size: 2,
     });
     second.batch = Some(VoteBatchRecovery {
+        delegation_van: None,
         digest,
         index: 1,
         size: 2,
@@ -1171,9 +1180,8 @@ fn delegation_bundles_are_reported_per_bundle_ascending() {
     );
     assert_eq!(
         summary.delegation_bundles_needing_signing,
-        vec![1, 2],
-        "both a bundle with nothing on the chain yet and one in flight need \
-         the voter's key; only an imported delegation never asks for it"
+        vec![2],
+        "proof preparation and imported recovery need no signing key; standalone advancement does"
     );
     assert_eq!(
         summary.needs_delegation_signing,
@@ -1229,10 +1237,10 @@ fn a_plan_with_no_delegation_work_names_no_bundles() {
 
 #[test]
 fn plan_work_summary_classifies_every_step_kind() {
-    // Locally prepared delegations need the signing key on both their
-    // first and later advancement passes.
+    // Early proof preparation needs no signature; a standalone submission's
+    // advancement retains the existing signing contract.
     let signing = summarize_plan_work(&[NextStep::Delegate { bundle_index: 0 }], false);
-    assert!(signing.needs_delegation_signing);
+    assert!(!signing.needs_delegation_signing);
     assert!(!signing.has_in_flight_delegation);
     assert!(!signing.needs_vote_polling);
 

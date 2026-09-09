@@ -10,6 +10,46 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Preserve combined-vote recovery records when upgrading version-22 preview
+  databases, including previews missing the delegation PCZT column. Unknown
+  preview schemas fail without changing stored state.
+
+- A cast on an imported delegation no longer asks the host for a delegation
+  signature. The imported transaction is already on the chain and its holder
+  has no delegation key; the run proceeds to the imported advance instead of
+  stopping at `NeedsDelegationSignatures`.
+- A combined delegation-and-cast batch that the chain definitely rejects on its
+  first POST is retired: its members, helper plans and delegation authorization
+  are cleared, the lifecycle row is removed, and the bundle returns to `Proved`
+  so the next run casts a fresh batch with the same delegation setup. A
+  rejection after an ambiguous POST, or a code-2 rejection, keeps the row
+  recoverable as before.
+- Every route-shaped vote-chain POST response preserves dispatch ambiguity and
+  durable recovery, including a 404/405 with the gateway's exact JSON error
+  shape. That shape carries `endpoint_unsupported`; HTML fallback pages and
+  other 404/405 responses carry `route_answer_replaced`. An intermediary can
+  reproduce either response after forwarding the POST, so neither releases the
+  reservation or unlocks ballot changes.
+- Combined rejection retirement clamps timestamps across wall-clock rollback,
+  preserving atomic cleanup and the rejection streak. A new delegation
+  generation starts its own timestamps.
+- A combined rejection streak is now cleared by a delegation rebuild and by a
+  ballot change, not only by confirmation. The streak is counted against the
+  delegation generation, so a rejection caused by a vote member previously
+  outlived the ballot edit that fixed it, and the discard-driven cleanup could
+  never reach a bundle whose retired vote rows the broadcast guard requires to
+  be absent.
+- A version-22 combined-preview database missing a `chain_submissions` index or
+  trigger now upgrades and is repaired instead of failing to open. That drift is
+  repairable and its repair runs after the migration ladder, so including those
+  objects in the preview fingerprint aborted the upgrade before the repair could
+  run and left the sidecar permanently unopenable.
+
+- Combined delegation-and-vote confirmation reads the chain event
+  `nullifier_count` field. Previously the SDK expected `nullifiers`, leaving
+  successfully committed batches in tracking. Existing submissions recover
+  through their saved transaction hash without being submitted again.
+
 - Helper-delivery diagnostics classify definite acceptance, ambiguous delivery,
   and definitely-unsent shares consistently at stage and invocation boundaries.
   Atomic-batch helper attempts and retries carry their actual bundle, proposal,

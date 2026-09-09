@@ -392,9 +392,9 @@ question, and terminality is what decides that.
 `Rejected` settles it: no observation transitions out of that state and a
 recovery retry may be reserved only from `Recovering`, so the row can never
 acquire an outstanding POST after the fact, and a definite rejection spent
-nothing. It is never deleted either, so counting it would retire the
-expectation for the rest of the round and skip both the leaf-content and the
-leaf-presence check — the fail-open direction again, one layer down
+nothing. A standalone `Rejected` row is never deleted either, so counting it
+would retire the expectation for the rest of the round and skip both the
+leaf-content and the leaf-presence check — the fail-open direction again, one layer down
 (`a_terminally_rejected_vote_keeps_its_bundles_van_expectation`).
 
 A `Recovering` row carrying `ChainRejected` does **not** settle it, and is
@@ -447,7 +447,12 @@ Their meanings are:
 - `Rejected`: a terminal row. Local POST rejection codes remain recovery
   diagnostics because they may depend on node state or chain time. A
   poll-only imported transaction enters `Rejected` when status proves that its
-  one immutable candidate committed unsuccessfully.
+  one immutable candidate committed unsuccessfully. A combined
+  delegation-and-cast batch enters `Rejected` on a definite first-POST
+  rejection with no prior dispatch ambiguity (any code but 2), or when its one
+  candidate commits unsuccessfully; that row is retired together with its
+  members in the same transaction and does not persist (see
+  [Combined delegation and cast batches](#combined-delegation-and-cast-batches)).
 
 The normal transitions are:
 
@@ -462,12 +467,22 @@ Recovering -> SubmittedWithoutHash
                              retry code 2 after unresolved dispatch
                              (exact tree: after a no-match pass)
 Submitting -> Recovering     chain rejection code
+Submitting -> Rejected       definite rejection of a delegate_and_cast_vote_batch
+                             (no prior ambiguity, code other than 2); the row
+                             and its members are retired in the same transaction
 Tracking -> Tracking         hash still pending
 Tracking -> Recovering       bounded tracking window expires inconclusively
 Tracking -> Confirmed        committed success and atomic persistence
 Tracking -> Recovering       local committed failure, failed candidate cleared
 Recovering -> Recovering     candidate, retry, no match, or interruption
 Recovering -> Confirmed      candidate success or exact tree layout
+
+combined Tracking -> Rejected
+                             candidate committed unsuccessfully; the row and
+                             its members are retired in the same transaction
+combined Recovering -> Rejected
+                             same, reached only because the tracking window
+                             expired inconclusively first
 
 imported new -> Tracking     atomically adopt the stored package hash
 imported Tracking -> Rejected
@@ -509,9 +524,9 @@ Other local recovery observations do not transition to `Tracking` or
 `Rejected`. In particular, a rejection, committed-failure candidate,
 cancellation, or empty scan cannot erase ambiguity. A hashless `Recovering` row
 may reserve the next bounded POST directly under status-only advancement when
-its diagnostic came from the possibly-dispatched path, either
-`AmbiguousDispatch` or `InvalidProtocolResponse`; exact-tree advancement
-completes a tree pass first and reaches a POST only through no-match
+its diagnostic came from the possibly-dispatched path:
+`AmbiguousDispatch`, `InvalidProtocolResponse`, or `EndpointUnsupported`;
+exact-tree advancement completes a tree pass first and reaches a POST only through no-match
 authorization. A hashless row created by a definite rejection carries
 `ChainRejected` and never reserves an ambiguous retry. A pending or
 unreadable candidate is never overwritten and blocks another POST until it is
@@ -609,9 +624,9 @@ only when dispatch ambiguity actually preceded it; classification never
 inspects or retains the untrusted response log. Within one invocation the
 coordinator knows whether an earlier attempt was possibly dispatched. Across
 invocations the durable row is the carrier: a `Recovering` row whose stored
-diagnostic kind is `AmbiguousDispatch`, `InvalidProtocolResponse`, or
-`TrackingWindowExpired` carries unresolved dispatch evidence, because each of
-those records a POST that left the wallet and never resolved. A diagnostic of
+diagnostic kind is `AmbiguousDispatch`, `InvalidProtocolResponse`,
+`EndpointUnsupported`, or `TrackingWindowExpired` carries unresolved dispatch
+evidence, because each of those records a POST that left the wallet and never resolved. A diagnostic of
 `ChainRejected` records a definite outcome, a rejected POST or a candidate that
 committed unsuccessfully, which spent nothing; code 2 after such a row is
 handled like any other definite rejection.
@@ -1118,12 +1133,15 @@ order, and batch digest are locked. Delegation setup, nullifiers, proof inputs,
 and VAN randomizer are likewise locked. Re-selecting the same generation is
 idempotent; changing it is rejected.
 
-A terminal rejection does not release an atomic batch's member
+A terminal rejection does not release an ordinary atomic batch's member
 locks. The rejected row still projects its phase through the signed recovery
 rows that define its ordered roster, so a conflicting ballot-intent change must
 fail before clearing vote recovery or helper-delivery records. A rejected
 singleton does not depend on a recovery-derived roster and is not additionally
-locked by this batch-roster rule.
+locked by this batch-roster rule. A terminally rejected *combined* batch is the
+exception: the lifecycle clears its members' recovery, shares, helper plans and
+the delegation authorization in the rejection transaction and removes the row,
+so its member locks are released and the ballot intent is free again.
 
 Confirmation does not release those locks. A vote that a generation has already
 placed on chain cannot have its ballot intent changed, whatever the confirmation
@@ -1765,3 +1783,207 @@ Public-lifecycle engine coverage is anchored by
 `public_vote_writers_reserve_before_validation_and_wait_on_contention`,
 `cancellation_during_final_dispatch_persists_hashless_recovery`, and
 `operation_epoch_change_during_final_dispatch_persists_hashless_recovery`.
+
+
+## Combined delegation and cast batches
+
+Fresh round execution uses `DelegateAndVoteBatch`, a distinct submission
+identity and generation. Its endpoint is
+`/shielded-vote/v1/delegate-and-cast-vote-batch`; the body contains `delegation`
+and `batch`. There is no endpoint fallback. An existing standalone or imported
+delegation continues through its original lifecycle.
+
+The initial VAN is the locally authenticated delegation output. Every nested
+cast uses anchor height zero and the synthetic predecessor witness. The cast
+authorization binds the round, initial VAN, action count, ordered effects and
+proposal IDs with `SVOTE_DELEGATE_AND_CAST_VOTE_BATCH_SIGHASH_V1`. The canonical
+encoding is defined only in `delegate_and_vote_batch/authorization.rs`; its frozen SDK
+vector is tested in `delegate_and_vote_batch/tests/authorization.rs`.
+
+The signed delegation authorization and all vote recoveries are persisted in
+one transaction. Preparation captures one wallet-scoped handle for both the
+delegation and the votes. Persistence requires the authorization and every
+vote to share the same wallet, round and bundle, even if their cryptographic
+material is identical. `combined_authorization_requires_the_same_wallet_round_and_bundle`
+and `combined_persistence_rejects_mixed_storage_scopes_before_writing` pin this
+boundary. `combined_authorization_refuses_a_wallet_switch_with_duplicate_setup`
+checks a wallet switch with byte-identical, validly signed delegation setups.
+Schema version 23 stores the authorization and its delegation
+generation digest. The version-22 upgrade preserves existing PCZTs, proofs,
+signatures and chain submission rows, and reopening is idempotent
+(`v22_upgrades_combined_storage_to_the_fresh_schema`). Recovery requires that
+generation to remain unchanged and never needs the delegation signing key. Ordinary batch identities refuse these
+recoveries. The persisted combined unit excludes standalone delegation
+admission, and fresh combined admission excludes any delegation submission
+evidence. Retiring an undispatched batch clears its authorization after its
+last member is cleared.
+
+A combined transaction has one reservation, candidate hash, retry history and
+terminal result. Confirmation must match the combined event, digest, complete
+ordered proposal/nullifier roster, final VAN and contiguous vote leaves. The
+combined event must also contain exactly one `nullifier_count`, parsed as an
+unsigned integer and equal to the locked delegation governance-nullifier count.
+A missing, duplicate, malformed or mismatched count is not confirmation
+evidence; `nullifiers` is not a supported alias. The
+initial delegation VAN is not a chain leaf. In one storage transaction,
+confirmation advances the bundle to the final successor VAN and records every
+vote position and the shared transaction hash. Tree recovery follows the same
+final-VAN-plus-vote-leaves layout and does not invent an initial VAN position.
+
+Conformance coverage: `combined_lifecycle_confirms_delegation_and_every_vote_together`
+checks 1, 2, 37 and 50 members and replay; `ordinary_batch_identity_cannot_dispatch_combined_signatures`
+checks endpoint separation; `changed_delegation_generation_refuses_combined_recovery`
+checks delegation generation binding.
+
+`combined_confirmation_rejects_wrong_kind_partial_roster_and_wrong_layout`
+checks confirmation binding, and
+`a_combined_confirmation_storage_failure_rolls_back_every_projection` checks
+transactional rollback. `combined_authorization_and_envelope_survive_database_reopen`
+checks recovery without a live signer.
+`combined_chain_receipt_recovers_after_reopen_without_resubmission` verifies
+a saved 37-question submission confirms by its existing hash after database
+reopen, without another POST.
+`combined_confirmation_requires_one_matching_chain_nullifier_count` covers
+missing, duplicate, malformed, overflowing and mismatched counts and rejects
+the unsupported old field name. The release-only
+`combined_batch_builds_real_proofs_and_binds_the_initial_delegation_van` builds
+two real ZKP2 proofs and checks their composite signatures and VAN binding.
+
+### Definite rejection
+
+A combined batch whose first POST the chain definitely rejects, with no attempt
+possibly dispatched before it, is chain evidence that nothing landed. The
+coordinator classifies it `TerminalRejection`; the state machine admits that
+observation from `Submitting` only, so an earlier ambiguous POST can never be
+erased by a later rejection (`a_terminal_rejection_from_submitting_is_rejected_and_refused_after_ambiguity`).
+Code 2 is excluded: it says the delegation notes are spent by something this
+wallet did not classify, which only tree recovery can explain, and a recast
+would fail the same way (`a_nullifier_spent_first_post_keeps_the_combined_row_recovering`).
+A combined candidate that commits unsuccessfully is treated the same way as an
+imported delegation's: its hash names the one signed envelope, so the failure
+is terminal (`a_combined_candidate_that_commits_unsuccessfully_retires_the_generation`).
+That holds from `Recovering` as well as `Tracking`. A row reaches `Recovering`
+rather than staying in `Tracking` only because its bounded tracking window
+expired inconclusively first, which changes nothing about whose bytes the chain
+has now reported on
+(`a_combined_candidate_committing_unsuccessfully_after_the_window_expires_is_terminal`).
+`StoredChainSubmission::retires_combined_generation` is the single owner of the
+rule, so every path a row can reach `Rejected` by retires on the same terms;
+the in-memory double counts each firing in `combined_retirements` because it
+holds no delegation setup to retire.
+
+The store retires the generation inside the transition's transaction
+(`retire_rejected_combined_generation`): every member's recovery JSON is
+cleared, which the generation-change triggers turn into deleted helper plans
+and immediate-share designation; the members' share records and the bundle's
+`delegate_cast_recovery` row are deleted; and the lifecycle row itself is
+deleted. The delegation setup — PCZT, sighash, ZKP1 proof and any stored
+Keystone signature — is untouched, so the bundle reads `Proved` again and the
+same SpendAuth signature authorizes the next envelope. Fresh combined admission
+of a new digest then follows the ordinary rules
+(`a_definitely_rejected_combined_batch_retires_its_members_and_frees_the_delegation`).
+A rejection after an ambiguous POST keeps the row `Recovering` with its
+members locked (`a_rejection_after_an_ambiguous_combined_post_keeps_the_row_recovering`).
+Standalone delegation, vote and vote-batch rows keep their existing terminal
+semantics.
+
+Retirement deletes the lifecycle row, so one durable trace of the rejection is
+kept deliberately outside it. In the same transaction the store appends to
+`combined_cast_rejections`: a per-bundle streak of consecutive rejections with
+the chain's own last diagnostic kind and message, keyed by the delegation
+generation the recast reuses rather than by the batch digest, which is
+re-randomized on every cast. That table is deliberately not a `chain_submissions`
+column — `chain_submissions` is fingerprinted on every open and rebuilt on
+drift, and both combined freshness gates admit a new batch only while no row
+exists in it, so the ledger has to be invisible to them. The streak is what
+bounds recasting; `docs/round_orchestration_invariants.md` owns the cap and the
+planning behavior it drives. Beyond it, the rejection diagnostic still survives
+in the run report and observability records.
+
+Three things clear the row, one for each way the streak can stop describing
+what would be sent next:
+
+- the batch confirms (`a_confirmed_combined_batch_forgets_its_rejection_streak`);
+- the delegation generation it was counted against ends. A rebuild is what
+  ordinarily ends one, and it replaces the setup rather than emptying it, so the
+  clear belongs to the setup write itself: any write that changes a stored setup
+  column clears the streak, and an idempotent resume, which changes none, keeps
+  it, because that resume reuses the very generation the chain refused
+  (`a_rebuild_clears_the_rejection_streak_the_old_delegation_earned`,
+  `an_idempotent_setup_rewrite_keeps_the_rejection_streak`). The discard's own
+  `DELETE` covers only a discard that actually emptied the bundle: it carries
+  the shared broadcast guard, which requires the bundle to hold no `votes` rows,
+  and retiring a rejected batch deliberately keeps them;
+- the ballot changes. The streak is keyed on the delegation generation, which a
+  ballot edit does not touch, so nothing else would lift a block whose cause was
+  a vote member rather than the delegation. A durable intent write that differs
+  from the stored decision clears the streak of every bundle holding a vote for
+  that proposal; an unchanged decision does not
+  (`changing_the_ballot_lifts_a_block_the_delegation_did_not_cause`,
+  `an_unchanged_ballot_decision_keeps_the_streak`).
+
+`VotingDb::retry_blocked_combined_cast` remains the host's explicit override for
+a cause fixed outside all three.
+
+Rejection timestamps use the lifecycle transition's clamped timestamp. Within
+one delegation generation, `first_rejected_at` remains fixed and
+`last_rejected_at` is the maximum of its stored value and the transition time.
+This also handles a recast whose entire lifetime falls before an earlier
+rejection because the wall clock moved backwards. A different delegation
+generation restarts both timestamps from its own clamped transition time.
+Clock rollback must not prevent atomic retirement or advancing the rejection
+streak. Coverage:
+`combined_rejection_retirement_clamps_clock_rollback_and_advances_the_streak`
+and
+`a_new_delegation_generation_restarts_rejection_timestamps_after_clock_rollback`.
+
+Fresh combined admission also refuses a bundle carrying any chain submission
+row, whatever its kind or state, before a reservation exists
+(`combined_admission_refuses_a_bundle_with_delegation_evidence`), and tree
+recovery confirms a combined generation from the same final-VAN-plus-vote-leaves
+layout as an ordinary batch without inventing a hash
+(`exact_recovery_confirms_a_combined_batch_from_the_tree`).
+
+### Route answers preserve dispatch ambiguity
+
+HTTP 404/405 and HTTP 200 HTML responses can indicate an unsupported mutation
+route, but no unsigned response shape authenticates which network component
+wrote it. A proxy can forward the POST upstream and then reproduce the
+gateway's exact `application/json` response with a lone `error` field.
+`deny_unknown_fields` validates only that shape; it cannot prove that the
+vote-chain router rejected the request before a handler ran.
+
+Every route-shaped answer therefore preserves dispatch ambiguity. A 404/405 in
+the gateway's error shape carries `EndpointUnsupported` because that is the
+most useful operator diagnosis; an HTML 200 fallback or any 404/405 outside
+that shape carries `RouteAnswerReplaced`. Both transition the generation
+durably to hashless `Recovering`. The SDK must not delete its reservation,
+unlock ballot changes, or retire recovery material because of either response.
+The bounded retry loop, backoff and endpoint rotation apply unchanged;
+exhausting the budget leaves the generation recoverable for a later invocation.
+A later rejection does not erase the earlier ambiguity, and a later usable hash
+or exact-tree match can still confirm the same generation. There is no fallback
+to separate delegation and cast POSTs.
+
+The response-size limit is applied before either classification, so an oversized
+body reaches the ordinary response-limit diagnostic rather than being read as a
+route answer. Every other non-JSON or unexpected-status answer stays ambiguous
+as before.
+
+Regression coverage:
+`a_gateway_shaped_404_or_405_preserves_dispatch_ambiguity`,
+`a_forwarded_post_with_a_gateway_shaped_replacement_keeps_recovery`,
+`an_html_200_from_a_proxy_preserves_dispatch_ambiguity`,
+`a_404_or_405_outside_the_gateway_envelope_preserves_dispatch_ambiguity`,
+`an_oversized_fallback_page_preserves_dispatch_ambiguity_and_size_validation`,
+`other_non_json_answers_stay_ambiguous`,
+`a_fallback_response_keeps_the_generation_recoverable`,
+`a_fallback_response_retries_the_same_generation_at_the_next_endpoint`,
+`replaced_post_response_keeps_combined_recovery_and_ballot_locked`, and
+`rejection_after_replaced_post_response_cannot_retire_combined_recovery`.
+
+The crash harness follows the fresh combined order: delegation proof, terminal
+ballot, delegation signing, cast proofs, combined persistence, helper planning,
+and one combined POST. `AfterTreeSync` is excluded from this fresh matrix.
+`make recovery-conformance-unit` runs the harness's hermetic tests;
+`make recovery-conformance` remains the separate live staging matrix.

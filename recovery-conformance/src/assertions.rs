@@ -427,13 +427,7 @@ pub fn assert_stage_state(
                 snapshot.proofs > 0,
                 "{stage}: no durable proof, so proof reuse cannot be exercised"
             );
-            require_step(
-                plan,
-                &NextStep::Delegate {
-                    bundle_index: bundle,
-                },
-                stage,
-            )?;
+            anyhow::ensure!(plan.next_steps.iter().any(|step| matches!(step, NextStep::CastVote { bundle_index, .. } if *bundle_index == bundle)), "{stage}: prepared delegation must resume the combined cast");
         }
         // The sharp case: bytes provably never left, yet the reservation must
         // survive as in-flight work. Re-delegating would build a second
@@ -450,17 +444,11 @@ pub fn assert_stage_state(
                 snapshot
                     .submissions
                     .iter()
-                    .any(|submission| submission.kind == "delegation" && submission.state == "submitting"),
+                    .any(|submission| submission.kind == "delegate_and_cast_vote_batch" && submission.state == "submitting"),
                 "B1 VIOLATED: the abandoned reservation is gone after reopen (states {:?});                  a restarted process cannot prove the bytes never left, so the row must                  survive as in-flight work rather than be discarded",
                 snapshot.states()
             );
-            require_step(
-                plan,
-                &NextStep::AdvanceDelegation {
-                    bundle_index: bundle,
-                },
-                stage,
-            )?;
+            anyhow::ensure!(plan.next_steps.iter().any(|step| matches!(step, NextStep::AdvanceVoteBatch { bundle_index, .. } if *bundle_index == bundle)), "{stage}: combined recovery must advance the complete batch");
             forbid_step(
                 plan,
                 &NextStep::Delegate {
@@ -471,13 +459,7 @@ pub fn assert_stage_state(
             )?;
         }
         S::AfterBroadcastUnread | S::AfterBroadcastRead | S::AfterTracking => {
-            require_step(
-                plan,
-                &NextStep::AdvanceDelegation {
-                    bundle_index: bundle,
-                },
-                stage,
-            )?;
+            anyhow::ensure!(plan.next_steps.iter().any(|step| matches!(step, NextStep::AdvanceVoteBatch { bundle_index, .. } if *bundle_index == bundle)), "{stage}: combined recovery must advance the complete batch");
             forbid_step(
                 plan,
                 &NextStep::Delegate {
@@ -580,10 +562,11 @@ pub fn assert_stage_state(
 /// The ordering is what makes a confirmed-vote-without-a-plan unreachable, and
 /// it is checkable from rows alone: if a vote submission exists, a plan must.
 pub fn assert_plans_precede_broadcast(snapshot: &DurableSnapshot) -> Result<()> {
-    let vote_submission = snapshot
-        .submissions
-        .iter()
-        .any(|submission| submission.kind == "vote" || submission.kind == "vote_batch");
+    let vote_submission = snapshot.submissions.iter().any(|submission| {
+        submission.kind == "vote"
+            || submission.kind == "vote_batch"
+            || submission.kind == "delegate_and_cast_vote_batch"
+    });
     if vote_submission {
         anyhow::ensure!(
             snapshot.helper_share_plans > 0,
@@ -606,7 +589,7 @@ pub fn confirmation_source(sidecar: &std::path::Path) -> Result<Option<String>> 
     Ok(connection
         .query_row(
             "select confirmation_source from chain_submissions
-             where kind = 'delegation' and confirmation_source is not null limit 1",
+             where kind IN ('delegation','delegate_and_cast_vote_batch') and confirmation_source is not null limit 1",
             [],
             |row| row.get::<_, String>(0),
         )
@@ -656,7 +639,7 @@ pub fn confirmed_transaction_hash(sidecar: &std::path::Path) -> Result<Option<St
     let hash = connection
         .query_row(
             "select confirmed_transaction_hash from chain_submissions
-             where kind = 'delegation' and confirmed_transaction_hash is not null limit 1",
+             where kind IN ('delegation','delegate_and_cast_vote_batch') and confirmed_transaction_hash is not null limit 1",
             [],
             |row| row.get::<_, String>(0),
         )
@@ -1036,7 +1019,10 @@ pub fn assert_every_share_is_confirmed(snapshot: &DurableSnapshot) -> Result<()>
 /// in the fleet's effective redundancy stays visible even though no rule names
 /// it.
 pub fn placement_spread(snapshot: &DurableSnapshot) -> (usize, usize) {
-    let counts = snapshot.deliveries.iter().map(|delivery| delivery.sent.len());
+    let counts = snapshot
+        .deliveries
+        .iter()
+        .map(|delivery| delivery.sent.len());
     let least = counts.clone().min().unwrap_or_default();
     let most = counts.max().unwrap_or_default();
     (least, most)
@@ -1206,14 +1192,23 @@ pub fn assert_the_stall_fired(
         "{target} never stopped answering; the run made no request of that class, so its \
          crash seam has stopped firing rather than the SDK having handled a hang. Recorded \
          instead: {:?}",
-        records.iter().map(|record| &record.target).collect::<Vec<_>>()
+        records
+            .iter()
+            .map(|record| &record.target)
+            .collect::<Vec<_>>()
     );
     let after_dispatch = point == crate::stall::StallPoint::AfterDispatch;
     anyhow::ensure!(
-        matching.iter().all(|record| record.after_dispatch == after_dispatch),
+        matching
+            .iter()
+            .all(|record| record.after_dispatch == after_dispatch),
         "{target} hung at the wrong point: asked for {point:?}, and the dispatch hook \
          {} fired",
-        if after_dispatch { "never" } else { "nonetheless" }
+        if after_dispatch {
+            "never"
+        } else {
+            "nonetheless"
+        }
     );
     Ok(())
 }

@@ -59,6 +59,15 @@ pub(crate) enum Obligation {
         bundle_index: u32,
         drafts: Vec<CastDraft>,
         prerequisite: Option<u32>,
+        /// The cast signs its bundle's delegation as one combined transaction,
+        /// so it needs the voter's key. False for a delegation already
+        /// confirmed, and for an imported one: that transaction is on the
+        /// chain already and its holder has no delegation key to offer.
+        ///
+        /// Decided here, where the delegation phase and the bundle's imported
+        /// flag are both in hand, so the signing preflight and the plan's work
+        /// summary cannot disagree about it.
+        signs_delegation: bool,
     },
     /// A fresh cast is due on the bundle but withheld.
     Blocked {
@@ -243,6 +252,14 @@ pub(crate) fn classify(
                 .filter(|(_, phase)| delegation_phase_holds_bundle(**phase))
                 .map(|(&bundle_index, _)| bundle_index),
         )
+        // A bundle whose combined batch the chain has refused repeatedly for
+        // the same delegation holds too. Retirement frees it to recast, and
+        // without this the wallet would re-prove every member and re-POST the
+        // identical delegation on every run. Reusing the holding set rather
+        // than adding a parallel one keeps one answer to "may this bundle cast
+        // now": no `Cast`, and no `Delegate` either, because a held bundle
+        // never reaches `bundles_needing_delegation`.
+        .chain(snapshot.rejection_blocked_bundles.keys().copied())
         .collect();
 
     // A conflicting intent for anything the chain may have seen is an error,
@@ -439,11 +456,13 @@ pub(crate) fn classify(
     }
 
     for (bundle_index, drafts) in drafts {
+        let signs_delegation = cast_signs_delegation(snapshot, &delegation, bundle_index);
         if crate::ATOMIC_VOTE_BATCHES_ENABLED {
             obligations.push(Obligation::Cast {
                 bundle_index,
                 drafts,
                 prerequisite: None,
+                signs_delegation,
             });
         } else {
             // One cast per proposal, so each becomes a singleton commitment on
@@ -456,6 +475,7 @@ pub(crate) fn classify(
                     bundle_index,
                     drafts: vec![draft],
                     prerequisite: None,
+                    signs_delegation,
                 });
             }
         }
@@ -476,8 +496,19 @@ pub(crate) fn classify(
     // prerequisite for a bundle that still has a vote to cast.
     let mut delegation_bundles = BTreeSet::new();
     for (&bundle_index, phase) in &delegation {
+        let combined = snapshot.votes.iter().any(|(&(bundle, _), vote)| {
+            bundle == bundle_index
+                && vote
+                    .recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.batch.as_ref())
+                    .is_some_and(|batch| batch.delegation_van.is_some())
+        });
+        if combined {
+            continue;
+        }
         match phase {
-            DelegationPhase::Confirmed => {}
+            DelegationPhase::Confirmed | DelegationPhase::Proved => {}
             DelegationPhase::Submitted | DelegationPhase::SubmissionManaged => {
                 let imported = snapshot
                     .bundles
@@ -497,7 +528,7 @@ pub(crate) fn classify(
                 });
             }
             DelegationPhase::SubmittedWithoutHash | DelegationPhase::SubmissionRejected => {}
-            DelegationPhase::Prepared | DelegationPhase::PcztBuilt | DelegationPhase::Proved => {
+            DelegationPhase::Prepared | DelegationPhase::PcztBuilt => {
                 if bundles_needing_delegation.contains(&bundle_index) {
                     delegation_bundles.insert(bundle_index);
                     obligations.push(Obligation::Delegate { bundle_index });
@@ -534,6 +565,26 @@ pub(crate) fn classify(
             }
             crate::phases::SharePhase::Confirmed => {}
         }
+    }
+
+    /// Whether a fresh cast on `bundle_index` must sign its own delegation.
+    ///
+    /// A delegation that is already confirmed needs no signature, and an imported
+    /// capability's delegation is on the chain already while its holder has no
+    /// delegation key, so its cast waits rather than signing.
+    fn cast_signs_delegation(
+        snapshot: &RoundSnapshot,
+        delegation: &BTreeMap<u32, DelegationPhase>,
+        bundle_index: u32,
+    ) -> bool {
+        let imported = snapshot
+            .bundles
+            .get(&bundle_index)
+            .is_some_and(|bundle| bundle.capability_imported);
+        !imported
+            && delegation
+                .get(&bundle_index)
+                .is_some_and(|phase| *phase != DelegationPhase::Confirmed)
     }
 
     for obligation in &mut obligations {

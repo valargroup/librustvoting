@@ -21,7 +21,7 @@ fn blocked(obligations: &[Obligation]) -> Vec<(u32, BlockedReason)> {
 #[test]
 fn an_open_proposal_blocks_the_cast_but_still_plans_the_delegation_prerequisite() {
     let snapshot = snapshot()
-        .bundle(0, DelegationPhase::Proved)
+        .bundle(0, DelegationPhase::Prepared)
         .intent(1, Decision::Choice(0))
         .build();
     let obligations = classify_round(&snapshot, &[1, 2]).unwrap();
@@ -107,6 +107,41 @@ fn a_bundle_held_by_a_managed_or_terminal_delegation_plans_no_cast_at_all() {
 }
 
 #[test]
+fn only_a_cast_that_signs_its_own_delegation_owes_the_voter_key() {
+    // The signing preflight reads this flag instead of re-deriving the answer
+    // from the delegation phase and the imported flag, so planning is the one
+    // place that decides it. A fresh combined cast signs its delegation; an
+    // already-confirmed one has nothing left to sign; and an imported
+    // capability is on the chain already while this wallet holds no delegation
+    // key to offer, whether or not the plan also carries a step to advance it.
+    let snapshot = snapshot()
+        .bundle(0, DelegationPhase::Proved)
+        .bundle(1, DelegationPhase::Confirmed)
+        .imported_bundle(2, DelegationPhase::Submitted)
+        .imported_bundle(3, DelegationPhase::Confirmed)
+        .intent(1, Decision::Choice(0))
+        .build();
+    let obligations = classify_round(&snapshot, &[1]).unwrap().obligations;
+
+    let signing = obligations
+        .iter()
+        .filter_map(|obligation| match obligation {
+            Obligation::Cast {
+                bundle_index,
+                signs_delegation,
+                ..
+            } => Some((*bundle_index, *signs_delegation)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        signing,
+        vec![(0, true), (1, false), (2, false), (3, false)],
+        "only the fresh locally prepared delegation is signed by its cast"
+    );
+}
+
+#[test]
 fn every_draft_of_a_bundle_is_one_cast_obligation_with_its_delegation_prerequisite() {
     let snapshot = snapshot()
         .bundle(0, DelegationPhase::Proved)
@@ -123,11 +158,12 @@ fn every_draft_of_a_bundle_is_one_cast_obligation_with_its_delegation_prerequisi
                 bundle_index,
                 drafts,
                 prerequisite,
+                ..
             } => Some((*bundle_index, drafts.len(), *prerequisite)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(casts, vec![(0, 2, Some(0)), (1, 2, None)]);
+    assert_eq!(casts, vec![(0, 2, None), (1, 2, None)]);
 }
 
 #[test]

@@ -148,6 +148,7 @@ fn batch_recoveries() -> ([u8; 32], Vec<VoteRecoveryBundle>) {
     let digest = crate::vote_commitment::cast_vote_batch_sighash(ROUND, 123, &actions).unwrap();
     for (index, recovery) in recoveries.iter_mut().enumerate() {
         recovery.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: index as u32,
             size: 2,

@@ -87,11 +87,9 @@ async fn a_choice_without_bundles_stops_for_bundle_setup() {
 
 #[tokio::test]
 async fn a_partly_decided_ballot_still_runs_the_delegation_prerequisite() {
-    // One choice recorded, one proposal still open. The cast is withheld, but
-    // the planner deliberately still lists the bundle's `Delegate` so the
-    // voter can delegate while deciding the rest of the roster. The run must
-    // therefore not stop for the ballot: it goes for the delegation, and stops
-    // only because this host carries no signing material.
+    // An incomplete ballot may prepare its delegation proof. The host's
+    // driver runs once, then the round waits for the remaining decision;
+    // neither signing nor a chain reservation is needed at this boundary.
     let executor = executor();
     executor
         .set_ballot_intents(&[BallotIntent {
@@ -107,15 +105,33 @@ async fn a_partly_decided_ballot_still_runs_the_delegation_prerequisite() {
     );
 
     let control = ChainSubmissionControl::new(1);
-    let (report, _) = drive(&executor, &control).await;
-
+    let report = RoundDriver::new(&executor)
+        .run(
+            &SigningHost {
+                database: executor.database(),
+            },
+            &control,
+            &RecordingReporter::default(),
+        )
+        .await;
     assert!(
-        matches!(
-            report.quiescence,
-            RoundQuiescence::NeedsDelegationSignatures { .. }
-        ),
+        matches!(report.quiescence, RoundQuiescence::NeedsBallot { .. }),
         "{:?}",
         report.quiescence
+    );
+    assert!(report.failures.is_empty());
+    assert_eq!(
+        executor.database().delegation_phase(ROUND_ID, 0).unwrap(),
+        crate::phases::DelegationPhase::Proved
+    );
+    assert_eq!(
+        executor
+            .database()
+            .conn()
+            .query_row("SELECT count(*) FROM chain_submissions", [], |row| row
+                .get::<_, u32>(0))
+            .unwrap(),
+        0
     );
 }
 

@@ -19,7 +19,10 @@ fn classifier() -> RequestClassifier {
 
 #[test]
 fn every_target_has_a_distinct_name_that_round_trips() {
-    let mut names: Vec<&str> = StallTarget::ALL.iter().map(|target| target.name()).collect();
+    let mut names: Vec<&str> = StallTarget::ALL
+        .iter()
+        .map(|target| target.name())
+        .collect();
     let count = names.len();
     names.sort_unstable();
     names.dedup();
@@ -83,7 +86,10 @@ fn every_target_declares_a_usable_bound() {
     // an unbounded request, too large and none ever does.
     for target in StallTarget::ALL {
         let bound = target.declared_bound();
-        assert!(bound >= Duration::from_secs(1), "{target} bound is too small");
+        assert!(
+            bound >= Duration::from_secs(1),
+            "{target} bound is too small"
+        );
         assert!(
             bound <= Duration::from_secs(300),
             "{target} bound is longer than any the SDK applies"
@@ -110,10 +116,22 @@ fn the_default_point_is_the_conservative_one() {
 fn each_endpoint_is_classified_as_the_target_that_names_it() {
     let classifier = classifier();
     let cases = [
-        ("POST", "/shielded-vote/v1/delegate-vote", StallTarget::DelegationPost),
+        (
+            "POST",
+            "/shielded-vote/v1/delegate-vote",
+            StallTarget::DelegationPost,
+        ),
         ("POST", "/shielded-vote/v1/cast-vote", StallTarget::VotePost),
-        ("POST", "/shielded-vote/v1/cast-vote-batch", StallTarget::VotePost),
-        ("GET", "/shielded-vote/v1/tx/abcd", StallTarget::TransactionLookup),
+        (
+            "POST",
+            "/shielded-vote/v1/cast-vote-batch",
+            StallTarget::VotePost,
+        ),
+        (
+            "GET",
+            "/shielded-vote/v1/tx/abcd",
+            StallTarget::TransactionLookup,
+        ),
         (
             "GET",
             "/shielded-vote/v1/commitment-tree/round-1/latest",
@@ -134,7 +152,11 @@ fn each_endpoint_is_classified_as_the_target_that_names_it() {
     }
 
     let helper_cases = [
-        ("GET", "/shielded-vote/v1/status", StallTarget::HelperPreflight),
+        (
+            "GET",
+            "/shielded-vote/v1/status",
+            StallTarget::HelperPreflight,
+        ),
         ("POST", "/shielded-vote/v1/shares", StallTarget::SharePost),
         (
             "GET",
@@ -202,7 +224,10 @@ fn a_mount_path_does_not_hide_the_endpoint() {
     // whole path, so a mounted deployment classifies the same way.
     let classifier = classifier();
     assert_eq!(
-        classifier.classify("POST", "https://vote.example/mount/shielded-vote/v1/delegate-vote"),
+        classifier.classify(
+            "POST",
+            "https://vote.example/mount/shielded-vote/v1/delegate-vote"
+        ),
         Some(StallTarget::DelegationPost)
     );
 }

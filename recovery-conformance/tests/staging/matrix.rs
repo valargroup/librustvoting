@@ -185,7 +185,14 @@ async fn exercise(
     let sidecar = fixture.workspace.join(format!("{}.db", stage.name()));
     let _ = std::fs::remove_file(&sidecar);
 
-    let armed = config_for(fixture, &sidecar, round, RunMode::Armed { stage }, MAX_DISPATCHES, &Faults::none());
+    let armed = config_for(
+        fixture,
+        &sidecar,
+        round,
+        RunMode::Armed { stage },
+        MAX_DISPATCHES,
+        &Faults::none(),
+    );
 
     // (c) spawn the armed child; (d) require SIGABRT and a matching observation
     let crash = run_until_crash(&fixture.worker, &armed);
@@ -270,7 +277,14 @@ async fn exercise(
     }
 
     // (h) resume to quiescence in a new process
-    let resumed = config_for(fixture, &sidecar, round, RunMode::Unarmed, MAX_DISPATCHES, &Faults::none());
+    let resumed = config_for(
+        fixture,
+        &sidecar,
+        round,
+        RunMode::Unarmed,
+        MAX_DISPATCHES,
+        &Faults::none(),
+    );
     if started.elapsed() > STAGE_BUDGET {
         return Err(Outcome::Skipped(
             "stage budget exhausted before resume".to_string(),
@@ -379,7 +393,6 @@ async fn exercise(
     Ok(())
 }
 
-
 /// Stages whose crash seam cannot fire, with the reason.
 ///
 /// Empty, and it should stay that way. `AfterVoteCommit` was listed here on the
@@ -394,7 +407,6 @@ async fn exercise(
 fn is_known_unreachable(_stage: CrashStage) -> bool {
     false
 }
-
 
 /// The stages this run exercises, or `None` for the whole matrix.
 ///
@@ -427,4 +439,3 @@ fn selected_stages() -> Option<Vec<CrashStage>> {
         .collect();
     (!stages.is_empty()).then_some(stages)
 }
-

@@ -4,7 +4,11 @@ use crate::VotingRoundParams;
 use rusqlite::OptionalExtension;
 
 fn pre_v8_schema() -> String {
-    include_str!("001_init.sql").replace("    note_identity_hashes_blob BLOB,\n", "")
+    include_str!("001_init.sql")
+        .split("-- Immutable public delegation authorization")
+        .next()
+        .unwrap()
+        .replace("    note_identity_hashes_blob BLOB,\n", "")
 }
 
 /// Strips the `pir_proof_cache` table (added at version 15) from a schema.
@@ -55,8 +59,30 @@ fn without_round_immediate_share(schema: &str) -> String {
     schema[..start].to_string()
 }
 
+/// Strips the combined-cast rejection ledger added at version 24. No database
+/// at version 23 or earlier can carry it.
+fn without_combined_cast_rejections(schema: &str) -> String {
+    let start = schema
+        .find("-- Consecutive chain rejections of one bundle's combined")
+        .expect("schema must contain the ledger added at version 24");
+    schema[..start].trim_end().to_string() + "\n"
+}
+
+fn v23_schema() -> String {
+    without_combined_cast_rejections(include_str!("001_init.sql"))
+}
+
+fn v22_schema() -> String {
+    v23_schema()
+        .split("-- Immutable public delegation authorization")
+        .next()
+        .unwrap()
+        .replace(", 'delegate_and_cast_vote_batch'", "")
+        .replace(",'delegate_and_cast_vote_batch'", "")
+}
+
 fn v21_schema() -> String {
-    include_str!("001_init.sql").replace("    delegation_pczt     BLOB,\n", "")
+    v22_schema().replace("    delegation_pczt     BLOB,\n", "")
 }
 
 /// The complete version-19 schema: everything but the designation row.
@@ -218,7 +244,7 @@ fn v21_adds_pczt_storage_without_rewriting_delegation_state() {
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            22
+            CURRENT_VERSION
         );
     }
 }
@@ -907,7 +933,7 @@ fn v17_projectionless_proved_delegation_remains_fresh_work() {
         crate::phases::DelegationPhase::Proved
     );
     let plan = crate::session::resume_plan(&db, ROUND, &[1]).unwrap();
-    assert!(plan
+    assert!(!plan
         .next_steps
         .contains(&crate::session::NextStep::Delegate { bundle_index: 0 }));
 }
@@ -1696,4 +1722,342 @@ fn repairs_a_real_sidecar_named_by_the_environment() {
         .unwrap();
     assert_eq!(before, after, "every submission must survive the repair");
     migrate(&mut conn).expect("a repaired sidecar stays repaired");
+}
+
+#[test]
+fn v22_upgrades_combined_storage_to_the_fresh_schema() {
+    let mut upgraded = Connection::open_in_memory().unwrap();
+    upgraded.execute_batch(&v22_schema()).unwrap();
+    upgraded.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    queries::insert_round(
+        &upgraded,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    insert_v17_delegation_with_complete_setup(&upgraded, ROUND, "wallet", 0, None);
+    upgraded
+        .execute("UPDATE bundles SET delegation_pczt = X'010203'", [])
+        .unwrap();
+    upgraded
+        .execute(
+            "INSERT INTO chain_submissions
+         (identity_key, round_id, wallet_id, network, bundle_index, kind,
+          proposal_id, generation_digest, state, committed_post_reservations,
+          tracking_started_at, diagnostic_kind, diagnostic, created_at, updated_at)
+         VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 50, ?3,
+                 'recovering', 7, 8, 'ambiguous_dispatch', 'timeout', 9, 10)",
+            rusqlite::params![vec![0x41_u8; 32], ROUND, vec![0x42_u8; 32]],
+        )
+        .unwrap();
+    upgraded
+        .execute(
+            "INSERT INTO keystone_signatures
+         (round_id, wallet_id, bundle_index, sig, sighash, rk, created_at)
+         VALUES (?1, 'wallet', 0, ?2, ?3, ?4, 9)",
+            rusqlite::params![
+                ROUND,
+                vec![0x51_u8; 64],
+                vec![0x52_u8; 32],
+                vec![0x53_u8; 32]
+            ],
+        )
+        .unwrap();
+    let preserved_tables = [
+        "bundles",
+        "proofs",
+        "keystone_signatures",
+        "chain_submissions",
+    ];
+    let before = preserved_tables.map(|table| dump_table(&upgraded, table));
+    upgraded.pragma_update(None, "user_version", 22).unwrap();
+    migrate(&mut upgraded).unwrap();
+    migrate(&mut upgraded).unwrap();
+    for (table, rows) in preserved_tables.into_iter().zip(before) {
+        assert_eq!(
+            dump_table(&upgraded, table),
+            rows,
+            "{table} must survive migration"
+        );
+    }
+    let mut fresh = Connection::open_in_memory().unwrap();
+    migrate(&mut fresh).unwrap();
+    let columns = |connection: &Connection, table: &str| {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for table in ["chain_submissions", "delegate_cast_recovery"] {
+        assert_eq!(columns(&upgraded, table), columns(&fresh, table));
+    }
+    assert_eq!(
+        upgraded
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        CURRENT_VERSION
+    );
+}
+
+#[test]
+fn v23_upgrades_to_a_schema_identical_to_a_fresh_one() {
+    // The rejection ledger's SQL is written twice: once in `001_init.sql` for
+    // a fresh database and once in `007_combined_cast_rejections.sql` for the
+    // ladder. Column shape alone would not catch a drifted CHECK constraint or
+    // a missing trigger, so this compares the full normalized schema of every
+    // object, which is what `preview_schema_fingerprint` already reports.
+    let mut upgraded = Connection::open_in_memory().unwrap();
+    upgraded.execute_batch(&v23_schema()).unwrap();
+    upgraded.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    queries::insert_round(
+        &upgraded,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    insert_v17_delegation_with_complete_setup(&upgraded, ROUND, "wallet", 0, None);
+    let preserved = dump_table(&upgraded, "bundles");
+    upgraded.pragma_update(None, "user_version", 23).unwrap();
+
+    migrate(&mut upgraded).unwrap();
+
+    let mut fresh = Connection::open_in_memory().unwrap();
+    migrate(&mut fresh).unwrap();
+    assert_eq!(
+        preview_schema_fingerprint(&upgraded).unwrap(),
+        preview_schema_fingerprint(&fresh).unwrap(),
+        "the ladder and `001_init.sql` must build the same schema"
+    );
+    assert_eq!(
+        dump_table(&upgraded, "bundles"),
+        preserved,
+        "an in-place upgrade preserves delegation state"
+    );
+    assert_eq!(
+        upgraded
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        CURRENT_VERSION
+    );
+}
+
+#[test]
+fn the_rejection_ledger_refuses_a_streak_that_does_not_match_its_generation() {
+    // The upsert is the only writer today and always agrees with these
+    // triggers, so nothing else would notice if they were dropped. They exist
+    // to stop a future writer from rewriting history: a streak may only grow
+    // within one delegation generation, and a new generation restarts it at
+    // one. Reads of the ledger treat the count as monotonic evidence.
+    let mut conn = Connection::open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO combined_cast_rejections (
+             round_id, wallet_id, bundle_index, delegation_generation_digest,
+             consecutive_rejections, last_batch_digest, last_diagnostic_kind,
+             last_diagnostic, first_rejected_at, last_rejected_at)
+         VALUES (?1, 'wallet', 0, ?2, 2, ?3, 'chain_rejected', 'refused', 5, 5)",
+        rusqlite::params![ROUND, vec![0xA1_u8; 32], vec![0xA2_u8; 32]],
+    )
+    .unwrap();
+
+    let rewind = conn.execute(
+        "UPDATE combined_cast_rejections SET consecutive_rejections = 1",
+        [],
+    );
+    assert!(
+        rewind.is_err(),
+        "a streak cannot decrease within a generation"
+    );
+
+    let carry_over = conn.execute(
+        "UPDATE combined_cast_rejections
+            SET delegation_generation_digest = ?1, consecutive_rejections = 3",
+        rusqlite::params![vec![0xB1_u8; 32]],
+    );
+    assert!(
+        carry_over.is_err(),
+        "a new delegation generation restarts the streak at one"
+    );
+
+    conn.execute(
+        "UPDATE combined_cast_rejections
+            SET delegation_generation_digest = ?1, consecutive_rejections = 1",
+        rusqlite::params![vec![0xB1_u8; 32]],
+    )
+    .expect("restarting at one is the allowed generation change");
+}
+
+fn combined_preview(has_pczt: bool) -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    // A real preview predates the version-24 rejection ledger.
+    let schema = v23_schema();
+    conn.execute_batch(&if has_pczt {
+        schema.clone()
+    } else {
+        schema.replace("    delegation_pczt     BLOB,\n", "")
+    })
+    .unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA user_version=22;")
+        .unwrap();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    insert_v17_delegation_with_complete_setup(&conn, ROUND, "wallet", 0, None);
+    conn.execute(
+        "INSERT INTO delegate_cast_recovery VALUES (?1, 'wallet', 0, ?2, ?3, ?4)",
+        rusqlite::params![ROUND, vec![1_u8; 32], vec![2_u8; 32], vec![3_u8; 64]],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO chain_submissions
+         (identity_key, round_id, wallet_id, network, bundle_index, kind,
+          ordered_batch_digest, generation_digest, state, candidate_transaction_hash,
+          tracking_started_at, created_at, updated_at)
+         VALUES (?1, ?2, 'wallet', 'testnet', 0, 'delegate_and_cast_vote_batch',
+                 ?3, ?4, 'tracking', ?5, 8, 9, 10)",
+        rusqlite::params![
+            vec![4_u8; 32],
+            ROUND,
+            vec![1_u8; 32],
+            vec![2_u8; 32],
+            vec![5_u8; 32]
+        ],
+    )
+    .unwrap();
+    conn
+}
+
+#[test]
+fn v22_combined_preview_preserves_recovery_and_tracking_with_or_without_pczt() {
+    for has_pczt in [false, true] {
+        let mut conn = combined_preview(has_pczt);
+        if has_pczt {
+            conn.execute("UPDATE bundles SET delegation_pczt=X'010203'", [])
+                .unwrap();
+        }
+        let recovery = dump_table(&conn, "delegate_cast_recovery");
+        let submissions = dump_table(&conn, "chain_submissions");
+        let bundles = dump_table(&conn, "bundles");
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(recovery, dump_table(&conn, "delegate_cast_recovery"));
+        assert_eq!(submissions, dump_table(&conn, "chain_submissions"));
+        let migrated_bundles = dump_table(&conn, "bundles");
+        if has_pczt {
+            assert_eq!(bundles, migrated_bundles);
+        } else {
+            assert_eq!(bundles.len(), migrated_bundles.len());
+            for (old, new) in bundles.iter().zip(&migrated_bundles) {
+                assert_eq!(old, &new[..old.len()]);
+            }
+            let pczt: Option<Vec<u8>> = conn
+                .query_row("SELECT delegation_pczt FROM bundles", [], |r| r.get(0))
+                .unwrap();
+            assert!(pczt.is_none());
+        }
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            CURRENT_VERSION
+        );
+        assert!(conn
+            .execute(
+                "UPDATE delegate_cast_recovery SET spend_auth_signature=zeroblob(64)",
+                []
+            )
+            .is_err());
+    }
+}
+
+/// `chain_submissions` drift is repairable, and the repair runs after the
+/// ladder. Fingerprinting its objects while identifying a preview database
+/// would abort the upgrade before the repair could run and leave `user_version`
+/// unadvanced, making exactly the sidecar this reconciliation exists to rescue
+/// permanently unopenable. `005_chain_submissions_proposal_range.sql` makes the
+/// same argument for the version-20 step, which
+/// `v20_missing_indexes_and_triggers_upgrade_and_are_repaired` covers.
+#[test]
+fn v22_preview_missing_submission_indexes_and_triggers_upgrades_and_is_repaired() {
+    for tamper in [
+        "DROP INDEX chain_submissions_candidate_owner",
+        "DROP INDEX chain_submissions_identity",
+        "DROP TRIGGER chain_submissions_immutable_identity",
+        "DROP TRIGGER chain_submissions_monotonic_reservations",
+    ] {
+        let mut conn = combined_preview(false);
+        conn.execute_batch(tamper).unwrap();
+        let recovery = dump_table(&conn, "delegate_cast_recovery");
+
+        migrate(&mut conn).unwrap_or_else(|error| panic!("{tamper}: {error}"));
+
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            CURRENT_VERSION,
+            "{tamper}"
+        );
+        assert_eq!(
+            recovery,
+            dump_table(&conn, "delegate_cast_recovery"),
+            "{tamper}: the preview's recovery records survive the repair"
+        );
+        // The repair restored the object, so a second open is a no-op.
+        migrate(&mut conn).unwrap_or_else(|error| panic!("{tamper}: {error}"));
+    }
+}
+
+#[test]
+fn v22_unknown_combined_preview_rolls_back_without_losing_recovery() {
+    for drift in [
+        "DROP TRIGGER delegate_cast_recovery_immutable",
+        "ALTER TABLE delegate_cast_recovery ADD COLUMN unknown BLOB",
+        "CREATE TABLE unknown_preview_table (id INTEGER)",
+    ] {
+        let mut conn = combined_preview(false);
+        conn.execute_batch(drift).unwrap();
+        let schema = preview_schema_fingerprint(&conn).unwrap();
+        let recovery = dump_table(&conn, "delegate_cast_recovery");
+        let submissions = dump_table(&conn, "chain_submissions");
+        assert!(migrate(&mut conn)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported version-22 combined-vote preview schema"));
+        assert_eq!(schema, preview_schema_fingerprint(&conn).unwrap());
+        assert_eq!(recovery, dump_table(&conn, "delegate_cast_recovery"));
+        assert_eq!(submissions, dump_table(&conn, "chain_submissions"));
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            22
+        );
+    }
 }

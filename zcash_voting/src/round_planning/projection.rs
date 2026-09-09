@@ -86,6 +86,9 @@ pub(crate) fn project(
     let blocking_recovery = submission_managed
         || submitted_without_hash
         || submission_rejected
+        // The bundle plans nothing, but the round is not finished: a person
+        // must decide whether the delegation is worth another attempt.
+        || !snapshot.rejection_blocked_bundles.is_empty()
         || steps.iter().any(|step| match step {
             NextStep::ConfirmShare {
                 bundle_index,
@@ -102,7 +105,15 @@ pub(crate) fn project(
             bundle_index: status.bundle_index,
             phase: status.phase,
             tx_hash: snapshot.delegation_tx_hash(status.bundle_index),
-            submission_diagnostic: status.diagnostic.clone(),
+            // Retirement deleted the lifecycle row that would carry this, so
+            // for a blocked bundle the ledger is the only place the chain's
+            // own words survive.
+            submission_diagnostic: status.diagnostic.clone().or_else(|| {
+                snapshot
+                    .rejection_blocked_bundles
+                    .get(&status.bundle_index)
+                    .cloned()
+            }),
             terminal: is_terminal_delegation_phase(status.phase),
         })
         .collect();
@@ -187,7 +198,42 @@ pub(crate) fn project(
         &steps,
     )?;
 
-    let work_summary = summarize_plan_work(&steps, blocking_share_work);
+    let mut work_summary = summarize_plan_work(&steps, blocking_share_work);
+    // A cast that signs its own delegation owes the voter's key. Classification
+    // made that call; reading it here keeps the plan's summary and the driver's
+    // signing preflight answering from the same decision.
+    let signing_casts: BTreeSet<u32> = obligations
+        .obligations
+        .iter()
+        .filter_map(|obligation| match obligation {
+            Obligation::Cast {
+                bundle_index,
+                signs_delegation: true,
+                ..
+            } => Some(*bundle_index),
+            _ => None,
+        })
+        .collect();
+    for step in &steps {
+        if let NextStep::CastVote { bundle_index, .. } = step {
+            if signing_casts.contains(bundle_index) {
+                work_summary
+                    .delegation_bundles_needing_signing
+                    .push(*bundle_index);
+                work_summary
+                    .delegation_bundles_needing_work
+                    .push(*bundle_index);
+            }
+        }
+    }
+    work_summary
+        .delegation_bundles_needing_signing
+        .sort_unstable();
+    work_summary.delegation_bundles_needing_signing.dedup();
+    work_summary.delegation_bundles_needing_work.sort_unstable();
+    work_summary.delegation_bundles_needing_work.dedup();
+    work_summary.needs_delegation_signing =
+        !work_summary.delegation_bundles_needing_signing.is_empty();
 
     let has_unconfirmed_shares = snapshot.shares.iter().any(|share| !share.confirmed);
 
@@ -810,11 +856,7 @@ pub(crate) fn summarize_plan_work(
     for step in steps {
         match step {
             NextStep::Delegate { bundle_index, .. } => {
-                summary.needs_delegation_signing = true;
                 needing_work.insert(*bundle_index);
-                // Nothing is on the chain for this bundle yet, so producing a
-                // delegation needs the voter's signature.
-                needing_signing.insert(*bundle_index);
             }
             NextStep::AdvanceDelegation { bundle_index, .. } => {
                 summary.needs_delegation_signing = true;

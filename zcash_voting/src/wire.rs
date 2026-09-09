@@ -112,6 +112,14 @@ pub struct VoteCommitmentWire {
     pub vote_auth_sig: String,
 }
 
+/// A delegation and its dependent cast batch in one atomic transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateAndVoteBatchWire {
+    pub delegation: DelegationSubmissionWire,
+    pub batch: VoteCommitmentBatchWire,
+}
+
 /// Canonical request body for an atomic cast-vote batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -645,6 +653,8 @@ pub enum ChainDiagnosticKindView {
     ReconciliationPending,
     InvalidProtocolResponse,
     StorageFailure,
+    EndpointUnsupported,
+    RouteAnswerReplaced,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -959,6 +969,9 @@ pub enum RoundStepProgressKind {
     Delegation,
     TreeSynced,
     VoteCommit,
+    /// The signed combined delegation-and-cast envelope is durable. New with
+    /// atomic casting; hosts must treat unknown kinds as opaque progress.
+    DelegateAndVoteBatchPersisted,
     HelperPlansPrepared,
     ChainOutcome,
     ShareOutcome,

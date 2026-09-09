@@ -942,6 +942,8 @@ impl From<crate::ChainSubmissionDiagnosticKind> for ChainDiagnosticKindView {
             Kind::ReconciliationPending => Self::ReconciliationPending,
             Kind::InvalidProtocolResponse => Self::InvalidProtocolResponse,
             Kind::StorageFailure => Self::StorageFailure,
+            Kind::EndpointUnsupported => Self::EndpointUnsupported,
+            Kind::RouteAnswerReplaced => Self::RouteAnswerReplaced,
         }
     }
 }
@@ -1381,6 +1383,10 @@ impl TryFrom<crate::RoundStepProgress> for RoundStepProgressView {
                 view.delegation_progress = Some(kind);
                 view.proof_progress = fraction;
             }
+            P::DelegateAndVoteBatchPersisted { bundle_index } => {
+                view.kind = RoundStepProgressKind::DelegateAndVoteBatchPersisted;
+                view.bundle_index = Some(bundle_index);
+            }
             P::TreeSynced { height } => {
                 view.kind = RoundStepProgressKind::TreeSynced;
                 view.tree_height = Some(height);
@@ -1765,6 +1771,7 @@ impl TryFrom<crate::round_drive::RoundDriveEvent> for RoundDriveEventView {
 
 #[cfg(test)]
 mod tests {
+    mod chain_diagnostic_view;
     mod error_view;
     mod pir_snapshot_view;
     mod round_drive_view;

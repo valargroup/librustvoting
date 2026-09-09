@@ -348,3 +348,21 @@ pub async fn advance_committed_vote(
         .await
         .map_err(|failure| anyhow::anyhow!("advance vote chain submission: {failure}"))
 }
+
+/// Commits a fresh delegation and the complete ballot as one recoverable batch.
+/// Prepare the delegation proof and obtain its SpendAuth signature first. The
+/// SDK builds synthetic witnesses locally, so no vote-tree sync is needed.
+pub fn commit_delegate_and_vote_batch(
+    voting_db: &VotingDb,
+    voting_hotkey: &VotingHotkey,
+    request: zcash_voting::delegate_and_vote_batch::DelegateAndVoteBatchRequest<'_>,
+) -> Result<SignedVoteBatch> {
+    let prepared = zcash_voting::delegate_and_vote_batch::prepare_delegate_and_vote_batch(
+        voting_db,
+        VoteSigner::hotkey(voting_hotkey),
+        request,
+    )
+    .context("prepare delegation-and-cast batch")?;
+    zcash_voting::delegate_and_vote_batch::persist_delegate_and_vote_batch(voting_db, prepared)
+        .context("persist delegation-and-cast batch")
+}

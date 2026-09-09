@@ -717,6 +717,31 @@ impl VotingDb {
         self.clear_round_unchecked(round_id)
     }
 
+    /// Forgets a bundle's combined-cast rejection streak, returning whether
+    /// one was recorded. The next plan owes a fresh combined `Cast` again.
+    ///
+    /// The wallet stops planning a combined cast after
+    /// `MAX_CONSECUTIVE_COMBINED_REJECTIONS` consecutive chain rejections of
+    /// the same delegation generation, because every attempt re-proves every
+    /// member and the chain has refused the identical delegation each time.
+    /// This is the host's explicit "the cause is fixed, try again", the only
+    /// way past a block that is deliberately advisory rather than a terminal
+    /// phase. It touches no delegation setup, proof or signature, so a further
+    /// rejection simply starts the streak at one again.
+    ///
+    /// Takes the round's submission gate, so it cannot run underneath an
+    /// active submission.
+    pub fn retry_blocked_combined_cast(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<bool, VotingError> {
+        let wallet_id = self.wallet_id();
+        let _lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
+        let conn = self.conn();
+        queries::clear_combined_rejection_ledger(&conn, &wallet_id, round_id, bundle_index)
+    }
+
     fn clear_round_unchecked(&self, round_id: &str) -> Result<(), VotingError> {
         let wallet_id = self.wallet_id();
         let _lease = self.acquire_round_exclusive_lease(round_id, &wallet_id)?;
@@ -2113,10 +2138,10 @@ impl VotingDb {
         })?;
         drop(conn);
 
-        if van_position != state.van_position {
+        if Some(van_position) != state.van_position {
             return Err(VotingError::InvalidInput {
                 message: format!(
-                    "VAN witness position {van_position} does not match current bundle position {} for round={round_id}, bundle={bundle_index}",
+                    "VAN witness position {van_position} does not match current bundle position {:?} for round={round_id}, bundle={bundle_index}",
                     state.van_position
                 ),
             });

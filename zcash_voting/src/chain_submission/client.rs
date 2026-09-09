@@ -118,6 +118,8 @@ pub enum ChainAdvanceRequest {
     ImportedDelegation(AdvanceImportedDelegation),
     Vote(AdvanceVote),
     VoteBatch(AdvanceVoteBatch),
+    /// Advance the durable combined delegation and cast generation.
+    DelegateAndVoteBatch(AdvanceVoteBatch),
 }
 
 /// Policy for one advancement episode, a finite composition of bounded passes.
@@ -1070,6 +1072,24 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         )
     }
 
+    /// Advances a persisted combined delegation and cast batch in one bounded
+    /// pass. The SDK restores its authorization, owns dispatch and confirmation,
+    /// and never falls back to separate delegation or cast transactions.
+    pub async fn advance_delegate_and_vote_batch(
+        &self,
+        request: AdvanceVoteBatch,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        self.advance_pass_in_epoch(
+            &ChainAdvanceRequest::DelegateAndVoteBatch(request),
+            recovery,
+            control,
+            control.operation_epoch(),
+        )
+        .await
+    }
+
     /// One bounded pass of `request` for work begun earlier under
     /// `entry_epoch`; see [`Self::advance_until_terminal_in_epoch`].
     async fn advance_pass_in_epoch(
@@ -1112,6 +1132,18 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
                 )?,
                 inner.ordered_proposal_ids.clone(),
             )?,
+            ChainAdvanceRequest::DelegateAndVoteBatch(inner) => {
+                StoreAdvancementRequest::vote_batch(
+                    self.identity(
+                        inner.vote_round_id,
+                        inner.bundle_index,
+                        ChainSubmissionTarget::DelegateAndVoteBatch {
+                            ordered_batch_digest: inner.ordered_batch_digest,
+                        },
+                    )?,
+                    inner.ordered_proposal_ids.clone(),
+                )?
+            }
         };
         self.coordinator
             .advance_in_epoch(advancement, recovery, control, entry_epoch)
@@ -1175,7 +1207,8 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .unwrap_or_else(|| crate::ObservationScope::disabled())
             .invocation();
         let attributed_observations = match &request {
-            ChainAdvanceRequest::VoteBatch(batch) => {
+            ChainAdvanceRequest::VoteBatch(batch)
+            | ChainAdvanceRequest::DelegateAndVoteBatch(batch) => {
                 invocation_observations.bind_round_bytes(&batch.vote_round_id);
                 invocation_observations.for_bundle(batch.bundle_index)
             }

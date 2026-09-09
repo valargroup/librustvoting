@@ -78,6 +78,7 @@ impl<T> CrashTransport<T> {
 fn submission_kind(url: &str) -> Option<SubmissionKind> {
     let endpoint = url.rsplit('/').next()?;
     match endpoint {
+        "delegate-and-cast-vote-batch" => Some(SubmissionKind::DelegateAndVoteBatch),
         "delegate-vote" => Some(SubmissionKind::Delegation),
         "cast-vote" | "cast-vote-batch" => Some(SubmissionKind::Vote),
         _ => None,

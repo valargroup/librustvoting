@@ -968,6 +968,114 @@ async fn atomic_vote_batches_from_one_through_protocol_maximum_confirm() {
     }
 }
 
+fn combined_identity(bundle_index: u32) -> ChainSubmissionIdentity {
+    ChainSubmissionIdentity::new(
+        "wallet",
+        Network::Testnet,
+        [1; 32],
+        bundle_index,
+        ChainSubmissionTarget::DelegateAndVoteBatch {
+            ordered_batch_digest: [0xcd; 32],
+        },
+    )
+    .unwrap()
+}
+
+/// A combined envelope over the same cast effects as `derived_batch`, so the
+/// tree layout it expects is identical: the delegation's initial VAN is never
+/// a leaf, only the final successor VAN and the vote commitments are.
+fn derived_combined_batch(
+    identity: ChainSubmissionIdentity,
+    ordered_proposal_ids: Vec<u32>,
+) -> DerivedChainSubmission {
+    let ChainSubmissionRequest::VoteBatch(mut batch) =
+        derived_batch(identity.clone(), ordered_proposal_ids.clone())
+            .request()
+            .clone()
+    else {
+        unreachable!("batch derivation carries a batch request")
+    };
+    // The combined envelope binds every cast to the delegation's own round at
+    // the synthetic anchor, and encodes each effect as canonical base64.
+    for vote in &mut batch.votes {
+        vote.anchor_height = 0;
+        vote.vote_round_id = BASE64_STANDARD.encode(identity.vote_round_id());
+    }
+    let delegation = crate::wire::DelegationSubmissionWire {
+        rk: BASE64_STANDARD.encode([0x31; 32]),
+        spend_auth_sig: BASE64_STANDARD.encode([0x32; 64]),
+        tx1_effects: BASE64_STANDARD.encode([0x33; 32]),
+        nf_signed: BASE64_STANDARD.encode([0x34; 32]),
+        cmx_new: BASE64_STANDARD.encode([0x35; 32]),
+        gov_comm: BASE64_STANDARD.encode([0x09; 32]),
+        gov_nullifiers: vec![BASE64_STANDARD.encode([0x36; 32])],
+        proof: BASE64_STANDARD.encode([0x37; 96]),
+        vote_round_id: BASE64_STANDARD.encode(identity.vote_round_id()),
+    };
+    DerivedChainSubmission::new(
+        ChainSubmissionGeneration::new(
+            identity,
+            ChainSubmissionGenerationDigest::from_bytes([0xce; 32]),
+        ),
+        ChainSubmissionRequest::DelegateAndVoteBatch(crate::wire::DelegateAndVoteBatchWire {
+            delegation,
+            batch,
+        }),
+        ExpectedTreeLayout::VoteBatch {
+            final_successor_van: [3; 32],
+            vote_commitments: vec![[4; 32]; ordered_proposal_ids.len()],
+        },
+        ordered_proposal_ids,
+    )
+}
+
+#[tokio::test]
+async fn exact_recovery_confirms_a_combined_batch_from_the_tree() {
+    // A combined generation that lost its hash confirms from the tree with
+    // the same final-VAN-plus-vote-leaves layout as an ordinary batch. No
+    // initial-VAN leaf is looked for, and no transaction hash is invented.
+    let identity = combined_identity(0);
+    let proposals = vec![1, 2, 5];
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_combined_batch(identity.clone(), proposals.clone()));
+    let request = StoreAdvancementRequest::vote_batch(identity.clone(), proposals.clone()).unwrap();
+    seed_hashless_tree_recovery(&store, &request);
+    let transport = Arc::new(ScriptedTransport::default());
+    for response in tree_responses(&[[8; 32], [3; 32], [4; 32], [4; 32], [4; 32], [7; 32]]) {
+        transport.queue(Ok(response));
+    }
+
+    let result = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    )
+    .advance_with_recovery(
+        request,
+        ChainRecoveryMode::ExactTree,
+        &ManualControl::default(),
+    )
+    .await
+    .unwrap();
+
+    let ChainSubmissionResult::Confirmed(confirmation) = result else {
+        panic!("complete combined layout must confirm: {result:?}")
+    };
+    assert_eq!(
+        confirmation.source(),
+        super::super::ChainSubmissionConfirmationSource::Tree
+    );
+    assert!(confirmation.transaction_hash().is_none());
+    assert_eq!(confirmation.final_van_position(), 1);
+    assert_eq!(confirmation.vote_commitment_positions(), &[2, 3, 4]);
+    assert_eq!(transport.methods(), vec!["GET", "GET"]);
+    assert!(matches!(
+        store.record(&identity).unwrap().state(),
+        SubmissionRecordState::Confirmed(_)
+    ));
+}
+
 #[tokio::test]
 async fn exact_recovery_confirms_complete_ordered_batch_layout() {
     let identity = batch_identity(0);
@@ -1801,6 +1909,15 @@ fn delegation_confirmed(identity: &ChainSubmissionIdentity) -> ChainHttpResponse
     )
 }
 
+fn coordinator_over(
+    transport: Arc<ScriptedTransport>,
+    store: Arc<InMemoryChainSubmissionStore>,
+    clock: ManualClock,
+    tracking_window_seconds: u64,
+) -> ChainSubmissionCoordinator<Arc<ScriptedTransport>, InMemoryChainSubmissionStore, ManualClock> {
+    coordinator(transport, store, clock, tracking_window_seconds)
+}
+
 fn coordinator(
     transport: Arc<ScriptedTransport>,
     store: Arc<InMemoryChainSubmissionStore>,
@@ -2010,6 +2127,180 @@ async fn definitely_unsent_failure_removes_fresh_authority() {
     assert_eq!(failure.kind(), ChainSubmissionFailureKind::Transport);
     assert!(failure.strongest_state().is_none());
     assert!(store.record(&identity).is_none());
+}
+
+fn explorer_fallback_page() -> ChainHttpResponse {
+    // What a node that does not serve the route answered on 2026-09-08:
+    // the explorer's single-page fallback, HTTP 200 and HTML.
+    ChainHttpResponse::new(
+        200,
+        b"<!doctype html>\n<html lang=\"en\">".to_vec(),
+        Some("text/html; charset=utf-8".to_string()),
+        Vec::new(),
+    )
+}
+
+#[tokio::test]
+async fn a_fallback_response_keeps_the_generation_recoverable() {
+    // An HTML page can replace a response after dispatch. Exhausting one
+    // attempt must preserve recovery; a later pass retries the same generation.
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Ok(explorer_fallback_page()));
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    );
+
+    let outcome = coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+        candidate_transaction_hash: None, ref diagnostic,
+    }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::RouteAnswerReplaced)
+    );
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+    assert_eq!(record.committed_post_reservations(), 1);
+    assert_eq!(transport.methods(), vec!["POST"], "no retry, no poll");
+
+    let upgraded = Arc::new(ScriptedTransport::default());
+    upgraded.queue(Ok(accepted()));
+    upgraded.queue(Ok(pending()));
+    coordinator_over(upgraded, Arc::clone(&store), ManualClock::new(200), 10)
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.record(&identity).unwrap().state(),
+        SubmissionRecordState::Tracking { .. }
+    ));
+    assert_eq!(
+        store
+            .record(&identity)
+            .unwrap()
+            .committed_post_reservations(),
+        2
+    );
+}
+
+fn gateway_shaped_replacement() -> ChainHttpResponse {
+    ChainHttpResponse::json(404, br#"{"error":"upstream response replaced"}"#.to_vec())
+}
+
+#[tokio::test]
+async fn a_forwarded_post_with_a_gateway_shaped_replacement_keeps_recovery() {
+    // The proxy returned the gateway's exact JSON shape after forwarding the
+    // POST. The response cannot prove non-dispatch, so the reservation and
+    // generation must remain durable.
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Ok(gateway_shaped_replacement()));
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    );
+
+    let submission_result = coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        submission_result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ref diagnostic,
+            ..
+        }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::EndpointUnsupported
+    ));
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+    assert_eq!(record.committed_post_reservations(), 1);
+    assert_eq!(transport.methods(), vec!["POST"], "no retry, no poll");
+
+    // The next pass retries the same durable generation rather than admitting
+    // a replacement that could encode a changed ballot.
+    let upgraded = Arc::new(ScriptedTransport::default());
+    upgraded.queue(Ok(accepted()));
+    upgraded.queue(Ok(pending()));
+    coordinator_over(upgraded, Arc::clone(&store), ManualClock::new(200), 10)
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.record(&identity).unwrap().state(),
+        SubmissionRecordState::Tracking { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_fallback_response_retries_the_same_generation_at_the_next_endpoint() {
+    // Two nodes, the first behind an old release. The attempt budget rotates
+    // to the second node, which accepts; the first is not asked again.
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Ok(explorer_fallback_page()));
+    transport.queue(Ok(accepted()));
+    transport.queue(Ok(confirmed(&identity)));
+    let protocol = ChainProtocolClient::new(
+        Arc::clone(&transport),
+        Network::Testnet,
+        &[
+            "https://old.example".to_string(),
+            "https://new.example".to_string(),
+        ],
+    )
+    .unwrap();
+    let coordinator = ChainSubmissionCoordinator::new(
+        protocol,
+        Arc::clone(&store),
+        ManualClock::new(100),
+        CoordinatorPolicy::new(Duration::from_secs(10), 2, vec![Duration::from_millis(1)]).unwrap(),
+    )
+    .unwrap();
+
+    coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    let urls = transport.post_urls();
+    assert_eq!(urls.len(), 2, "{urls:?}");
+    assert!(urls[0].starts_with("https://old.example/"), "{urls:?}");
+    assert!(urls[1].starts_with("https://new.example/"), "{urls:?}");
+    assert!(matches!(
+        store.record(&identity).unwrap().state(),
+        SubmissionRecordState::Confirmed(_)
+    ));
 }
 
 #[tokio::test]
@@ -4624,4 +4915,101 @@ async fn a_pass_bound_to_an_earlier_epoch_is_refused_under_the_current_one() {
         "no request may be sent for the stale epoch: {:?}",
         transport.methods()
     );
+}
+
+#[tokio::test]
+async fn a_combined_candidate_committing_unsuccessfully_after_the_window_expires_is_terminal() {
+    // A combined batch's candidate hash names its one signed envelope, so a
+    // committed failure of that hash is the generation's final word. Reaching
+    // the committed failure through an expired tracking window rather than
+    // straight from `Tracking` changes nothing about whose bytes the chain
+    // reported on, so the generation must still be retired rather than left
+    // recovering, which would re-POST an envelope the chain already failed.
+    let identity = combined_identity(0);
+    let proposals = vec![1, 2];
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_combined_batch(identity.clone(), proposals.clone()));
+    let request =
+        || StoreAdvancementRequest::vote_batch(identity.clone(), proposals.clone()).unwrap();
+
+    // Accepted, then pending inside the window: the row tracks its hash.
+    let opening = Arc::new(ScriptedTransport::default());
+    opening.queue(Ok(accepted_with_batch_digest(&identity)));
+    opening.queue(Ok(pending()));
+    coordinator(opening, Arc::clone(&store), ManualClock::new(100), 10)
+        .advance(request(), &ManualControl::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.record(&identity).unwrap().durable_state(),
+        ChainSubmissionState::Tracking
+    );
+
+    // Pending again past the window: the candidate survives into recovery.
+    let expiring = Arc::new(ScriptedTransport::default());
+    expiring.queue(Ok(pending()));
+    coordinator(expiring, Arc::clone(&store), ManualClock::new(200), 10)
+        .advance(request(), &ManualControl::default())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            store.record(&identity).unwrap().state(),
+            SubmissionRecordState::Recovering {
+                candidate_transaction_hash: Some(_),
+                ..
+            }
+        ),
+        "an expired window keeps the candidate: {:?}",
+        store.record(&identity).unwrap().state()
+    );
+
+    // The chain now reports that candidate committed unsuccessfully.
+    let failing = Arc::new(ScriptedTransport::default());
+    failing.queue(Ok(ChainHttpResponse::json(
+        422,
+        br#"{"height":"9","code":12,"log":"rejected","events":[]}"#.to_vec(),
+    )));
+    let result = coordinator(
+        Arc::clone(&failing),
+        Arc::clone(&store),
+        ManualClock::new(300),
+        10,
+    )
+    .advance(request(), &ManualControl::default())
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(result, ChainSubmissionResult::Rejected(_)),
+        "a combined committed failure is terminal however the row reached it: {result:?}"
+    );
+    assert!(
+        store.record(&identity).is_none(),
+        "a terminally rejected combined generation leaves no row behind"
+    );
+    // An absent row alone could mean many things; this pins that the shared
+    // retirement rule is what removed it, on the recovery path too.
+    assert_eq!(
+        store.combined_retirements(&identity),
+        1,
+        "the row is gone because the generation was retired, exactly once"
+    );
+    assert_eq!(failing.methods().len(), 1, "one poll, no further POST");
+}
+
+/// An accepting POST answer echoing `identity`'s combined batch digest.
+fn accepted_with_batch_digest(identity: &ChainSubmissionIdentity) -> ChainHttpResponse {
+    let digest = identity
+        .target()
+        .batch_digest()
+        .expect("a combined identity carries a batch digest");
+    ChainHttpResponse::json(
+        200,
+        format!(
+            r#"{{"tx_hash":"{HASH}","code":0,"log":"","batch_digest":"{}"}}"#,
+            hex::encode(digest)
+        )
+        .into_bytes(),
+    )
 }

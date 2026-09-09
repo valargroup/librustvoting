@@ -46,7 +46,7 @@ pub(super) fn bundle_index(step: &NextStep) -> u32 {
 pub(super) fn needs_delegation_signer(step: &NextStep) -> bool {
     matches!(
         step,
-        NextStep::Delegate { .. } | NextStep::AdvanceDelegation { .. }
+        NextStep::Delegate { .. } | NextStep::CastVote { .. } | NextStep::AdvanceDelegation { .. }
     )
 }
 

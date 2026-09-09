@@ -279,6 +279,15 @@ pub fn export_delegation_capability(
     let conn = db.conn();
     let wallet_id = db.wallet_id();
     let round_id = hex::encode(voting_target.vote_round_id());
+    let combined: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM delegate_cast_recovery WHERE round_id=?1 AND wallet_id=?2)",
+        rusqlite::params![round_id, wallet_id], |row| row.get(0),
+    ).map_err(|error| internal(format!("check combined capability export: {error}")))?;
+    if combined {
+        return Err(invalid(
+            "capability V1 cannot export an atomic delegation-and-cast transaction",
+        ));
+    }
     let (params, network) = queries::load_round_params_with_network(&conn, &round_id, &wallet_id)?;
     validate_round_params(&params).map_err(|e| VotingError::Internal {
         message: format!("stored round parameters are invalid: {e}"),
@@ -935,7 +944,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, 24);
         for index in 0..2 {
             let data =
                 queries::load_zkp2_inputs(&conn, &params.vote_round_id, WALLET, index).unwrap();

@@ -722,11 +722,13 @@ mod tests {
         let digest =
             crate::vote_commitment::cast_vote_batch_sighash(ROUND_ID, 100, &actions).unwrap();
         first.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: 0,
             size: 2,
         });
         second.batch = Some(VoteBatchRecovery {
+            delegation_van: None,
             digest,
             index: 1,
             size: 2,

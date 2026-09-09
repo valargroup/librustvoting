@@ -12,10 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use recovery_conformance::assertions::{
-    assert_acceptances_never_downgraded, assert_every_unanswered_helper_was_journalled,
-    assert_idempotent, assert_no_contact_outside_the_fleet,
-    assert_no_premature_resend_to_an_accepted_helper, assert_placement_stays_within_the_fleet,
-    assert_every_share_is_confirmed, assert_reservations_monotonic, deterministic_plan,
+    assert_acceptances_never_downgraded, assert_every_share_is_confirmed,
+    assert_every_unanswered_helper_was_journalled, assert_idempotent,
+    assert_no_contact_outside_the_fleet, assert_no_premature_resend_to_an_accepted_helper,
+    assert_placement_stays_within_the_fleet, assert_reservations_monotonic, deterministic_plan,
     placement_spread, DurableSnapshot,
 };
 use recovery_conformance::child::{run_to_quiescence, run_until_crash, CrashLog};
@@ -134,7 +134,9 @@ async fn drive(fixture: Fixture) -> Report {
         let round = match provision(&fixture).await {
             Ok(round) => round,
             Err(error) => {
-                report.skipped.push((scenario, format!("no round: {error:#}")));
+                report
+                    .skipped
+                    .push((scenario, format!("no round: {error:#}")));
                 continue;
             }
         };
@@ -179,7 +181,9 @@ async fn exercise(
     round: &ProvisionedRound,
     control: &DurableSnapshot,
 ) -> Result<(), Outcome> {
-    let sidecar = fixture.workspace.join(format!("fleet-{}.db", scenario.name()));
+    let sidecar = fixture
+        .workspace
+        .join(format!("fleet-{}.db", scenario.name()));
     let _ = std::fs::remove_file(&sidecar);
 
     let first = scenario.first_fleet(backend);
@@ -410,8 +414,13 @@ async fn exercise(
     {
         return Err(Outcome::Failed(format!("{error:#}")));
     }
-    let settled = deterministic_plan(&sidecar, &fixture_account(), &round.round_id, &proposal_ids())
-        .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+    let settled = deterministic_plan(
+        &sidecar,
+        &fixture_account(),
+        &round.round_id,
+        &proposal_ids(),
+    )
+    .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     assert_idempotent(&settled).map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     Ok(())
 }

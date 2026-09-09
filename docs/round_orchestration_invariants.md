@@ -213,15 +213,84 @@ persisted recovery bundles rather than from the constant.
 ### Delegation obligations
 
 - `Delegate` is planned for a bundle whose delegation is `Prepared`,
-  `PcztBuilt` or `Proved` whenever that bundle has a `Cast` or a
+  `PcztBuilt` whenever that bundle has a `Cast` or a
   `Blocked` cast, so the prerequisite is visible while the voter decides the
   rest of the roster.
 - `AdvanceDelegation` is planned for `Submitted` and `SubmissionManaged`
   delegations; an imported capability advances without a signer.
 - `SubmittedWithoutHash` and `SubmissionRejected` delegations plan nothing and
   block their bundle's casts.
-- Every vote or share obligation on a bundle whose delegation is not
-  `Confirmed` carries that bundle's delegation step as its **prerequisite**.
+- `Delegate` prepares and persists the proof only; it never signs or broadcasts.
+  A `Proved` bundle waits for a terminal ballot, then `Cast` signs delegation
+  and casts together through `delegate-and-cast-vote-batch`, including a
+  one-choice ballot. The first witness is synthetic and needs no tree sync.
+- A combined recovery unit owns its delegation prerequisite. It plans only
+  the batch reconciliation, never a standalone `AdvanceDelegation`.
+- Existing standalone and imported delegations retain their prerequisites.
+  Terminal-ballot signing preflight covers fresh combined casts before the
+  wave starts. Early proof preparation needs a driver but no signature.
+- `a_delegate_step_cancelled_after_preparation_keeps_the_proof_without_signing`
+  and `a_partly_decided_ballot_still_runs_the_delegation_prerequisite` pin the
+  early-preparation boundary. `combined_lifecycle_confirms_delegation_and_every_vote_together`
+  pins the shared submission ownership and atomic confirmation.
+  The release-only `combined_executor_zkp2_prepares_submits_confirms_and_delivers`
+  exercises the executor with real cast proofs: early preparation does not
+  sign or POST, terminal casting submits one combined envelope, and helpers
+  receive shares only after the delegation and every vote are confirmed.
+  `combined_executor_zkp2_cancellation_reopens_and_resumes_without_signing`
+  cancels after combined persistence, reopens the database, and advances the
+  exact same envelope without a hotkey or delegation driver. Both run through
+  `make proofs` with scripted transports, without contacting a live chain.
+- A `Cast` on an imported delegation never owes the voter's key: the imported
+  transaction is already on the chain, the cast waits for it to confirm, and
+  the wallet holding an imported capability has no delegation key to offer.
+  `an_imported_delegation_with_a_terminal_ballot_needs_no_signer` pins this;
+  only a fresh combined cast is counted by the signing preflight.
+- Whether a cast signs its own delegation is decided once, by planning, and
+  carried on the obligation as `Obligation::Cast::signs_delegation`. It is
+  true for a fresh combined cast and false for a delegation that is already
+  `Confirmed` or imported. The signing preflight reads that flag rather than
+  re-deriving the answer from the delegation phase and the imported flag a
+  second time, so the preflight and the plan's work summary cannot disagree
+  about which bundles owe the voter's key.
+- A combined batch whose first POST the chain definitely rejects is retired by
+  the lifecycle (see `docs/chain_submission_invariants.md`, "Definite
+  rejection"): the bundle's delegation reads `Proved` again and the next plan
+  owes a fresh `Cast` with a new digest. The run that observed the rejection
+  ends `ChainTerminal` and never recasts within itself; a host that runs again
+  retries once per run. The release-only
+  `combined_executor_zkp2_rejection_returns_the_bundle_to_proved_and_recasts_on_the_next_run`
+  exercises both runs.
+- That per-run retry is bounded. Retirement deliberately leaves the delegation
+  setup untouched, so nothing else durable records that the chain refused this
+  delegation, and an unbounded retry would re-prove every member and re-POST
+  the identical delegation on every run forever. The lifecycle therefore counts
+  consecutive rejections in `combined_cast_rejections`, keyed by the delegation
+  generation each recast reuses rather than by the batch digest, which is
+  re-randomized on every cast. At `MAX_CONSECUTIVE_COMBINED_REJECTIONS`
+  (currently 2) the bundle joins the holding set: planning emits neither `Cast`
+  nor `Delegate` for it, and the round reports `blocking_recovery` because a
+  person must decide whether the delegation is worth another attempt.
+  `consecutive_combined_rejections_accumulate_against_one_delegation_generation`
+  pins the accumulation, the cap and the host's release.
+- The block is advisory, not a terminal delegation phase, and it is
+  self-healing in three ways. A confirmed batch clears the streak, so a later
+  unrelated rejection starts from one
+  (`a_confirmed_combined_batch_forgets_its_rejection_streak`). Discarding an
+  unbroadcast delegation setup deletes the ledger row with it, because the
+  generation the count described is gone. And the snapshot only blocks a
+  bundle whose *current* delegation generation still equals the one the
+  rejections were counted against, so rebuilding or re-proving the delegation
+  lifts the block on its own. `VotingDb::retry_blocked_combined_cast` is the
+  host's explicit "the cause is fixed, try again": it clears the streak, takes
+  the round's submission gate, and touches no proof or signature, so the next
+  cast reuses the same delegation and a further rejection restarts the streak
+  at one.
+- For hosts: the delegation signature prompt has moved from ballot-open to
+  ballot-terminal time. `NeedsDelegationSignatures` no longer fires for
+  `Delegate`, which only prepares the proof; it fires for the `Cast` that signs
+  the combined transaction. `RoundStepProgress::DelegateAndVoteBatchPersisted`
+  is a new progress kind between vote signing and helper planning.
 
 ### Share obligations
 

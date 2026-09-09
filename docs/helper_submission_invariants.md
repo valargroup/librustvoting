@@ -1891,3 +1891,40 @@ A change to helper submission or recovery should answer all of the following:
 - Do schema and wire changes preserve legacy rows and safe helper identity?
 - Are readiness, status, per-share timeout, and the process-wide 128-POST limit
   still enforced by their SDK entry points?
+
+
+## Combined delegation and cast integration
+
+A combined delegation-and-cast envelope is one atomic vote unit, including
+when it has one member. Fresh execution persists every signed vote and the
+delegation authorization, then persists the complete helper plan before the
+combined POST. A recovered unit already owned by the chain lifecycle reconciles
+that lifecycle first. Helper delivery starts only after the unit's complete
+confirmation records the final VAN and every VC position. The existing timeout,
+placement, ambiguous-POST and durable delivery rules apply unchanged.
+
+A definite first-POST rejection of the combined unit retires it: the members'
+recovery JSON is cleared, which the existing generation-change triggers turn
+into deleted helper plans and a cleared immediate-share designation, and the
+members' share records are deleted with it. Nothing was delivered, because
+delivery waits for confirmation. The recast is a fresh cast and re-plans its
+helpers before its own POST.
+
+Recasting is bounded. Consecutive rejections of one delegation generation are
+counted durably, and at the cap the bundle stops being planned until a host
+clears the streak, so a delegation the chain keeps refusing cannot re-plan and
+re-deliver helper shares on every run. This changes only how often a recast is
+planned; every share the recast does plan follows the timeout, placement,
+ambiguous-POST and durable delivery rules unchanged.
+`docs/round_orchestration_invariants.md` is the source of truth for the cap.
+
+A route-shaped chain POST response — an HTML 200 fallback page or any 404/405,
+including the gateway's exact JSON error shape — is not a definite rejection.
+An intermediary can reproduce every unsigned shape after forwarding the POST,
+so the response preserves the combined generation and its recovery material; a
+later rejection cannot erase that dispatch ambiguity. This keeps helper
+delivery recoverable if the envelope already reached the chain.
+`replaced_post_response_keeps_combined_recovery_and_ballot_locked` and
+`rejection_after_replaced_post_response_cannot_retire_combined_recovery` cover
+that boundary. The chain-submission specification owns the response
+classification and retry rules.

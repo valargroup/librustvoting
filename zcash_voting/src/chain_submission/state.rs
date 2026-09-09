@@ -26,11 +26,13 @@ impl SubmissionRecordState {
     /// True for a hashless `Recovering` row created by a possibly-dispatched
     /// POST, which may reserve the next same-generation POST directly.
     ///
-    /// Both `AmbiguousDispatch` (timeout, transport ambiguity, interruption
-    /// after dispatch, abandoned reservation) and `InvalidProtocolResponse`
-    /// (an unusable or malformed response after dispatch, including a hash
-    /// owned by another generation) are dispatch ambiguities. A definite
-    /// rejection lands here with `ChainRejected` and never reserves this way.
+    /// `AmbiguousDispatch` (timeout, transport ambiguity, interruption after
+    /// dispatch, abandoned reservation), `EndpointUnsupported` and
+    /// `RouteAnswerReplaced` (possibly replaced route responses), and
+    /// `InvalidProtocolResponse` (an unusable or malformed response after
+    /// dispatch, including a hash owned by another generation) are dispatch
+    /// ambiguities. A definite rejection lands here with `ChainRejected` and
+    /// never reserves this way.
     pub(super) fn permits_ambiguous_retry(&self) -> bool {
         matches!(
             self,
@@ -41,6 +43,8 @@ impl SubmissionRecordState {
                 ambiguity_diagnostic.kind(),
                 ChainSubmissionDiagnosticKind::AmbiguousDispatch
                     | ChainSubmissionDiagnosticKind::InvalidProtocolResponse
+                    | ChainSubmissionDiagnosticKind::EndpointUnsupported
+                    | ChainSubmissionDiagnosticKind::RouteAnswerReplaced
             )
         )
     }
@@ -52,8 +56,9 @@ impl SubmissionRecordState {
     /// enters `Recovering` and replaced only by a later observation that is
     /// itself dispatch evidence, so it survives restarts:
     ///
-    /// - `AmbiguousDispatch` and `InvalidProtocolResponse` record a POST whose
-    ///   delivery or response was lost;
+    /// - `AmbiguousDispatch`, `InvalidProtocolResponse`,
+    ///   `EndpointUnsupported`, and `RouteAnswerReplaced` record a POST whose
+    ///   delivery or response was lost or possibly replaced;
     /// - `TrackingWindowExpired` records an accepted hash that never resolved.
     ///
     /// `ChainRejected` records a definite outcome: a rejected POST or a
@@ -71,6 +76,8 @@ impl SubmissionRecordState {
                 ambiguity_diagnostic.kind(),
                 ChainSubmissionDiagnosticKind::AmbiguousDispatch
                     | ChainSubmissionDiagnosticKind::InvalidProtocolResponse
+                    | ChainSubmissionDiagnosticKind::EndpointUnsupported
+                    | ChainSubmissionDiagnosticKind::RouteAnswerReplaced
                     | ChainSubmissionDiagnosticKind::TrackingWindowExpired
             )
         )
@@ -96,6 +103,12 @@ pub(super) enum SubmissionObservation {
     UsableCandidateHash(CandidateTransactionHash),
     PossiblyDispatched(ChainSubmissionDiagnostic),
     DefiniteRejection(ChainSubmissionDiagnostic),
+    /// The first POST of a combined delegation-and-cast batch was definitely
+    /// rejected before any attempt was possibly dispatched. Unlike
+    /// `DefiniteRejection`, which keeps a row recoverable because an earlier
+    /// attempt may have landed, this is chain evidence that nothing landed and
+    /// makes the generation terminal so its members can be retired.
+    TerminalRejection(ChainSubmissionDiagnostic),
     SubmittedWithoutHash(ChainSubmissionDiagnostic),
     CandidatePending,
     TrackingWindowExpired(ChainSubmissionDiagnostic),
@@ -138,6 +151,12 @@ pub(super) fn apply_submission_observation(
                 candidate_transaction_hash: None,
                 ambiguity_diagnostic: diagnostic,
             }))
+        }
+        // Only `Submitting` admits this: the state exists solely before any
+        // possibly-dispatched attempt, so a terminal rejection can never
+        // erase dispatch ambiguity recorded by an earlier POST.
+        (Some(State::Submitting), Observation::TerminalRejection(diagnostic)) => {
+            Ok(Some(State::Rejected(diagnostic)))
         }
         (Some(State::Submitting), Observation::SubmittedWithoutHash(diagnostic))
         | (Some(State::Recovering { .. }), Observation::SubmittedWithoutHash(diagnostic)) => {
@@ -309,6 +328,7 @@ impl SubmissionObservation {
             Self::UsableCandidateHash(_) => "usable_candidate_hash",
             Self::PossiblyDispatched(_) => "possibly_dispatched",
             Self::DefiniteRejection(_) => "definite_rejection",
+            Self::TerminalRejection(_) => "terminal_rejection",
             Self::SubmittedWithoutHash(_) => "submitted_without_hash",
             Self::CandidatePending => "candidate_pending",
             Self::TrackingWindowExpired(_) => "tracking_window_expired",
@@ -542,6 +562,8 @@ mod tests {
         for kind in [
             ChainSubmissionDiagnosticKind::AmbiguousDispatch,
             ChainSubmissionDiagnosticKind::InvalidProtocolResponse,
+            ChainSubmissionDiagnosticKind::EndpointUnsupported,
+            ChainSubmissionDiagnosticKind::RouteAnswerReplaced,
             ChainSubmissionDiagnosticKind::TrackingWindowExpired,
         ] {
             assert!(recovering(kind).has_unresolved_dispatch(), "{kind:?}");
@@ -717,6 +739,7 @@ mod tests {
         UsableCandidateHash,
         PossiblyDispatched,
         DefiniteRejection,
+        TerminalRejection,
         CandidatePending,
         TrackingWindowExpired,
         CandidateCommittedFailure,
@@ -729,12 +752,13 @@ mod tests {
     }
 
     impl ObservationKind {
-        const ALL: [Self; 14] = [
+        const ALL: [Self; 15] = [
             Self::ReserveFreshSubmission,
             Self::DefinitelyUnsent,
             Self::UsableCandidateHash,
             Self::PossiblyDispatched,
             Self::DefiniteRejection,
+            Self::TerminalRejection,
             Self::CandidatePending,
             Self::TrackingWindowExpired,
             Self::CandidateCommittedFailure,
@@ -758,6 +782,9 @@ mod tests {
                 }
                 Self::DefiniteRejection => {
                     SubmissionObservation::DefiniteRejection(diagnostic("rejected"))
+                }
+                Self::TerminalRejection => {
+                    SubmissionObservation::TerminalRejection(diagnostic("terminal rejection"))
                 }
                 Self::CandidatePending => SubmissionObservation::CandidatePending,
                 Self::TrackingWindowExpired => {
@@ -796,6 +823,7 @@ mod tests {
                     | Observation::UsableCandidateHash
                     | Observation::PossiblyDispatched
                     | Observation::DefiniteRejection
+                    | Observation::TerminalRejection
                     | Observation::SubmittedWithoutHash
                     | Observation::AbandonedSubmitting
             ),
@@ -836,6 +864,32 @@ mod tests {
             State::ConfirmedByTree => matches!(observation, Observation::ConfirmedByTree),
             State::Rejected => false,
             State::SubmittedWithoutHash => false,
+        }
+    }
+
+    #[test]
+    fn a_terminal_rejection_from_submitting_is_rejected_and_refused_after_ambiguity() {
+        let rejected = apply_submission_observation(
+            Some(SubmissionRecordState::Submitting),
+            SubmissionObservation::TerminalRejection(diagnostic("round closed")),
+        )
+        .unwrap();
+        assert!(matches!(
+            rejected,
+            Some(SubmissionRecordState::Rejected(ref stored)) if stored.message() == "round closed"
+        ));
+        // Once any attempt may have been dispatched the generation may be on
+        // chain, so a later rejection can only be surfaced, never terminal.
+        for ambiguous in [
+            StateCase::RecoveringWithoutCandidate,
+            StateCase::RecoveringWithCandidate,
+            StateCase::Tracking,
+        ] {
+            assert!(apply_submission_observation(
+                ambiguous.state(),
+                SubmissionObservation::TerminalRejection(diagnostic("late")),
+            )
+            .is_err());
         }
     }
 

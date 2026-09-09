@@ -20,6 +20,7 @@ pub(super) struct SnapshotBuilder {
 pub(super) fn snapshot() -> SnapshotBuilder {
     SnapshotBuilder {
         snapshot: RoundSnapshot {
+            rejection_blocked_bundles: std::collections::BTreeMap::new(),
             round_id: ROUND.to_string(),
             delegations: Vec::new(),
             bundles: BTreeMap::new(),
@@ -48,6 +49,18 @@ impl SnapshotBuilder {
                 delegation_tx_hash: None,
             },
         );
+        self
+    }
+
+    /// A bundle whose delegation is a structurally imported capability,
+    /// already on the chain and with no delegation key in this wallet.
+    pub(super) fn imported_bundle(mut self, bundle_index: u32, phase: DelegationPhase) -> Self {
+        self = self.bundle(bundle_index, phase);
+        self.snapshot
+            .bundles
+            .get_mut(&bundle_index)
+            .expect("the bundle was just inserted")
+            .capability_imported = true;
         self
     }
 
@@ -116,6 +129,7 @@ impl SnapshotBuilder {
         let size = recoveries.len() as u32;
         for (index, recovery) in recoveries.iter_mut().enumerate() {
             recovery.batch = Some(VoteBatchRecovery {
+                delegation_van: None,
                 digest,
                 index: index as u32,
                 size,

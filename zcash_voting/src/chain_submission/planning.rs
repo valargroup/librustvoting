@@ -70,12 +70,12 @@ pub(crate) fn lifecycle_transaction_hash(
     let mut hashes: Vec<Vec<u8>> = Vec::new();
     {
         let sql = match target {
-            PlanningTarget::Delegation => format!("{SELECT}cs.kind = 'delegation'{ORDER}"),
+            PlanningTarget::Delegation => format!("{SELECT}cs.kind IN ('delegation','delegate_and_cast_vote_batch'){ORDER}"),
             PlanningTarget::Vote { .. } => {
                 format!("{SELECT}cs.kind = 'vote' AND cs.proposal_id = :proposal{ORDER}")
             }
             PlanningTarget::VoteBatch { .. } => format!(
-                "{SELECT}cs.kind = 'vote_batch' AND cs.ordered_batch_digest = :digest{ORDER}"
+                "{SELECT}cs.kind IN ('vote_batch','delegate_and_cast_vote_batch') AND cs.ordered_batch_digest = :digest{ORDER}"
             ),
         };
         let mut statement = conn.prepare(&sql).map_err(|e| VotingError::Internal {
@@ -218,18 +218,29 @@ pub(crate) fn lifecycle_transaction_hashes(
                 bundle_index,
                 proposal_id: proposal_id as u32,
             },
-            ("vote_batch", _, Some(digest)) => LifecycleHashKey::VoteBatch {
-                bundle_index,
-                ordered_batch_digest: digest.try_into().map_err(|_| VotingError::Internal {
-                    message: "stored ordered batch digest is not 32 bytes".to_string(),
-                })?,
-            },
+            ("vote_batch" | "delegate_and_cast_vote_batch", _, Some(digest)) => {
+                LifecycleHashKey::VoteBatch {
+                    bundle_index,
+                    ordered_batch_digest: digest.try_into().map_err(|_| VotingError::Internal {
+                        message: "stored ordered batch digest is not 32 bytes".to_string(),
+                    })?,
+                }
+            }
             (kind, _, _) => {
                 return Err(VotingError::Internal {
                     message: format!("chain submission row has unexpected shape for kind {kind}"),
                 })
             }
         };
+        // A combined row owns both the batch and its delegation prerequisite.
+        // Keep the snapshot projection equivalent to the single-target query.
+        if kind == "delegate_and_cast_vote_batch" {
+            hashes
+                .hashes
+                .entry(LifecycleHashKey::Delegation { bundle_index })
+                .or_default()
+                .insert(hash.clone());
+        }
         hashes.hashes.entry(key).or_default().insert(hash);
     }
     Ok(hashes)

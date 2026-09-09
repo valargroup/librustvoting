@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 22;
+const CURRENT_VERSION: u32 = 24;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -144,13 +144,23 @@ END;",
         include_str!("migrations/005_chain_submissions_proposal_range.sql"),
     ),
     (21, "ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;"),
+    (22, include_str!("migrations/006_delegate_cast.sql")),
+    // The rejection ledger cannot be a `chain_submissions` column: that table
+    // is fingerprinted on every open and rebuilt on drift, and the combined
+    // freshness gates key off the absence of a row in it.
+    (
+        23,
+        include_str!("migrations/007_combined_cast_rejections.sql"),
+    ),
 ];
 
-const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
+const RESET_SQL: &str = "DROP TABLE IF EXISTS combined_cast_rejections;
+DROP TABLE IF EXISTS pir_proof_cache;
 DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
 DROP TABLE IF EXISTS round_immediate_share;
 DROP TABLE IF EXISTS helper_share_plans;
+DROP TABLE IF EXISTS delegate_cast_recovery;
 DROP TABLE IF EXISTS chain_submissions;
 DROP TABLE IF EXISTS share_delegations;
 DROP TABLE IF EXISTS keystone_signatures;
@@ -211,6 +221,10 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
                 upgraded = from + 1;
                 continue;
             }
+            if *from == 22 && reconcile_combined_preview(&tx)? {
+                upgraded = from + 1;
+                continue;
+            }
             tx.execute_batch(sql).map_err(|e| {
                 VotingError::from_sqlite(
                     &format!(
@@ -241,6 +255,88 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     // A ladder that ends on a different shape than this build describes is the
     // same drift, reached the long way round.
     ensure_current_chain_submission_schema(conn)
+}
+
+/// Recognizes the version-22 combined-vote preview without discarding its
+/// immutable recovery records. Only the exact current schema, optionally
+/// missing the nullable PCZT column, is accepted. The caller owns the migration
+/// transaction, so both the column repair and version advance commit together.
+fn reconcile_combined_preview(conn: &Connection) -> Result<bool, VotingError> {
+    let has_recovery: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'delegate_cast_recovery')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(migration_error)?;
+    if !has_recovery {
+        return Ok(false);
+    }
+    let expected = Connection::open_in_memory().map_err(migration_error)?;
+    expected
+        .execute_batch(include_str!("migrations/001_init.sql"))
+        .map_err(migration_error)?;
+    // The preview predates the combined-cast rejection ledger, which the
+    // version-23 ladder entry below creates. It is therefore not part of what
+    // identifies a preview schema, and leaving it in the expected fingerprint
+    // would refuse every preview database instead of upgrading it.
+    expected
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS combined_cast_rejections_monotonic_streak;
+             DROP TRIGGER IF EXISTS combined_cast_rejections_generation_restart;
+             DROP TABLE IF EXISTS combined_cast_rejections;",
+        )
+        .map_err(migration_error)?;
+    let actual = preview_schema_fingerprint(conn)?;
+    if actual == preview_schema_fingerprint(&expected)? {
+        return Ok(true);
+    }
+    expected
+        .execute_batch("ALTER TABLE bundles DROP COLUMN delegation_pczt;")
+        .map_err(migration_error)?;
+    if actual != preview_schema_fingerprint(&expected)? {
+        return Err(VotingError::Internal {
+            message: "unsupported version-22 combined-vote preview schema; existing recovery records were preserved".into(),
+        });
+    }
+    conn.execute_batch("ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;")
+        .map_err(migration_error)?;
+    Ok(true)
+}
+
+/// Compares the explicit schema objects that identify a preview database,
+/// including recovery constraints and triggers; table existence alone cannot
+/// establish migration compatibility.
+///
+/// Everything `chain_submissions` owns is excluded. That table's DDL has been
+/// edited without a version bump more than once, so real sidecars are in the
+/// field missing one of its indexes or triggers;
+/// [`ensure_current_chain_submission_schema`] exists to repair exactly that and
+/// runs after this ladder. Fingerprinting those objects here would refuse such
+/// a database with a hard error before the repair could run, and since nothing
+/// would advance `user_version`, the sidecar this reconciliation exists to
+/// rescue would become permanently unopenable. `005_chain_submissions_proposal_range.sql`
+/// makes the same argument for the version-20 step.
+fn preview_schema_fingerprint(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String)>, VotingError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_schema \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+           AND name NOT LIKE 'chain_submissions%' \
+         ORDER BY type, name",
+        )
+        .map_err(migration_error)?;
+    let fingerprint = statement
+        .query_map([], |row| {
+            let sql: String = row.get(2)?;
+            Ok((row.get(0)?, row.get(1)?, normalize_schema_sql(&sql)))
+        })
+        .map_err(migration_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(migration_error)?;
+    Ok(fingerprint)
 }
 
 /// Brings `chain_submissions` to the shape `002_chain_submissions.sql`

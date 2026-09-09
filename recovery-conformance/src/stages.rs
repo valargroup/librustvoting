@@ -19,84 +19,45 @@ use std::str::FromStr;
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub enum CrashStage {
-    /// The delegation obligation was selected and nothing has run.
+    /// Delegation proof preparation is about to begin.
     BeforeDelegation,
-    /// Notes have been selected and nothing is written yet.
-    ///
-    /// Fires on `PcztBuilding`, the first event after selection returns.
-    /// `SelectingNotes` announces the intent to select and is emitted before
-    /// any note is chosen, so arming on it would repeat `BeforeDelegation`
-    /// under a name promising more.
+    /// Notes have been selected; preparation has not written the PCZT.
     AfterNoteSelection,
-    /// The PCZT is durable: `bundles.pczt_sighash` and its TX1 effects, which
-    /// are write-once. A resumed run must reuse them, never rebuild them.
+    /// The PCZT and its signing fields are durable.
     AfterPczt,
-    /// ZKP #1 is durable in `proofs`. Resume must reuse the proof rather than
-    /// re-enter PIR and prove again.
+    /// The delegation proof is durable and reused on resume.
     AfterProof,
-    /// The delegation payload is signed. For a Keystone signer the signature
-    /// is durable, so resume must not re-prompt the device.
-    AfterSigning,
-    /// A `Submitting` reservation exists and the request bytes provably never
-    /// reached the network. The sharp case: see [`CrashStage::is_sharp`].
-    BeforeBroadcast,
-    /// The dispatch marker is set and the response was never read. The
-    /// delegation may be on chain and the wallet holds no hash for it.
-    AfterBroadcastUnread,
-    /// The response body was read but never durably classified.
-    AfterBroadcastRead,
-    /// The submission is `Tracking` with a candidate hash.
-    ///
-    /// Reaching this needs a one-pass chain policy. `ChainOutcome` is reported
-    /// once per `advance_step`, at the end, carrying the episode's *terminal*
-    /// outcome rather than each poll — so under the default 45 passes the
-    /// episode polls through to confirmation and a stage waiting to see a
-    /// submission still tracking never fires. The run arms a single-pass policy
-    /// for this stage only, which ends the episode while the submission is
-    /// still pending.
-    AfterTracking,
-
-    /// The cast obligation was selected; the delegation is confirmed.
+    /// The terminal ballot is ready for combined delegation and casts.
     BeforeCast,
-    /// The vote-commitment tree synced. A crash here must leave a consistent
-    /// cached tree or none at all, never a partially appended one.
+    /// Legacy confirmed-delegation tree sync; excluded from the fresh combined matrix.
     AfterTreeSync,
-    /// ZKP #2 is in flight. Nothing is durable, so the proof is lost by
-    /// design; the assertion is that nothing is *damaged*.
+    /// The delegation payload is signed; cast proofs are not yet durable.
+    AfterSigning,
+    /// Cast proofs are complete in memory, before durable commitment.
     AfterVoteProof,
-    /// The vote is committed: `votes.commitment_bundle_json` is durable and no
-    /// POST has been reserved.
-    ///
-    /// **Not currently reachable.** The durable boundary is real and worth
-    /// covering — a crash here leaves a committed vote with no helper plan —
-    /// but nothing observable marks it. Casting persists the vote, prepares
-    /// helper plans, and reserves the chain POST inside a single `advance_step`,
-    /// so the driver never re-plans in between, and the step's own progress
-    /// stream jumps from `VoteCommit(Signing)` straight to
-    /// `HelperPlansPrepared`, which is already the *next* boundary
-    /// ([`AfterHelperPlans`](Self::AfterHelperPlans)). Reaching it would need a
-    /// The seam is the fleet preflight: vote completion probes every helper
-    /// after the vote is durably committed and before its helper plans are
-    /// written, so a crash on that request lands between the two commits.
+    /// The combined authorization and all cast recoveries are durable.
     AfterVoteCommit,
-    /// Helper delivery plans and the round's immediate-share designation are
-    /// durable. This is the commit that makes a confirmed-vote-without-a-plan
-    /// unreachable.
+    /// Complete helper plans are durable, before the chain POST.
     AfterHelperPlans,
-    /// A `Submitting` reservation exists for the vote, pre-dispatch.
+    /// A combined reservation exists; bytes have not been dispatched.
+    BeforeBroadcast,
+    /// Alias boundary for the casts in the same combined reservation.
     BeforeVoteBroadcast,
-    /// The vote POST crossed the dispatch boundary.
+    /// The combined POST was dispatched; its response has not been read.
+    AfterBroadcastUnread,
+    /// Alias boundary for the casts in the same dispatched envelope.
     AfterVoteBroadcast,
-    /// The vote is confirmed and carries its commitment-tree position.
+    /// The combined POST response was read but not durably classified.
+    AfterBroadcastRead,
+    /// One bounded pass recorded the combined candidate; the stage uses a one-pass policy.
+    AfterTracking,
+    /// The delegation and all cast positions are confirmed together.
     AfterVoteConfirmed,
-
-    /// A helper is durably journaled in `attempting_urls` and the POST has not
-    /// been sent.
+    /// A helper attempt is durable, before its POST.
     BeforeSharePost,
-    /// The helper answered and the outcome was never written. Indistinguishable
-    /// from interruption, and must be treated as ambiguous on resume.
+    /// The helper response has not been durably classified.
     AfterSharePost,
-    /// A helper definitely accepted the share.
+    /// A definite helper acceptance is durable.
     AfterShareAccepted,
 }
 
@@ -126,6 +87,8 @@ pub enum CrashTrigger {
 pub enum SubmissionKind {
     Delegation,
     Vote,
+    /// Fresh delegation and all dependent casts in one transaction.
+    DelegateAndVoteBatch,
 }
 
 /// Where inside one POST the process dies.
@@ -146,18 +109,17 @@ impl CrashStage {
         Self::AfterNoteSelection,
         Self::AfterPczt,
         Self::AfterProof,
-        Self::AfterSigning,
-        Self::BeforeBroadcast,
-        Self::AfterBroadcastUnread,
-        Self::AfterBroadcastRead,
-        Self::AfterTracking,
         Self::BeforeCast,
-        Self::AfterTreeSync,
+        Self::AfterSigning,
         Self::AfterVoteProof,
         Self::AfterVoteCommit,
         Self::AfterHelperPlans,
+        Self::BeforeBroadcast,
         Self::BeforeVoteBroadcast,
+        Self::AfterBroadcastUnread,
         Self::AfterVoteBroadcast,
+        Self::AfterBroadcastRead,
+        Self::AfterTracking,
         Self::AfterVoteConfirmed,
         Self::BeforeSharePost,
         Self::AfterSharePost,
@@ -193,13 +155,13 @@ impl CrashStage {
     /// How this stage is detected.
     pub fn trigger(self) -> CrashTrigger {
         use BroadcastPoint::{AfterDispatch, AfterResponse, BeforeDispatch};
-        use SubmissionKind::{Delegation, Vote};
+        use SubmissionKind::DelegateAndVoteBatch;
         match self {
-            Self::BeforeBroadcast => broadcast(Delegation, BeforeDispatch),
-            Self::AfterBroadcastUnread => broadcast(Delegation, AfterDispatch),
-            Self::AfterBroadcastRead => broadcast(Delegation, AfterResponse),
-            Self::BeforeVoteBroadcast => broadcast(Vote, BeforeDispatch),
-            Self::AfterVoteBroadcast => broadcast(Vote, AfterDispatch),
+            Self::BeforeBroadcast => broadcast(DelegateAndVoteBatch, BeforeDispatch),
+            Self::AfterBroadcastUnread => broadcast(DelegateAndVoteBatch, AfterDispatch),
+            Self::AfterBroadcastRead => broadcast(DelegateAndVoteBatch, AfterResponse),
+            Self::BeforeVoteBroadcast => broadcast(DelegateAndVoteBatch, BeforeDispatch),
+            Self::AfterVoteBroadcast => broadcast(DelegateAndVoteBatch, AfterDispatch),
             _ => CrashTrigger::Event,
         }
     }
@@ -210,14 +172,16 @@ impl CrashStage {
     /// needs its own round because its unarmed resume continues to quiescence
     /// and may submit after any crash stage.
     pub fn touches_chain(self) -> bool {
-        !matches!(
+        matches!(
             self,
-            Self::BeforeDelegation
-                | Self::AfterNoteSelection
-                | Self::AfterPczt
-                | Self::AfterProof
-                | Self::AfterSigning
-                | Self::BeforeBroadcast
+            Self::AfterBroadcastUnread
+                | Self::AfterVoteBroadcast
+                | Self::AfterBroadcastRead
+                | Self::AfterTracking
+                | Self::AfterVoteConfirmed
+                | Self::BeforeSharePost
+                | Self::AfterSharePost
+                | Self::AfterShareAccepted
         )
     }
 

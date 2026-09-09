@@ -1563,6 +1563,25 @@ fn store_delegation_setup_within(
         });
     }
 
+    // A write that changed the setup ended the delegation generation any
+    // recorded rejection streak was counted against, so the streak no longer
+    // describes anything that can be sent again and must not block the
+    // replacement's first cast. This is the rebuild's cleanup: the discard's
+    // own `DELETE` cannot reach a bundle that still holds retired `votes`
+    // rows, and a rebuild replaces the setup rather than emptying it. An
+    // idempotent resume, which changes no column, deliberately keeps the
+    // streak: it reuses the very generation the chain refused.
+    //
+    // The comparison covers every column this write can touch, which is a
+    // superset of the delegation generation's inputs. It can therefore clear a
+    // streak for a write that changed only a non-input column, and never keeps
+    // one past a generation change. That is the safe direction: the cap is an
+    // advisory bound on recasting, so clearing it early costs one more attempt,
+    // while keeping it late blocks a delegation the chain has never seen.
+    if !write_changes_nothing {
+        clear_combined_rejection_ledger(tx, wallet_id, round_id, bundle_index)?;
+    }
+
     Ok(())
 }
 
@@ -2007,7 +2026,7 @@ pub(crate) struct VoteRowState {
 pub(crate) struct VotePreparationState {
     pub network: Network,
     pub zkp2: Zkp2DelegationData,
-    pub van_position: u32,
+    pub van_position: Option<u32>,
     /// `(skipped, choice)` from `ballot_intent`, if present.
     pub ballot_intent: Option<(bool, Option<u32>)>,
     pub vote: Option<VoteRowState>,
@@ -2110,7 +2129,13 @@ pub(crate) fn load_vote_preparation_state(
 ) -> Result<VotePreparationState, VotingError> {
     let network = load_round_network(conn, round_id, wallet_id)?;
     let zkp2 = load_zkp2_inputs(conn, round_id, wallet_id, bundle_index)?;
-    let van_position = load_van_position(conn, round_id, wallet_id, bundle_index)?;
+    let van_position = load_optional_van_position_u64(conn, round_id, wallet_id, bundle_index)?
+        .map(|position| {
+            u32::try_from(position).map_err(|_| VotingError::InvalidInput {
+                message: "VAN position exceeds circuit range".to_string(),
+            })
+        })
+        .transpose()?;
     let ballot_intent = conn
         .query_row(
             "SELECT skipped, choice FROM ballot_intent
@@ -2365,7 +2390,7 @@ pub(crate) fn load_van_tree_entries(
                         WHERE cs.round_id = b.round_id
                           AND cs.wallet_id = b.wallet_id
                           AND cs.bundle_index = b.bundle_index
-                          AND cs.kind IN ('vote', 'vote_batch')
+                          AND cs.kind IN ('vote', 'vote_batch', 'delegate_and_cast_vote_batch')
                           AND cs.state != 'rejected'
                     ))
              FROM bundles b
@@ -3738,6 +3763,131 @@ pub(crate) fn bundle_planning_rows(
         .map_err(|e| VotingError::from_sqlite("read bundle planning row", &e))
 }
 
+/// One bundle's combined-cast rejection streak.
+pub(crate) struct CombinedRejectionLedgerRow {
+    pub(crate) bundle_index: u32,
+    /// The delegation generation the streak was counted against. A bundle whose
+    /// current generation differs has been rebuilt and is not blocked.
+    pub(crate) delegation_generation_digest: [u8; 32],
+    pub(crate) consecutive_rejections: u32,
+    /// The chain's own last rejection, kept because retirement deletes the
+    /// lifecycle row that would otherwise carry it.
+    pub(crate) diagnostic: crate::ChainSubmissionDiagnostic,
+}
+
+/// Reads every bundle's combined-cast rejection streak for one round.
+pub(crate) fn combined_rejection_ledger_rows(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<CombinedRejectionLedgerRow>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, delegation_generation_digest, consecutive_rejections,
+                    last_diagnostic_kind, last_diagnostic
+             FROM combined_cast_rejections
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+             ORDER BY bundle_index",
+        )
+        .map_err(|e| VotingError::from_sqlite("prepare combined rejection ledger", &e))?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("query combined rejection ledger", &e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::from_sqlite("read combined rejection ledger row", &e))?;
+    rows.into_iter()
+        .map(|(bundle_index, digest, streak, kind, message)| {
+            let delegation_generation_digest: [u8; 32] =
+                digest.try_into().map_err(|_| VotingError::Internal {
+                    message: "combined rejection ledger stores a malformed generation digest"
+                        .to_string(),
+                })?;
+            let diagnostic =
+                crate::phases::stored_submission_diagnostic(Some(kind), Some(message))?
+                    .ok_or_else(|| VotingError::Internal {
+                        message: "combined rejection ledger stores no diagnostic".to_string(),
+                    })?;
+            Ok(CombinedRejectionLedgerRow {
+                bundle_index,
+                delegation_generation_digest,
+                consecutive_rejections: u32::try_from(streak).unwrap_or(u32::MAX),
+                diagnostic,
+            })
+        })
+        .collect()
+}
+
+/// Forgets a bundle's combined-cast rejection streak, returning whether one
+/// was recorded. Callers use this when the streak's premise no longer holds:
+/// the batch confirmed, or the delegation setup it counted against changed.
+pub(crate) fn clear_combined_rejection_ledger(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+) -> Result<bool, VotingError> {
+    let removed = conn
+        .execute(
+            "DELETE FROM combined_cast_rejections
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("clear combined rejection ledger", &e))?;
+    Ok(removed > 0)
+}
+
+/// Clears the rejection streak of every bundle that holds a vote for
+/// `proposal_id`, and reports how many rows went.
+///
+/// A changed ballot means the next combined batch differs from the one the
+/// chain refused, so a streak counted against the old batch no longer describes
+/// anything that will be sent. The streak is keyed on the delegation
+/// generation, which a ballot edit does not change, so without this the block
+/// would outlive its own cause whenever the rejection came from a vote member
+/// rather than the delegation.
+///
+/// Scoped through `votes` rather than through live recovery: retiring a
+/// terminally rejected batch clears `commitment_bundle_json` but keeps the vote
+/// rows, and those retired bundles are exactly the ones carrying a streak.
+pub(crate) fn clear_combined_rejection_ledger_for_proposal(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+) -> Result<usize, VotingError> {
+    conn.execute(
+        "DELETE FROM combined_cast_rejections
+          WHERE round_id = :round_id AND wallet_id = :wallet_id
+            AND bundle_index IN (
+                SELECT bundle_index FROM votes
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND proposal_id = :proposal_id
+            )",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":proposal_id": proposal_id as i64,
+        },
+    )
+    .map_err(|e| VotingError::from_sqlite("clear combined rejection ledger for proposal", &e))
+}
+
 pub fn get_commitment_bundle(
     conn: &Connection,
     round_id: &str,
@@ -4315,6 +4465,16 @@ fn discard_unbroadcast_delegation_setup_within(
         (
             "discard delegation witnesses",
             format!("DELETE FROM witnesses WHERE {unbroadcast_guard}"),
+        ),
+        // The streak counts rejections of one delegation generation. Discarding
+        // the setup ends that generation, so the count no longer describes
+        // anything and must not block a rebuilt delegation's first cast. A
+        // rebuild, which replaces the setup rather than clearing it, clears the
+        // streak from `store_delegation_setup_within` instead: this statement
+        // only covers a discard that actually emptied the bundle.
+        (
+            "discard combined cast rejections",
+            format!("DELETE FROM combined_cast_rejections WHERE {unbroadcast_guard}"),
         ),
     ] {
         let mut statement = tx.prepare(&sql).map_err(|e| VotingError::Internal {
