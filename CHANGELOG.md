@@ -52,6 +52,8 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Keep expired round re-poll deadlines runnable so expiry between selection and
+  waiting cannot leave the driver asleep until host cancellation.
 - Raise the continuous helper queue to up to 32 process-wide active share deliveries,
   weighting admission by planned helper fan-out so queued shares do not exhaust
   their delivery deadlines behind other queued shares. Retain the independent

@@ -551,6 +551,14 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   Due re-polls lead, followed by ready continuations of previously admitted
   bundles, then new bundles in stable plan order. Re-poll deadlines belong to
   individual obligations; delayed obligations release execution capacity.
+  A deadline that expires between selection and waiting wakes the driver for
+  immediate replanning when admission is available; it must never be discarded
+  in favor of an unbounded wait. With full capacity, an exhausted dispatch
+  budget, or an active operation on that bundle, wait for completion or
+  interruption instead of spinning on its deadline
+  (`a_deadline_expiring_after_selection_wakes_the_idle_driver`,
+  `repoll_wakes_at_the_earliest_deadline_including_exact_expiry`,
+  `unavailable_repolls_wait_for_completion_or_interruption`).
   `StopRound` always admits one obligation at a time. Under `SkipBundle`, a
   failure excludes its bundle while healthy bundles continue.
   Run-wide terminal conditions stop admission and drain already-admitted work.

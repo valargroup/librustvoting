@@ -242,13 +242,11 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
             let completion = if stopping.is_some() {
                 flights.next().await
             } else {
-                let delay = deadlines
-                    .iter()
-                    .filter_map(|(_, deadline)| *deadline)
-                    .filter(|deadline| *deadline > tokio::time::Instant::now())
-                    .min()
-                    .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
-                    .unwrap_or(std::time::Duration::MAX);
+                let delay = repoll_delay(
+                    &deadlines,
+                    &active,
+                    flights.len() < limit && run.dispatches < self.policy.max_dispatches,
+                );
                 tokio::select! {
                     completion = flights.next(), if !flights.is_empty() => completion,
                     _ = sleep_until_interrupted(delay, control, entry_epoch) => continue,
@@ -308,6 +306,26 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
             }
         }
     }
+}
+
+/// Wakes for the earliest re-poll that can use an admission slot. When capacity
+/// or dispatch budget is exhausted, only completion or interruption can help.
+/// Expiry after selection remains a zero delay so overdue work cannot lose its wake-up.
+pub(super) fn repoll_delay(
+    deadlines: &[(NextStep, Option<tokio::time::Instant>)],
+    active: &BTreeSet<u32>,
+    admission_available: bool,
+) -> std::time::Duration {
+    if !admission_available {
+        return std::time::Duration::MAX;
+    }
+    deadlines
+        .iter()
+        .filter(|(step, _)| !active.contains(&selection::bundle_index(step)))
+        .filter_map(|(_, deadline)| *deadline)
+        .min()
+        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .unwrap_or(std::time::Duration::MAX)
 }
 
 /// Waits `delay`, returning `false` if the host interrupted meanwhile.
