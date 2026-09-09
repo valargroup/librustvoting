@@ -86,6 +86,9 @@ pub(crate) fn project(
     let blocking_recovery = submission_managed
         || submitted_without_hash
         || submission_rejected
+        // The bundle plans nothing, but the round is not finished: a person
+        // must decide whether the delegation is worth another attempt.
+        || !snapshot.rejection_blocked_bundles.is_empty()
         || steps.iter().any(|step| match step {
             NextStep::ConfirmShare {
                 bundle_index,
@@ -102,7 +105,15 @@ pub(crate) fn project(
             bundle_index: status.bundle_index,
             phase: status.phase,
             tx_hash: snapshot.delegation_tx_hash(status.bundle_index),
-            submission_diagnostic: status.diagnostic.clone(),
+            // Retirement deleted the lifecycle row that would carry this, so
+            // for a blocked bundle the ledger is the only place the chain's
+            // own words survive.
+            submission_diagnostic: status.diagnostic.clone().or_else(|| {
+                snapshot
+                    .rejection_blocked_bundles
+                    .get(&status.bundle_index)
+                    .cloned()
+            }),
             terminal: is_terminal_delegation_phase(status.phase),
         })
         .collect();
@@ -188,20 +199,24 @@ pub(crate) fn project(
     )?;
 
     let mut work_summary = summarize_plan_work(&steps, blocking_share_work);
+    // A cast that signs its own delegation owes the voter's key. Classification
+    // made that call; reading it here keeps the plan's summary and the driver's
+    // signing preflight answering from the same decision.
+    let signing_casts: BTreeSet<u32> = obligations
+        .obligations
+        .iter()
+        .filter_map(|obligation| match obligation {
+            Obligation::Cast {
+                bundle_index,
+                signs_delegation: true,
+                ..
+            } => Some(*bundle_index),
+            _ => None,
+        })
+        .collect();
     for step in &steps {
         if let NextStep::CastVote { bundle_index, .. } = step {
-            // A fresh cast on an unconfirmed delegation signs the delegation
-            // as part of its combined transaction. An imported delegation is
-            // already on the chain and its holder has no delegation key.
-            let imported = snapshot
-                .bundles
-                .get(bundle_index)
-                .is_some_and(|bundle| bundle.capability_imported);
-            if !imported
-                && delegation
-                    .get(bundle_index)
-                    .is_some_and(|phase| *phase != DelegationPhase::Confirmed)
-            {
+            if signing_casts.contains(bundle_index) {
                 work_summary
                     .delegation_bundles_needing_signing
                     .push(*bundle_index);

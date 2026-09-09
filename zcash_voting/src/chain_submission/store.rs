@@ -300,6 +300,19 @@ impl StoredChainSubmission {
         self.updated_at = effective_now;
     }
 
+    /// Whether this transition retires a combined generation: the row has just
+    /// become terminally rejected and must leave no durable trace, so the
+    /// bundle's delegation reads `Proved` and can be cast afresh.
+    ///
+    /// The single owner of that rule. Every store applies it at every path a
+    /// row can reach `Rejected` by, so a new observation or target kind cannot
+    /// retire on one path and persist on another.
+    pub(super) fn retires_combined_generation(&self, previous: ChainSubmissionState) -> bool {
+        matches!(self.state, SubmissionRecordState::Rejected(_))
+            && previous != ChainSubmissionState::Rejected
+            && self.identity.target().is_combined()
+    }
+
     fn fresh(
         generation: &ChainSubmissionGeneration,
         committed_post_reservations: u64,
@@ -590,6 +603,9 @@ pub(super) mod memory {
         derivations: HashMap<ChainSubmissionIdentity, DerivedChainSubmission>,
         batch_rosters: HashMap<ChainSubmissionIdentity, Vec<u32>>,
         projections: HashMap<ChainSubmissionIdentity, super::super::ChainSubmissionConfirmation>,
+        /// How often each combined generation has been retired. The double has
+        /// no delegation setup to retire, so it records that the rule fired.
+        combined_retirements: HashMap<ChainSubmissionIdentity, u32>,
         fail_before_commit: bool,
         fail_before_commit_without_state: bool,
     }
@@ -672,6 +688,21 @@ pub(super) mod memory {
             identity: &ChainSubmissionIdentity,
         ) -> Option<StoredChainSubmission> {
             self.state.lock().unwrap().records.get(identity).cloned()
+        }
+
+        /// How often `identity` has been retired as a terminally rejected
+        /// combined generation.
+        pub(in crate::chain_submission) fn combined_retirements(
+            &self,
+            identity: &ChainSubmissionIdentity,
+        ) -> u32 {
+            self.state
+                .lock()
+                .unwrap()
+                .combined_retirements
+                .get(identity)
+                .copied()
+                .unwrap_or(0)
         }
 
         pub(in crate::chain_submission) fn projection(
@@ -1109,13 +1140,16 @@ pub(super) mod memory {
                         )
                     })?;
                 record.settle_after_transition(previous_state, None, now);
-                // Parity with the SQLite store: a combined generation that
-                // becomes terminally rejected leaves no row behind.
-                if matches!(record.state, SubmissionRecordState::Rejected(_))
-                    && previous_state != ChainSubmissionState::Rejected
-                    && generation.identity().target().is_combined()
-                {
+                // Parity with the SQLite store's row removal. The double holds
+                // no delegation setup or members, so it counts the retirement
+                // rather than performing it: an absent row alone cannot tell a
+                // test that this rule is what removed it.
+                if record.retires_combined_generation(previous_state) {
                     state.records.remove(generation.identity());
+                    *state
+                        .combined_retirements
+                        .entry(generation.identity().clone())
+                        .or_insert(0) += 1;
                     return Ok(record);
                 }
                 state
@@ -1198,11 +1232,12 @@ pub(super) mod memory {
                     .map_err(|error| transition_failure(previous_state, error))?
                     .expect("reconciliation cannot remove a row");
                 record.settle_after_transition(previous_state, diagnostic, now);
-                if matches!(record.state, SubmissionRecordState::Rejected(_))
-                    && previous_state != ChainSubmissionState::Rejected
-                    && generation.identity().target().is_combined()
-                {
+                if record.retires_combined_generation(previous_state) {
                     state.records.remove(generation.identity());
+                    *state
+                        .combined_retirements
+                        .entry(generation.identity().clone())
+                        .or_insert(0) += 1;
                     return Ok(record);
                 }
                 state

@@ -192,6 +192,38 @@ async fn an_html_200_from_a_proxy_is_definitely_unsent_with_endpoint_unsupported
 }
 
 #[tokio::test]
+async fn an_oversized_fallback_page_is_still_definitely_unsent() {
+    // What makes an answer definitely unsent is its status and content type:
+    // a router 404 fired before any handler, and the gateway never writes
+    // HTML. How long the page is says nothing about whether the request was
+    // decoded, so the size limit that bounds a JSON body must not turn these
+    // into ambiguous dispatch and strand a reservation the chain never saw.
+    let oversized = vec![b'x'; MAX_CHAIN_HTTP_RESPONSE_BYTES + 1];
+    for (status, content_type) in [
+        (200, "text/html; charset=utf-8"),
+        (404, "text/html"),
+        (405, "application/json"),
+    ] {
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.queue(Ok(ChainHttpResponse::new(
+            status,
+            oversized.clone(),
+            Some(content_type.to_string()),
+            Vec::new(),
+        )));
+        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+
+        assert!(
+            matches!(
+                client.submit_delegation(0, &delegation()).await,
+                PostAttemptOutcome::EndpointUnsupported(_)
+            ),
+            "an oversized {status} {content_type} answer is definitely unsent"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_router_404_or_405_is_definitely_unsent_with_endpoint_unsupported() {
     // gorilla mux answers before any handler runs: 404 for an unknown path,
     // 405 for a known path with the wrong method. JSON or not, no handler

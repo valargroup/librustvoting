@@ -988,13 +988,19 @@ fn derived_combined_batch(
     identity: ChainSubmissionIdentity,
     ordered_proposal_ids: Vec<u32>,
 ) -> DerivedChainSubmission {
-    let ChainSubmissionRequest::VoteBatch(batch) =
+    let ChainSubmissionRequest::VoteBatch(mut batch) =
         derived_batch(identity.clone(), ordered_proposal_ids.clone())
             .request()
             .clone()
     else {
         unreachable!("batch derivation carries a batch request")
     };
+    // The combined envelope binds every cast to the delegation's own round at
+    // the synthetic anchor, and encodes each effect as canonical base64.
+    for vote in &mut batch.votes {
+        vote.anchor_height = 0;
+        vote.vote_round_id = BASE64_STANDARD.encode(identity.vote_round_id());
+    }
     let delegation = crate::wire::DelegationSubmissionWire {
         rk: BASE64_STANDARD.encode([0x31; 32]),
         spend_auth_sig: BASE64_STANDARD.encode([0x32; 64]),
@@ -4846,4 +4852,101 @@ async fn a_pass_bound_to_an_earlier_epoch_is_refused_under_the_current_one() {
         "no request may be sent for the stale epoch: {:?}",
         transport.methods()
     );
+}
+
+#[tokio::test]
+async fn a_combined_candidate_committing_unsuccessfully_after_the_window_expires_is_terminal() {
+    // A combined batch's candidate hash names its one signed envelope, so a
+    // committed failure of that hash is the generation's final word. Reaching
+    // the committed failure through an expired tracking window rather than
+    // straight from `Tracking` changes nothing about whose bytes the chain
+    // reported on, so the generation must still be retired rather than left
+    // recovering, which would re-POST an envelope the chain already failed.
+    let identity = combined_identity(0);
+    let proposals = vec![1, 2];
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_combined_batch(identity.clone(), proposals.clone()));
+    let request =
+        || StoreAdvancementRequest::vote_batch(identity.clone(), proposals.clone()).unwrap();
+
+    // Accepted, then pending inside the window: the row tracks its hash.
+    let opening = Arc::new(ScriptedTransport::default());
+    opening.queue(Ok(accepted_with_batch_digest(&identity)));
+    opening.queue(Ok(pending()));
+    coordinator(opening, Arc::clone(&store), ManualClock::new(100), 10)
+        .advance(request(), &ManualControl::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.record(&identity).unwrap().durable_state(),
+        ChainSubmissionState::Tracking
+    );
+
+    // Pending again past the window: the candidate survives into recovery.
+    let expiring = Arc::new(ScriptedTransport::default());
+    expiring.queue(Ok(pending()));
+    coordinator(expiring, Arc::clone(&store), ManualClock::new(200), 10)
+        .advance(request(), &ManualControl::default())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            store.record(&identity).unwrap().state(),
+            SubmissionRecordState::Recovering {
+                candidate_transaction_hash: Some(_),
+                ..
+            }
+        ),
+        "an expired window keeps the candidate: {:?}",
+        store.record(&identity).unwrap().state()
+    );
+
+    // The chain now reports that candidate committed unsuccessfully.
+    let failing = Arc::new(ScriptedTransport::default());
+    failing.queue(Ok(ChainHttpResponse::json(
+        422,
+        br#"{"height":"9","code":12,"log":"rejected","events":[]}"#.to_vec(),
+    )));
+    let result = coordinator(
+        Arc::clone(&failing),
+        Arc::clone(&store),
+        ManualClock::new(300),
+        10,
+    )
+    .advance(request(), &ManualControl::default())
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(result, ChainSubmissionResult::Rejected(_)),
+        "a combined committed failure is terminal however the row reached it: {result:?}"
+    );
+    assert!(
+        store.record(&identity).is_none(),
+        "a terminally rejected combined generation leaves no row behind"
+    );
+    // An absent row alone could mean many things; this pins that the shared
+    // retirement rule is what removed it, on the recovery path too.
+    assert_eq!(
+        store.combined_retirements(&identity),
+        1,
+        "the row is gone because the generation was retired, exactly once"
+    );
+    assert_eq!(failing.methods().len(), 1, "one poll, no further POST");
+}
+
+/// An accepting POST answer echoing `identity`'s combined batch digest.
+fn accepted_with_batch_digest(identity: &ChainSubmissionIdentity) -> ChainHttpResponse {
+    let digest = identity
+        .target()
+        .batch_digest()
+        .expect("a combined identity carries a batch digest");
+    ChainHttpResponse::json(
+        200,
+        format!(
+            r#"{{"tx_hash":"{HASH}","code":0,"log":"","batch_digest":"{}"}}"#,
+            hex::encode(digest)
+        )
+        .into_bytes(),
+    )
 }

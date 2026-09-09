@@ -1,3 +1,5 @@
+use rusqlite::OptionalExtension;
+
 use crate::{
     chain_submission::{generation_for_delegation, ChainSubmissionIdentity, ChainSubmissionTarget},
     round::VotingDb,
@@ -62,6 +64,38 @@ impl DelegationAuthorization {
             ));
         }
         Ok(())
+    }
+
+    /// The delegation generation one persisted combined authorization was
+    /// signed against, or `None` when no authorization is stored.
+    ///
+    /// Read separately from `recover_submission` because the chain lifecycle
+    /// needs the generation identity while retiring a rejected batch, at a
+    /// point where rebuilding the whole submission would be wasted work and
+    /// the authorization row is about to be deleted.
+    pub(crate) fn persisted_generation_digest(
+        conn: &rusqlite::Connection,
+        wallet: &str,
+        round: &str,
+        bundle: u32,
+        digest: &[u8; 32],
+    ) -> Result<Option<[u8; 32]>, VotingError> {
+        conn.query_row(
+            "SELECT delegation_generation_digest FROM delegate_cast_recovery
+             WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3 AND batch_digest=?4",
+            rusqlite::params![round, wallet, bundle, digest.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|error| VotingError::Storage {
+            message: format!("read combined authorization generation: {error}"),
+        })?
+        .map(|stored| {
+            stored
+                .try_into()
+                .map_err(|_| invalid("stored combined delegation generation must contain 32 bytes"))
+        })
+        .transpose()
     }
 
     /// Restores the exact public authorization without treating an on-wire

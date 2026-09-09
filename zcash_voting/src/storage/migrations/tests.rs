@@ -59,8 +59,21 @@ fn without_round_immediate_share(schema: &str) -> String {
     schema[..start].to_string()
 }
 
+/// Strips the combined-cast rejection ledger added at version 24. No database
+/// at version 23 or earlier can carry it.
+fn without_combined_cast_rejections(schema: &str) -> String {
+    let start = schema
+        .find("-- Consecutive chain rejections of one bundle's combined")
+        .expect("schema must contain the ledger added at version 24");
+    schema[..start].trim_end().to_string() + "\n"
+}
+
+fn v23_schema() -> String {
+    without_combined_cast_rejections(include_str!("001_init.sql"))
+}
+
 fn v22_schema() -> String {
-    include_str!("001_init.sql")
+    v23_schema()
         .split("-- Immutable public delegation authorization")
         .next()
         .unwrap()
@@ -1799,11 +1812,111 @@ fn v22_upgrades_combined_storage_to_the_fresh_schema() {
     );
 }
 
+#[test]
+fn v23_upgrades_to_a_schema_identical_to_a_fresh_one() {
+    // The rejection ledger's SQL is written twice: once in `001_init.sql` for
+    // a fresh database and once in `007_combined_cast_rejections.sql` for the
+    // ladder. Column shape alone would not catch a drifted CHECK constraint or
+    // a missing trigger, so this compares the full normalized schema of every
+    // object, which is what `preview_schema_fingerprint` already reports.
+    let mut upgraded = Connection::open_in_memory().unwrap();
+    upgraded.execute_batch(&v23_schema()).unwrap();
+    upgraded.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    queries::insert_round(
+        &upgraded,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    insert_v17_delegation_with_complete_setup(&upgraded, ROUND, "wallet", 0, None);
+    let preserved = dump_table(&upgraded, "bundles");
+    upgraded.pragma_update(None, "user_version", 23).unwrap();
+
+    migrate(&mut upgraded).unwrap();
+
+    let mut fresh = Connection::open_in_memory().unwrap();
+    migrate(&mut fresh).unwrap();
+    assert_eq!(
+        preview_schema_fingerprint(&upgraded).unwrap(),
+        preview_schema_fingerprint(&fresh).unwrap(),
+        "the ladder and `001_init.sql` must build the same schema"
+    );
+    assert_eq!(
+        dump_table(&upgraded, "bundles"),
+        preserved,
+        "an in-place upgrade preserves delegation state"
+    );
+    assert_eq!(
+        upgraded
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        CURRENT_VERSION
+    );
+}
+
+#[test]
+fn the_rejection_ledger_refuses_a_streak_that_does_not_match_its_generation() {
+    // The upsert is the only writer today and always agrees with these
+    // triggers, so nothing else would notice if they were dropped. They exist
+    // to stop a future writer from rewriting history: a streak may only grow
+    // within one delegation generation, and a new generation restarts it at
+    // one. Reads of the ledger treat the count as monotonic evidence.
+    let mut conn = Connection::open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO combined_cast_rejections (
+             round_id, wallet_id, bundle_index, delegation_generation_digest,
+             consecutive_rejections, last_batch_digest, last_diagnostic_kind,
+             last_diagnostic, first_rejected_at, last_rejected_at)
+         VALUES (?1, 'wallet', 0, ?2, 2, ?3, 'chain_rejected', 'refused', 5, 5)",
+        rusqlite::params![ROUND, vec![0xA1_u8; 32], vec![0xA2_u8; 32]],
+    )
+    .unwrap();
+
+    let rewind = conn.execute(
+        "UPDATE combined_cast_rejections SET consecutive_rejections = 1",
+        [],
+    );
+    assert!(
+        rewind.is_err(),
+        "a streak cannot decrease within a generation"
+    );
+
+    let carry_over = conn.execute(
+        "UPDATE combined_cast_rejections
+            SET delegation_generation_digest = ?1, consecutive_rejections = 3",
+        rusqlite::params![vec![0xB1_u8; 32]],
+    );
+    assert!(
+        carry_over.is_err(),
+        "a new delegation generation restarts the streak at one"
+    );
+
+    conn.execute(
+        "UPDATE combined_cast_rejections
+            SET delegation_generation_digest = ?1, consecutive_rejections = 1",
+        rusqlite::params![vec![0xB1_u8; 32]],
+    )
+    .expect("restarting at one is the allowed generation change");
+}
+
 fn combined_preview(has_pczt: bool) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    let schema = include_str!("001_init.sql");
+    // A real preview predates the version-24 rejection ledger.
+    let schema = v23_schema();
     conn.execute_batch(&if has_pczt {
-        schema.to_string()
+        schema.clone()
     } else {
         schema.replace("    delegation_pczt     BLOB,\n", "")
     })

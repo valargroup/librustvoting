@@ -1909,3 +1909,11 @@ into deleted helper plans and a cleared immediate-share designation, and the
 members' share records are deleted with it. Nothing was delivered, because
 delivery waits for confirmation. The recast is a fresh cast and re-plans its
 helpers before its own POST.
+
+Recasting is bounded. Consecutive rejections of one delegation generation are
+counted durably, and at the cap the bundle stops being planned until a host
+clears the streak, so a delegation the chain keeps refusing cannot re-plan and
+re-deliver helper shares on every run. This changes only how often a recast is
+planned; every share the recast does plan follows the timeout, placement,
+ambiguous-POST and durable delivery rules unchanged.
+`docs/round_orchestration_invariants.md` is the source of truth for the cap.

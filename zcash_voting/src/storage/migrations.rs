@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 23;
+const CURRENT_VERSION: u32 = 24;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -145,9 +145,17 @@ END;",
     ),
     (21, "ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;"),
     (22, include_str!("migrations/006_delegate_cast.sql")),
+    // The rejection ledger cannot be a `chain_submissions` column: that table
+    // is fingerprinted on every open and rebuilt on drift, and the combined
+    // freshness gates key off the absence of a row in it.
+    (
+        23,
+        include_str!("migrations/007_combined_cast_rejections.sql"),
+    ),
 ];
 
-const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
+const RESET_SQL: &str = "DROP TABLE IF EXISTS combined_cast_rejections;
+DROP TABLE IF EXISTS pir_proof_cache;
 DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
 DROP TABLE IF EXISTS round_immediate_share;
@@ -267,6 +275,17 @@ fn reconcile_combined_preview(conn: &Connection) -> Result<bool, VotingError> {
     let expected = Connection::open_in_memory().map_err(migration_error)?;
     expected
         .execute_batch(include_str!("migrations/001_init.sql"))
+        .map_err(migration_error)?;
+    // The preview predates the combined-cast rejection ledger, which the
+    // version-23 ladder entry below creates. It is therefore not part of what
+    // identifies a preview schema, and leaving it in the expected fingerprint
+    // would refuse every preview database instead of upgrading it.
+    expected
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS combined_cast_rejections_monotonic_streak;
+             DROP TRIGGER IF EXISTS combined_cast_rejections_generation_restart;
+             DROP TABLE IF EXISTS combined_cast_rejections;",
+        )
         .map_err(migration_error)?;
     let actual = preview_schema_fingerprint(conn)?;
     if actual == preview_schema_fingerprint(&expected)? {

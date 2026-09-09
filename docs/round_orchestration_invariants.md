@@ -246,14 +246,46 @@ persisted recovery bundles rather than from the constant.
   the wallet holding an imported capability has no delegation key to offer.
   `an_imported_delegation_with_a_terminal_ballot_needs_no_signer` pins this;
   only a fresh combined cast is counted by the signing preflight.
+- Whether a cast signs its own delegation is decided once, by planning, and
+  carried on the obligation as `Obligation::Cast::signs_delegation`. It is
+  true for a fresh combined cast and false for a delegation that is already
+  `Confirmed` or imported. The signing preflight reads that flag rather than
+  re-deriving the answer from the delegation phase and the imported flag a
+  second time, so the preflight and the plan's work summary cannot disagree
+  about which bundles owe the voter's key.
 - A combined batch whose first POST the chain definitely rejects is retired by
   the lifecycle (see `docs/chain_submission_invariants.md`, "Definite
   rejection"): the bundle's delegation reads `Proved` again and the next plan
   owes a fresh `Cast` with a new digest. The run that observed the rejection
   ends `ChainTerminal` and never recasts within itself; a host that runs again
-  retries exactly once per run. The release-only
+  retries once per run. The release-only
   `combined_executor_zkp2_rejection_returns_the_bundle_to_proved_and_recasts_on_the_next_run`
   exercises both runs.
+- That per-run retry is bounded. Retirement deliberately leaves the delegation
+  setup untouched, so nothing else durable records that the chain refused this
+  delegation, and an unbounded retry would re-prove every member and re-POST
+  the identical delegation on every run forever. The lifecycle therefore counts
+  consecutive rejections in `combined_cast_rejections`, keyed by the delegation
+  generation each recast reuses rather than by the batch digest, which is
+  re-randomized on every cast. At `MAX_CONSECUTIVE_COMBINED_REJECTIONS`
+  (currently 2) the bundle joins the holding set: planning emits neither `Cast`
+  nor `Delegate` for it, and the round reports `blocking_recovery` because a
+  person must decide whether the delegation is worth another attempt.
+  `consecutive_combined_rejections_accumulate_against_one_delegation_generation`
+  pins the accumulation, the cap and the host's release.
+- The block is advisory, not a terminal delegation phase, and it is
+  self-healing in three ways. A confirmed batch clears the streak, so a later
+  unrelated rejection starts from one
+  (`a_confirmed_combined_batch_forgets_its_rejection_streak`). Discarding an
+  unbroadcast delegation setup deletes the ledger row with it, because the
+  generation the count described is gone. And the snapshot only blocks a
+  bundle whose *current* delegation generation still equals the one the
+  rejections were counted against, so rebuilding or re-proving the delegation
+  lifts the block on its own. `VotingDb::retry_blocked_combined_cast` is the
+  host's explicit "the cause is fixed, try again": it clears the streak, takes
+  the round's submission gate, and touches no proof or signature, so the next
+  cast reuses the same delegation and a further rejection restarts the streak
+  at one.
 - For hosts: the delegation signature prompt has moved from ballot-open to
   ballot-terminal time. `NeedsDelegationSignatures` no longer fires for
   `Delegate`, which only prepares the proof; it fires for the `Cast` that signs

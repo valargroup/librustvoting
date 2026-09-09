@@ -889,10 +889,11 @@ impl SqliteChainSubmissionStore {
             // delegation's durable setup, which reads `Proved`. The returned
             // record still describes the rejection for this invocation's
             // caller. A standalone generation keeps its terminal row.
-            let entered_rejected = matches!(record.state, SubmissionRecordState::Rejected(_))
-                && previous != ChainSubmissionState::Rejected;
-            if entered_rejected && generation.identity().target().is_combined() {
-                retire_rejected_combined_generation(tx, generation.identity())
+            if record.retires_combined_generation(previous) {
+                let diagnostic = record.diagnostic().cloned().ok_or_else(|| {
+                    transition_failure(previous, "a rejected row carries its diagnostic")
+                })?;
+                retire_rejected_combined_generation(tx, generation.identity(), &diagnostic, now)
                     .map_err(map_generation_error)?;
                 tx.execute(
                     "DELETE FROM chain_submissions WHERE identity_key=?1",

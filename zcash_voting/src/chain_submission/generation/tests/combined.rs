@@ -880,6 +880,144 @@ fn assert_retired_to_proved(db: &VotingDb, proposals: u32) {
     );
 }
 
+/// The bundle's recorded rejection streak, with the chain's last message.
+fn rejection_ledger(db: &VotingDb) -> Option<(u32, Vec<u8>, String)> {
+    db.conn()
+        .query_row(
+            "SELECT consecutive_rejections, delegation_generation_digest, last_diagnostic
+               FROM combined_cast_rejections",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .ok()
+}
+
+#[tokio::test]
+async fn consecutive_combined_rejections_accumulate_against_one_delegation_generation() {
+    // Retirement deletes every other durable trace of the rejection, so the
+    // ledger is the only thing that can tell a first failure from a delegation
+    // the chain keeps refusing. It counts the generation each recast reuses,
+    // not the batch digest, which is re-randomized on every cast.
+    let (db, request) = fixture(2);
+    let signature = stored_signature(&db);
+    let reject_once = |request: &AdvanceVoteBatch| {
+        Arc::new(ScriptedPosts {
+            inner: Transport {
+                request: request.clone(),
+                calls: Mutex::new(Vec::new()),
+            },
+            posts: Mutex::new(vec![rejection(7, request)]),
+        })
+    };
+    let control = ChainSubmissionControl::new(1);
+
+    client_over(&db, reject_once(&request))
+        .advance_delegate_and_vote_batch(request.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    let (streak, generation, message) = rejection_ledger(&db).expect("a rejection is recorded");
+    assert_eq!(streak, 1);
+    assert!(message.contains("code 7"), "{message}");
+    assert!(message.contains("round closed"), "{message}");
+
+    // A fresh batch over the same untouched delegation setup.
+    let recast = persist_combined_batch(&db, signature, 2, 1);
+    assert_ne!(recast.ordered_batch_digest, request.ordered_batch_digest);
+    client_over(&db, reject_once(&recast))
+        .advance_delegate_and_vote_batch(recast.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+
+    let (streak, same_generation, _) = rejection_ledger(&db).expect("the streak survives");
+    assert_eq!(
+        streak, 2,
+        "a different batch digest over the same delegation continues the streak"
+    );
+    assert_eq!(
+        same_generation, generation,
+        "the delegation generation is what the streak is counted against"
+    );
+    assert_retired_to_proved(&db, 2);
+
+    // At the cap the wallet stops planning the cast on its own, and the
+    // chain's own words survive the deleted lifecycle row.
+    assert!(
+        blocked_bundles(&db).contains_key(&0),
+        "the second rejection reaches the cap"
+    );
+
+    // The block is advisory: the host's explicit retry lifts it, leaving the
+    // delegation setup untouched so the next cast reuses the same signature.
+    assert!(db.retry_blocked_combined_cast(ROUND, 0).unwrap());
+    assert!(
+        blocked_bundles(&db).is_empty(),
+        "the host cleared the block"
+    );
+    assert_eq!(
+        db.delegation_phase(ROUND, 0).unwrap(),
+        crate::phases::DelegationPhase::Proved,
+        "clearing a block touches no delegation setup"
+    );
+}
+
+/// The bundles planning refuses to cast for, with the chain's last rejection.
+fn blocked_bundles(
+    db: &VotingDb,
+) -> std::collections::BTreeMap<u32, crate::ChainSubmissionDiagnostic> {
+    let mut conn = db.conn();
+    let tx = conn.transaction().unwrap();
+    crate::round_planning::load_round_snapshot(&tx, "wallet-1", ROUND)
+        .unwrap()
+        .rejection_blocked_bundles
+}
+
+#[tokio::test]
+async fn a_confirmed_combined_batch_forgets_its_rejection_streak() {
+    // The streak means "this delegation keeps being refused". A batch that
+    // lands disproves that, so a later unrelated rejection starts from one.
+    let (db, request) = fixture(2);
+    let signature = stored_signature(&db);
+    let transport = Arc::new(ScriptedPosts {
+        inner: Transport {
+            request: request.clone(),
+            calls: Mutex::new(Vec::new()),
+        },
+        posts: Mutex::new(vec![rejection(7, &request)]),
+    });
+    let control = ChainSubmissionControl::new(1);
+    client_over(&db, transport)
+        .advance_delegate_and_vote_batch(request.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    assert!(rejection_ledger(&db).is_some());
+
+    let fresh = persist_combined_batch(&db, signature, 2, 1);
+    let accepting = Arc::new(Transport {
+        request: fresh.clone(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let client = client_over(&db, accepting);
+    client
+        .advance_delegate_and_vote_batch(fresh.clone(), ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    let confirmed = client
+        .advance_delegate_and_vote_batch(fresh, ChainRecoveryMode::StatusOnly, &control)
+        .await
+        .unwrap();
+    assert!(matches!(confirmed, ChainSubmissionResult::Confirmed(_)));
+    assert!(
+        rejection_ledger(&db).is_none(),
+        "confirmation clears the streak"
+    );
+}
+
 /// Scripted POST answers ahead of the accepting `Transport`.
 struct ScriptedPosts {
     inner: Transport,

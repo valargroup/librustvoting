@@ -390,10 +390,8 @@ fn confirmation_error(error: super::ChainSubmissionConfirmationError) -> VotingE
     }
 }
 
-/// Projects validated terminal evidence onto the rows locked by `derived`.
-///
 /// Retires a terminally rejected combined generation in the caller's
-/// lifecycle transaction.
+/// lifecycle transaction and records the rejection.
 ///
 /// Every member vote's recovery, shares, helper plans and immediate-share
 /// designation are cleared and the bundle's combined authorization is dropped,
@@ -402,9 +400,16 @@ fn confirmation_error(error: super::ChainSubmissionConfirmationError) -> VotingE
 /// Keystone signature — is untouched: the chain rejected this envelope, not
 /// the delegation, and the same signature authorizes the next one. A member
 /// that reached the chain makes this an error, which the caller must roll back.
+///
+/// Because that leaves no other durable trace of the rejection, the streak is
+/// recorded against the delegation generation every recast reuses, so a
+/// delegation the chain keeps refusing stops being recast forever. The streak
+/// is read back from the ledger by round planning, not returned here.
 pub(super) fn retire_rejected_combined_generation(
     conn: &rusqlite::Transaction<'_>,
     identity: &super::ChainSubmissionIdentity,
+    diagnostic: &super::ChainSubmissionDiagnostic,
+    now: u64,
 ) -> Result<(), VotingError> {
     let Some(digest) = identity
         .target()
@@ -416,30 +421,91 @@ pub(super) fn retire_rejected_combined_generation(
         });
     };
     let round_id = hex::encode(identity.vote_round_id());
-    let members = crate::vote::load_vote_batch_recoveries_with_conn(
+    // Read the generation the streak is counted against before retirement
+    // deletes the authorization row that carries it.
+    let delegation_generation_digest =
+        crate::delegate_and_vote_batch::DelegationAuthorization::persisted_generation_digest(
+            conn,
+            identity.wallet_id(),
+            &round_id,
+            identity.bundle_index(),
+            &digest,
+        )?
+        .ok_or_else(|| VotingError::Internal {
+            message: "rejected combined generation has no persisted authorization".to_string(),
+        })?;
+    let cleared = crate::vote::clear_vote_batch_recovery_with_conn(
         conn,
         identity.wallet_id(),
         &round_id,
         identity.bundle_index(),
         digest,
     )?;
-    if members.is_empty() {
+    if cleared.is_empty() {
         return Err(VotingError::Internal {
             message: "rejected combined generation has no persisted members".to_string(),
         });
     }
-    for member in &members {
-        crate::vote::clear_unsubmitted_vote_recovery_with_conn(
-            conn,
-            identity.wallet_id(),
-            &round_id,
-            identity.bundle_index(),
-            member.proposal_id,
-        )?;
-    }
-    Ok(())
+    record_combined_rejection(
+        conn,
+        identity,
+        &round_id,
+        &delegation_generation_digest,
+        &digest,
+        diagnostic,
+        now,
+    )
 }
 
+/// Adds one rejection to the bundle's streak, restarting it at one whenever the
+/// delegation generation differs from the one already recorded.
+fn record_combined_rejection(
+    conn: &rusqlite::Transaction<'_>,
+    identity: &super::ChainSubmissionIdentity,
+    round_id: &str,
+    delegation_generation_digest: &[u8; 32],
+    batch_digest: &[u8; 32],
+    diagnostic: &super::ChainSubmissionDiagnostic,
+    now: u64,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "INSERT INTO combined_cast_rejections (
+             round_id, wallet_id, bundle_index, delegation_generation_digest,
+             consecutive_rejections, last_batch_digest,
+             last_diagnostic_kind, last_diagnostic, first_rejected_at, last_rejected_at)
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?8)
+         ON CONFLICT(round_id, wallet_id, bundle_index) DO UPDATE SET
+             consecutive_rejections = CASE
+                 WHEN combined_cast_rejections.delegation_generation_digest
+                      = excluded.delegation_generation_digest
+                 THEN combined_cast_rejections.consecutive_rejections + 1 ELSE 1 END,
+             delegation_generation_digest = excluded.delegation_generation_digest,
+             last_batch_digest = excluded.last_batch_digest,
+             last_diagnostic_kind = excluded.last_diagnostic_kind,
+             last_diagnostic = excluded.last_diagnostic,
+             first_rejected_at = CASE
+                 WHEN combined_cast_rejections.delegation_generation_digest
+                      = excluded.delegation_generation_digest
+                 THEN combined_cast_rejections.first_rejected_at
+                 ELSE excluded.first_rejected_at END,
+             last_rejected_at = excluded.last_rejected_at",
+        rusqlite::params![
+            round_id,
+            identity.wallet_id(),
+            identity.bundle_index() as i64,
+            delegation_generation_digest.as_slice(),
+            batch_digest.as_slice(),
+            diagnostic.kind().as_str(),
+            diagnostic.message(),
+            now as i64,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| VotingError::from_sqlite("record combined cast rejection", &error))
+}
+
+/// Projects validated terminal evidence onto the rows locked by `derived`.
+///
 /// The caller must include this connection in its lifecycle transaction. The
 /// function rejects confirmation positions that do not match the generation's
 /// expected action layout and performs no network I/O. The caller must roll
@@ -518,6 +584,14 @@ pub(super) fn apply_confirmed_generation(
                         hash,
                     )?;
                 }
+                // A confirmed batch ends whatever rejection streak preceded it,
+                // so a later unrelated rejection starts counting from one.
+                crate::storage::queries::clear_combined_rejection_ledger(
+                    conn,
+                    identity.wallet_id(),
+                    &round_id,
+                    identity.bundle_index(),
+                )?;
             }
             Ok(())
         }

@@ -477,6 +477,13 @@ Tracking -> Recovering       local committed failure, failed candidate cleared
 Recovering -> Recovering     candidate, retry, no match, or interruption
 Recovering -> Confirmed      candidate success or exact tree layout
 
+combined Tracking -> Rejected
+                             candidate committed unsuccessfully; the row and
+                             its members are retired in the same transaction
+combined Recovering -> Rejected
+                             same, reached only because the tracking window
+                             expired inconclusively first
+
 imported new -> Tracking     atomically adopt the stored package hash
 imported Tracking -> Rejected
                              immutable candidate committed unsuccessfully
@@ -1855,6 +1862,15 @@ would fail the same way (`a_nullifier_spent_first_post_keeps_the_combined_row_re
 A combined candidate that commits unsuccessfully is treated the same way as an
 imported delegation's: its hash names the one signed envelope, so the failure
 is terminal (`a_combined_candidate_that_commits_unsuccessfully_retires_the_generation`).
+That holds from `Recovering` as well as `Tracking`. A row reaches `Recovering`
+rather than staying in `Tracking` only because its bounded tracking window
+expired inconclusively first, which changes nothing about whose bytes the chain
+has now reported on
+(`a_combined_candidate_committing_unsuccessfully_after_the_window_expires_is_terminal`).
+`StoredChainSubmission::retires_combined_generation` is the single owner of the
+rule, so every path a row can reach `Rejected` by retires on the same terms;
+the in-memory double counts each firing in `combined_retirements` because it
+holds no delegation setup to retire.
 
 The store retires the generation inside the transition's transaction
 (`retire_rejected_combined_generation`): every member's recovery JSON is
@@ -1868,9 +1884,22 @@ of a new digest then follows the ordinary rules
 (`a_definitely_rejected_combined_batch_retires_its_members_and_frees_the_delegation`).
 A rejection after an ambiguous POST keeps the row `Recovering` with its
 members locked (`a_rejection_after_an_ambiguous_combined_post_keeps_the_row_recovering`).
-The rejection diagnostic survives in the run report and observability records
-only; the durable row is gone. Standalone delegation, vote and vote-batch rows
-keep their existing terminal semantics.
+Standalone delegation, vote and vote-batch rows keep their existing terminal
+semantics.
+
+Retirement deletes the lifecycle row, so one durable trace of the rejection is
+kept deliberately outside it. In the same transaction the store appends to
+`combined_cast_rejections`: a per-bundle streak of consecutive rejections with
+the chain's own last diagnostic kind and message, keyed by the delegation
+generation the recast reuses rather than by the batch digest, which is
+re-randomized on every cast. That table is deliberately not a `chain_submissions`
+column — `chain_submissions` is fingerprinted on every open and rebuilt on
+drift, and both combined freshness gates admit a new batch only while no row
+exists in it, so the ledger has to be invisible to them. The streak is what
+bounds recasting; `docs/round_orchestration_invariants.md` owns the cap and the
+planning behavior it drives. The ledger row is cleared when the batch confirms
+and when the delegation setup it counted against is discarded. Beyond it, the
+rejection diagnostic still survives in the run report and observability records.
 
 Fresh combined admission also refuses a bundle carrying any chain submission
 row, whatever its kind or state, before a reservation exists

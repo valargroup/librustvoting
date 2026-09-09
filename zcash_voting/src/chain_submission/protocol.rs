@@ -671,7 +671,7 @@ fn unsupported_endpoint(
         200 => has_media_type(response, "text/html"),
         _ => false,
     };
-    if !routed_elsewhere || response.body().len() > MAX_CHAIN_HTTP_RESPONSE_BYTES {
+    if !routed_elsewhere {
         return None;
     }
     let observed = response.content_type().unwrap_or("(absent)");

@@ -3624,24 +3624,13 @@ pub(crate) fn retire_undispatched_votes_outside_roster_with_conn(
             continue;
         }
         match batch_digest {
-            Some(digest) => {
-                for member in load_vote_batch_recoveries_with_conn(
-                    conn,
-                    wallet_id,
-                    round_id,
-                    bundle_index,
-                    digest,
-                )? {
-                    clear_unsubmitted_vote_recovery_with_conn(
-                        conn,
-                        wallet_id,
-                        round_id,
-                        bundle_index,
-                        member.proposal_id,
-                    )?;
-                    cleared.push(member.proposal_id);
-                }
-            }
+            Some(digest) => cleared.extend(clear_vote_batch_recovery_with_conn(
+                conn,
+                wallet_id,
+                round_id,
+                bundle_index,
+                digest,
+            )?),
             None => clear_unsubmitted_vote_recovery_with_conn(
                 conn,
                 wallet_id,
@@ -3655,6 +3644,44 @@ pub(crate) fn retire_undispatched_votes_outside_roster_with_conn(
     Ok(retired)
 }
 
+/// Retires every signed, never-confirmed member of one batch digest in the
+/// caller's transaction, returning the proposals cleared in roster order.
+///
+/// The single owner of the "clear a whole batch" sequence: the ballot-driven
+/// roster retirement and the chain lifecycle's rejection retirement both use
+/// it, so a change to what retiring a batch means cannot apply to only one.
+/// Callers decide whether retiring is allowed; this performs it.
+pub(crate) fn clear_vote_batch_recovery_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    batch_digest: [u8; 32],
+) -> Result<Vec<u32>, VotingError> {
+    let members = load_vote_batch_recoveries_with_conn(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        batch_digest,
+    )?;
+    let mut cleared = Vec::with_capacity(members.len());
+    for member in &members {
+        clear_unsubmitted_vote_recovery_with_conn(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            member.proposal_id,
+        )?;
+        cleared.push(member.proposal_id);
+    }
+    if !cleared.is_empty() {
+        retire_combined_authorization_with_conn(conn, wallet_id, round_id, bundle_index)?;
+    }
+    Ok(cleared)
+}
+
 /// Retires one signed, never-confirmed vote in the caller's transaction.
 ///
 /// Clears the recovery JSON (which the generation-change triggers turn into
@@ -3665,7 +3692,7 @@ pub(crate) fn retire_undispatched_votes_outside_roster_with_conn(
 /// This is the lifecycle's retirement primitive and deliberately does not
 /// consult `vote_recovery_is_lifecycle_owned`: the chain lifecycle calls it
 /// when it has itself decided that the generation is terminal.
-pub(crate) fn clear_unsubmitted_vote_recovery_with_conn(
+fn clear_unsubmitted_vote_recovery_with_conn(
     conn: &rusqlite::Connection,
     wallet_id: &str,
     round_id: &str,
@@ -3692,9 +3719,12 @@ pub(crate) fn clear_unsubmitted_vote_recovery_with_conn(
             message: format!("clear stale vote recovery failed: {e}"),
         })?;
     if updated != 1 {
+        // Either the vote reached the chain between the caller's decision and
+        // this write, or another writer cleared it first. Both mean the
+        // caller's premise is stale, so it must roll back rather than proceed.
         return Err(VotingError::InvalidInput {
             message: format!(
-                "vote recovery changed while updating ballot intent for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+                "vote recovery changed before it could be retired for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
             ),
         });
     }
@@ -3714,8 +3744,22 @@ pub(crate) fn clear_unsubmitted_vote_recovery_with_conn(
     .map_err(|e| VotingError::Internal {
         message: format!("clear stale vote shares failed: {e}"),
     })?;
-    // A combined authorization survives exactly as long as its signed members.
-    // Clear it only after the final member is retired, in the caller's transaction.
+    Ok(())
+}
+
+/// Drops a bundle's combined authorization once no signed combined member of
+/// it remains.
+///
+/// Run once per batch rather than once per member: the guard scans every
+/// still-signed recovery blob on the bundle, and can only succeed after the
+/// final member is cleared, so per-member evaluation is quadratic work whose
+/// every early pass is known to do nothing.
+fn retire_combined_authorization_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+) -> Result<(), VotingError> {
     conn.execute(
         "DELETE FROM delegate_cast_recovery AS authorization
          WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3

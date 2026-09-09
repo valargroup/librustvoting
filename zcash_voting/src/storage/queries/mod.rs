@@ -3744,6 +3744,95 @@ pub(crate) fn bundle_planning_rows(
         .map_err(|e| VotingError::from_sqlite("read bundle planning row", &e))
 }
 
+/// One bundle's combined-cast rejection streak.
+pub(crate) struct CombinedRejectionLedgerRow {
+    pub(crate) bundle_index: u32,
+    /// The delegation generation the streak was counted against. A bundle whose
+    /// current generation differs has been rebuilt and is not blocked.
+    pub(crate) delegation_generation_digest: [u8; 32],
+    pub(crate) consecutive_rejections: u32,
+    /// The chain's own last rejection, kept because retirement deletes the
+    /// lifecycle row that would otherwise carry it.
+    pub(crate) diagnostic: crate::ChainSubmissionDiagnostic,
+}
+
+/// Reads every bundle's combined-cast rejection streak for one round.
+pub(crate) fn combined_rejection_ledger_rows(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<CombinedRejectionLedgerRow>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, delegation_generation_digest, consecutive_rejections,
+                    last_diagnostic_kind, last_diagnostic
+             FROM combined_cast_rejections
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+             ORDER BY bundle_index",
+        )
+        .map_err(|e| VotingError::from_sqlite("prepare combined rejection ledger", &e))?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("query combined rejection ledger", &e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::from_sqlite("read combined rejection ledger row", &e))?;
+    rows.into_iter()
+        .map(|(bundle_index, digest, streak, kind, message)| {
+            let delegation_generation_digest: [u8; 32] =
+                digest.try_into().map_err(|_| VotingError::Internal {
+                    message: "combined rejection ledger stores a malformed generation digest"
+                        .to_string(),
+                })?;
+            let diagnostic =
+                crate::phases::stored_submission_diagnostic(Some(kind), Some(message))?
+                    .ok_or_else(|| VotingError::Internal {
+                        message: "combined rejection ledger stores no diagnostic".to_string(),
+                    })?;
+            Ok(CombinedRejectionLedgerRow {
+                bundle_index,
+                delegation_generation_digest,
+                consecutive_rejections: u32::try_from(streak).unwrap_or(u32::MAX),
+                diagnostic,
+            })
+        })
+        .collect()
+}
+
+/// Forgets a bundle's combined-cast rejection streak, returning whether one
+/// was recorded. Callers use this when the streak's premise no longer holds:
+/// the batch confirmed, or the delegation setup it counted against changed.
+pub(crate) fn clear_combined_rejection_ledger(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+) -> Result<bool, VotingError> {
+    let removed = conn
+        .execute(
+            "DELETE FROM combined_cast_rejections
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+            },
+        )
+        .map_err(|e| VotingError::from_sqlite("clear combined rejection ledger", &e))?;
+    Ok(removed > 0)
+}
+
 pub fn get_commitment_bundle(
     conn: &Connection,
     round_id: &str,
@@ -4321,6 +4410,13 @@ fn discard_unbroadcast_delegation_setup_within(
         (
             "discard delegation witnesses",
             format!("DELETE FROM witnesses WHERE {unbroadcast_guard}"),
+        ),
+        // The streak counts rejections of one delegation generation. Discarding
+        // the setup ends that generation, so the count no longer describes
+        // anything and must not block a rebuilt delegation's first cast.
+        (
+            "discard combined cast rejections",
+            format!("DELETE FROM combined_cast_rejections WHERE {unbroadcast_guard}"),
         ),
     ] {
         let mut statement = tx.prepare(&sql).map_err(|e| VotingError::Internal {

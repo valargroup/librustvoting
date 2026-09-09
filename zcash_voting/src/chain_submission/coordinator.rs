@@ -285,6 +285,10 @@ where
 
         let mut ambiguity_seen = is_retryable_dispatch_ambiguity(&reserved);
         let mut unsupported_endpoints = std::collections::BTreeSet::new();
+        // An unsupported endpoint is an immediate answer from a node that will
+        // never serve the route, not congestion, so rotating to the next node
+        // waits for nothing.
+        let mut rotate_without_backoff = false;
         for attempt_index in first_attempt_index..self.policy.maximum_post_attempts {
             let observations = observations
                 .attempt(u32::try_from(attempt_index.saturating_add(1)).unwrap_or(u32::MAX));
@@ -440,6 +444,7 @@ where
                     // protocol failure, not a transport one: the network works,
                     // the node speaks an older protocol.
                     unsupported_endpoints.insert(endpoint_index);
+                    rotate_without_backoff = true;
                     if ambiguity_seen {
                         reserved = self.reconcile_with_durable_state(
                             derived.generation(),
@@ -526,12 +531,13 @@ where
                     }
                 };
             } else {
+                let backoff = if std::mem::take(&mut rotate_without_backoff) {
+                    Duration::ZERO
+                } else {
+                    self.policy.retry_backoffs[attempt_index]
+                };
                 if let Some(reason) = self
-                    .wait_backoff_or_interruption(
-                        self.policy.retry_backoffs[attempt_index],
-                        operation,
-                        control,
-                    )
+                    .wait_backoff_or_interruption(backoff, operation, control)
                     .await
                 {
                     return interrupted_without_state(reason);
@@ -887,10 +893,23 @@ where
                         control,
                     }),
                     LookupProgress::Observed(TransactionStatusObservation::CommittedFailure(_)) => {
-                        if request.is_imported_delegation() {
+                        // Same terminality rule as the `Tracking` arm above: an
+                        // imported delegation has one immutable candidate, and a
+                        // combined batch's candidate is the hash of its one
+                        // signed envelope. A row reaches here rather than
+                        // `Tracking` only because its tracking window expired
+                        // inconclusively first, which changes nothing about
+                        // whose bytes the chain just reported on.
+                        let terminal = request.is_imported_delegation()
+                            || derived.generation().identity().target().is_combined();
+                        if terminal {
                             let diagnostic = ChainSubmissionDiagnostic::from_redacted_message(
                                 ChainSubmissionDiagnosticKind::ChainRejected,
-                                "imported vote-chain transaction committed unsuccessfully",
+                                if request.is_imported_delegation() {
+                                    "imported vote-chain transaction committed unsuccessfully"
+                                } else {
+                                    "combined vote-chain transaction committed unsuccessfully"
+                                },
                             );
                             return self
                                 .reconcile_with_durable_state(

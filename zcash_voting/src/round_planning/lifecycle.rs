@@ -104,6 +104,24 @@ pub(crate) fn delegation_phase_holds_bundle(phase: DelegationPhase) -> bool {
     }
 }
 
+/// Consecutive chain rejections of one bundle's combined batch, counted
+/// against a single delegation generation, after which the wallet stops
+/// planning that cast on its own.
+///
+/// Every blocked-through attempt re-proves every member of the batch and
+/// re-POSTs the identical delegation. The POST retry budget is already spent
+/// inside one invocation, so retrying across runs only helps for a cause that
+/// is transient *between* runs. One extra run covers that; a second identical
+/// refusal is evidence the envelope itself is at fault.
+pub(crate) const MAX_CONSECUTIVE_COMBINED_REJECTIONS: u32 = 2;
+
+/// Whether `streak` consecutive rejections stop the wallet planning a further
+/// combined cast for the bundle. Advisory, not a terminal delegation phase: a
+/// host can clear the streak and the bundle plans again.
+pub(crate) fn combined_rejections_block_bundle(streak: u32) -> bool {
+    streak >= MAX_CONSECUTIVE_COMBINED_REJECTIONS
+}
+
 /// Whether a delegation ended without a confirmation and will never be
 /// planned again; `Confirmed` is a success, not a terminal failure.
 ///

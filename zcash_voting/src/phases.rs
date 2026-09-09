@@ -48,7 +48,7 @@ pub(crate) struct VoteSubmissionStatus {
 ///
 /// Both columns are written together by the lifecycle store, so one without
 /// the other or an unknown kind is corrupt state rather than "no diagnostic".
-fn stored_submission_diagnostic(
+pub(crate) fn stored_submission_diagnostic(
     kind: Option<String>,
     message: Option<String>,
 ) -> Result<Option<ChainSubmissionDiagnostic>, VotingError> {
