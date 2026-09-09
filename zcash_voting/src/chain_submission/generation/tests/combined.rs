@@ -9,6 +9,9 @@ use crate::{chain_submission::*, round::VotingDb, vote::VoteBatchRecovery};
 const ROUND: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+#[path = "combined/recovery_boundaries.rs"]
+mod recovery_boundaries;
+
 fn fixture(count: u32) -> (Arc<VotingDb>, AdvanceVoteBatch) {
     let (db, _, signature) = persisted_delegation();
     let db = Arc::new(db);

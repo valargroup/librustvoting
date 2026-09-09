@@ -191,19 +191,19 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                     ObservationOutcome::Pending
                 }
                 "missing_route" => {
-                    // A router 404 never decoded the body: definitely unsent,
-                    // no durable row, and a protocol failure naming the route.
+                    // A proxy may replace the response after forwarding the
+                    // POST. Plain and reported calls must preserve recovery.
                     assert!(
                         matches!(
                             &result,
-                            Err(failure)
-                                if failure.kind() == crate::ChainSubmissionFailureKind::Protocol
-                                    && failure.strongest_state().is_none()
-                                    && failure.message().contains("does not serve /shielded-vote/v1/cast-vote-batch")
+                            Ok(ChainSubmissionResult::Pending(crate::ChainSubmissionPending::Recovering {
+                                candidate_transaction_hash: None, diagnostic,
+                            })) if diagnostic.kind() == crate::ChainSubmissionDiagnosticKind::EndpointUnsupported
+                                && diagnostic.message().contains("may not serve /shielded-vote/v1/cast-vote-batch")
                         ),
                         "{result:?}"
                     );
-                    ObservationOutcome::Failed
+                    ObservationOutcome::Pending
                 }
                 "cancelled" => {
                     assert!(
@@ -282,8 +282,8 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                 assert!(diagnostics
                     .records
                     .iter()
-                    .any(|r| r.outcome == ObservationOutcome::Failed
-                        && r.error_kind.as_deref() == Some("EndpointUnsupported")));
+                    .any(|r| r.outcome == ObservationOutcome::PossiblyDispatched
+                        && r.error_kind.as_deref() == Some("PossiblyDispatched")));
             }
             let serialized = serde_json::to_string(&diagnostics).unwrap();
             assert!(!serialized.contains("vote.example"));

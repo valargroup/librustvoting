@@ -524,9 +524,9 @@ Other local recovery observations do not transition to `Tracking` or
 `Rejected`. In particular, a rejection, committed-failure candidate,
 cancellation, or empty scan cannot erase ambiguity. A hashless `Recovering` row
 may reserve the next bounded POST directly under status-only advancement when
-its diagnostic came from the possibly-dispatched path, either
-`AmbiguousDispatch` or `InvalidProtocolResponse`; exact-tree advancement
-completes a tree pass first and reaches a POST only through no-match
+its diagnostic came from the possibly-dispatched path:
+`AmbiguousDispatch`, `InvalidProtocolResponse`, or `EndpointUnsupported`;
+exact-tree advancement completes a tree pass first and reaches a POST only through no-match
 authorization. A hashless row created by a definite rejection carries
 `ChainRejected` and never reserves an ambiguous retry. A pending or
 unreadable candidate is never overwritten and blocks another POST until it is
@@ -624,9 +624,9 @@ only when dispatch ambiguity actually preceded it; classification never
 inspects or retains the untrusted response log. Within one invocation the
 coordinator knows whether an earlier attempt was possibly dispatched. Across
 invocations the durable row is the carrier: a `Recovering` row whose stored
-diagnostic kind is `AmbiguousDispatch`, `InvalidProtocolResponse`, or
-`TrackingWindowExpired` carries unresolved dispatch evidence, because each of
-those records a POST that left the wallet and never resolved. A diagnostic of
+diagnostic kind is `AmbiguousDispatch`, `InvalidProtocolResponse`,
+`EndpointUnsupported`, or `TrackingWindowExpired` carries unresolved dispatch
+evidence, because each of those records a POST that left the wallet and never resolved. A diagnostic of
 `ChainRejected` records a definite outcome, a rejected POST or a candidate that
 committed unsuccessfully, which spent nothing; code 2 after such a row is
 handled like any other definite rejection.
@@ -1901,6 +1901,18 @@ planning behavior it drives. The ledger row is cleared when the batch confirms
 and when the delegation setup it counted against is discarded. Beyond it, the
 rejection diagnostic still survives in the run report and observability records.
 
+Rejection timestamps use the lifecycle transition's clamped timestamp. Within
+one delegation generation, `first_rejected_at` remains fixed and
+`last_rejected_at` is the maximum of its stored value and the transition time.
+This also handles a recast whose entire lifetime falls before an earlier
+rejection because the wall clock moved backwards. A different delegation
+generation restarts both timestamps from its own clamped transition time.
+Clock rollback must not prevent atomic retirement or advancing the rejection
+streak. Coverage:
+`combined_rejection_retirement_clamps_clock_rollback_and_advances_the_streak`
+and
+`a_new_delegation_generation_restarts_rejection_timestamps_after_clock_rollback`.
+
 Fresh combined admission also refuses a bundle carrying any chain submission
 row, whatever its kind or state, before a reservation exists
 (`combined_admission_refuses_a_bundle_with_delegation_evidence`), and tree
@@ -1908,27 +1920,31 @@ recovery confirms a combined generation from the same final-VAN-plus-vote-leaves
 layout as an ordinary batch without inventing a hash
 (`exact_recovery_confirms_a_combined_batch_from_the_tree`).
 
-### Unsupported endpoint is definitely unsent
+### Route diagnostics preserve dispatch ambiguity
 
-A node behind a release without the route answers a mutation from outside the
-vote-chain API. Two signals identify that: HTTP 404 or 405, which the router
-emits before any handler runs, and an HTML body with HTTP 200, which is a
-front-end fallback page (production answered exactly that for every batch route
-on 2026-09-08). In both cases the request body was never decoded, so the
-attempt is `EndpointUnsupported`: definitely unsent, never ambiguous. A fresh
-reservation is released, the invocation rotates to the next configured node and
-stops once every node has answered this way, and the caller receives a
-`Protocol` failure whose message names the route
-(`an_html_200_from_a_proxy_is_definitely_unsent_with_endpoint_unsupported`,
-`a_router_404_or_405_is_definitely_unsent_with_endpoint_unsupported`,
-`an_unsupported_endpoint_is_definitely_unsent_and_reported_as_protocol`,
-`an_unsupported_endpoint_rotates_to_the_next_configured_node`). After earlier
-ambiguity the row keeps its ambiguity diagnostic exactly as for a
-definitely-unsent retry. Every other non-JSON or unexpected-status answer,
-including a 200 of any type other than HTML, may have followed a dispatched
-request and stays ambiguous
-(`other_non_json_answers_stay_ambiguous`). There is no fallback to the
-two-transaction flow.
+HTTP 404/405 and HTTP 200 HTML responses can indicate an unsupported mutation
+route, but they do not prove the POST was unsent. A proxy can replace an
+upstream response after forwarding the request to the chain. The SDK therefore
+classifies these responses as `PossiblyDispatched`, with an
+`endpoint_unsupported` diagnostic describing a possible route mismatch. The
+response-size limit still applies. Only reliable pre-dispatch transport evidence
+can establish that a request was definitely unsent.
+
+The existing bounded retry loop, backoff and endpoint rotation apply. Exhausting
+the budget leaves the generation durably hashless `Recovering`. The SDK must
+not delete its reservation, unlock ballot changes, or retire recovery material
+because of these responses. A later rejection does not erase the earlier
+ambiguity, and a later usable hash or exact-tree match can still confirm the
+same generation. There is no fallback to separate delegation and cast POSTs.
+
+Regression coverage:
+`an_html_200_from_a_proxy_preserves_dispatch_ambiguity`,
+`a_404_or_405_response_preserves_dispatch_ambiguity`,
+`an_oversized_fallback_page_preserves_dispatch_ambiguity_and_size_validation`,
+`a_fallback_response_keeps_the_generation_recoverable`,
+`a_fallback_response_retries_the_same_generation_at_the_next_endpoint`,
+`replaced_post_response_keeps_combined_recovery_and_ballot_locked`, and
+`rejection_after_replaced_post_response_cannot_retire_combined_recovery`.
 
 The crash harness follows the fresh combined order: delegation proof, terminal
 ballot, delegation signing, cast proofs, combined persistence, helper planning,

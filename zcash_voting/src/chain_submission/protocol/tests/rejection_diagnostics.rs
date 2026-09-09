@@ -1,5 +1,4 @@
-//! How a deterministic chain rejection, and an answer that never reached the
-//! chain at all, become a durable diagnostic.
+//! Diagnostics distinguish chain rejection from an inconclusive POST response.
 
 use super::*;
 
@@ -87,8 +86,7 @@ async fn a_non_json_response_reports_its_type_and_body() {
     let transport = Arc::new(ScriptedTransport::default());
     // What a proxy error page looks like: the gateway itself always answers
     // in JSON, so this is the case where knowing the body is the whole
-    // diagnosis. (A router 404 or 405 is the separate, definitely-unsent
-    // `EndpointUnsupported` case.)
+    // diagnosis. A 404 or 405 is equally inconclusive after dispatch.
     transport.queue(Ok(ChainHttpResponse::new(
         502,
         b"502 bad gateway".to_vec(),
@@ -154,12 +152,12 @@ async fn nullifier_spent_is_classified_only_by_numeric_code() {
 }
 
 #[tokio::test]
-async fn an_html_200_from_a_proxy_is_definitely_unsent_with_endpoint_unsupported() {
+async fn an_html_200_from_a_proxy_preserves_dispatch_ambiguity() {
     let transport = Arc::new(ScriptedTransport::default());
     // What production answered on 2026-09-08 for a route its vote-sdk did not
     // yet serve: the explorer's single-page fallback, HTTP 200 and HTML. The
-    // gateway never writes HTML, so the body was never decoded and nothing
-    // was dispatched.
+    // gateway never writes HTML, but a proxy can also replace a response
+    // after forwarding the POST. This is no proof of non-dispatch.
     transport.queue(Ok(ChainHttpResponse::new(
         200,
         b"<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />".to_vec(),
@@ -168,10 +166,10 @@ async fn an_html_200_from_a_proxy_is_definitely_unsent_with_endpoint_unsupported
     )));
     let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
 
-    let PostAttemptOutcome::EndpointUnsupported(diagnostic) =
+    let PostAttemptOutcome::PossiblyDispatched(diagnostic) =
         client.submit_delegation(0, &delegation()).await
     else {
-        panic!("a fallback page proves the route was never reached");
+        panic!("a fallback page cannot prove the route was never reached");
     };
     assert_eq!(
         diagnostic.kind(),
@@ -180,7 +178,7 @@ async fn an_html_200_from_a_proxy_is_definitely_unsent_with_endpoint_unsupported
     assert!(
         diagnostic
             .message()
-            .contains("does not serve /shielded-vote/v1/delegate-vote"),
+            .contains("may not serve /shielded-vote/v1/delegate-vote"),
         "{}",
         diagnostic.message()
     );
@@ -192,12 +190,8 @@ async fn an_html_200_from_a_proxy_is_definitely_unsent_with_endpoint_unsupported
 }
 
 #[tokio::test]
-async fn an_oversized_fallback_page_is_still_definitely_unsent() {
-    // What makes an answer definitely unsent is its status and content type:
-    // a router 404 fired before any handler, and the gateway never writes
-    // HTML. How long the page is says nothing about whether the request was
-    // decoded, so the size limit that bounds a JSON body must not turn these
-    // into ambiguous dispatch and strand a reservation the chain never saw.
+async fn an_oversized_fallback_page_preserves_dispatch_ambiguity_and_size_validation() {
+    // A fallback page cannot bypass the response limit or release recovery.
     let oversized = vec![b'x'; MAX_CHAIN_HTTP_RESPONSE_BYTES + 1];
     for (status, content_type) in [
         (200, "text/html; charset=utf-8"),
@@ -216,18 +210,19 @@ async fn an_oversized_fallback_page_is_still_definitely_unsent() {
         assert!(
             matches!(
                 client.submit_delegation(0, &delegation()).await,
-                PostAttemptOutcome::EndpointUnsupported(_)
+                PostAttemptOutcome::PossiblyDispatched(ref diagnostic)
+                    if diagnostic.kind() == ChainSubmissionDiagnosticKind::InvalidProtocolResponse
+                        && diagnostic.message().contains("byte limit")
             ),
-            "an oversized {status} {content_type} answer is definitely unsent"
+            "an oversized {status} {content_type} answer must preserve ambiguity"
         );
     }
 }
 
 #[tokio::test]
-async fn a_router_404_or_405_is_definitely_unsent_with_endpoint_unsupported() {
-    // gorilla mux answers before any handler runs: 404 for an unknown path,
-    // 405 for a known path with the wrong method. JSON or not, no handler
-    // decoded the request.
+async fn a_404_or_405_response_preserves_dispatch_ambiguity() {
+    // The status alone cannot identify whether a router rejected the request
+    // before dispatch or a proxy replaced the answer after forwarding it.
     for (status, body, content_type) in [
         (
             404,
@@ -253,7 +248,7 @@ async fn a_router_404_or_405_is_definitely_unsent_with_endpoint_unsupported() {
         assert!(
             matches!(
                 outcome,
-                PostAttemptOutcome::EndpointUnsupported(ref diagnostic)
+                PostAttemptOutcome::PossiblyDispatched(ref diagnostic)
                     if diagnostic.message().contains(&format!("HTTP {status}"))
             ),
             "status {status}: {outcome:?}"
@@ -264,8 +259,7 @@ async fn a_router_404_or_405_is_definitely_unsent_with_endpoint_unsupported() {
 #[tokio::test]
 async fn other_non_json_answers_stay_ambiguous() {
     // A proxy error page or challenge after the request may have been
-    // forwarded is still unknown dispatch, not proof the route is missing;
-    // so is a 200 of any type other than HTML.
+    // forwarded is still unknown dispatch, not proof the route is missing.
     for (status, content_type) in [
         (403, "text/html"),
         (500, "text/html"),

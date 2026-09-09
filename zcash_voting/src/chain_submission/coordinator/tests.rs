@@ -2141,11 +2141,9 @@ fn explorer_fallback_page() -> ChainHttpResponse {
 }
 
 #[tokio::test]
-async fn an_unsupported_endpoint_is_definitely_unsent_and_reported_as_protocol() {
-    // The only configured node answers from outside the API. Nothing was
-    // dispatched, so the fresh reservation is released and no retry is spent
-    // on an answer that cannot change. A later pass against an upgraded node
-    // submits the same generation afresh.
+async fn a_fallback_response_keeps_the_generation_recoverable() {
+    // An HTML page can replace a response after dispatch. Exhausting one
+    // attempt must preserve recovery; a later pass retries the same generation.
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived(identity.clone(), 1));
@@ -2158,24 +2156,22 @@ async fn an_unsupported_endpoint_is_definitely_unsent_and_reported_as_protocol()
         10,
     );
 
-    let failure = coordinator
+    let outcome = coordinator
         .advance(
             StoreAdvancementRequest::vote(identity.clone()),
             &ManualControl::default(),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Protocol);
-    assert!(failure.strongest_state().is_none());
     assert!(
-        failure
-            .message()
-            .contains("does not serve /shielded-vote/v1/cast-vote"),
-        "{}",
-        failure.message()
+        matches!(outcome, ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+        candidate_transaction_hash: None, ref diagnostic,
+    }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::EndpointUnsupported)
     );
-    assert!(store.record(&identity).is_none());
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+    assert_eq!(record.committed_post_reservations(), 1);
     assert_eq!(transport.methods(), vec!["POST"], "no retry, no poll");
 
     let upgraded = Arc::new(ScriptedTransport::default());
@@ -2192,10 +2188,17 @@ async fn an_unsupported_endpoint_is_definitely_unsent_and_reported_as_protocol()
         store.record(&identity).unwrap().state(),
         SubmissionRecordState::Tracking { .. }
     ));
+    assert_eq!(
+        store
+            .record(&identity)
+            .unwrap()
+            .committed_post_reservations(),
+        2
+    );
 }
 
 #[tokio::test]
-async fn an_unsupported_endpoint_rotates_to_the_next_configured_node() {
+async fn a_fallback_response_retries_the_same_generation_at_the_next_endpoint() {
     // Two nodes, the first behind an old release. The attempt budget rotates
     // to the second node, which accepts; the first is not asked again.
     let identity = identity(1, 0);

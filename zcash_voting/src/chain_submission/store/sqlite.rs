@@ -893,7 +893,12 @@ impl SqliteChainSubmissionStore {
                 let diagnostic = record.diagnostic().cloned().ok_or_else(|| {
                     transition_failure(previous, "a rejected row carries its diagnostic")
                 })?;
-                retire_rejected_combined_generation(tx, generation.identity(), &diagnostic, now)
+                retire_rejected_combined_generation(
+                    tx,
+                    generation.identity(),
+                    &diagnostic,
+                    record.updated_at(),
+                )
                     .map_err(map_generation_error)?;
                 tx.execute(
                     "DELETE FROM chain_submissions WHERE identity_key=?1",

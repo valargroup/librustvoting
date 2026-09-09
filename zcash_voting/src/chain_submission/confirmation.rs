@@ -458,7 +458,8 @@ pub(super) fn retire_rejected_combined_generation(
 }
 
 /// Adds one rejection to the bundle's streak, restarting it at one whenever the
-/// delegation generation differs from the one already recorded.
+/// delegation generation differs from the one already recorded. Within one
+/// generation, rejection timestamps never move backwards with the wall clock.
 fn record_combined_rejection(
     conn: &rusqlite::Transaction<'_>,
     identity: &super::ChainSubmissionIdentity,
@@ -488,7 +489,11 @@ fn record_combined_rejection(
                       = excluded.delegation_generation_digest
                  THEN combined_cast_rejections.first_rejected_at
                  ELSE excluded.first_rejected_at END,
-             last_rejected_at = excluded.last_rejected_at",
+             last_rejected_at = CASE
+                 WHEN combined_cast_rejections.delegation_generation_digest
+                      = excluded.delegation_generation_digest
+                 THEN MAX(combined_cast_rejections.last_rejected_at, excluded.last_rejected_at)
+                 ELSE excluded.last_rejected_at END",
         rusqlite::params![
             round_id,
             identity.wallet_id(),

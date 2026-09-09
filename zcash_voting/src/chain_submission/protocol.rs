@@ -85,9 +85,6 @@ pub(super) enum PostAttemptOutcome {
     },
     LocalFailure(ChainSubmissionDiagnostic),
     DefinitelyUnsent(ChainTransportError),
-    /// The node answered from outside the vote-chain API, so it does not
-    /// serve this route. Nothing decoded the body, so nothing was dispatched.
-    EndpointUnsupported(ChainSubmissionDiagnostic),
     PossiblyDispatched(ChainSubmissionDiagnostic),
 }
 
@@ -391,10 +388,6 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             PostAttemptOutcome::DefinitelyUnsent(_) => {
                 (crate::ObservationOutcome::Failed, Some("DefinitelyUnsent"))
             }
-            PostAttemptOutcome::EndpointUnsupported(_) => (
-                crate::ObservationOutcome::Failed,
-                Some("EndpointUnsupported"),
-            ),
             PostAttemptOutcome::LocalFailure(_) => {
                 (crate::ObservationOutcome::Failed, Some("Protocol"))
             }
@@ -510,8 +503,8 @@ fn parse_post_response(
     endpoint: &str,
     expected_batch_digest: Option<[u8; 32]>,
 ) -> PostAttemptOutcome {
-    if let Some(diagnostic) = unsupported_endpoint(&response, endpoint) {
-        return PostAttemptOutcome::EndpointUnsupported(diagnostic);
+    if let Some(diagnostic) = endpoint_routing_diagnostic(&response, endpoint) {
+        return PostAttemptOutcome::PossiblyDispatched(diagnostic);
     }
     if let Err(diagnostic) = validate_json_response(&response) {
         return PostAttemptOutcome::PossiblyDispatched(diagnostic);
@@ -648,39 +641,35 @@ fn parse_status_response(
     }
 }
 
-/// Recognizes a mutation answer that never reached the vote-chain API.
+/// Explains a possible route mismatch without claiming the POST was unsent.
 ///
-/// The gateway writes `application/json` on every response it produces,
-/// including its errors, and never answers a mounted mutation route with 404
-/// or 405. Those two statuses therefore come from the router before any
-/// handler ran, and an HTML body with status 200 comes from whatever sits in
-/// front of the node — in production the explorer's single-page fallback,
-/// which answers every unknown path with HTTP 200 and `text/html`. In each
-/// case the request body was never decoded, so the attempt is definitely
-/// unsent rather than ambiguous, and no retry against the same node can change
-/// the answer. Every other non-JSON or unexpected-status answer (a proxy 502,
-/// a challenge page, a panic, a 200 of any other type) may have followed a
-/// dispatched request and stays ambiguous.
-fn unsupported_endpoint(
+/// An old gateway or frontend may answer an unknown route with 404, 405, or
+/// HTML. A forwarding proxy can also replace the response after the POST
+/// reached the chain, so these answers must preserve dispatch ambiguity.
+/// Oversized responses go through the ordinary response-limit diagnostic.
+fn endpoint_routing_diagnostic(
     response: &ChainHttpResponse,
     endpoint: &str,
 ) -> Option<ChainSubmissionDiagnostic> {
+    if response.body().len() > MAX_CHAIN_HTTP_RESPONSE_BYTES {
+        return None;
+    }
     let status = response.status();
-    let routed_elsewhere = match status {
+    let possible_route_mismatch = match status {
         404 | 405 => true,
         200 => has_media_type(response, "text/html"),
         _ => false,
     };
-    if !routed_elsewhere {
+    if !possible_route_mismatch {
         return None;
     }
     let observed = response.content_type().unwrap_or("(absent)");
     Some(ChainSubmissionDiagnostic::from_redacted_message(
         ChainSubmissionDiagnosticKind::EndpointUnsupported,
         format!(
-            "vote-chain endpoint unsupported: this node does not serve /{}/{endpoint} \
-             (HTTP {status}, Content-Type {observed}); it needs a vote-sdk release that \
-             includes the route",
+            "vote-chain endpoint may not serve /{}/{endpoint} \
+             (HTTP {status}, Content-Type {observed}); the POST may have reached the chain; \
+             check the gateway route and vote-sdk release",
             API_PREFIX.join("/")
         ),
     ))

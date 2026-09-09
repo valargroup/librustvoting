@@ -50,9 +50,9 @@ pub enum ChainSubmissionDiagnosticKind {
     ReconciliationPending,
     InvalidProtocolResponse,
     StorageFailure,
-    /// The node answered a mutation from outside the vote-chain API (a
-    /// router 404/405 or a proxy's fallback page), so it does not serve the
-    /// requested route. Nothing decoded the request, so nothing was dispatched.
+    /// A mutation response suggests an unsupported route (HTTP 404/405 or an
+    /// HTML fallback). A proxy may have replaced a response after forwarding
+    /// the POST, so this diagnostic does not establish non-dispatch.
     EndpointUnsupported,
 }
 

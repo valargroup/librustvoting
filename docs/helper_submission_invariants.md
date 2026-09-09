@@ -1917,3 +1917,12 @@ re-deliver helper shares on every run. This changes only how often a recast is
 planned; every share the recast does plan follows the timeout, placement,
 ambiguous-POST and durable delivery rules unchanged.
 `docs/round_orchestration_invariants.md` is the source of truth for the cap.
+
+A replaced chain POST response (including HTML 200 or HTTP 404/405) is not a
+definite rejection. It preserves the combined generation and its recovery
+material; a later rejection cannot erase that dispatch ambiguity. This keeps
+helper delivery recoverable if the envelope already reached the chain.
+`replaced_post_response_keeps_combined_recovery_and_ballot_locked` and
+`rejection_after_replaced_post_response_cannot_retire_combined_recovery` cover
+that boundary. The chain-submission specification owns the response
+classification and retry rules.

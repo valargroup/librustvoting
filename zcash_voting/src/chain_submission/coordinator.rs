@@ -284,11 +284,6 @@ where
         let observations = control.observations();
 
         let mut ambiguity_seen = is_retryable_dispatch_ambiguity(&reserved);
-        let mut unsupported_endpoints = std::collections::BTreeSet::new();
-        // An unsupported endpoint is an immediate answer from a node that will
-        // never serve the route, not congestion, so rotating to the next node
-        // waits for nothing.
-        let mut rotate_without_backoff = false;
         for attempt_index in first_attempt_index..self.policy.maximum_post_attempts {
             let observations = observations
                 .attempt(u32::try_from(attempt_index.saturating_add(1)).unwrap_or(u32::MAX));
@@ -432,50 +427,6 @@ where
                         diagnostic.message(),
                     ));
                 }
-                PostAttemptOutcome::EndpointUnsupported(diagnostic) => {
-                    // The node answered from outside the vote-chain API, so
-                    // nothing decoded the body and nothing was dispatched: the
-                    // fresh reservation is released exactly as for a
-                    // definitely-unsent attempt. Another configured node may
-                    // still serve the route, so the remaining attempts rotate
-                    // on; once every node has answered this way, or the budget
-                    // is spent, the invocation stops instead of backing off
-                    // against an answer that cannot change. The failure is a
-                    // protocol failure, not a transport one: the network works,
-                    // the node speaks an older protocol.
-                    unsupported_endpoints.insert(endpoint_index);
-                    rotate_without_backoff = true;
-                    if ambiguity_seen {
-                        reserved = self.reconcile_with_durable_state(
-                            derived.generation(),
-                            SubmissionObservation::DefinitelyUnsent,
-                            Some(ChainSubmissionDiagnostic::from_redacted_message(
-                                ChainSubmissionDiagnosticKind::ReconciliationPending,
-                                diagnostic.message(),
-                            )),
-                            ChainSubmissionState::Recovering,
-                        )?;
-                    } else {
-                        self.remove_fresh_reservation(derived.generation())?;
-                    }
-                    let every_node_refused =
-                        unsupported_endpoints.len() >= self.protocol.endpoint_count();
-                    if every_node_refused || attempt_index + 1 == self.policy.maximum_post_attempts
-                    {
-                        return Err(if ambiguity_seen {
-                            ChainSubmissionFailure::with_durable_state(
-                                ChainSubmissionFailureKind::Protocol,
-                                ChainSubmissionState::Recovering,
-                                diagnostic.message(),
-                            )
-                        } else {
-                            ChainSubmissionFailure::without_state(
-                                ChainSubmissionFailureKind::Protocol,
-                                diagnostic.message(),
-                            )
-                        });
-                    }
-                }
                 PostAttemptOutcome::DefinitelyUnsent(error) => {
                     if ambiguity_seen {
                         reserved = self.reconcile_with_durable_state(
@@ -531,13 +482,12 @@ where
                     }
                 };
             } else {
-                let backoff = if std::mem::take(&mut rotate_without_backoff) {
-                    Duration::ZERO
-                } else {
-                    self.policy.retry_backoffs[attempt_index]
-                };
                 if let Some(reason) = self
-                    .wait_backoff_or_interruption(backoff, operation, control)
+                    .wait_backoff_or_interruption(
+                        self.policy.retry_backoffs[attempt_index],
+                        operation,
+                        control,
+                    )
                     .await
                 {
                     return interrupted_without_state(reason);
@@ -1384,26 +1334,6 @@ where
                     ChainSubmissionFailureKind::Transport,
                     ChainSubmissionState::Recovering,
                     error.message(),
-                ));
-            }
-            // The retry never left the node's front door, so the row keeps
-            // its earlier dispatch ambiguity untouched; the answer is reported
-            // as a protocol failure because no node in rotation serves the
-            // route this generation needs.
-            PostAttemptOutcome::EndpointUnsupported(diagnostic) => {
-                self.reconcile_with_durable_state(
-                    derived.generation(),
-                    SubmissionObservation::DefinitelyUnsent,
-                    Some(ChainSubmissionDiagnostic::from_redacted_message(
-                        ChainSubmissionDiagnosticKind::ReconciliationPending,
-                        diagnostic.message(),
-                    )),
-                    ChainSubmissionState::Recovering,
-                )?;
-                return Err(ChainSubmissionFailure::with_durable_state(
-                    ChainSubmissionFailureKind::Protocol,
-                    ChainSubmissionState::Recovering,
-                    diagnostic.message(),
                 ));
             }
             PostAttemptOutcome::LocalFailure(diagnostic) => {
