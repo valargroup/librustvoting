@@ -10,6 +10,10 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Raise the continuous helper queue to 32 process-wide active share deliveries,
+  retaining the independent 128 initial-POST ceiling and existing placement,
+  timeout, cancellation, and recovery behavior.
+
 - Helper diagnostics distinguish queue residence, active delivery, permit/lock
   waits, parsed acceptance, durable acceptance, confirmation quorum and persistence,
   and tracking cadence. Configured endpoint ordinals survive health reordering

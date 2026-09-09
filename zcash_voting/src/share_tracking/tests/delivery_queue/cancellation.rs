@@ -37,25 +37,27 @@ async fn cancellation_and_epoch_changes_drain_live_posts_and_release_capacity() 
         });
         let cancel = || control.is_cancelled() || control.operation_epoch() != entry_epoch;
         let interrupt = async {
-            transport.wait_for(16).await;
+            transport.wait_for(32).await;
             if change_epoch {
                 control.set_operation_epoch(entry_epoch + 1);
             } else {
                 control.cancel();
             }
-            gate.add_permits(16);
+            gate.add_permits(32);
         };
         let (reports, ()) = tokio::join!(fixture.deliver(transport.clone(), &cancel), interrupt);
-        assert_eq!(transport.count(), 16);
+        assert_eq!(transport.count(), 32);
         assert_eq!(transport.active.load(Ordering::SeqCst), 0);
         let mut reports = reports.into_iter();
-        let first = reports.next().unwrap().unwrap();
-        assert!(first.cancelled);
-        assert_eq!(first.deliveries.len(), 16);
-        assert!(first
-            .deliveries
-            .iter()
-            .all(|share| share.submission.accepted_urls.len() == 1));
+        for _ in 0..2 {
+            let first = reports.next().unwrap().unwrap();
+            assert!(first.cancelled);
+            assert_eq!(first.deliveries.len(), 16);
+            assert!(first
+                .deliveries
+                .iter()
+                .all(|share| share.submission.accepted_urls.len() == 1));
+        }
         for report in reports {
             let report = report.unwrap();
             assert!(report.cancelled);
@@ -64,7 +66,7 @@ async fn cancellation_and_epoch_changes_drain_live_posts_and_release_capacity() 
         // A subsequent pass obtains all slots and only sends the unsent work.
         let resumed = ScriptedTransport::new(|_| ReplyPlan::default());
         assert_complete(fixture.deliver(resumed.clone(), &uncancelled).await, 3);
-        assert_eq!(resumed.count(), SHARE_COUNT * 2);
+        assert_eq!(resumed.count(), SHARE_COUNT);
     }
 }
 

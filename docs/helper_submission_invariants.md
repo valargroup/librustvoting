@@ -839,6 +839,7 @@ report invalid or unfinished entries as not ready.
 | Concurrent status GETs per share | 4 (from `SHARE_STATUS_MAX_CONCURRENT_POLLS`) | `poll_share_helpers` |
 | Total status quorum search for one share | 10 seconds (from `SHARE_STATUS_POLL_BUDGET_MILLISECONDS`) | `poll_share_helpers` |
 | One helper POST | 30 seconds | `HelperClient` |
+| Active initial share workflows across the process | 32 | shared `vote/share_delivery` queue |
 | Concurrent initial POSTs across the process | 128 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `ConfirmedVote::submit_prepared_shares` |
 | Total initial fan-out per share | 60 seconds | committed share delivery |
 | Minimum budget to start an initial POST | 1 second | committed share delivery |
@@ -1025,7 +1026,7 @@ of completion timing. Unprocessed and failed shares remain pending; completed
 shares retain their durable acceptance or ambiguity. Existing public singleton
 submission APIs and report shapes are unchanged.
 
-Up to 16 share tasks across all wallets and committed votes in the process may
+Up to 32 share tasks across all wallets and committed votes in the process may
 hold a delivery permit at once. Separately, a process-wide semaphore limits
 initial POST operations across those tasks to 128. Waiting for a POST permit
 observes cancellation every 50 milliseconds and stops when one second or less
@@ -1172,14 +1173,14 @@ are `stale_handle_cannot_prepare_same_commitment_replacement`,
 `planning_rejects_incomplete_duplicate_and_omitting_rosters_before_persistence`,
 `later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan`,
 `delayed_immediate_plan_is_rejected_before_network`, and
-`share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`.
+`share_task_ceiling_is_thirty_two_and_queued_cancellation_returns_pending_shares`.
 These replace the former wallet-example planner and per-share delivery tests.
 
 Cross-proposal queue regressions live in
 `share_tracking/tests/delivery_queue/`:
 
 - `completed_slots_refill_across_three_proposals_without_a_barrier` and
-  `batch_and_singleton_calls_share_the_process_wide_sixteen_slots` pin refill
+  `batch_and_singleton_calls_share_the_process_wide_thirty_two_slots` pin refill
   and shared admission;
 - `thirty_seven_proposals_finish_faster_with_identical_durable_results`
   compares the production queue to sequential singleton calls under identical
@@ -1555,7 +1556,7 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
 `cancelled_pass_reports_cancellation_and_keeps_durable_effects`,
 `cancellation_aborts_initial_wait_for_live_share_operation`,
 `cancellation_aborts_wait_for_live_share_operation`,
-`share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`,
+`share_task_ceiling_is_thirty_two_and_queued_cancellation_returns_pending_shares`,
 `cancellation_before_request_is_not_scored`,
 `late_cancellation_does_not_replace_final_failed_poll`, and
 `late_cancellation_does_not_replace_final_failed_resubmission`.
@@ -1864,6 +1865,9 @@ is covered by `queued_delivery_rejects_a_deleted_round_before_posting`,
 `queued_delivery_leaves_a_replacement_generation_untouched`,
 `queued_delivery_requires_its_attempt_reservation`, and
 `queued_delivery_does_not_validate_against_a_different_wallet`.
+`thirty_two_share_workflows_never_exceed_the_128_post_ceiling` additionally
+saturates 32 workflows across two commitments and a 20-helper fleet, checking
+that all 320 accepted placements retain the separate 128-POST ceiling.
 These are enforced behavior, not host integration metadata.
 
 `SHARE_STATUS_MAX_CONCURRENT_POLLS` and

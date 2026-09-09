@@ -3,7 +3,7 @@ use tokio::sync::Semaphore;
 
 #[tokio::test(start_paused = true)]
 async fn queued_replaced_generation_is_not_posted_or_mutated() {
-    let fixture = Fixture::new(2);
+    let fixture = Fixture::new(3);
     let gate = Arc::new(Semaphore::new(0));
     let transport = ScriptedTransport::new({
         let gate = gate.clone();
@@ -13,26 +13,26 @@ async fn queued_replaced_generation_is_not_posted_or_mutated() {
         }
     });
     let replace = async {
-        transport.wait_for(16).await;
+        transport.wait_for(32).await;
         fixture.db.conn().execute(
-            "UPDATE votes SET commitment_bundle_json = replace(commitment_bundle_json, '\"anchor_height\":123', '\"anchor_height\":124') WHERE proposal_id = 2", []
+            "UPDATE votes SET commitment_bundle_json = replace(commitment_bundle_json, '\"anchor_height\":123', '\"anchor_height\":124') WHERE proposal_id = 3", []
         ).unwrap();
-        gate.add_permits(SHARE_COUNT * 2);
+        gate.add_permits(SHARE_COUNT * 3);
     };
     let (mut reports, ()) = tokio::join!(fixture.deliver(transport.clone(), &uncancelled), replace);
-    assert_complete(vec![reports.remove(0)], 1);
+    assert_complete(reports.drain(..2).collect(), 2);
     let failed = reports.remove(0).unwrap_err().partial.unwrap();
     assert_eq!(failed.pending_share_indices.len(), SHARE_COUNT);
-    assert_eq!(transport.count(), SHARE_COUNT);
+    assert_eq!(transport.count(), SHARE_COUNT * 2);
     assert!(share::list(&fixture.db, ROUND_ID)
         .unwrap()
         .iter()
-        .all(|share| share.proposal_id == 1));
+        .all(|share| share.proposal_id <= 2));
 }
 
 #[tokio::test(start_paused = true)]
 async fn queued_work_retains_its_wallet_even_after_active_wallet_switches() {
-    let fixture = Fixture::new(2);
+    let fixture = Fixture::new(3);
     let wallet = fixture.db.wallet_id();
     let gate = Arc::new(Semaphore::new(0));
     let transport = ScriptedTransport::new({
@@ -43,26 +43,26 @@ async fn queued_work_retains_its_wallet_even_after_active_wallet_switches() {
         }
     });
     let switch = async {
-        transport.wait_for(16).await;
+        transport.wait_for(32).await;
         fixture.db.set_wallet_id("other-wallet");
         seed_round_and_bundle(&fixture.db);
-        gate.add_permits(SHARE_COUNT * 2);
+        gate.add_permits(SHARE_COUNT * 3);
     };
     let (reports, ()) = tokio::join!(fixture.deliver(transport.clone(), &uncancelled), switch);
-    assert_complete(reports, 2);
+    assert_complete(reports, 3);
     assert!(share::list(&fixture.db, ROUND_ID).unwrap().is_empty());
     fixture.db.set_wallet_id(&wallet);
     assert_eq!(
         share::list(&fixture.db, ROUND_ID).unwrap().len(),
-        SHARE_COUNT * 2
+        SHARE_COUNT * 3
     );
 }
 
 #[tokio::test(start_paused = true)]
 async fn waiting_in_queue_does_not_spend_the_next_shares_fanout_budget() {
-    let fixture = Fixture::new(3);
+    let fixture = Fixture::new(5);
     let transport = ScriptedTransport::new(|wire| ReplyPlan {
-        delay: if wire.proposal_id <= 2 {
+        delay: if wire.proposal_id <= 4 {
             Duration::from_secs(31)
         } else {
             Duration::ZERO
@@ -71,10 +71,10 @@ async fn waiting_in_queue_does_not_spend_the_next_shares_fanout_budget() {
     });
     let start = tokio::time::Instant::now();
     let reports = fixture.deliver(transport.clone(), &uncancelled).await;
-    // Each of the first two proposals consumes the 30-second request timeout.
+    // Two waves of 32 shares consume the 30-second request timeout each.
     assert!(start.elapsed() >= Duration::from_secs(60));
-    assert_eq!(transport.count(), SHARE_COUNT * 3);
-    assert!(reports[2]
+    assert_eq!(transport.count(), SHARE_COUNT * 5);
+    assert!(reports[4]
         .as_ref()
         .unwrap()
         .deliveries
@@ -107,7 +107,7 @@ async fn reopened_database_reuses_plans_and_only_delivers_unsent_proposals() {
     let transport = ScriptedTransport::new({
         let gate = gate.clone();
         move |wire| ReplyPlan {
-            gate: (wire.proposal_id == 2).then(|| gate.clone()),
+            gate: (wire.proposal_id <= 2).then(|| gate.clone()),
             status: if wire.proposal_id == 2 { 503 } else { 200 },
             ..Default::default()
         }
@@ -117,7 +117,7 @@ async fn reopened_database_reuses_plans_and_only_delivers_unsent_proposals() {
     let interrupt = async {
         transport.wait_for(SHARE_COUNT * 2).await;
         cancelled.store(true, Ordering::SeqCst);
-        gate.add_permits(SHARE_COUNT);
+        gate.add_permits(SHARE_COUNT * 2);
     };
     let (reports, ()) = tokio::join!(fixture.deliver(transport.clone(), &cancel), interrupt);
     assert_eq!(transport.count(), SHARE_COUNT * 2);

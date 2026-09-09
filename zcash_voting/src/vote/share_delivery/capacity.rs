@@ -5,7 +5,7 @@ use std::{sync::LazyLock, time::Duration};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// Active share workflows, independently of the lower-level 128-POST ceiling.
-pub(super) const MAX_CONCURRENT_SHARE_DELIVERIES: usize = 16;
+pub(super) const MAX_CONCURRENT_SHARE_DELIVERIES: usize = 32;
 static DELIVERY_PERMITS: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_SHARE_DELIVERIES));
 

@@ -18,7 +18,7 @@ async fn queue_residence_precedes_admission_and_active_delivery_includes_journal
     let client =
         HelperClient::new(transport.clone(), HelperHealth::default()).observing(invocation.scope());
     let release = async {
-        transport.wait_for(16).await;
+        transport.wait_for(32).await;
         gate.add_permits(4 * SHARE_COUNT);
     };
     let mut on_report = |_: &crate::vote::CommittedVote, _: &ShareBatchDeliveryReport| {};
