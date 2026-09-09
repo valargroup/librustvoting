@@ -990,6 +990,89 @@ async fn consecutive_combined_rejections_accumulate_against_one_delegation_gener
     );
 }
 
+/// Rejects `request` once through a scripted transport.
+async fn reject_combined_once(db: &Arc<VotingDb>, request: &AdvanceVoteBatch) {
+    let transport = Arc::new(ScriptedPosts {
+        inner: Transport {
+            request: request.clone(),
+            calls: Mutex::new(Vec::new()),
+        },
+        posts: Mutex::new(vec![rejection(7, request)]),
+    });
+    client_over(db, transport)
+        .advance_delegate_and_vote_batch(
+            request.clone(),
+            ChainRecoveryMode::StatusOnly,
+            &ChainSubmissionControl::new(1),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn changing_the_ballot_lifts_a_block_the_delegation_did_not_cause() {
+    // The streak is counted against the delegation generation, which a ballot
+    // edit leaves untouched. Nothing else would ever lift a block whose cause
+    // was a vote member: re-proving reuses the same delegation, and the
+    // retirement that deletes every other durable trace keeps the vote rows,
+    // so the discard's own cleanup cannot reach the row either.
+    let (db, request) = fixture(2);
+    // Captured before the first rejection, which retires the recovery row it
+    // is read from.
+    let signature = stored_signature(&db);
+    db.set_ballot_intent(ROUND, 1, crate::session::Decision::Choice(2), 3)
+        .unwrap();
+
+    reject_combined_once(&db, &request).await;
+    let recast = persist_combined_batch(&db, signature, 2, 1);
+    reject_combined_once(&db, &recast).await;
+
+    assert_eq!(rejection_ledger(&db).expect("a streak").0, 2);
+    assert!(
+        blocked_bundles(&db).contains_key(&0),
+        "the cap is reached before the ballot changes"
+    );
+
+    // The voter answers proposal 1 differently. The next batch is not the one
+    // the chain refused, so the streak stops describing it.
+    db.set_ballot_intent(ROUND, 1, crate::session::Decision::Choice(1), 3)
+        .unwrap();
+
+    assert!(
+        rejection_ledger(&db).is_none(),
+        "a changed ballot clears the streak it no longer describes"
+    );
+    assert!(
+        blocked_bundles(&db).is_empty(),
+        "planning offers the cast again"
+    );
+    assert_eq!(
+        db.delegation_phase(ROUND, 0).unwrap(),
+        crate::phases::DelegationPhase::Proved,
+        "lifting the block touches no delegation setup"
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_ballot_decision_keeps_the_streak() {
+    // Re-asserting the same decision changes nothing about what will be sent,
+    // so it must not launder a block away.
+    let (db, request) = fixture(2);
+    db.set_ballot_intent(ROUND, 1, crate::session::Decision::Choice(2), 3)
+        .unwrap();
+    reject_combined_once(&db, &request).await;
+    let before = rejection_ledger(&db).expect("a streak");
+
+    db.set_ballot_intent(ROUND, 1, crate::session::Decision::Choice(2), 3)
+        .unwrap();
+
+    assert_eq!(
+        rejection_ledger(&db).expect("the streak survives"),
+        before,
+        "an idempotent intent write is not a ballot change"
+    );
+}
+
 /// The bundles planning refuses to cast for, with the chain's last rejection.
 fn blocked_bundles(
     db: &VotingDb,

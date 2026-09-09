@@ -173,7 +173,7 @@ async fn an_html_200_from_a_proxy_preserves_dispatch_ambiguity() {
     };
     assert_eq!(
         diagnostic.kind(),
-        ChainSubmissionDiagnosticKind::EndpointUnsupported
+        ChainSubmissionDiagnosticKind::RouteAnswerReplaced
     );
     assert!(
         diagnostic
@@ -220,13 +220,46 @@ async fn an_oversized_fallback_page_preserves_dispatch_ambiguity_and_size_valida
 }
 
 #[tokio::test]
-async fn a_404_or_405_response_preserves_dispatch_ambiguity() {
-    // The status alone cannot identify whether a router rejected the request
-    // before dispatch or a proxy replaced the answer after forwarding it.
+async fn a_router_404_or_405_in_the_gateway_envelope_is_definitely_unsent() {
+    // The gateway writes `application/json` with a lone `error` field on every
+    // response it produces, and never answers a mounted mutation route with
+    // either status. That combination is the router speaking before any
+    // handler ran, so the body was never decoded.
+    for status in [404, 405] {
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.queue(Ok(json(
+            status,
+            r#"{"error":"route not found"}"#.to_string(),
+        )));
+        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+        let outcome = client.submit_delegation(0, &delegation()).await;
+        let PostAttemptOutcome::EndpointUnsupported(diagnostic) = outcome else {
+            panic!("status {status}: expected a definite router refusal, got {outcome:?}");
+        };
+        assert_eq!(
+            diagnostic.kind(),
+            ChainSubmissionDiagnosticKind::EndpointUnsupported
+        );
+        assert!(
+            diagnostic
+                .message()
+                .contains("does not serve /shielded-vote/v1/delegate-vote"),
+            "{}",
+            diagnostic.message()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_404_or_405_outside_the_gateway_envelope_preserves_dispatch_ambiguity() {
+    // Without the gateway's envelope the status alone cannot say whether a
+    // router rejected the request before dispatch or a proxy replaced the
+    // answer after forwarding it. A JSON body of some other shape is a proxy's
+    // JSON, not the gateway's.
     for (status, body, content_type) in [
         (
             404,
-            r#"{"error":"not found"}"#,
+            r#"{"message":"not found","code":404}"#,
             Some("application/json".to_string()),
         ),
         (
@@ -249,7 +282,8 @@ async fn a_404_or_405_response_preserves_dispatch_ambiguity() {
             matches!(
                 outcome,
                 PostAttemptOutcome::PossiblyDispatched(ref diagnostic)
-                    if diagnostic.message().contains(&format!("HTTP {status}"))
+                    if diagnostic.kind() == ChainSubmissionDiagnosticKind::RouteAnswerReplaced
+                        && diagnostic.message().contains(&format!("HTTP {status}"))
             ),
             "status {status}: {outcome:?}"
         );

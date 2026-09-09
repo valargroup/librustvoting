@@ -2167,7 +2167,7 @@ async fn a_fallback_response_keeps_the_generation_recoverable() {
     assert!(
         matches!(outcome, ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
         candidate_transaction_hash: None, ref diagnostic,
-    }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::EndpointUnsupported)
+    }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::RouteAnswerReplaced)
     );
     let record = store.record(&identity).unwrap();
     assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
@@ -2195,6 +2195,68 @@ async fn a_fallback_response_keeps_the_generation_recoverable() {
             .committed_post_reservations(),
         2
     );
+}
+
+fn router_route_refusal() -> ChainHttpResponse {
+    // The gateway's own error envelope: `application/json` with a lone `error`
+    // field. Only the router writes this, and never for a mounted route.
+    ChainHttpResponse::json(404, br#"{"error":"route not found"}"#.to_vec())
+}
+
+#[tokio::test]
+async fn a_router_refusal_releases_the_reservation_and_leaves_no_row() {
+    // The chain has not been upgraded to serve the route. Nothing decoded the
+    // body, so the generation must stay admissible: a durable hashless
+    // `Recovering` row here would lock the ballot and the delegation behind
+    // an envelope the chain never saw.
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Ok(router_route_refusal()));
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    );
+
+    let failure = coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Protocol);
+    assert!(failure.strongest_state().is_none());
+    assert!(
+        failure.message().contains("does not serve"),
+        "{}",
+        failure.message()
+    );
+    assert!(
+        store.record(&identity).is_none(),
+        "a refused route must not leave a durable row"
+    );
+    assert_eq!(transport.methods(), vec!["POST"], "no retry, no poll");
+
+    // The upgraded chain accepts the same generation on the next pass.
+    let upgraded = Arc::new(ScriptedTransport::default());
+    upgraded.queue(Ok(accepted()));
+    upgraded.queue(Ok(pending()));
+    coordinator_over(upgraded, Arc::clone(&store), ManualClock::new(200), 10)
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.record(&identity).unwrap().state(),
+        SubmissionRecordState::Tracking { .. }
+    ));
 }
 
 #[tokio::test]

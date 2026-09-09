@@ -1897,9 +1897,33 @@ column — `chain_submissions` is fingerprinted on every open and rebuilt on
 drift, and both combined freshness gates admit a new batch only while no row
 exists in it, so the ledger has to be invisible to them. The streak is what
 bounds recasting; `docs/round_orchestration_invariants.md` owns the cap and the
-planning behavior it drives. The ledger row is cleared when the batch confirms
-and when the delegation setup it counted against is discarded. Beyond it, the
-rejection diagnostic still survives in the run report and observability records.
+planning behavior it drives. Beyond it, the rejection diagnostic still survives
+in the run report and observability records.
+
+Three things clear the row, one for each way the streak can stop describing
+what would be sent next:
+
+- the batch confirms (`a_confirmed_combined_batch_forgets_its_rejection_streak`);
+- the delegation generation it was counted against ends. A rebuild is what
+  ordinarily ends one, and it replaces the setup rather than emptying it, so the
+  clear belongs to the setup write itself: any write that changes a stored setup
+  column clears the streak, and an idempotent resume, which changes none, keeps
+  it, because that resume reuses the very generation the chain refused
+  (`a_rebuild_clears_the_rejection_streak_the_old_delegation_earned`,
+  `an_idempotent_setup_rewrite_keeps_the_rejection_streak`). The discard's own
+  `DELETE` covers only a discard that actually emptied the bundle: it carries
+  the shared broadcast guard, which requires the bundle to hold no `votes` rows,
+  and retiring a rejected batch deliberately keeps them;
+- the ballot changes. The streak is keyed on the delegation generation, which a
+  ballot edit does not touch, so nothing else would lift a block whose cause was
+  a vote member rather than the delegation. A durable intent write that differs
+  from the stored decision clears the streak of every bundle holding a vote for
+  that proposal; an unchanged decision does not
+  (`changing_the_ballot_lifts_a_block_the_delegation_did_not_cause`,
+  `an_unchanged_ballot_decision_keeps_the_streak`).
+
+`VotingDb::retry_blocked_combined_cast` remains the host's explicit override for
+a cause fixed outside all three.
 
 Rejection timestamps use the lifecycle transition's clamped timestamp. Within
 one delegation generation, `first_rejected_at` remains fixed and
@@ -1920,27 +1944,53 @@ recovery confirms a combined generation from the same final-VAN-plus-vote-leaves
 layout as an ordinary batch without inventing a hash
 (`exact_recovery_confirms_a_combined_batch_from_the_tree`).
 
-### Route diagnostics preserve dispatch ambiguity
+### A route answer is definite only when the router itself wrote it
 
-HTTP 404/405 and HTTP 200 HTML responses can indicate an unsupported mutation
-route, but they do not prove the POST was unsent. A proxy can replace an
-upstream response after forwarding the request to the chain. The SDK therefore
-classifies these responses as `PossiblyDispatched`, with an
-`endpoint_unsupported` diagnostic describing a possible route mismatch. The
-response-size limit still applies. Only reliable pre-dispatch transport evidence
-can establish that a request was definitely unsent.
+A 404 or 405 can mean the vote-chain router refused an unmounted route before
+any handler ran, or it can mean something in front of the node replaced an
+answer after already forwarding the POST upstream. The two need opposite
+treatment, so the classification turns on who wrote the response, not on the
+status alone.
 
-The existing bounded retry loop, backoff and endpoint rotation apply. Exhausting
-the budget leaves the generation durably hashless `Recovering`. The SDK must
-not delete its reservation, unlock ballot changes, or retire recovery material
-because of these responses. A later rejection does not erase the earlier
-ambiguity, and a later usable hash or exact-tree match can still confirm the
-same generation. There is no fallback to separate delegation and cast POSTs.
+The gateway writes `application/json` on every response it produces, its errors
+carry a lone `error` field and nothing else, and it never answers a mounted
+mutation route with 404 or 405. A 404 or 405 in that envelope is therefore the
+router speaking before any handler ran: the body was never decoded, so the
+attempt is `EndpointUnsupported` — definitely unsent, never ambiguous. A fresh
+reservation is released, the invocation rotates to the next configured node
+without waiting out a backoff against an answer that cannot change, and stops
+once every node has refused or the budget is spent; the caller receives a
+`Protocol` failure whose message names the route. This is what keeps a chain
+that has not yet been upgraded to serve a route from locking the bundle: no
+durable row is written, so the ballot stays editable and the same generation is
+admitted again once the route exists
+(`a_router_404_or_405_in_the_gateway_envelope_is_definitely_unsent`,
+`a_router_refusal_releases_the_reservation_and_leaves_no_row`).
+
+Every other route-shaped answer is `RouteAnswerReplaced` and preserves dispatch
+ambiguity: an HTML body with HTTP 200, which is a front end's fallback page
+(production answered exactly that for every batch route on 2026-09-08), and any
+404 or 405 outside the gateway's envelope, including a proxy's own JSON error.
+A proxy can produce either after the chain already accepted the envelope, so
+the SDK must not delete the reservation, unlock ballot changes, or retire
+recovery material because of one. The bounded retry loop, backoff and rotation
+apply unchanged; exhausting the budget leaves the generation durably hashless
+`Recovering`. A later rejection does not erase that ambiguity, and a later
+usable hash or exact-tree match can still confirm the same generation. There is
+no fallback to separate delegation and cast POSTs.
+
+The response-size limit is applied before either classification, so an oversized
+body reaches the ordinary response-limit diagnostic rather than being read as a
+route answer. Every other non-JSON or unexpected-status answer stays ambiguous
+as before.
 
 Regression coverage:
+`a_router_404_or_405_in_the_gateway_envelope_is_definitely_unsent`,
+`a_router_refusal_releases_the_reservation_and_leaves_no_row`,
 `an_html_200_from_a_proxy_preserves_dispatch_ambiguity`,
-`a_404_or_405_response_preserves_dispatch_ambiguity`,
+`a_404_or_405_outside_the_gateway_envelope_preserves_dispatch_ambiguity`,
 `an_oversized_fallback_page_preserves_dispatch_ambiguity_and_size_validation`,
+`other_non_json_answers_stay_ambiguous`,
 `a_fallback_response_keeps_the_generation_recoverable`,
 `a_fallback_response_retries_the_same_generation_at_the_next_endpoint`,
 `replaced_post_response_keeps_combined_recovery_and_ballot_locked`, and

@@ -24,13 +24,29 @@ This release is `zcash_voting` 4.0.0.
   so the next run casts a fresh batch with the same delegation setup. A
   rejection after an ambiguous POST, or a code-2 rejection, keeps the row
   recoverable as before.
-- HTML fallback and HTTP 404/405 responses to vote-chain POSTs preserve
-  dispatch ambiguity and durable recovery. A proxy may replace a response after
-  forwarding the request, so a possible route mismatch no longer releases the
-  generation or allows its ballot and recovery material to be cleared.
+- A vote-chain POST answered 404 or 405 in the gateway's own error envelope is
+  classified as definitely unsent with the `endpoint_unsupported` diagnostic and
+  a `Protocol` failure naming the route: the reservation is released and the
+  bundle stays admissible, so a chain that does not yet serve the route cannot
+  lock a ballot. Every other route-shaped answer — an HTML fallback page, or a
+  404/405 from something other than the router — carries the new
+  `route_answer_replaced` diagnostic and preserves dispatch ambiguity and
+  durable recovery, because a proxy may replace a response after forwarding the
+  request.
 - Combined rejection retirement clamps timestamps across wall-clock rollback,
   preserving atomic cleanup and the rejection streak. A new delegation
   generation starts its own timestamps.
+- A combined rejection streak is now cleared by a delegation rebuild and by a
+  ballot change, not only by confirmation. The streak is counted against the
+  delegation generation, so a rejection caused by a vote member previously
+  outlived the ballot edit that fixed it, and the discard-driven cleanup could
+  never reach a bundle whose retired vote rows the broadcast guard requires to
+  be absent.
+- A version-22 combined-preview database missing a `chain_submissions` index or
+  trigger now upgrades and is repaired instead of failing to open. That drift is
+  repairable and its repair runs after the migration ladder, so including those
+  objects in the preview fingerprint aborted the upgrade before the repair could
+  run and left the sidecar permanently unopenable.
 
 - Combined delegation-and-vote confirmation reads the chain event
   `nullifier_count` field. Previously the SDK expected `nullifiers`, leaving

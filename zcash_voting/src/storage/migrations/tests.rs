@@ -1998,6 +1998,43 @@ fn v22_combined_preview_preserves_recovery_and_tracking_with_or_without_pczt() {
     }
 }
 
+/// `chain_submissions` drift is repairable, and the repair runs after the
+/// ladder. Fingerprinting its objects while identifying a preview database
+/// would abort the upgrade before the repair could run and leave `user_version`
+/// unadvanced, making exactly the sidecar this reconciliation exists to rescue
+/// permanently unopenable. `005_chain_submissions_proposal_range.sql` makes the
+/// same argument for the version-20 step, which
+/// `v20_missing_indexes_and_triggers_upgrade_and_are_repaired` covers.
+#[test]
+fn v22_preview_missing_submission_indexes_and_triggers_upgrades_and_is_repaired() {
+    for tamper in [
+        "DROP INDEX chain_submissions_candidate_owner",
+        "DROP INDEX chain_submissions_identity",
+        "DROP TRIGGER chain_submissions_immutable_identity",
+        "DROP TRIGGER chain_submissions_monotonic_reservations",
+    ] {
+        let mut conn = combined_preview(false);
+        conn.execute_batch(tamper).unwrap();
+        let recovery = dump_table(&conn, "delegate_cast_recovery");
+
+        migrate(&mut conn).unwrap_or_else(|error| panic!("{tamper}: {error}"));
+
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            CURRENT_VERSION,
+            "{tamper}"
+        );
+        assert_eq!(
+            recovery,
+            dump_table(&conn, "delegate_cast_recovery"),
+            "{tamper}: the preview's recovery records survive the repair"
+        );
+        // The repair restored the object, so a second open is a no-op.
+        migrate(&mut conn).unwrap_or_else(|error| panic!("{tamper}: {error}"));
+    }
+}
+
 #[test]
 fn v22_unknown_combined_preview_rolls_back_without_losing_recovery() {
     for drift in [

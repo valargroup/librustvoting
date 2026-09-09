@@ -654,6 +654,7 @@ pub enum ChainDiagnosticKindView {
     InvalidProtocolResponse,
     StorageFailure,
     EndpointUnsupported,
+    RouteAnswerReplaced,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

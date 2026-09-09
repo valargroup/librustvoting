@@ -104,6 +104,7 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
         "pending",
         "rejected",
         "missing_route",
+        "replaced_route",
         "cancelled",
         "invalid",
     ] {
@@ -132,6 +133,18 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                         .push_back(ChainHttpResponse::json(
                             404,
                             br#"{"error":"missing route"}"#.to_vec(),
+                        ))
+                }
+                "replaced_route" => {
+                    transport
+                        .responses
+                        .lock()
+                        .unwrap()
+                        .push_back(ChainHttpResponse::new(
+                            200,
+                            b"<!doctype html><html></html>".to_vec(),
+                            Some("text/html; charset=utf-8".to_string()),
+                            Vec::new(),
                         ))
                 }
                 _ => {
@@ -191,6 +204,22 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                     ObservationOutcome::Pending
                 }
                 "missing_route" => {
+                    // The vote-chain router refused the route in its own error
+                    // envelope, so nothing decoded the body. Plain and reported
+                    // calls must both release the reservation and report a
+                    // protocol failure naming the route.
+                    let failure = result.as_ref().expect_err("a router refusal fails");
+                    assert_eq!(failure.kind(), crate::ChainSubmissionFailureKind::Protocol);
+                    assert!(failure.strongest_state().is_none(), "{result:?}");
+                    assert!(
+                        failure
+                            .message()
+                            .contains("does not serve /shielded-vote/v1/cast-vote-batch"),
+                        "{result:?}"
+                    );
+                    ObservationOutcome::Failed
+                }
+                "replaced_route" => {
                     // A proxy may replace the response after forwarding the
                     // POST. Plain and reported calls must preserve recovery.
                     assert!(
@@ -198,7 +227,7 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                             &result,
                             Ok(ChainSubmissionResult::Pending(crate::ChainSubmissionPending::Recovering {
                                 candidate_transaction_hash: None, diagnostic,
-                            })) if diagnostic.kind() == crate::ChainSubmissionDiagnosticKind::EndpointUnsupported
+                            })) if diagnostic.kind() == crate::ChainSubmissionDiagnosticKind::RouteAnswerReplaced
                                 && diagnostic.message().contains("may not serve /shielded-vote/v1/cast-vote-batch")
                         ),
                         "{result:?}"
@@ -278,7 +307,17 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                     .iter()
                     .any(|r| r.outcome == ObservationOutcome::Rejected));
             }
+            // A router refusal and a replaced answer both name a route the
+            // node did not serve, but only the first proves non-dispatch, and
+            // the transport observations must keep them apart.
             if scenario == "missing_route" {
+                assert!(diagnostics
+                    .records
+                    .iter()
+                    .any(|r| r.outcome == ObservationOutcome::Failed
+                        && r.error_kind.as_deref() == Some("EndpointUnsupported")));
+            }
+            if scenario == "replaced_route" {
                 assert!(diagnostics
                     .records
                     .iter()

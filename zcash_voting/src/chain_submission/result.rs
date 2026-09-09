@@ -50,10 +50,17 @@ pub enum ChainSubmissionDiagnosticKind {
     ReconciliationPending,
     InvalidProtocolResponse,
     StorageFailure,
-    /// A mutation response suggests an unsupported route (HTTP 404/405 or an
-    /// HTML fallback). A proxy may have replaced a response after forwarding
-    /// the POST, so this diagnostic does not establish non-dispatch.
+    /// The vote-chain router itself refused the route: HTTP 404 or 405
+    /// carrying the gateway's own `{"error": ...}` envelope. Only the gateway
+    /// writes that envelope, and it never answers a mounted mutation route
+    /// with either status, so the request reached the router and no handler
+    /// decoded it. Nothing was dispatched.
     EndpointUnsupported,
+    /// A mutation answer that looks like a missing route but cannot be
+    /// attributed to the router: an HTML 200 fallback page, or a 404/405
+    /// without the gateway's error envelope. A proxy can produce either after
+    /// forwarding the POST upstream, so this does not establish non-dispatch.
+    RouteAnswerReplaced,
 }
 
 impl ChainSubmissionDiagnosticKind {
@@ -70,6 +77,7 @@ impl ChainSubmissionDiagnosticKind {
             Self::InvalidProtocolResponse => "invalid_protocol_response",
             Self::StorageFailure => "storage_failure",
             Self::EndpointUnsupported => "endpoint_unsupported",
+            Self::RouteAnswerReplaced => "route_answer_replaced",
         }
     }
 
@@ -85,6 +93,7 @@ impl ChainSubmissionDiagnosticKind {
             "invalid_protocol_response" => Some(Self::InvalidProtocolResponse),
             "storage_failure" => Some(Self::StorageFailure),
             "endpoint_unsupported" => Some(Self::EndpointUnsupported),
+            "route_answer_replaced" => Some(Self::RouteAnswerReplaced),
             _ => None,
         }
     }

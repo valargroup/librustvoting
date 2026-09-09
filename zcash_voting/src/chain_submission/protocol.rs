@@ -85,6 +85,9 @@ pub(super) enum PostAttemptOutcome {
     },
     LocalFailure(ChainSubmissionDiagnostic),
     DefinitelyUnsent(ChainTransportError),
+    /// The vote-chain router refused the route in its own error envelope, so
+    /// nothing decoded the body and nothing was dispatched.
+    EndpointUnsupported(ChainSubmissionDiagnostic),
     PossiblyDispatched(ChainSubmissionDiagnostic),
 }
 
@@ -388,6 +391,10 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             PostAttemptOutcome::DefinitelyUnsent(_) => {
                 (crate::ObservationOutcome::Failed, Some("DefinitelyUnsent"))
             }
+            PostAttemptOutcome::EndpointUnsupported(_) => (
+                crate::ObservationOutcome::Failed,
+                Some("EndpointUnsupported"),
+            ),
             PostAttemptOutcome::LocalFailure(_) => {
                 (crate::ObservationOutcome::Failed, Some("Protocol"))
             }
@@ -503,7 +510,10 @@ fn parse_post_response(
     endpoint: &str,
     expected_batch_digest: Option<[u8; 32]>,
 ) -> PostAttemptOutcome {
-    if let Some(diagnostic) = endpoint_routing_diagnostic(&response, endpoint) {
+    if let Some(diagnostic) = router_refusal(&response, endpoint) {
+        return PostAttemptOutcome::EndpointUnsupported(diagnostic);
+    }
+    if let Some(diagnostic) = replaced_route_answer(&response, endpoint) {
         return PostAttemptOutcome::PossiblyDispatched(diagnostic);
     }
     if let Err(diagnostic) = validate_json_response(&response) {
@@ -601,7 +611,7 @@ fn parse_status_response(
 ) -> Result<TransactionStatusObservation, ChainSubmissionDiagnostic> {
     validate_json_response(&response)?;
     if response.status() == 404 {
-        let pending: PendingTransactionJson = serde_json::from_slice(response.body())
+        let pending: GatewayErrorJson = serde_json::from_slice(response.body())
             .map_err(|_| invalid_protocol("vote-chain pending response is malformed JSON"))?;
         if pending.error != "tx not found" {
             return Err(invalid_protocol(
@@ -641,13 +651,54 @@ fn parse_status_response(
     }
 }
 
-/// Explains a possible route mismatch without claiming the POST was unsent.
+/// Recognizes a mutation answer that the vote-chain router itself produced.
 ///
-/// An old gateway or frontend may answer an unknown route with 404, 405, or
-/// HTML. A forwarding proxy can also replace the response after the POST
-/// reached the chain, so these answers must preserve dispatch ambiguity.
-/// Oversized responses go through the ordinary response-limit diagnostic.
-fn endpoint_routing_diagnostic(
+/// The gateway writes `application/json` on every response it produces,
+/// including its errors, which carry a single `error` field and nothing else;
+/// it never answers a mounted mutation route with 404 or 405. A 404 or 405 in
+/// that envelope therefore came from the router before any handler ran, so the
+/// request body was never decoded and the attempt is definitely unsent. The
+/// envelope, rather than the status or the content type alone, is what carries
+/// the attribution: a proxy that happens to emit JSON errors cannot be mistaken
+/// for the gateway, and its answer stays ambiguous.
+///
+/// Oversized bodies return `None` so the ordinary response-limit diagnostic
+/// still owns them.
+fn router_refusal(
+    response: &ChainHttpResponse,
+    endpoint: &str,
+) -> Option<ChainSubmissionDiagnostic> {
+    if response.body().len() > MAX_CHAIN_HTTP_RESPONSE_BYTES {
+        return None;
+    }
+    let status = response.status();
+    if !matches!(status, 404 | 405) || !is_json_content_type(response) {
+        return None;
+    }
+    serde_json::from_slice::<GatewayErrorJson>(response.body()).ok()?;
+    Some(ChainSubmissionDiagnostic::from_redacted_message(
+        ChainSubmissionDiagnosticKind::EndpointUnsupported,
+        format!(
+            "vote-chain endpoint unsupported: this node does not serve /{}/{endpoint} \
+             (HTTP {status}, vote-chain error envelope); it needs a vote-sdk release that \
+             includes the route",
+            API_PREFIX.join("/")
+        ),
+    ))
+}
+
+/// Explains a possible route mismatch that cannot be attributed to the router.
+///
+/// An HTML body with status 200 is a front end's fallback page, and a 404 or
+/// 405 without the gateway's error envelope came from something that is not the
+/// gateway. Either can be a proxy replacing an answer after it already
+/// forwarded the POST upstream, so these preserve dispatch ambiguity. Every
+/// other non-JSON or unexpected-status answer reaches the ordinary ambiguous
+/// diagnostics unchanged.
+///
+/// Oversized bodies return `None` so the ordinary response-limit diagnostic
+/// still owns them.
+fn replaced_route_answer(
     response: &ChainHttpResponse,
     endpoint: &str,
 ) -> Option<ChainSubmissionDiagnostic> {
@@ -665,7 +716,7 @@ fn endpoint_routing_diagnostic(
     }
     let observed = response.content_type().unwrap_or("(absent)");
     Some(ChainSubmissionDiagnostic::from_redacted_message(
-        ChainSubmissionDiagnosticKind::EndpointUnsupported,
+        ChainSubmissionDiagnosticKind::RouteAnswerReplaced,
         format!(
             "vote-chain endpoint may not serve /{}/{endpoint} \
              (HTTP {status}, Content-Type {observed}); the POST may have reached the chain; \
@@ -761,9 +812,15 @@ struct TransactionStatusJson {
     events: Vec<TxEvent>,
 }
 
+/// The gateway's error envelope: a lone `error` field and nothing else.
+///
+/// `deny_unknown_fields` is what makes the shape evidence rather than a guess.
+/// It identifies a "tx not found" lookup answer and, on a mutation, a router
+/// refusal that proves the request body was never decoded, so anything else
+/// that emits JSON errors cannot be mistaken for the gateway.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PendingTransactionJson {
+struct GatewayErrorJson {
     error: String,
 }
 

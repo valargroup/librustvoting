@@ -1563,6 +1563,25 @@ fn store_delegation_setup_within(
         });
     }
 
+    // A write that changed the setup ended the delegation generation any
+    // recorded rejection streak was counted against, so the streak no longer
+    // describes anything that can be sent again and must not block the
+    // replacement's first cast. This is the rebuild's cleanup: the discard's
+    // own `DELETE` cannot reach a bundle that still holds retired `votes`
+    // rows, and a rebuild replaces the setup rather than emptying it. An
+    // idempotent resume, which changes no column, deliberately keeps the
+    // streak: it reuses the very generation the chain refused.
+    //
+    // The comparison covers every column this write can touch, which is a
+    // superset of the delegation generation's inputs. It can therefore clear a
+    // streak for a write that changed only a non-input column, and never keeps
+    // one past a generation change. That is the safe direction: the cap is an
+    // advisory bound on recasting, so clearing it early costs one more attempt,
+    // while keeping it late blocks a delegation the chain has never seen.
+    if !write_changes_nothing {
+        clear_combined_rejection_ledger(tx, wallet_id, round_id, bundle_index)?;
+    }
+
     Ok(())
 }
 
@@ -3833,6 +3852,42 @@ pub(crate) fn clear_combined_rejection_ledger(
     Ok(removed > 0)
 }
 
+/// Clears the rejection streak of every bundle that holds a vote for
+/// `proposal_id`, and reports how many rows went.
+///
+/// A changed ballot means the next combined batch differs from the one the
+/// chain refused, so a streak counted against the old batch no longer describes
+/// anything that will be sent. The streak is keyed on the delegation
+/// generation, which a ballot edit does not change, so without this the block
+/// would outlive its own cause whenever the rejection came from a vote member
+/// rather than the delegation.
+///
+/// Scoped through `votes` rather than through live recovery: retiring a
+/// terminally rejected batch clears `commitment_bundle_json` but keeps the vote
+/// rows, and those retired bundles are exactly the ones carrying a streak.
+pub(crate) fn clear_combined_rejection_ledger_for_proposal(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_id: u32,
+) -> Result<usize, VotingError> {
+    conn.execute(
+        "DELETE FROM combined_cast_rejections
+          WHERE round_id = :round_id AND wallet_id = :wallet_id
+            AND bundle_index IN (
+                SELECT bundle_index FROM votes
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND proposal_id = :proposal_id
+            )",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":proposal_id": proposal_id as i64,
+        },
+    )
+    .map_err(|e| VotingError::from_sqlite("clear combined rejection ledger for proposal", &e))
+}
+
 pub fn get_commitment_bundle(
     conn: &Connection,
     round_id: &str,
@@ -4413,7 +4468,10 @@ fn discard_unbroadcast_delegation_setup_within(
         ),
         // The streak counts rejections of one delegation generation. Discarding
         // the setup ends that generation, so the count no longer describes
-        // anything and must not block a rebuilt delegation's first cast.
+        // anything and must not block a rebuilt delegation's first cast. A
+        // rebuild, which replaces the setup rather than clearing it, clears the
+        // streak from `store_delegation_setup_within` instead: this statement
+        // only covers a discard that actually emptied the bundle.
         (
             "discard combined cast rejections",
             format!("DELETE FROM combined_cast_rejections WHERE {unbroadcast_guard}"),

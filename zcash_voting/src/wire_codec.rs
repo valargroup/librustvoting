@@ -943,6 +943,7 @@ impl From<crate::ChainSubmissionDiagnosticKind> for ChainDiagnosticKindView {
             Kind::InvalidProtocolResponse => Self::InvalidProtocolResponse,
             Kind::StorageFailure => Self::StorageFailure,
             Kind::EndpointUnsupported => Self::EndpointUnsupported,
+            Kind::RouteAnswerReplaced => Self::RouteAnswerReplaced,
         }
     }
 }

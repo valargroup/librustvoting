@@ -304,14 +304,30 @@ fn reconcile_combined_preview(conn: &Connection) -> Result<bool, VotingError> {
     Ok(true)
 }
 
-/// Compares all explicit schema objects, including recovery constraints and
-/// triggers; table existence alone cannot establish migration compatibility.
+/// Compares the explicit schema objects that identify a preview database,
+/// including recovery constraints and triggers; table existence alone cannot
+/// establish migration compatibility.
+///
+/// Everything `chain_submissions` owns is excluded. That table's DDL has been
+/// edited without a version bump more than once, so real sidecars are in the
+/// field missing one of its indexes or triggers;
+/// [`ensure_current_chain_submission_schema`] exists to repair exactly that and
+/// runs after this ladder. Fingerprinting those objects here would refuse such
+/// a database with a hard error before the repair could run, and since nothing
+/// would advance `user_version`, the sidecar this reconciliation exists to
+/// rescue would become permanently unopenable. `005_chain_submissions_proposal_range.sql`
+/// makes the same argument for the version-20 step.
 fn preview_schema_fingerprint(
     conn: &Connection,
 ) -> Result<Vec<(String, String, String)>, VotingError> {
-    let mut statement = conn.prepare(
-        "SELECT type, name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY type, name",
-    ).map_err(migration_error)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_schema \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+           AND name NOT LIKE 'chain_submissions%' \
+         ORDER BY type, name",
+        )
+        .map_err(migration_error)?;
     let fingerprint = statement
         .query_map([], |row| {
             let sql: String = row.get(2)?;

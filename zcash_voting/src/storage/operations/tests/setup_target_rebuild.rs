@@ -403,6 +403,70 @@ fn a_rebuild_that_is_not_refused_replaces_the_setup_and_its_proof() {
     );
 }
 
+/// A recorded rejection streak for bundle 0, if any.
+fn rejection_streak(db: &VotingDb) -> Option<u32> {
+    db.conn()
+        .query_row(
+            "SELECT consecutive_rejections FROM combined_cast_rejections
+              WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+            rusqlite::params![ROUND_ID, W],
+            |row| row.get::<_, i64>(0).map(|streak| streak as u32),
+        )
+        .ok()
+}
+
+/// Records one combined rejection against bundle 0's delegation generation.
+fn record_rejection_streak(db: &VotingDb, streak: u32) {
+    db.conn()
+        .execute(
+            "INSERT INTO combined_cast_rejections
+                (round_id, wallet_id, bundle_index, delegation_generation_digest,
+                 last_batch_digest, consecutive_rejections, last_diagnostic_kind,
+                 last_diagnostic, first_rejected_at, last_rejected_at)
+             VALUES (?1, ?2, 0, ?3, ?4, ?5, 'chain_rejected', 'code 7', 100, 100)",
+            rusqlite::params![ROUND_ID, W, [0x01u8; 32], [0x02u8; 32], streak as i64],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_rebuild_clears_the_rejection_streak_the_old_delegation_earned() {
+    // The streak is counted against a delegation generation. A rebuild ends
+    // that generation, so the count no longer describes anything that can be
+    // sent and must not block the replacement's first cast. The discard's own
+    // `DELETE` cannot do this: retiring the rejected batch keeps the bundle's
+    // `votes` rows, which the shared broadcast guard requires to be absent.
+    let db = db_with_delegation_setup(1);
+    record_rejection_streak(&db, 2);
+
+    replace_setup(&db, &[0x99; 32]).expect("an unbroadcast bundle rebuilds");
+
+    assert_eq!(
+        rejection_streak(&db),
+        None,
+        "the streak goes with the delegation it was counted against"
+    );
+}
+
+#[test]
+fn an_idempotent_setup_rewrite_keeps_the_rejection_streak() {
+    // Resuming an interrupted setup rewrites the same columns with the same
+    // values. That is the very generation the chain refused, so the streak
+    // still describes what would be sent and must survive.
+    let db = db_with_delegation_setup(1);
+    let stored = van_comm_rand_of(&db, 0).expect("the fixture bound the setup");
+    record_rejection_streak(&db, 2);
+
+    store_binding(&db, &stored.clone().try_into().unwrap())
+        .expect("rewriting the same binding is allowed");
+
+    assert_eq!(
+        rejection_streak(&db),
+        Some(2),
+        "an unchanged setup is the same delegation generation"
+    );
+}
+
 /// Exchanges bundle 0's setup for one bound to `van_comm_rand`.
 fn replace_setup(db: &VotingDb, van_comm_rand: &[u8; 32]) -> Result<(), VotingError> {
     queries::replace_unbroadcast_delegation_setup(
