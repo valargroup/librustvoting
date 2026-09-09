@@ -1,3 +1,7 @@
+mod observations;
+pub(crate) use observations::observe_helper_http;
+pub use observations::{HttpObservationContext, HttpObservationPhase};
+
 use std::{
     future::Future,
     pin::Pin,
@@ -677,7 +681,18 @@ impl RouteHttp for DirectRoute {
                     // handed over. A connect failure is reported distinctly and
                     // reclassified as pre-dispatch below.
                     on_dispatch();
-                    let response = self.client.request(hyper_request).await.map_err(|error| {
+                    let observations = observations::scope();
+                    let headers_stage = observations.stage("helper.http.response_headers");
+                    let response = self.client.request(hyper_request).await;
+                    headers_stage.finish(
+                        if response.is_ok() {
+                            crate::ObservationOutcome::Succeeded
+                        } else {
+                            crate::ObservationOutcome::Failed
+                        },
+                        None,
+                    );
+                    let response = response.map_err(|error| {
                         let message = format!("send HTTP request: {}", error_chain(&error));
                         if error.is_connect() {
                             RouteError::before_dispatch(message)
@@ -696,6 +711,7 @@ impl RouteHttp for DirectRoute {
                                 .map(|value| (name.as_str().to_string(), value.to_string()))
                         })
                         .collect();
+                    let body_stage = observations.stage("helper.http.response_body");
                     let body = Limited::new(response.into_body(), max_response_bytes)
                         .collect()
                         .await
@@ -706,6 +722,7 @@ impl RouteHttp for DirectRoute {
                         })?
                         .to_bytes()
                         .to_vec();
+                    body_stage.finish(crate::ObservationOutcome::Succeeded, None);
                     Ok(RouteResponse {
                         status,
                         headers,
@@ -1876,3 +1893,7 @@ mod tests {
         assert!(result.is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "http_transport/tests/observations.rs"]
+mod observation_tests;

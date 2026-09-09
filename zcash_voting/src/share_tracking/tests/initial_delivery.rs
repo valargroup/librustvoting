@@ -2158,3 +2158,43 @@ async fn initial_delivery_does_not_recreate_share_after_round_deletion() {
     // the share rows back into a round the host has forgotten.
     assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn delivering_one_share_does_not_decode_unrelated_round_rows() {
+    let db = db_with_delivery(&[], &[], 1);
+    // An unrelated row is deliberately unreadable. A whole-round reload
+    // would fail before delivering our valid share; an exact-key read must
+    // not inspect it. Keep this outside the selected generation's identity.
+    db.conn()
+        .execute(
+            "INSERT INTO share_delegations
+         (round_id, wallet_id, bundle_index, proposal_id, share_index,
+          sent_to_urls, ambiguous_urls, attempting_urls, target_count,
+          nullifier, confirmed, submit_at, created_at)
+         SELECT round_id, wallet_id, bundle_index, proposal_id, 15,
+                'invalid-json', ambiguous_urls, attempting_urls, target_count,
+                nullifier, confirmed, submit_at, created_at
+         FROM share_delegations WHERE round_id = ?1 AND wallet_id = ?2
+           AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+            rusqlite::params![ROUND_ID, WALLET_ID],
+        )
+        .unwrap();
+    let configured = helpers(1);
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        json_status("queued"),
+    );
+    let report = submit_share_to_helpers(
+        &db,
+        &client_with(transport.clone()),
+        &initial_submission(&configured),
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.accepted_urls, configured);
+    assert_eq!(transport.calls().len(), 1);
+    // The normal full-list API must still validate every row it returns.
+    assert!(share::list(&db, ROUND_ID).is_err());
+}

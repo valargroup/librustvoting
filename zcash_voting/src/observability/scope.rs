@@ -37,6 +37,10 @@ impl std::fmt::Debug for ObservationScope {
 }
 
 impl ObservationScope {
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.collector.is_some()
+    }
+
     /// Creates a no-op scope without touching a clock or allocating.
     pub(crate) fn disabled() -> Self {
         Self {

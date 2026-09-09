@@ -748,14 +748,6 @@ pub fn list(db: &VotingDb, round_id: &str) -> Result<Vec<ShareDelegationRecord>,
     db.get_share_delegations(round_id)
 }
 
-pub(crate) fn list_for_scope(
-    db: &VotingDb,
-    scope: &ShareOperationScope,
-    round_id: &str,
-) -> Result<Vec<ShareDelegationRecord>, VotingError> {
-    db.get_share_delegations_for_wallet(round_id, scope.wallet_id())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_delegation_for_scope(
     db: &VotingDb,
