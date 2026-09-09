@@ -31,20 +31,21 @@ fn every_hung_request_is_bounded_and_the_round_recovers() {
         }
         stall_matrix::Run::Completed(report) => {
             report.print();
-            assert!(
-                report.attempted > 0,
-                "the stall matrix attempted no targets at all"
-            );
-            assert!(
-                !report.passed.is_empty(),
-                "the stall matrix passed no target it attempted"
-            );
-            assert!(
-                report.failed.is_empty(),
-                "{} stall target(s) failed: {:?}",
-                report.failed.len(),
-                report.failed
-            );
+            recovery_conformance::matrix_coverage::MatrixCoverage {
+                attempted: report.attempted,
+                passed: report.passed.len(),
+                failed: report.failed.len(),
+                skipped: report.skipped.len(),
+                excluded: report
+                    .skipped
+                    .iter()
+                    .filter(|(target, _)| {
+                        *target == recovery_conformance::stall::StallTarget::Lightwalletd
+                    })
+                    .count(),
+            }
+            .validate()
+            .expect("incomplete live conformance coverage");
         }
     }
 }

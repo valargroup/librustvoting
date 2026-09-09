@@ -194,7 +194,7 @@ async fn exercise(
     // --- the first run, under the fleet the scenario starts with
     let mode = match scenario.crash_stage() {
         Some(stage) => RunMode::Armed { stage },
-        None => RunMode::Unarmed,
+        None => RunMode::ObserveHelperOutage,
     };
     let mut opening = config_for(
         fixture,
@@ -216,26 +216,40 @@ async fn exercise(
         warm_from(fixture, &sidecar);
         crash.map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     } else {
-        // Not judged for success. A fleet that cannot be reached is supposed to
-        // leave a round short of its placement, so the interesting output is the
-        // durable state, not the quiescence.
+        // Cancellation after a delivery observation is the expected opening
+        // boundary. A transport or setup failure is not evidence of an outage.
         let outcome = run_to_quiescence(&fixture.worker, &opening);
         warm_from(fixture, &sidecar);
-        match outcome {
-            // The kind, not the Debug rendering: `BackgroundShareWorkOnly`
-            // carries every unconfirmed share, and 144 of them buries the lines
-            // that actually say what the run did.
-            Ok(outcome) => eprintln!(
-                "  {scenario}: first run ended at {}",
+        let outcome = outcome
+            .map_err(|error| Outcome::Failed(format!("outage opening failed: {error:#}")))?;
+        if outcome.quiescence_kind != "Cancelled" {
+            return Err(Outcome::Failed(format!(
+                "outage opening missed its delivery boundary: {}",
                 outcome.quiescence_kind
-            ),
-            Err(error) => eprintln!("  {scenario}: first run stopped early: {error:#}"),
+            )));
         }
+        eprintln!(
+            "  {scenario}: first run ended at {}",
+            outcome.quiescence_kind
+        );
     }
 
     let after_first = DurableSnapshot::read(&sidecar)
         .map_err(|error| Outcome::Failed(format!("unreadable sidecar: {error:#}")))?;
     let first_contacts = contacts(&opening);
+    if scenario == FleetScenario::WholeFleetDown
+        && (first_contacts.refused.is_empty()
+            || !first_contacts.answered.is_empty()
+            || after_first.deliveries.is_empty()
+            || after_first
+                .deliveries
+                .iter()
+                .any(|delivery| delivery.confirmed || !delivery.sent.is_empty()))
+    {
+        return Err(Outcome::Failed(
+            "whole-fleet outage did not leave observed, unaccepted helper work".into(),
+        ));
+    }
     eprintln!(
         "  {scenario}: first run placed {} share(s) with {} helper(s); answered {:?}, \
          refused {}, silent {}",

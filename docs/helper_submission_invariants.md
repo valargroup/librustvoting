@@ -1983,3 +1983,54 @@ delivery recoverable if the envelope already reached the chain.
 `rejection_after_replaced_post_response_cannot_retire_combined_recovery` cover
 that boundary. The chain-submission specification owns the response
 classification and retry rules.
+
+### Live combined recovery conformance
+
+The `recovery-conformance` matrices exercise fresh combined rounds. Their scoped
+snapshots require the complete authorization and ordered membership, helper plans
+before a fresh POST, and the final VAN plus every contiguous vote position at
+confirmation. Crash resumes preserve already-persisted PCZT/proof fingerprints,
+authorization, and batch membership. A target-only round-driver pass removes the
+voter mnemonic and supplies no signing inputs before normal round completion.
+
+`recovery-conformance/tests/combined_recovery.rs` rejects missing authorization,
+partial membership or confirmation, wrong generation metadata, missing helper
+plans, and evidence belonging to another wallet. The combined POST fault wrapper
+is exercised on both sides of dispatch by
+`combined_post_stalls_on_the_selected_side_of_dispatch`. Live tree-read stalls
+start from a real hashless dispatch because a fresh combined cast does not need
+the initial tree synchronization of a standalone delegation.
+
+The live `whole-fleet-down` case cancels its opening round drive through the
+host control after the first `ShareOutcome` observation. It requires observed
+refusals and unaccepted durable share work before restoring the fleet and
+resuming. This bounds the intentionally unavailable phase without changing SDK
+retry policy or treating a setup failure as evidence of helper recovery.
+
+A normal conformance resume that stops only with `HelperDeliveryIncomplete`
+reopens the same sidecar within the existing six-attempt bound. Background
+tracking can confirm the attempted member while later members of its combined
+unit still owe initial delivery; another round drive executes those obligations.
+A mixed failure or exhausted bound remains a failure, and terminal checks still
+require every member and all 144 shares.
+
+The PIR stall fixture separates padded-note setup from proof-cache warmup. Its
+armed fresh sidecar has stable fixture padding but no imported proofs, so it
+must reach the real PIR transport fault. Fault-free resumes may import the
+control's snapshot-bound proof cache; existing padding is never overwritten.
+`cold_fault_keeps_dummy_nullifiers_but_resume_can_warm_proofs` and
+`seeding_preserves_existing_padding_and_other_wallets_and_rounds` pin this
+fixture behavior without changing the SDK's proof validation or retry rules.
+
+If the foreground finishes but the last background tracking run reaches the
+harness time budget, the parent reopens the same sidecar within its existing
+six-attempt bound. This does not accept cancellation, mixed failures, or
+unrecoverable shares as progress. The final comparison still requires all
+144 shares confirmed; exhaustion remains a failure. The regression
+`only_the_last_recoverable_background_budget_pause_is_resumed` pins this rule.
+
+The conformance share-POST stall also stops through host cancellation after its
+first completed share-delivery result. The injected request must be observed
+and return through the SDK deadline before that callback can stop the drive.
+Fault-free resume restores normal tracking and must confirm every share; the
+host stop does not turn incomplete delivery into a successful round.

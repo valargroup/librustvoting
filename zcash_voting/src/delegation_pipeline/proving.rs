@@ -264,6 +264,9 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
 
     /// Generates or reuses the bundle's durable proof without signing.
     ///
+    /// Reports selection before preparation and forwards PCZT/proof progress
+    /// for work performed, including the durable `PcztBuilt` boundary.
+    ///
     /// A bundle whose proof is already persisted returns
     /// [`DelegationProofStatus::Reused`] without touching PIR, after checking
     /// that this pipeline's notes and target-bound hotkey are the ones the
@@ -329,6 +332,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         progress: &dyn DelegationProgressReporter,
         observations: &crate::ObservationScope,
     ) -> Result<DelegationProofStatus, VotingError> {
+        progress.on_progress(DelegationProgress::SelectingNotes);
         let prepared = self.execute_prepare(bundle_index, observations)?;
         if self.execute_has_persisted_proof(bundle_index, observations)?
             && self.persisted_proof_is_reusable(&prepared, observations)?
@@ -338,7 +342,7 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         // Reached with a persisted proof only when that proof belongs to a
         // target this hotkey cannot reproduce. Setup discards the unusable
         // bundle and rebuilds it, or refuses if it may be on chain.
-        self.ensure_setup(&prepared, &NoopProgressReporter, observations)?;
+        self.ensure_setup(&prepared, progress, observations)?;
         self.prove_with_fleet(&prepared, pir, progress, observations)
     }
 

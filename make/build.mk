@@ -84,36 +84,44 @@ clippy: ## Lint the default Zakura stack
 # processes, so it must never join `check`, `test`, or CI's hermetic jobs. It
 # shares the Zakura target dir so it reuses the main build's artifacts.
 RECOVERY_CONFORMANCE_PACKAGE = -p recovery-conformance
+RECOVERY_CONFORMANCE_ARGS ?=
+
+.PHONY: recovery-conformance-worker
+recovery-conformance-worker: ## Build the exact worker used by live recovery matrices
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo build $(RECOVERY_CONFORMANCE_PACKAGE) --bin recovery-conformance-worker --locked
 
 recovery-conformance-check: ## Type-check the staging crash-recovery suite
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
 		cargo clippy $(RECOVERY_CONFORMANCE_PACKAGE) --all-targets --locked
 
-recovery-conformance: ## Run every staging recovery matrix: crash, hang, fleet (network, very slow)
+recovery-conformance: recovery-conformance-worker ## Run every staging recovery matrix: crash, hang, fleet (network, very slow)
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
-		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked $(RECOVERY_CONFORMANCE_ARGS)
 
 # One axis at a time. The full run provisions roughly thirty-five rounds on
 # `svote-1` and takes hours, so a change that can only affect one axis should
 # pay for one axis. The hermetic tests run under every one of these.
-recovery-conformance-crash: ## Run only the staging crash matrix (network, slow)
+recovery-conformance-crash: recovery-conformance-worker ## Run only the staging crash matrix (network, slow)
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
-		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked $(RECOVERY_CONFORMANCE_ARGS) \
 		-E 'not (binary(stall_conformance) or binary(helper_fleet_conformance))'
 
-recovery-conformance-stalls: ## Run only the staging hang matrix (network, slow)
+recovery-conformance-stalls: recovery-conformance-worker ## Run only the staging hang matrix (network, slow)
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
-		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked $(RECOVERY_CONFORMANCE_ARGS) \
 		-E 'not (binary(staging_conformance) or binary(helper_fleet_conformance))'
 
-recovery-conformance-fleet: ## Run only the staging helper-fleet matrix (network, slow)
+recovery-conformance-fleet: recovery-conformance-worker ## Run only the staging helper-fleet matrix (network, slow)
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
-		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked $(RECOVERY_CONFORMANCE_ARGS) \
 		-E 'not (binary(staging_conformance) or binary(stall_conformance))'
 
 .PHONY: recovery-conformance-unit
 recovery-conformance-unit: ## Run hermetic crash-recovery harness tests (no staging)
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
-		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked $(RECOVERY_CONFORMANCE_ARGS) \
 		--test stage_taxonomy --test stage_config --test target_chain \
-		--test crash_log --test round_shape --test orchestration
+		--test crash_log --test round_shape --test orchestration \
+		--test fault_routes --test helper_fleet_plan --test stall_taxonomy \
+		--test combined_recovery --test precompute

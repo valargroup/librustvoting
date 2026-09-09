@@ -1987,3 +1987,21 @@ ballot, delegation signing, cast proofs, combined persistence, helper planning,
 and one combined POST. `AfterTreeSync` is excluded from this fresh matrix.
 `make recovery-conformance-unit` runs the harness's hermetic tests;
 `make recovery-conformance` remains the separate live staging matrix.
+
+
+### Live combined recovery conformance
+
+The `recovery-conformance` matrices exercise fresh combined rounds. Their scoped
+snapshots require the complete authorization and ordered membership, helper plans
+before a fresh POST, and the final VAN plus every contiguous vote position at
+confirmation. Crash resumes preserve already-persisted PCZT/proof fingerprints,
+authorization, and batch membership. A target-only round-driver pass removes the
+voter mnemonic and supplies no signing inputs before normal round completion.
+
+`recovery-conformance/tests/combined_recovery.rs` rejects missing authorization,
+partial membership or confirmation, wrong generation metadata, missing helper
+plans, and evidence belonging to another wallet. The combined POST fault wrapper
+is exercised on both sides of dispatch by
+`combined_post_stalls_on_the_selected_side_of_dispatch`. Live tree-read stalls
+start from a real hashless dispatch because a fresh combined cast does not need
+the initial tree synchronization of a standalone delegation.

@@ -28,20 +28,15 @@ fn a_changing_helper_fleet_still_places_every_share_exactly_once() {
         }
         helper_fleet_matrix::Run::Completed(report) => {
             report.print();
-            assert!(
-                report.attempted > 0,
-                "the fleet matrix attempted no scenarios at all"
-            );
-            assert!(
-                !report.passed.is_empty(),
-                "the fleet matrix passed no scenario it attempted"
-            );
-            assert!(
-                report.failed.is_empty(),
-                "{} fleet scenario(s) failed: {:?}",
-                report.failed.len(),
-                report.failed
-            );
+            recovery_conformance::matrix_coverage::MatrixCoverage {
+                attempted: report.attempted,
+                passed: report.passed.len(),
+                failed: report.failed.len(),
+                skipped: report.skipped.len(),
+                excluded: 0,
+            }
+            .validate()
+            .expect("incomplete live conformance coverage");
         }
     }
 }

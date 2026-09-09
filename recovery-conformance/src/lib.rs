@@ -22,8 +22,11 @@
 
 pub mod assertions;
 pub mod child;
+pub mod combined;
 pub mod environment;
 pub mod helper_fleet;
+pub mod matrix_coverage;
+pub mod precompute;
 pub mod provisioning;
 pub mod round_run;
 pub mod run_config;

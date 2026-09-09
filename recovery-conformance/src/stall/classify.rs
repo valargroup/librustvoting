@@ -45,6 +45,7 @@ impl RequestClassifier {
         let endpoint = path.split(['/', '?']).next()?;
         let posting = method.eq_ignore_ascii_case("POST");
         match (endpoint, posting) {
+            ("delegate-and-cast-vote-batch", true) => Some(StallTarget::DelegateAndCastPost),
             ("delegate-vote", true) => Some(StallTarget::DelegationPost),
             ("cast-vote" | "cast-vote-batch", true) => Some(StallTarget::VotePost),
             ("shares", true) => Some(StallTarget::SharePost),

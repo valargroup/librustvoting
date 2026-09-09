@@ -398,3 +398,33 @@ fn the_two_wrappers_compose_the_way_a_run_stacks_them() {
         route.execute(request(Method::POST, &url), &|| {})
     ));
 }
+
+#[test]
+fn combined_post_stalls_on_the_selected_side_of_dispatch() {
+    for point in [StallPoint::BeforeDispatch, StallPoint::AfterDispatch] {
+        let (log, _) = log(&format!("combined-{point:?}"));
+        let contacts = Recorded::default();
+        let route = StallingRoute::new(
+            RecordingRoute::sharing(&contacts),
+            StallPlan::hanging(StallTarget::DelegateAndCastPost, point),
+            classifier(),
+            log,
+        );
+        let dispatches = AtomicUsize::new(0);
+        let url = "https://vote.example/shielded-vote/v1/delegate-and-cast-vote-batch";
+        let dispatch = || {
+            dispatches.fetch_add(1, Ordering::SeqCst);
+        };
+        assert!(still_hanging(
+            route.execute(request(Method::POST, url), &dispatch)
+        ));
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            usize::from(point == StallPoint::AfterDispatch)
+        );
+        assert!(
+            contacts.urls().is_empty(),
+            "fault injection escaped to the real route"
+        );
+    }
+}

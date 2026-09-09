@@ -26,8 +26,7 @@ pub enum StallTarget {
     ///
     /// The one target not reachable through the route: `lwd.rs` dials tonic
     /// directly rather than through an injected transport, so no wrapper sees
-    /// it. It is stalled instead by pointing the run at a black-hole listener
-    /// that accepts a connection and never writes.
+    /// it. Live coverage is excluded until a black-hole listener is added.
     Lightwalletd,
     /// A PIR query, matched by the configured PIR endpoint it addresses.
     ///
@@ -40,6 +39,8 @@ pub enum StallTarget {
     DelegationPost,
     /// `POST .../shielded-vote/v1/cast-vote` or `.../cast-vote-batch`.
     VotePost,
+    /// Fresh delegation and all dependent casts in one POST.
+    DelegateAndCastPost,
     /// `GET .../shielded-vote/v1/tx/{hash}` — the submission status poll.
     TransactionLookup,
     /// `GET .../shielded-vote/v1/commitment-tree/...`.
@@ -89,12 +90,12 @@ impl Default for StallPoint {
 }
 
 impl StallTarget {
-    /// Every target, in the order a round meets them.
+    /// Targets reported by the fresh combined matrix. Standalone POST classes
+    /// remain available to hermetic route tests but are not live selections.
     pub const ALL: &'static [Self] = &[
         Self::Lightwalletd,
         Self::PirQuery,
-        Self::DelegationPost,
-        Self::VotePost,
+        Self::DelegateAndCastPost,
         Self::TransactionLookup,
         Self::CommitmentTreeRead,
         Self::HelperPreflight,
@@ -109,6 +110,7 @@ impl StallTarget {
             Self::PirQuery => "pir-query",
             Self::DelegationPost => "delegation-post",
             Self::VotePost => "vote-post",
+            Self::DelegateAndCastPost => "delegate-and-cast-post",
             Self::TransactionLookup => "transaction-lookup",
             Self::CommitmentTreeRead => "commitment-tree-read",
             Self::HelperPreflight => "helper-preflight",
@@ -127,12 +129,15 @@ impl StallTarget {
 
     /// Whether a stall here can leave a possibly-delivered submission.
     ///
-    /// True for the two POSTs that carry a transaction. A stall after dispatch
+    /// True for the combined and legacy POSTs that carry a transaction. A stall after dispatch
     /// on either leaves the wallet unable to prove the bytes never left, which
     /// is the conservative case the whole recovery model exists for; every
     /// other class is a read, and a read that never answers costs only time.
     pub fn carries_a_submission(self) -> bool {
-        matches!(self, Self::DelegationPost | Self::VotePost)
+        matches!(
+            self,
+            Self::DelegationPost | Self::VotePost | Self::DelegateAndCastPost
+        )
     }
 
     /// The deadline the SDK is expected to apply to this class.
@@ -149,7 +154,9 @@ impl StallTarget {
             // `PIR_REQUEST_BUDGET`, shared by both attempts.
             Self::PirQuery => Duration::from_secs(60),
             // `DEFAULT_CHAIN_POST_TIMEOUT`.
-            Self::DelegationPost | Self::VotePost => Duration::from_secs(150),
+            Self::DelegationPost | Self::VotePost | Self::DelegateAndCastPost => {
+                Duration::from_secs(150)
+            }
             // `DEFAULT_CHAIN_LOOKUP_TIMEOUT`.
             Self::TransactionLookup => Duration::from_secs(10),
             // `TREE_REQUEST_TIMEOUT`, and `RECOVERY_REQUEST_TIMEOUT` is 60s

@@ -52,6 +52,7 @@ fn config(mode: RunMode) -> RoundRunConfig {
 /// `(kind, bundle_index, generation_digest, state, reservations)`.
 fn snapshot(submissions: Vec<(&str, i64, &str, &str, i64)>) -> DurableSnapshot {
     DurableSnapshot {
+        combined: Vec::new(),
         submissions: submissions
             .into_iter()
             .map(
@@ -199,6 +200,40 @@ fn only_a_finished_round_counts_as_terminal_success() {
             "{unfinished} must not read as a finished round"
         );
     }
+}
+
+#[test]
+fn incomplete_helper_delivery_requires_a_bounded_resume_not_success() {
+    let mut outcome = RunOutcome {
+        quiescence: "Failures".into(),
+        quiescence_kind: "Failures".into(),
+        failures: vec![FailureRecord {
+            step: Some("CastVote { bundle_index: 2, proposal_id: 1, choice: 0 }".into()),
+            bundle_index: Some(2),
+            kind: "HelperDeliveryIncomplete".into(),
+            message: "helper delivery ended with pending shares".into(),
+        }],
+        dispatches: 1,
+        share_tracking: Vec::new(),
+    };
+    assert!(outcome.needs_helper_recovery());
+    assert!(!outcome.is_terminal_success());
+    assert!(!outcome.is_environmental());
+    outcome.failures.push(FailureRecord {
+        step: None,
+        bundle_index: Some(1),
+        kind: "InvariantViolation".into(),
+        message: "inconsistent durable work".into(),
+    });
+    assert!(!outcome.needs_helper_recovery());
+    outcome.failures.pop();
+    for reason in ["Cancelled", "PassBudgetExhausted", "ChainTerminal"] {
+        outcome.quiescence_kind = reason.into();
+        assert!(!outcome.needs_helper_recovery());
+    }
+    outcome.quiescence_kind = "Failures".into();
+    outcome.failures.clear();
+    assert!(!outcome.needs_helper_recovery());
 }
 
 #[test]
@@ -390,4 +425,93 @@ fn the_control_comparison_notices_a_round_that_lost_its_votes() {
     let error = assert_matches_control(&hollow, &full)
         .expect_err("identical state names must not hide a round with no votes");
     assert!(format!("{error}").contains("A3 VIOLATED"), "{error}");
+}
+
+#[test]
+fn a_matrix_cannot_pass_by_skipping_runnable_cases() {
+    use recovery_conformance::matrix_coverage::MatrixCoverage;
+    let complete = MatrixCoverage {
+        attempted: 8,
+        passed: 7,
+        failed: 0,
+        skipped: 1,
+        excluded: 1,
+    };
+    complete.validate().unwrap();
+    assert!(MatrixCoverage {
+        passed: 6,
+        skipped: 2,
+        ..complete
+    }
+    .validate()
+    .is_err());
+    assert!(MatrixCoverage {
+        attempted: 1,
+        passed: 0,
+        skipped: 1,
+        ..complete
+    }
+    .validate()
+    .is_err());
+    assert!(MatrixCoverage {
+        passed: 6,
+        failed: 1,
+        ..complete
+    }
+    .validate()
+    .is_err());
+    assert!(MatrixCoverage {
+        passed: 6,
+        ..complete
+    }
+    .validate()
+    .is_err());
+}
+
+#[test]
+fn only_the_last_recoverable_background_budget_pause_is_resumed() {
+    use recovery_conformance::run_config::ShareTrackingSummary;
+    let paused = ShareTrackingSummary {
+        quiescence: "SuiteBudgetExpired".into(),
+        ..ShareTrackingSummary::default()
+    };
+    let mut outcome = RunOutcome {
+        quiescence: "BackgroundShareWorkOnly".into(),
+        quiescence_kind: "BackgroundShareWorkOnly".into(),
+        failures: Vec::new(),
+        dispatches: 0,
+        share_tracking: vec![paused.clone()],
+    };
+    assert!(outcome.needs_background_recovery());
+    for reason in [
+        "Cancelled",
+        "Failures",
+        "ChainTerminal",
+        "PassBudgetExhausted",
+        "TargetRecovered",
+    ] {
+        outcome.quiescence_kind = reason.into();
+        assert!(!outcome.needs_background_recovery());
+    }
+    outcome.quiescence_kind = "NoWorkLeft".into();
+    assert!(outcome.needs_background_recovery());
+    outcome.share_tracking.push(ShareTrackingSummary {
+        quiescence: "AllConfirmed".into(),
+        ..ShareTrackingSummary::default()
+    });
+    assert!(!outcome.needs_background_recovery());
+    outcome.share_tracking = vec![paused];
+    outcome.share_tracking[0].unrecoverable = 1;
+    assert!(!outcome.needs_background_recovery());
+    outcome.share_tracking[0].unrecoverable = 0;
+    outcome.failures.push(FailureRecord {
+        step: None,
+        bundle_index: None,
+        kind: "InvariantViolation".into(),
+        message: "durable state is inconsistent".into(),
+    });
+    assert!(!outcome.needs_background_recovery());
+    outcome.failures.clear();
+    outcome.share_tracking.clear();
+    assert!(!outcome.needs_background_recovery());
 }

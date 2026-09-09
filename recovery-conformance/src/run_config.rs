@@ -51,6 +51,11 @@ pub enum RunMode {
     /// control a resumed round is compared against; the two differ only in the
     /// sidecar they start from, which is what makes them comparable.
     Unarmed,
+    /// Advance only the persisted target batch without loading any signing key.
+    RecoverCombined,
+    /// Stop through host cancellation after observing one helper delivery result.
+    /// Used to preserve refused delivery work before restoring an unavailable fleet.
+    ObserveHelperOutage,
 }
 
 /// Everything one child run needs.
@@ -105,7 +110,7 @@ impl RoundRunConfig {
     pub fn armed_stage(&self) -> Option<CrashStage> {
         match &self.mode {
             RunMode::Armed { stage } => Some(*stage),
-            RunMode::Unarmed => None,
+            RunMode::Unarmed | RunMode::RecoverCombined | RunMode::ObserveHelperOutage => None,
         }
     }
 
@@ -238,7 +243,7 @@ impl RunOutcome {
     pub fn is_terminal_success(&self) -> bool {
         matches!(
             self.quiescence_kind.as_str(),
-            "NoWorkLeft" | "BackgroundShareWorkOnly"
+            "NoWorkLeft" | "BackgroundShareWorkOnly" | "TargetRecovered"
         )
     }
 
@@ -250,5 +255,31 @@ impl RunOutcome {
     /// Whether every failure is one the SDK repairs on the next pass.
     pub fn is_self_healing(&self) -> bool {
         !self.failures.is_empty() && self.failures.iter().all(FailureRecord::is_self_healing)
+    }
+
+    /// Whether the foreground finished but the last background tracking run
+    /// exhausted the harness time budget. Reopen only this recoverable pause;
+    /// cancellation, SDK failures, and an earlier expired pass are not evidence.
+    pub fn needs_background_recovery(&self) -> bool {
+        self.failures.is_empty()
+            && matches!(
+                self.quiescence_kind.as_str(),
+                "NoWorkLeft" | "BackgroundShareWorkOnly"
+            )
+            && self.share_tracking.last().is_some_and(|tracking| {
+                tracking.quiescence == "SuiteBudgetExpired" && tracking.unrecoverable == 0
+            })
+    }
+
+    /// Whether incomplete helper delivery is the only reason the drive stopped.
+    /// The host may reopen the same sidecar and resume its remaining obligations;
+    /// this is never terminal success and never masks a different failure kind.
+    pub fn needs_helper_recovery(&self) -> bool {
+        self.quiescence_kind == "Failures"
+            && !self.failures.is_empty()
+            && self
+                .failures
+                .iter()
+                .all(|failure| failure.kind == "HelperDeliveryIncomplete")
     }
 }
