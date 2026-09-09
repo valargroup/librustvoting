@@ -1244,6 +1244,17 @@ These boundaries are covered by
 `status_endpoint_ordinals_survive_health_order_and_keep_pending_semantics`,
 `cancelled_confirmation_reports_lock_wait_without_polling`, and
 `reported_tracking_waits_preserve_cadence_and_cancellation`.
+Reported helper POSTs also measure response headers/body collection, individual
+future polls, suspension between polls, and first wake to the next poll. These
+are nested diagnostic spans, not additional deadlines. The request-local
+context preserves attribution across host route callbacks and exposes only a
+closed phase vocabulary for route selection, direct/Tor requests and Tor body
+collection. Disabled collection bypasses the polling wrapper. Diagnostics never
+spawn request tasks or alter dispatch, timeout, placement or retry semantics.
+`records_wake_delay_and_preserves_result_and_attribution`,
+`disabled_observation_preserves_pending_and_cancellation`, and
+`separates_response_headers_from_delayed_body` cover these boundaries.
+
 See [the benchmark procedure](helper_delivery_benchmark.md) for correlation
 limitations and the difference between helper acceptance and chain inclusion.
 
@@ -2068,3 +2079,16 @@ first completed share-delivery result. The injected request must be observed
 and return through the SDK deadline before that callback can stop the drive.
 Fault-free resume restores normal tracking and must confirm every share; the
 host stop does not turn incomplete delivery into a successful round.
+
+### Exact-key delivery revalidation
+
+Initial delivery and the per-share tracking loop reload only the complete
+wallet/round/bundle/proposal/share key, then check the expected nullifier.
+Tracking additionally rejects a row already confirmed since its pass snapshot.
+The tracker still loads its full pending set at pass boundaries. These reads
+must not replace generation checks with cached state or weaken reservations.
+`delivering_one_share_does_not_decode_unrelated_round_rows` guards against
+reintroducing full-round decoding in a per-share operation;
+`full_ballot_delivers_592_shares_with_bounded_admission` exercises a 37-proposal
+ballot, durable acceptance and the 32-delivery limit. Existing queued-deletion,
+wallet-scope, generation-replacement and confirmation-race tests remain binding.

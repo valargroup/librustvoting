@@ -968,15 +968,15 @@ async fn walk_pending_shares(
             report.cancelled = true;
             break;
         };
-        let Some(share) = share::unconfirmed_for_scope(db, &scope, params.round_id)?
-            .into_iter()
-            .find(|share| {
-                share.bundle_index == loaded_share.bundle_index
-                    && share.proposal_id == loaded_share.proposal_id
-                    && share.share_index == loaded_share.share_index
-                    && share.nullifier == loaded_share.nullifier
-            })
-        else {
+        let Some(share) = share::get_delegation_for_scope(
+            db,
+            &scope,
+            params.round_id,
+            loaded_share.bundle_index,
+            loaded_share.proposal_id,
+            loaded_share.share_index,
+        )?
+        .filter(|share| !share.confirmed && share.nullifier == loaded_share.nullifier) else {
             continue;
         };
 

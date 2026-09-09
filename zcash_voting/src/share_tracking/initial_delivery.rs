@@ -161,17 +161,18 @@ fn load_prepared_share_delivery(
     durable_submit_at: u64,
     expected_nullifier: &[u8; 32],
 ) -> Result<(u64, ShareDelegationRecord), VotingError> {
-    let persisted_delivery = share::list_for_scope(db, scope, params.round_id)?
-        .into_iter()
-        .find(|share| {
-            share.bundle_index == params.bundle_index
-                && share.proposal_id == params.proposal_id
-                && share.share_index == params.share_index
-                && share.nullifier == expected_nullifier.as_slice()
-        })
-        .ok_or_else(|| VotingError::Internal {
-            message: "newly journaled helper share was not found".to_string(),
-        })?;
+    let persisted_delivery = share::get_delegation_for_scope(
+        db,
+        scope,
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+    )?
+    .filter(|share| share.nullifier == expected_nullifier.as_slice())
+    .ok_or_else(|| VotingError::Internal {
+        message: "newly journaled helper share was not found".to_string(),
+    })?;
     Ok((durable_submit_at, persisted_delivery))
 }
 
@@ -449,15 +450,16 @@ fn load_current_delivery_state(
     expected_nullifier: &[u8],
     candidates: &[String],
 ) -> Result<share::ShareDeliveryState, VotingError> {
-    let current_delivery = share::list_for_scope(db, scope, params.round_id)?
-        .into_iter()
-        .find(|share| {
-            share.bundle_index == params.bundle_index
-                && share.proposal_id == params.proposal_id
-                && share.share_index == params.share_index
-                && share.nullifier == expected_nullifier
-        })
-        .ok_or_else(|| stale_delivery_error(params))?;
+    let current_delivery = share::get_delegation_for_scope(
+        db,
+        scope,
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+    )?
+    .filter(|share| share.nullifier == expected_nullifier)
+    .ok_or_else(|| stale_delivery_error(params))?;
     let definite_acceptance_urls = current_delivery
         .sent_to_urls
         .into_iter()
