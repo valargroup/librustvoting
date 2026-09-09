@@ -12,6 +12,12 @@ use clap::{Parser, Subcommand};
 use recovery_conformance::helper_fleet::{HelperFleetPlan, SYNTHETIC_HELPER_URLS};
 use recovery_conformance::round_run::{endpoints_from, endpoints_with_fleet, helper_backend};
 use stage_bench::ballot::{Ballot, DEFAULT_OPTION_WIDTHS};
+
+/// The SDK's ceiling on concurrent batch proofs (`MAX_BATCH_PROOF_CONCURRENCY`).
+///
+/// Mirrored because the constant is private. Checked here so an out-of-range
+/// request fails before a round is provisioned rather than inside proving.
+const MAX_PROOF_CONCURRENCY: usize = 15;
 use stage_bench::events::EventLog;
 use stage_bench::metrics::{render, Metrics};
 use stage_bench::preflight::{self, Preflight};
@@ -85,11 +91,18 @@ struct RunArgs {
     #[arg(long, default_value_t = 1)]
     helpers: usize,
 
-    /// Bundles the driver advances at once. Staging serves PIR from one
-    /// synchronous endpoint, so raising this is an experiment about that
-    /// endpoint rather than free parallelism.
-    #[arg(long, default_value_t = 1)]
+    /// Bundles the driver advances at once. Defaults to the SDK's own three, so
+    /// a plain run measures what a host gets. Lower it to 1 for a cold-PIR run:
+    /// staging serves PIR from one synchronous endpoint.
+    #[arg(long, default_value_t = 3)]
     bundle_concurrency: usize,
+
+    /// Vote-commitment proofs built at once within a bundle. Defaults to the
+    /// SDK's `DEFAULT_BATCH_PROOF_CONCURRENCY`; 15 is its ceiling. A wide ballot
+    /// builds one proof per proposal per bundle, so this is the other axis a
+    /// 37-proposal round is serialized on.
+    #[arg(long, default_value_t = 3)]
+    proof_concurrency: usize,
 
     /// Seconds between provisioning and the round's vote end. Share scheduling
     /// derives its windows from this, so hold it fixed across compared runs.
@@ -195,6 +208,10 @@ async fn run(args: RunArgs) -> Result<()> {
         args.confirm_concurrency >= 1,
         "--confirm-concurrency must be at least 1"
     );
+    anyhow::ensure!(
+        (1..=MAX_PROOF_CONCURRENCY).contains(&args.proof_concurrency),
+        "--proof-concurrency takes 1 to {MAX_PROOF_CONCURRENCY}, the SDK's own ceiling"
+    );
     if args.confirm_concurrency > 1 {
         eprintln!(
             "bench: confirming {} shares at a time through focused confirmation. This \
@@ -206,6 +223,18 @@ async fn run(args: RunArgs) -> Result<()> {
 
     let started_at_unix = now_unix();
     let preflight = preflight::resolve().await?;
+    if args.bundle_concurrency > 1 && (args.no_warm_pir || preflight.warm_pir.is_none()) {
+        // Not refused, because a deliberate cold run at width is a legitimate
+        // experiment about the PIR endpoint. Named, because the failure it
+        // produces — an endpoint that stops answering — reads as a delivery
+        // problem rather than as the load this flag applied.
+        eprintln!(
+            "bench: WARNING — {} bundles wide with no warm PIR cache. Staging serves PIR \
+             from one synchronous endpoint and stops answering under concurrent queries. \
+             Use --bundle-concurrency 1 for a cold run.",
+            args.bundle_concurrency
+        );
+    }
     eprintln!(
         "bench: ballot of {} proposals, {} helpers, bundle concurrency {}",
         ballot.len(),
@@ -351,6 +380,7 @@ fn build_config(
         fleet,
         vote_end_time_seconds: round.vote_end_time_seconds,
         bundle_concurrency: args.bundle_concurrency,
+        proof_concurrency: args.proof_concurrency,
         tracking_budget_seconds: args.tracking_budget,
         confirm_concurrency: args.confirm_concurrency,
         max_dispatches: max_dispatches(ballot.len()),

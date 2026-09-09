@@ -214,6 +214,7 @@ pub async fn drive(config: &BenchRunConfig) -> Result<BenchOutcome> {
             signer: DelegationSigner::Software(signing::software_signer(seed)),
             pir,
         }),
+        max_proof_concurrency: config.proof_concurrency,
     };
 
     let options = ObservabilityOptions {
@@ -305,10 +306,11 @@ pub async fn drive(config: &BenchRunConfig) -> Result<BenchOutcome> {
 
 /// Pacing for one benchmark run.
 ///
-/// `max_bundle_concurrency` is a measured variable rather than a constant: the
-/// staging PIR fleet is one endpoint that answers synchronously, so raising it
-/// is a deliberate experiment about that endpoint, not free parallelism. The
-/// default of one is what a warm, well-behaved run uses.
+/// `max_bundle_concurrency` is a measured variable rather than a constant. It
+/// defaults to the SDK's own three, so a plain run measures what a host gets;
+/// the reason to lower it is a cold PIR cache, because staging serves PIR from
+/// one endpoint that answers synchronously and fifteen concurrent queries stop
+/// it answering at all.
 ///
 /// Failure isolation stays at the shipped `SkipBundle`, because that is the
 /// behaviour a host actually gets and a benchmark that changed it would be
@@ -333,6 +335,7 @@ struct Host {
     vote_tree_urls: Vec<String>,
     vote_end_time_seconds: u64,
     delegation: Option<DelegationStepInputs>,
+    max_proof_concurrency: usize,
 }
 
 impl RoundHostSource for Host {
@@ -349,7 +352,7 @@ impl RoundHostSource for Host {
             vote_tree_node_urls: self.vote_tree_urls.clone(),
             delegation: self.delegation.clone(),
             chain_policy: ChainAdvancePolicy::default(),
-            max_proof_concurrency: 1,
+            max_proof_concurrency: self.max_proof_concurrency,
         }
     }
 }

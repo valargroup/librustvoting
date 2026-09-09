@@ -64,7 +64,8 @@ the benchmark before.
 | `--option-widths 2,3,4` | `2,3,4` | Cycled across the ballot; each 2 to 8. |
 | `--ballot <path>` | — | Replay a vote manager's round export instead. Conflicts with the two above. |
 | `--helpers N` | 1 | 1 is the real staging primary; 2 to 10 build a synthetic fleet routed onto it. |
-| `--bundle-concurrency N` | 1 | Bundles advanced at once. |
+| `--bundle-concurrency N` | 3 | Bundles advanced at once; the SDK's own default. Use 1 for a cold-PIR run. |
+| `--proof-concurrency N` | 3 | Vote-commitment proofs built at once in a bundle; 1–15. |
 | `--vote-window <s>` | 21600 | Seconds until the round's vote end. |
 | `--tracking-budget <s>` | 1800 | Seconds the confirmation phase may run. |
 | `--confirm-concurrency N` | 1 | 1 = shipped tracker. Above 1 = concurrent focused confirmation, an experiment. |
@@ -166,6 +167,40 @@ behaviour, which `AGENTS.md` gates behind
 [`docs/helper_submission_invariants.md`](../docs/helper_submission_invariants.md)
 and its named regression tests. This crate does not make that change; it
 produces the evidence such a change would need.
+
+## What raising the widths does, and does not, do
+
+Measured on two 37-proposal staging rounds, one bundle-serial and one at the
+SDK's shipped widths:
+
+| | 1 bundle / 1 proof | 3 bundles / 3 proofs |
+| --- | --- | --- |
+| drive | 63.6 s | 58.0 s |
+| batch prep, accumulated | 14.2 s | 9.5 s |
+| per ZKP2 proof, p50 | 0.117 s | 0.214 s |
+| chain advance, accumulated | 20.4 s | 21.1 s |
+| delivery work | 447.7 s | 523.0 s |
+| delivery peak / effective | 32 / ~14.5 s | 32 / ~16.3 s |
+
+Two things to take from it.
+
+**Vote work is round-serialized by design, so `--bundle-concurrency` moves
+less than it looks like it should.**
+[`vote_work/round_lock.rs`](../zcash_voting/src/vote_work/round_lock.rs)'s
+`bundle_scope` gives `Delegate` and `AdvanceDelegation` a per-bundle scope and
+every vote step — `CastVote`, `AdvanceVote`, `AdvanceVoteBatch`, `SubmitShares`,
+`ConfirmShare` — the round-wide one. The driver schedules with the same
+function, so it will not admit two round-locked steps together. Three bundles
+therefore still cast one at a time, which the timeline shows plainly: batch
+prep, chain post, and chain advance all report peak concurrency 1 while
+`advance_step` reports 3.
+
+**Proof concurrency is sublinear because proving is CPU-bound.** At 3 wide each
+proof took 0.214 s instead of 0.117 s; accumulated batch preparation still fell
+from 14.2 s to 9.5 s, so it is a real but ~1.5x win, not 3x.
+
+Delivery is not the lever in either run: 523 s of accumulated work landed in
+about 16 s of bursts at the full 32 slots.
 
 ## The run directory
 

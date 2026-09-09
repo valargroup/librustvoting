@@ -37,6 +37,9 @@ pub struct Manifest {
     /// Whether the fleet was synthetic names routed onto one real backend.
     pub synthetic_fleet: bool,
     pub bundle_concurrency: usize,
+    /// Vote-commitment proofs built at once within a bundle.
+    #[serde(default)]
+    pub proof_concurrency: usize,
     /// Seconds the confirmation phase was allowed.
     ///
     /// Defaulted on read so a directory archived before this field existed still
@@ -99,6 +102,7 @@ impl Manifest {
             configured_helpers: config.endpoints.helper_urls.len(),
             synthetic_fleet: !config.fleet.configured_urls().is_empty(),
             bundle_concurrency: config.bundle_concurrency,
+            proof_concurrency: config.proof_concurrency,
             tracking_budget_seconds: config.tracking_budget_seconds,
             confirm_concurrency: config.confirm_concurrency,
             max_dispatches: config.max_dispatches,

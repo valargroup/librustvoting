@@ -21,11 +21,12 @@ pub fn render(manifest: &Manifest, metrics: &Metrics) -> String {
     let _ = writeln!(out, "\n== stage-bench: {} ==", manifest.round_id);
     let _ = writeln!(
         out,
-        "{} proposals x {} bundles, {} configured helpers, bundle concurrency {}",
+        "{} proposals x {} bundles, {} configured helpers, {} bundles and {} proofs wide",
         manifest.proposals,
         manifest.bundles,
         manifest.configured_helpers,
-        manifest.bundle_concurrency
+        manifest.bundle_concurrency,
+        manifest.proof_concurrency
     );
     if manifest.confirm_concurrency > 1 {
         let _ = writeln!(

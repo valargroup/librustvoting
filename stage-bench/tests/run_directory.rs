@@ -41,7 +41,8 @@ fn config(run_dir: &std::path::Path) -> BenchRunConfig {
         ballot: Ballot::synthetic(37, &[2, 3, 4]).expect("a benchmark ballot"),
         fleet: HelperFleetPlan::none(),
         vote_end_time_seconds: 1_800_000_000,
-        bundle_concurrency: 1,
+        bundle_concurrency: 3,
+        proof_concurrency: 3,
         tracking_budget_seconds: 30 * 60,
         confirm_concurrency: 1,
         max_dispatches: 8_192,
@@ -222,6 +223,7 @@ fn a_finished_run_directory_renders_its_report() {
     assert!(table.contains("0123456789abcdef"));
     assert!(table.contains("helper::active_delivery"));
     assert!(table.contains("37 proposals x 3 bundles"));
+    assert!(table.contains("3 bundles and 3 proofs wide"));
     assert!(!table.contains("INCOMPLETE CAPTURE"));
 
     let _ = std::fs::remove_dir_all(&run_dir);

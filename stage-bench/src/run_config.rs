@@ -48,7 +48,16 @@ pub struct BenchRunConfig {
     /// rather than an incidental setting.
     pub vote_end_time_seconds: u64,
     /// Bundles the driver advances at once.
+    ///
+    /// The SDK ships three. Lowering it to one is what a cold-PIR run needs,
+    /// because staging serves PIR from a single synchronous endpoint.
     pub bundle_concurrency: usize,
+    /// Vote-commitment proofs built at once within a bundle.
+    ///
+    /// The SDK's `DEFAULT_BATCH_PROOF_CONCURRENCY` is three, capped at fifteen.
+    /// A 37-proposal bundle builds 37 of these, so this is the second of the
+    /// two serializations a wide ballot pays for.
+    pub proof_concurrency: usize,
     /// Upper bound on driver dispatches, so a plan that never shrinks ends the
     /// run instead of hanging the benchmark.
     pub max_dispatches: usize,
