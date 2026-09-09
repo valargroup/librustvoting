@@ -477,6 +477,34 @@ returned on an outcome is a host-facing projection, not a control input.
 - **One completion path.** Fresh casts and resumed units go through one
   completion routine that differs only in when helper plans are made
   durable; there is no second driver.
+- **A confirmed unit delivers through one shared share queue.** Fresh casts,
+  combined delegation-and-cast completion, and resumed chain reconciliation
+  all recover fresh confirmed handles and use the same bounded queue across
+  their ordered members. Every member's full plan is validated before its
+  first share is admitted. A local preparation or execution failure does not
+  prevent independent eligible members from completing. No helper POST starts
+  before durable chain confirmation. Already-confirmed `Deliver` obligations
+  remain per proposal and invoke the same queue with one vote; this does not
+  change planning, step selection, or lock scope.
+- **Every finalized delivery report is retained before deciding the step.**
+  `ShareOutcome` events are emitted once per available report in completion
+  order, with the actual vote identity, after recording it in the ledger.
+  The drained ledger is normalized to original unit order. The first hard
+  error in unit order (and persisted payload order within a vote) wins,
+  including over cancellation. Without a hard error, interruption wins, then
+  any incomplete delivery yields `HelperDeliveryIncomplete`, then any
+  ambiguous-only proposal yields `Pending`; only all-complete delivery yields
+  `Advanced`. A fast ambiguous proposal therefore cannot hide a later
+  incomplete one. Shared preflight failures still end the operation before
+  delivery. Every exit retains the chain outcome and signed delegation.
+  These contracts are covered in `share_tracking/tests/delivery_queue/executor.rs`
+  by `round_driver_refills_across_confirmed_members_and_retains_every_report`,
+  `round_completion_folds_all_proposals_before_deciding_disposition`,
+  `round_failure_retains_confirmation_and_successes_from_later_proposals`, and
+  `hard_error_outranks_callback_cancellation_after_all_durable_effects_are_kept`.
+  `combined_reconciliation_delivers_later_proposals_while_the_first_is_unfinished`
+  in `chain_submission/generation/tests/combined/helper_delivery.rs` exercises
+  combined-envelope recovery through `RoundDriver` without invoking the prover.
 - **Prerequisites are refused at dispatch.** A step whose obligation carries
   a delegation prerequisite fails with `InvalidInput` naming it, before any
   I/O.

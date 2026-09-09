@@ -27,6 +27,9 @@ use crate::{
     },
 };
 
+mod share_delivery;
+pub(crate) use share_delivery::submit_confirmed_vote_shares;
+
 /// Number of siblings in a vote-authority-note witness.
 pub const VAN_AUTH_PATH_LEN: usize = 24;
 
@@ -587,153 +590,18 @@ impl CommittedVote {
         crate::share_tracking::ShareBatchDeliveryReport,
         crate::share_tracking::ShareDeliveryFailure,
     > {
-        // Nothing has been attempted until the delivery stream runs, so a
-        // failure here carries no partial report.
-        let unstarted = |error| crate::share_tracking::ShareDeliveryFailure {
-            error,
-            partial: None,
-        };
-
-        use futures_util::{stream, StreamExt as _};
-        use std::sync::LazyLock;
-        use std::time::Duration;
-        use tokio::sync::Semaphore;
-
-        // Bound active share workflows separately from the process-wide POST limit.
-        const MAX_CONCURRENT_SHARE_DELIVERIES: usize = 16;
-        const DELIVERY_PERMIT_CANCEL_CHECK_MILLISECONDS: u64 = 50;
-        static DELIVERY_PERMITS: LazyLock<Semaphore> =
-            LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_SHARE_DELIVERIES));
-
-        let scope = crate::share::ShareOperationScope::capture(db);
-        let (plan, plan_generation) = crate::share_tracking::load_share_delivery_plan(
+        share_delivery::submit_votes(
+            std::iter::once(self),
             db,
-            &scope,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-            &self.commitment_bundle_json,
-            params.configured_server_urls,
-            &self.commit.share_payloads,
+            client,
+            params,
+            cancel,
+            &mut |_, _| {},
         )
-        .map_err(unstarted)?;
-
-        let recovery = crate::recovery::helper_recovery_material_for_wallet(
-            db,
-            scope.wallet_id(),
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-        )
-        .map_err(unstarted)?;
-        let vc_tree_position = match recovery {
-            crate::recovery::HelperRecoveryMaterial::Ready(bundle)
-                if bundle.commitment_bundle_json == plan_generation =>
-            {
-                bundle.vc_tree_position
-            }
-            crate::recovery::HelperRecoveryMaterial::Ready(_) => {
-                return Err(unstarted(VotingError::InvalidInput {
-                    message: "committed vote changed after loading its helper-share delivery plan"
-                        .to_string(),
-                }))
-            }
-            crate::recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
-                return Err(unstarted(VotingError::InvalidInput {
-                    message: "committed vote must be confirmed before submitting helper shares"
-                        .to_string(),
-                }))
-            }
-            crate::recovery::HelperRecoveryMaterial::Missing => {
-                return Err(unstarted(VotingError::Internal {
-                    message: "committed vote is missing durable helper recovery material"
-                        .to_string(),
-                }))
-            }
-        };
-        for (payload, share_plan) in self.commit.share_payloads.iter().zip(&plan.share_plans) {
-            payload
-                .to_wire_json(Some(vc_tree_position), share_plan.submit_at)
-                .map_err(unstarted)?;
-        }
-
-        let configured = params.configured_server_urls.to_vec();
-        let planning_fleet = plan.configured_server_urls.clone();
-        let now_seconds = params.now_seconds;
-        let work = self
-            .commit
-            .share_payloads
-            .iter()
-            .zip(plan.share_plans.iter())
-            .map(|(payload, share_plan)| (payload.enc_share.share_index, share_plan.clone()))
-            .collect::<Vec<_>>();
-        let deliveries = stream::iter(work)
-            .map(|(share_index, share_plan)| {
-                let configured = &configured;
-                let planning_fleet = &planning_fleet;
-                let plan_generation = &plan_generation;
-                let scope = &scope;
-                async move {
-                    if cancel() {
-                        return Ok(None);
-                    }
-                    let acquire_permit = DELIVERY_PERMITS.acquire();
-                    tokio::pin!(acquire_permit);
-                    let permit = loop {
-                        if cancel() {
-                            return Ok(None);
-                        }
-                        tokio::select! {
-                            biased;
-                            result = &mut acquire_permit => {
-                                break result.map_err(|_| VotingError::Internal {
-                                    message: "helper-share delivery semaphore closed".to_string(),
-                                })?;
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(
-                                DELIVERY_PERMIT_CANCEL_CHECK_MILLISECONDS,
-                            )) => {}
-                        }
-                    };
-                    if cancel() {
-                        drop(permit);
-                        return Ok(None);
-                    }
-                    let submission = self
-                        .submit_share_to_helpers_for_generation(
-                            db,
-                            client,
-                            crate::share_tracking::CommittedShareSubmissionRequest {
-                                share_index,
-                                plan: &share_plan,
-                                planning_server_urls: planning_fleet,
-                                configured_server_urls: configured,
-                                now_seconds,
-                            },
-                            plan_generation,
-                            scope,
-                            cancel,
-                        )
-                        .await?;
-                    drop(permit);
-                    Ok(Some(crate::share_tracking::ShareDeliveryOutcome {
-                        share_index,
-                        submission,
-                    }))
-                }
-            })
-            .buffer_unordered(MAX_CONCURRENT_SHARE_DELIVERIES)
-            .collect::<Vec<Result<Option<crate::share_tracking::ShareDeliveryOutcome>, VotingError>>>()
-            .await;
-        crate::share_tracking::batch_delivery_report(
-            deliveries,
-            self.commit
-                .share_payloads
-                .iter()
-                .map(|payload| payload.enc_share.share_index),
-            cancel(),
-            plan.placement_guarantee,
-        )
+        .await
+        .pop()
+        .expect("one vote produces one delivery result")
+        .delivery
     }
 
     /// Submits one committed helper share using crate-owned durable journaling.
