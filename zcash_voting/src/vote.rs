@@ -3425,7 +3425,7 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
                 });
             }
         }
-        batches.push((bundle_index, recoveries));
+        batches.push((bundle_index, digest));
     }
 
     for &(bundle_index, singleton_proposal_id) in &singleton_keys {
@@ -3458,16 +3458,8 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
         }
     }
 
-    for (bundle_index, recoveries) in batches {
-        for recovery in recoveries {
-            clear_unsubmitted_vote_recovery_with_conn(
-                conn,
-                wallet_id,
-                round_id,
-                bundle_index,
-                recovery.proposal_id,
-            )?;
-        }
+    for (bundle_index, digest) in batches {
+        clear_vote_batch_recovery_with_conn(conn, wallet_id, round_id, bundle_index, digest)?;
     }
     for (bundle_index, singleton_proposal_id) in singleton_keys {
         clear_unsubmitted_vote_recovery_with_conn(

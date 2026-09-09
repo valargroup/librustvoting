@@ -536,6 +536,27 @@ fn retiring_combined_members_removes_their_authorization() {
     assert_eq!(count, 0);
 }
 
+#[test]
+fn changing_a_combined_member_removes_the_batch_authorization() {
+    let (db, _) = fixture(2);
+
+    crate::vote::invalidate_unsubmitted_vote_recoveries_for_intent(
+        &db.conn(),
+        "wallet-1",
+        ROUND,
+        2,
+        Some(1),
+    )
+    .unwrap();
+
+    assert_eq!(count(&db, "delegate_cast_recovery"), 0);
+    for proposal_id in 1..=2 {
+        assert!(crate::vote::recovery_bundle(&db, ROUND, 0, proposal_id)
+            .unwrap()
+            .is_none());
+    }
+}
+
 /// Real ZKP2 proofs exercise the synthetic delegation output and successor
 /// chain. The delegation fixture carries a verified SpendAuth signature; the
 /// independent ZKP1 proof test covers its circuit and proving key.
