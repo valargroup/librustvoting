@@ -242,3 +242,24 @@ async fn helper_fanout_bounds_admitted_workflows() {
         assert_eq!(transport.active.load(Ordering::SeqCst), 0);
     }
 }
+
+#[tokio::test]
+async fn full_ballot_delivers_592_shares_with_bounded_admission() {
+    let fixture = Fixture::with_helpers(37, 2);
+    let transport = ScriptedTransport::new(|_| ReplyPlan {
+        delay: Duration::from_millis(1),
+        ..Default::default()
+    });
+    let started = std::time::Instant::now();
+    let reports = fixture.deliver(transport.clone(), &uncancelled).await;
+    eprintln!("37-proposal helper delivery: {:?}", started.elapsed());
+    assert_complete(reports, 37);
+    assert_eq!(transport.count(), 592);
+    assert!(transport.peak.load(Ordering::SeqCst) <= 32);
+    assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+    let persisted = share::list(&fixture.db, ROUND_ID).unwrap();
+    assert_eq!(persisted.len(), 592);
+    assert!(persisted.iter().all(|share| share.sent_to_urls.len() == 1
+        && share.ambiguous_urls.is_empty()
+        && share.attempting_urls.is_empty()));
+}
