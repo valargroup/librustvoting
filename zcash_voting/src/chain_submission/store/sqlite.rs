@@ -458,11 +458,19 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                 return Ok(StoreAdmission::Ready { derived: Box::new(derived), record, fresh_reservation: false });
             }
             if request.identity().target().is_combined() {
+                // The `chain_submissions` disjunct binds `:network` like the
+                // predecessor and superseded guards below, so all three read
+                // the same rows. The two `bundles` disjuncts cannot: that table
+                // has no network column, and one `(round_id, wallet_id)` is one
+                // network because `chain_submissions` and `bundles` are both
+                // foreign-key bound to a single `rounds` row.
                 let occupied: bool = tx.query_row(
                     "SELECT b.delegation_tx_hash IS NOT NULL OR b.van_leaf_position IS NOT NULL OR EXISTS(
-                       SELECT 1 FROM chain_submissions s WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id AND s.bundle_index=b.bundle_index)
-                     FROM bundles b WHERE b.round_id=?1 AND b.wallet_id=?2 AND b.bundle_index=?3",
-                    rusqlite::params![hex::encode(request.identity().vote_round_id()), request.identity().wallet_id(), request.identity().bundle_index()],
+                       SELECT 1 FROM chain_submissions s WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
+                         AND s.network=:network AND s.bundle_index=b.bundle_index)
+                     FROM bundles b WHERE b.round_id=:round AND b.wallet_id=:wallet AND b.bundle_index=:bundle",
+                    named_params! { ":wallet": request.identity().wallet_id(), ":network": network_name(request.identity().network()),
+                        ":round": hex::encode(request.identity().vote_round_id()), ":bundle": request.identity().bundle_index() },
                     |row| row.get(0),
                 ).map_err(storage_error)?;
                 if occupied { return Err(ChainSubmissionFailure::without_state(ChainSubmissionFailureKind::InvalidInput, "combined admission requires a fresh delegation")); }

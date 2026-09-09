@@ -214,6 +214,16 @@ pub struct ShareSubmissionReport {
     pub ambiguous_urls: Vec<String>,
     /// Desired number of definite helper placements.
     pub target_count: usize,
+    /// Whether this pass ended because its own process ran out of POST
+    /// admission slots rather than because a helper answered.
+    ///
+    /// Local admission is a bound this SDK imposes on itself, so its expiry is
+    /// evidence about this process and not about any helper: nothing was sent,
+    /// nothing was refused. It is reported so completion can distinguish "no
+    /// helper holds this share" from "this pass never got to ask", which are
+    /// the same empty result but call for opposite responses — a failure the
+    /// voter must see, or another pass. Not persisted: it describes one pass.
+    pub local_capacity_exhausted: bool,
 }
 
 /// Strength of the initial helper-placement guarantee retained on disk.

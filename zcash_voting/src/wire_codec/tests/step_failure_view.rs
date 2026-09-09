@@ -23,6 +23,7 @@ fn partial_delivery() -> VoteShareDeliveryReport {
                     accepted_urls: vec!["https://helper-a.example".to_string()],
                     ambiguous_urls: vec!["https://helper-b.example".to_string()],
                     target_count: 2,
+                    local_capacity_exhausted: false,
                 },
             }],
             pending_share_indices: vec![1],

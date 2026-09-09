@@ -1939,7 +1939,13 @@ and
 
 Fresh combined admission also refuses a bundle carrying any chain submission
 row, whatever its kind or state, before a reservation exists
-(`combined_admission_refuses_a_bundle_with_delegation_evidence`), and tree
+(`combined_admission_refuses_a_bundle_with_delegation_evidence`). That guard
+reads only this network's rows, binding `:network` like the predecessor and
+superseded guards beside it, so all three see the same rows
+(`combined_admission_reads_only_this_networks_submission_evidence`). Its two
+`bundles` disjuncts cannot be scoped that way and do not need to be: `bundles`
+has no network column, and one `(round_id, wallet_id)` is one network because
+both tables are foreign-key bound to a single `rounds` row. Tree
 recovery confirms a combined generation from the same final-VAN-plus-vote-leaves
 layout as an ordinary batch without inventing a hash
 (`exact_recovery_confirms_a_combined_batch_from_the_tree`).

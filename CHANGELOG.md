@@ -33,6 +33,28 @@ This release is `zcash_voting` 4.0.0.
   `route_answer_replaced` diagnostic and preserves dispatch ambiguity and
   durable recovery, because a proxy may replace a response after forwarding the
   request.
+- Helper delivery no longer discards an acceptance it observed. Every member of
+  a POST wave has its outcome written before any of them reports a failure, so
+  one helper losing its reservation mid-wave stops throwing away a sibling
+  helper's `queued` answer and re-POSTing it as an interrupted attempt.
+- A helper-share pass that ran out of this SDK's own POST admission slots is
+  reported as pending rather than as a failed delivery. Nothing was sent, so no
+  helper refused anything and every durable row is clean; the pass now stops
+  instead of reserving its remaining candidates into the same expiring queue,
+  and vote completion reschedules instead of raising
+  `HelperDeliveryIncomplete`. `ShareSubmissionReport` gains
+  `local_capacity_exhausted` to carry this.
+- A bundle blocked by the combined rejection cap no longer hides a sibling
+  bundle's completed vote. The block still keeps the round out of `Done` and
+  still reports blocking recovery; only the completed-vote view stopped being
+  suppressed round-wide for a vote that is already on chain.
+- Combined admission reads only the current network's submission rows, binding
+  `network` like the predecessor and superseded guards beside it.
+- An unrecognized diagnostic kind in the combined rejection ledger degrades to a
+  generic message instead of making the whole round unplannable. Ledger rows
+  outlive retirement, so an SDK downgrade after a newer build recorded a kind it
+  added was otherwise unrecoverable except through
+  `VotingDb::retry_blocked_combined_cast`.
 - Combined rejection retirement clamps timestamps across wall-clock rollback,
   preserving atomic cleanup and the rejection streak. A new delegation
   generation starts its own timestamps.

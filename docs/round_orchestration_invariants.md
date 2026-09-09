@@ -273,12 +273,45 @@ persisted recovery bundles rather than from the constant.
   person must decide whether the delegation is worth another attempt.
   `consecutive_combined_rejections_accumulate_against_one_delegation_generation`
   pins the accumulation, the cap and the host's release.
+- The block belongs to its bundle. It keeps the round out of `Done` and holds
+  `blocking_recovery`, which stays a property of the whole round, but it does
+  not hide a *sibling* bundle's completed vote: that vote is on chain with its
+  shares delivered, and withholding the completed view round-wide told the
+  voter only that something, somewhere, was unresolved. A blocked bundle
+  contributes nothing to that view: its weight was never cast, so its stored
+  choice is excluded from the display rather than reported as a vote that
+  happened, and it cannot disagree with a confirmed sibling and render the
+  proposal undecided inside a display headed "completed". A lone blocked bundle
+  therefore shows no completed view at all, and neither does a round where some
+  proposal's only cast sits behind the block: a proposal with no readable choice
+  renders as `None`, which is also how a skipped proposal renders, so showing it
+  would report a skip the voter never made. The displayed "voted at" is read
+  from the same bundles as the choices, so a blocked bundle's earlier attempt
+  cannot stamp a view it contributed nothing to
+  (`a_blocked_bundle_does_not_hide_a_sibling_bundles_completed_vote`,
+  `a_blocked_bundles_own_choice_never_reaches_the_completed_view`,
+  `a_proposal_whose_only_cast_is_blocked_withholds_the_whole_view`,
+  `a_blocked_bundle_does_not_stamp_the_display_with_its_own_timestamp`,
+  `a_lone_blocked_bundle_shows_no_completed_vote`). `completed_vote_artifact`
+  is unchanged and still counts every bundle, so it can be true while the
+  display is absent; that divergence predates this rule. A rejection block is the
+  only blocker treated this way; every other reason the round is unfinished
+  suppresses the completed view exactly as before. Because a held bundle emits
+  no steps, `primary_action` in this state is `Idle`: the block reaches the host
+  through `blocking_recovery` and the bundle's own `submission_diagnostic`, not
+  through the action.
 - The block is advisory, not a terminal delegation phase, and it is
   self-healing in three ways. A confirmed batch clears the streak, so a later
   unrelated rejection starts from one
   (`a_confirmed_combined_batch_forgets_its_rejection_streak`). Discarding an
   unbroadcast delegation setup deletes the ledger row with it, because the
-  generation the count described is gone. And the snapshot only blocks a
+  generation the count described is gone. A diagnostic kind the reading build
+  does not recognize degrades to a generic message rather than failing the
+  snapshot: a ledger row outlives retirement, so an SDK downgrade after a newer
+  build recorded a kind it added would otherwise make the whole round
+  unplannable, while the streak that actually bounds recasting reads the same
+  either way (`a_diagnostic_kind_this_build_does_not_know_still_plans_the_round`).
+  And the snapshot only blocks a
   bundle whose *current* delegation generation still equals the one the
   rejections were counted against, so rebuilding or re-proving the delegation
   lifts the block on its own. `VotingDb::retry_blocked_combined_cast` is the

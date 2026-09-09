@@ -409,6 +409,8 @@ fn db_with_delivery_for_wallet(
         accepted_urls: sent_to_urls.to_vec(),
         ambiguous_urls: ambiguous_urls.to_vec(),
         target_count,
+        // A durable record describes placements, not the pass that made them.
+        local_capacity_exhausted: false,
     };
     share::record_delivery(
         &db,

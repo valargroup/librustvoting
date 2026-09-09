@@ -178,13 +178,28 @@ impl SnapshotBuilder {
             nullifier: vec![0x77; 32],
             confirmed: phase == SharePhase::Confirmed,
             submit_at: 0,
-            created_at: 100,
+            // Distinct per bundle so a test can tell which bundle a displayed
+            // "voted at" came from.
+            created_at: 100 + u64::from(bundle_index),
         });
         self
     }
 
     pub(super) fn intent(mut self, proposal_id: u32, decision: Decision) -> Self {
         self.snapshot.intents.insert(proposal_id, decision);
+        self
+    }
+
+    /// A bundle whose combined recasting has hit the rejection cap, so
+    /// planning holds it and a person must decide what to do about it.
+    pub(super) fn rejection_blocked(mut self, bundle_index: u32) -> Self {
+        self.snapshot.rejection_blocked_bundles.insert(
+            bundle_index,
+            crate::ChainSubmissionDiagnostic::from_redacted_message(
+                crate::ChainSubmissionDiagnosticKind::ChainRejected,
+                "vote chain rejected transaction with code 7",
+            ),
+        );
         self
     }
 

@@ -1085,6 +1085,39 @@ fn blocked_bundles(
 }
 
 #[tokio::test]
+async fn a_diagnostic_kind_this_build_does_not_know_still_plans_the_round() {
+    // A ledger row outlives retirement, and only confirmation, a rebuild, a
+    // ballot change or the host's explicit retry removes one. Downgrading the
+    // SDK after a newer build recorded a diagnostic kind it added would
+    // otherwise make every plan for the round fail, on a column no schema
+    // constraint bounds. The streak, which is what actually blocks recasting,
+    // reads the same either way.
+    let (db, request) = fixture(2);
+    reject_combined_once(&db, &request).await;
+    assert!(rejection_ledger(&db).is_some());
+    db.conn()
+        .execute(
+            "UPDATE combined_cast_rejections
+                SET last_diagnostic_kind = 'a_kind_from_a_newer_build',
+                    consecutive_rejections = 2",
+            [],
+        )
+        .unwrap();
+
+    let blocked = blocked_bundles(&db);
+
+    assert!(
+        blocked.contains_key(&0),
+        "the streak still blocks the bundle"
+    );
+    assert!(
+        blocked[&0].message().contains("a_kind_from_a_newer_build"),
+        "the unreadable kind is surfaced rather than dropped: {}",
+        blocked[&0].message()
+    );
+}
+
+#[tokio::test]
 async fn a_confirmed_combined_batch_forgets_its_rejection_streak() {
     // The streak means "this delegation keeps being refused". A batch that
     // lands disproves that, so a later unrelated rejection starts from one.
@@ -1417,5 +1450,60 @@ async fn combined_admission_refuses_a_bundle_with_delegation_evidence() {
         count(&db, "chain_submissions"),
         1,
         "no combined reservation"
+    );
+}
+
+#[tokio::test]
+async fn combined_admission_reads_only_this_networks_submission_evidence() {
+    // The guard's `chain_submissions` disjunct binds `:network` like the
+    // predecessor and superseded guards beside it, so all three read the same
+    // rows. Without it a row for another network refused admission with
+    // "requires a fresh delegation", and the only escape was deleting a row
+    // belonging to a different chain.
+    let (db, request) = fixture(2);
+    let other_network = ChainSubmissionIdentity::new(
+        "wallet-1",
+        crate::Network::Regtest,
+        [0x11; 32],
+        0,
+        ChainSubmissionTarget::Delegation,
+    )
+    .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO chain_submissions
+               (identity_key, round_id, wallet_id, network, bundle_index, kind,
+                generation_digest, state, committed_post_reservations,
+                diagnostic_kind, diagnostic, created_at, updated_at)
+             VALUES (?1, ?2, 'wallet-1', 'regtest', 0, 'delegation', ?3, 'recovering', 1,
+                     'ambiguous_dispatch', 'timed out', 9, 9)",
+            rusqlite::params![
+                crate::chain_submission::identity::submission_identity_key(&other_network),
+                ROUND,
+                vec![0x44_u8; 32]
+            ],
+        )
+        .unwrap();
+    let transport = Arc::new(ScriptedPosts {
+        inner: Transport {
+            request: request.clone(),
+            calls: Mutex::new(Vec::new()),
+        },
+        posts: Mutex::new(vec![rejection(7, &request)]),
+    });
+
+    // Admission is reached: the testnet batch is POSTed and its answer applied.
+    client_over(&db, transport)
+        .advance_delegate_and_vote_batch(
+            request,
+            ChainRecoveryMode::StatusOnly,
+            &ChainSubmissionControl::new(1),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        rejection_ledger(&db).is_some(),
+        "the batch reached the chain rather than being refused admission"
     );
 }

@@ -25,6 +25,7 @@ fn accepted_delivery() -> VoteShareDeliveryReport {
                     accepted_urls: vec!["https://helper-a.example".to_string()],
                     ambiguous_urls: Vec::new(),
                     target_count: 1,
+                    local_capacity_exhausted: false,
                 },
             }],
             pending_share_indices: Vec::new(),

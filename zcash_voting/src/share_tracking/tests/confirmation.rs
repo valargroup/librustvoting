@@ -111,6 +111,7 @@ async fn focused_confirmation_confirms_only_the_requested_share() {
         accepted_urls: configured.clone(),
         ambiguous_urls: Vec::new(),
         target_count: configured.len(),
+        local_capacity_exhausted: false,
     };
     share::record_delivery(
         &db,
@@ -198,6 +199,7 @@ async fn focused_confirmation_ignores_malformed_unrelated_share() {
                 accepted_urls: configured.clone(),
                 ambiguous_urls: Vec::new(),
                 target_count: configured.len(),
+                local_capacity_exhausted: false,
             },
             submit_at: SUBMIT_AT,
         },

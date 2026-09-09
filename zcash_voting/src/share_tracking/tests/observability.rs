@@ -12,6 +12,7 @@ fn delivery_report(evidence: &[(bool, bool)]) -> ShareBatchDeliveryReport {
                     accepted_urls: if accepted { vec![helper(1)] } else { vec![] },
                     ambiguous_urls: if ambiguous { vec![helper(2)] } else { vec![] },
                     target_count: 2,
+                    local_capacity_exhausted: false,
                 },
             })
             .collect(),

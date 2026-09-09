@@ -402,6 +402,13 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     // rerunning delivery at once.
                     return self.outcome(scope, RoundStepDisposition::Pending, ledger);
                 }
+                DeliveryProgress::AwaitingLocalCapacity => {
+                    // Nothing was sent, so no helper has refused anything and
+                    // the durable rows are clean. The next pass starts from a
+                    // full fleet; failing the step here would report this
+                    // SDK's own POST queue as a delivery failure.
+                    return self.outcome(scope, RoundStepDisposition::Pending, ledger);
+                }
                 DeliveryProgress::Incomplete => {
                     return Err(self.step_failure(
                         RoundStepFailureKind::HelperDeliveryIncomplete,

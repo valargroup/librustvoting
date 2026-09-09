@@ -28,6 +28,7 @@ fn share_round_plan() -> ClassifiedPlan {
                 accepted_urls: helpers.clone(),
                 ambiguous_urls: Vec::new(),
                 target_count: helpers.len(),
+                local_capacity_exhausted: false,
             },
             submit_at: 1_700_000_000,
         },

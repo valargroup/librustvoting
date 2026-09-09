@@ -218,7 +218,8 @@ pub(crate) fn share_delivery_outcome(
         Ok(report) if !report.pending_share_indices.is_empty() => ObservationOutcome::Pending,
         Ok(report) => match delivery_progress(report) {
             DeliveryProgress::Complete => ObservationOutcome::Succeeded,
-            DeliveryProgress::AwaitingAmbiguousHelpers => ObservationOutcome::Pending,
+            DeliveryProgress::AwaitingAmbiguousHelpers
+            | DeliveryProgress::AwaitingLocalCapacity => ObservationOutcome::Pending,
             DeliveryProgress::Incomplete => ObservationOutcome::Failed,
         },
     }

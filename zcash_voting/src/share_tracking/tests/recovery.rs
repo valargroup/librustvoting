@@ -83,6 +83,7 @@ async fn confirmation_stays_bound_to_the_wallet_that_started_tracking() {
         accepted_urls: configured.clone(),
         ambiguous_urls: Vec::new(),
         target_count: configured.len(),
+        local_capacity_exhausted: false,
     };
     share::record_delivery(
         &db,
@@ -224,6 +225,7 @@ async fn stalled_status_poll_does_not_starve_a_later_share() {
         accepted_urls: configured.clone(),
         ambiguous_urls: Vec::new(),
         target_count: configured.len(),
+        local_capacity_exhausted: false,
     };
     share::record_delivery(
         &db,

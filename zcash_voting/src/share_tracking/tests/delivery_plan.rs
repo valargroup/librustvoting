@@ -1297,6 +1297,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
                 accepted_urls: vec![helper(1)],
                 ambiguous_urls: vec![],
                 target_count: 1,
+                local_capacity_exhausted: false,
             },
             submit_at: SUBMIT_AT,
         },

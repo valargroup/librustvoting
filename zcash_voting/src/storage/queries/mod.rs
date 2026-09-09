@@ -3813,11 +3813,27 @@ pub(crate) fn combined_rejection_ledger_rows(
                     message: "combined rejection ledger stores a malformed generation digest"
                         .to_string(),
                 })?;
-            let diagnostic =
-                crate::phases::stored_submission_diagnostic(Some(kind), Some(message))?
-                    .ok_or_else(|| VotingError::Internal {
-                        message: "combined rejection ledger stores no diagnostic".to_string(),
-                    })?;
+            // An unrecognized kind degrades the diagnostic instead of failing
+            // the read. `chain_submissions` can be strict here because its rows
+            // are retired on transition and rebuilt by migrations, so a kind
+            // this build does not know is transient there. A ledger row is not:
+            // it outlives retirement, and the only paths that remove one are
+            // confirmation, a rebuild, a ballot change and the host's explicit
+            // retry. Downgrading the SDK after a newer build recorded a kind it
+            // added would otherwise make every plan for the round fail, while
+            // the streak — the part that actually bounds recasting — is
+            // readable either way.
+            let diagnostic = crate::phases::stored_submission_diagnostic(
+                Some(kind.clone()),
+                Some(message.clone()),
+            )
+            .unwrap_or(None)
+            .unwrap_or_else(|| {
+                crate::ChainSubmissionDiagnostic::from_redacted_message(
+                    crate::ChainSubmissionDiagnosticKind::ChainRejected,
+                    format!("chain rejection recorded as {kind}: {message}"),
+                )
+            });
             Ok(CombinedRejectionLedgerRow {
                 bundle_index,
                 delegation_generation_digest,

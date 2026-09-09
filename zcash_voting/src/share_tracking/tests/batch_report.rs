@@ -15,6 +15,7 @@ fn accepted(share_index: u32) -> ShareDeliveryOutcome {
             accepted_urls: vec![format!("https://helper-{share_index}.example")],
             ambiguous_urls: Vec::new(),
             target_count: 1,
+            local_capacity_exhausted: false,
         },
     }
 }

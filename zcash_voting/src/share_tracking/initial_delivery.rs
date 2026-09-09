@@ -175,6 +175,27 @@ fn load_prepared_share_delivery(
     Ok((durable_submit_at, persisted_delivery))
 }
 
+/// What one wave member's slot produced.
+///
+/// The two are kept apart because only one of them is evidence about the
+/// helper. Local admission expiry is a property of this process's own POST
+/// queue: the request never left, so the helper is neither slow, unreachable,
+/// nor refusing, and spending its single attempt on that would be reading a
+/// queue as an answer.
+enum WaveAttempt {
+    /// Local admission never granted a POST slot, so this helper was never
+    /// contacted. Carries why, because only budget expiry is the throttling a
+    /// pass reports; cancellation ends the pass on its own.
+    NotAdmitted(crate::HelperError),
+    /// The POST ran. Inner `Err` is the delivery deadline elapsing mid-flight.
+    Posted(
+        Result<
+            Result<crate::helper::client::ShareSubmissionStatus, crate::HelperError>,
+            tokio::time::error::Elapsed,
+        >,
+    ),
+}
+
 /// Continues fan-out from an already-prepared durable delivery record.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_share_to_canonical_helpers(
@@ -201,12 +222,19 @@ async fn dispatch_share_to_canonical_helpers(
     else {
         let delivery_state =
             load_current_delivery_state(db, scope, params, &expected_nullifier, &candidates)?;
-        return Ok(delivery_report(&delivery_state, params.target_count));
+        return Ok(delivery_report(&delivery_state, params.target_count, false));
     };
     let generation = share::ShareGeneration::new(scope, &expected_nullifier);
     let planned_set: HashSet<&str> = planned.iter().map(String::as_str).collect();
     let mut delivery_state =
         load_current_delivery_state(db, scope, params, &expected_nullifier, &candidates)?;
+    // Both are set for the whole pass, not one wave: together they explain
+    // the report the caller finally sees. `helper_answered` is what keeps a
+    // real refusal from being read as local throttling: a pass that asked
+    // even one helper has evidence about the fleet, whatever else it also
+    // failed to send.
+    let mut never_admitted_a_candidate = false;
+    let mut helper_answered = false;
     let mut remaining = candidates.clone();
     remaining.retain(|url| {
         !delivery_state.accepted_urls().contains(url)
@@ -306,11 +334,14 @@ async fn dispatch_share_to_canonical_helpers(
 
         let placement_fleet = candidates.as_slice();
         let posts = wave.iter().map(|server_url| async move {
-            // Waiting consumes the fan-out budget, but an unsent reservation
-            // must remain a definite failure on cancellation or expiry.
+            // Waiting consumes the fan-out budget. Failing here means local
+            // admission never granted a slot, however it failed, so the helper
+            // was never contacted and nothing about it can be concluded. Both
+            // reasons clear the reservation as a definite failure; only budget
+            // expiry is the throttling the pass reports.
             let _permit = match super::post_capacity::acquire(deadline, cancel).await {
                 Ok(permit) => permit,
-                Err(error) => return Ok(Ok(Err(error))),
+                Err(error) => return Ok(WaveAttempt::NotAdmitted(error)),
             };
             // A permit wait can outlive the durable generation or its attempt.
             // Validate the starting wallet's journal again before any POST.
@@ -325,27 +356,43 @@ async fn dispatch_share_to_canonical_helpers(
                 return Err(stale_delivery_error(params));
             }
             let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
-            Ok(tokio::time::timeout_at(
-                deadline,
-                client.submit_share_with_timeout(
-                    server_url,
-                    params.share_wire_json,
-                    params.now_seconds,
-                    cancel,
-                    remaining_time,
-                    Some(deadline),
-                ),
-            )
-            .await)
+            Ok(WaveAttempt::Posted(
+                tokio::time::timeout_at(
+                    deadline,
+                    client.submit_share_with_timeout(
+                        server_url,
+                        params.share_wire_json,
+                        params.now_seconds,
+                        cancel,
+                        remaining_time,
+                        Some(deadline),
+                    ),
+                )
+                .await,
+            ))
         });
         let helper_post_outcomes = futures_util::future::join_all(posts).await;
 
-        // Outcomes are applied in wave order, one at a time: each writes the
-        // durable attempt row, and a stale generation must abort before a
-        // later write can mask it.
+        // Every wave member's outcome is written before any of them reports a
+        // failure. `join_all` has already run all of them to completion, so by
+        // this point each answer is something the process observed, and
+        // returning at the first bad one left the rest of the wave sitting in
+        // `attempting_urls`: a helper that answered `queued` was re-POSTed as
+        // an interrupted attempt on the next pass, discarding an acceptance
+        // this process saw. Ordering is still safe because every write is
+        // guarded on the generation and refuses a stale one on its own, so a
+        // later write cannot mask an earlier staleness.
         let mut deadline_elapsed = false;
+        let mut stale_generation = false;
+        let mut wave_failure = None;
         for (server_url, helper_post_outcome) in wave.iter().zip(helper_post_outcomes) {
-            let helper_post_outcome = helper_post_outcome?;
+            let helper_post_outcome = match helper_post_outcome {
+                Ok(helper_post_outcome) => helper_post_outcome,
+                Err(error) => {
+                    wave_failure.get_or_insert(error);
+                    continue;
+                }
+            };
             let attempt = share::ShareDeliveryAttemptParams {
                 round_id: params.round_id,
                 bundle_index: params.bundle_index,
@@ -355,50 +402,21 @@ async fn dispatch_share_to_canonical_helpers(
                 target_count: definite_acceptance_target,
                 submit_at: params.submit_at,
             };
-            match helper_post_outcome {
-                Err(_) => {
-                    // The client returns a held definite error rather than
-                    // sleeping a retry backoff into this deadline, so an elapse
-                    // here can only cancel an in-flight HTTP attempt, whose
-                    // transport outcome is genuinely unknown; retain it for
-                    // polling.
-                    if !share::resolve_delivery_attempt_for_generation(
-                        db,
-                        &attempt,
-                        generation,
-                        share::ShareDeliveryAttemptOutcome::Ambiguous,
-                        false,
-                    )? {
-                        return Err(stale_delivery_error(params));
-                    }
-                    delivery_state.mark_outcome_unknown(server_url)?;
-                    deadline_elapsed = true;
-                }
-                Ok(Ok(_)) => {
-                    if !share::resolve_delivery_attempt_for_generation(
-                        db,
-                        &attempt,
-                        generation,
-                        share::ShareDeliveryAttemptOutcome::Accepted,
-                        false,
-                    )? {
-                        return Err(stale_delivery_error(params));
-                    }
-                    delivery_state.mark_accepted(server_url)?;
-                }
-                Ok(Err(error)) if error.is_ambiguous() => {
-                    if !share::resolve_delivery_attempt_for_generation(
-                        db,
-                        &attempt,
-                        generation,
-                        share::ShareDeliveryAttemptOutcome::Ambiguous,
-                        false,
-                    )? {
-                        return Err(stale_delivery_error(params));
-                    }
-                    delivery_state.mark_outcome_unknown(server_url)?;
-                }
-                Ok(Err(_)) => {
+            // The client returns a held definite error rather than sleeping a
+            // retry backoff into this deadline, so an elapse can only cancel an
+            // in-flight HTTP attempt, whose transport outcome is genuinely
+            // unknown; retain it for polling.
+            let posted = match helper_post_outcome {
+                WaveAttempt::Posted(posted) => posted,
+                WaveAttempt::NotAdmitted(reason) => {
+                    // Nothing was sent, so this says nothing about the helper.
+                    // The reservation is released as a definite failure, which
+                    // clears the marker and leaves the helper eligible for a
+                    // later pass, but the pass must not go on to report an
+                    // empty result as though a helper had refused: that is how
+                    // a share ends with no accepted and no ambiguous answers,
+                    // which `DeliveryProgress` reads as `Incomplete` and vote
+                    // completion turns into a hard step failure.
                     if !share::resolve_delivery_attempt_for_generation(
                         db,
                         &attempt,
@@ -406,10 +424,57 @@ async fn dispatch_share_to_canonical_helpers(
                         share::ShareDeliveryAttemptOutcome::DefiniteFailure,
                         false,
                     )? {
-                        return Err(stale_delivery_error(params));
+                        stale_generation = true;
+                        continue;
                     }
+                    // Cancellation also never contacted the helper, but it is
+                    // not throttling and the pass is ending anyway: the batch
+                    // report's own cancellation flag is what a caller reads.
+                    if matches!(reason, crate::HelperError::DeadlineExceeded) {
+                        never_admitted_a_candidate = true;
+                    }
+                    continue;
                 }
+            };
+            helper_answered = true;
+            let (outcome, elapsed) = match posted {
+                Err(_) => (share::ShareDeliveryAttemptOutcome::Ambiguous, true),
+                Ok(Ok(_)) => (share::ShareDeliveryAttemptOutcome::Accepted, false),
+                Ok(Err(error)) if error.is_ambiguous() => {
+                    (share::ShareDeliveryAttemptOutcome::Ambiguous, false)
+                }
+                Ok(Err(_)) => (share::ShareDeliveryAttemptOutcome::DefiniteFailure, false),
+            };
+            if !share::resolve_delivery_attempt_for_generation(
+                db, &attempt, generation, outcome, false,
+            )? {
+                stale_generation = true;
+                continue;
             }
+            match outcome {
+                share::ShareDeliveryAttemptOutcome::Accepted => {
+                    delivery_state.mark_accepted(server_url)?
+                }
+                share::ShareDeliveryAttemptOutcome::Ambiguous => {
+                    delivery_state.mark_outcome_unknown(server_url)?
+                }
+                share::ShareDeliveryAttemptOutcome::DefiniteFailure => {}
+            }
+            deadline_elapsed |= elapsed;
+        }
+        if stale_generation {
+            return Err(stale_delivery_error(params));
+        }
+        if let Some(error) = wave_failure {
+            return Err(error);
+        }
+        // Local admission only expires once the delivery budget is nearly
+        // spent, so there is nothing left to try in this pass. Stopping here
+        // keeps the remaining candidates untouched rather than reserving them
+        // into a queue that will expire the same way; their durable rows are
+        // clean, so a later pass starts from a full fleet.
+        if never_admitted_a_candidate {
+            break;
         }
 
         if deadline_elapsed || stop_after_wave {
@@ -418,7 +483,11 @@ async fn dispatch_share_to_canonical_helpers(
     }
     delivery_state =
         load_current_delivery_state(db, scope, params, &expected_nullifier, &candidates)?;
-    Ok(delivery_report(&delivery_state, params.target_count))
+    Ok(delivery_report(
+        &delivery_state,
+        params.target_count,
+        never_admitted_a_candidate && !helper_answered,
+    ))
 }
 
 fn load_current_delivery_state(
@@ -462,6 +531,7 @@ fn load_current_delivery_state(
 fn delivery_report(
     delivery_state: &share::ShareDeliveryState,
     target_count: usize,
+    local_capacity_exhausted: bool,
 ) -> ShareSubmissionReport {
     ShareSubmissionReport {
         accepted_urls: delivery_state.accepted_urls().to_vec(),
@@ -472,6 +542,7 @@ fn delivery_report(
             .cloned()
             .collect(),
         target_count,
+        local_capacity_exhausted,
     }
 }
 

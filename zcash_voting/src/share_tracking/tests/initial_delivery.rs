@@ -131,8 +131,14 @@ async fn post_capacity_deadline_clears_unsent_reservations() {
     assert_eq!(started.elapsed(), Duration::from_secs(59));
     assert!(report.accepted_urls.is_empty());
     assert!(report.ambiguous_urls.is_empty());
+    assert!(
+        report.local_capacity_exhausted,
+        "the pass must say it never got to ask, so completion reschedules \
+         instead of reporting a delivery failure"
+    );
     assert!(only_share(&db).attempting_urls.is_empty());
     assert!(transport.calls().is_empty());
+    assert!(report.accepted_urls.is_empty());
     drop(held_permits);
     transport.queue_post(
         &format!("{}/shielded-vote/v1/shares", helper(1)),

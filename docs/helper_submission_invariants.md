@@ -1004,7 +1004,35 @@ hold a delivery permit at once. Separately, a process-wide semaphore limits
 initial POST operations across those tasks to 128. Waiting for a POST permit
 observes cancellation every 50 milliseconds and stops when one second or less
 remains in the fan-out budget. An unsent reservation is cleared as a
-definite failure on cancellation or budget exhaustion. After admission, the
+definite failure on cancellation or budget exhaustion.
+
+Budget exhaustion in that queue is reported apart from anything a helper said.
+Nothing was POSTed, so the helper is neither slow, unreachable, nor refusing:
+the empty result is about this process, not the fleet. The pass releases the
+reservation and stops rather than reserving the remaining candidates into a
+queue that will expire the same way, so their durable rows stay clean and the
+next pass starts from a full fleet.
+
+`local_capacity_exhausted` is recorded only when the pass POSTed to no helper
+at all and at least one candidate's admission expired. A pass that reached even
+one helper has evidence about the fleet, whatever else it failed to send, so a
+refusal stays a delivery failure the voter sees rather than being laundered
+into a silent reschedule
+(`a_pass_that_reached_a_helper_reports_the_answer_and_not_the_queue`).
+Cancellation during admission also never contacts the helper and clears the
+reservation the same way, but it is not throttling and does not set the flag:
+the batch report's own cancellation flag is what a caller reads, and vote
+completion checks it before delivery progress.
+`delivery_progress` reads that as `AwaitingLocalCapacity` and vote completion
+reports `Pending`, the same reschedule ambiguity gets, instead of the
+`HelperDeliveryIncomplete` step failure a share that really reached no helper
+produces. A share that placed nothing after actually asking is still
+`Incomplete`, and a pass with shares left queued is `Incomplete` whatever
+throttled its siblings. Coverage:
+`post_capacity_deadline_clears_unsent_reservations` and
+`a_share_this_process_never_got_to_send_waits_instead_of_failing`.
+
+After admission, the
 executor re-reads the starting wallet's exact share nullifier and requires the
 helper's attempting marker before dispatch. Deletion, generation replacement,
 or loss of that reservation fails without sending the queued payload or
@@ -1071,7 +1099,15 @@ executor:
 1. re-evaluates helper health before each reservation;
 2. selects each helper at most once in the outer fan-out (the client can still
    repeat a definite transient transport attempt under its retry policy);
-3. resolves definite and ambiguous outcomes into their separate durable sets;
+3. resolves definite and ambiguous outcomes into their separate durable sets.
+   Every member of a wave has its outcome written before any of them reports a
+   failure: the wave's futures are all run to completion, so each answer is one
+   the process observed, and returning at the first bad one left the rest of
+   the wave in `attempting_urls`, discarding an acceptance and re-POSTing it as
+   an interrupted attempt on the next pass. Ordering stays safe because every
+   write is guarded on the generation and refuses a stale one on its own, so a
+   later write cannot mask an earlier staleness
+   (`a_stale_wave_member_does_not_discard_a_sibling_helper_acceptance`);
 4. stops when `target_count` definite helpers have accepted, candidates are
    exhausted, cancellation fires, or the 60-second deadline expires; and
 5. returns partial or empty acceptance as a report rather than treating it as

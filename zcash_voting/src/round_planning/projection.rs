@@ -83,12 +83,12 @@ pub(crate) fn project(
         || votes
             .values()
             .any(|phase| *phase == VotePhase::SubmissionRejected);
-    let blocking_recovery = submission_managed
+    // Everything that blocks the round for a reason that is not one bundle's
+    // exhausted recasting. Split out because a rejection block is the one
+    // blocker that belongs to a single bundle and says nothing about a sibling.
+    let unfinished_work = submission_managed
         || submitted_without_hash
         || submission_rejected
-        // The bundle plans nothing, but the round is not finished: a person
-        // must decide whether the delegation is worth another attempt.
-        || !snapshot.rejection_blocked_bundles.is_empty()
         || steps.iter().any(|step| match step {
             NextStep::ConfirmShare {
                 bundle_index,
@@ -97,6 +97,9 @@ pub(crate) fn project(
             } => blocking_confirm_share_keys.contains(&(*bundle_index, *proposal_id, *share_index)),
             _ => true,
         });
+    // The blocked bundle plans nothing, but the round is not finished: a
+    // person must decide whether the delegation is worth another attempt.
+    let blocking_recovery = unfinished_work || !snapshot.rejection_blocked_bundles.is_empty();
 
     let delegation_statuses = snapshot
         .delegations
@@ -134,11 +137,14 @@ pub(crate) fn project(
         }
         None => false,
     });
-    let completed_vote_artifact =
+    // `bundle_counts` decides which bundles contribute a completed artifact, so
+    // the same rule can be asked about every bundle or only the unblocked ones.
+    let vote_artifact_over = |bundle_counts: &dyn Fn(u32) -> bool| {
         vote_choices
             .iter()
             .any(|(&(bundle_index, proposal_id), &stored_choice)| {
-                !stale_vote_keys.contains(&(bundle_index, proposal_id))
+                bundle_counts(bundle_index)
+                    && !stale_vote_keys.contains(&(bundle_index, proposal_id))
                     && matches!(
                         intents.get(&proposal_id),
                         Some(Decision::Choice(intent_choice)) if *intent_choice == stored_choice
@@ -148,21 +154,71 @@ pub(crate) fn project(
                 .share_phases
                 .iter()
                 .any(|(bundle_index, proposal_id, _, _)| {
-                    !stale_vote_keys.contains(&(*bundle_index, *proposal_id))
+                    bundle_counts(*bundle_index)
+                        && !stale_vote_keys.contains(&(*bundle_index, *proposal_id))
                         && matches!(intents.get(proposal_id), Some(Decision::Choice(_)))
-                });
+                })
+    };
+    let completed_vote_artifact = vote_artifact_over(&|_| true);
     let completed_for_display = completed_vote_artifact && !blocking_recovery;
+    // A bundle whose recasting is blocked stops the round being `Done`, but it
+    // is not a reason to hide a *sibling* bundle's completed vote: that vote is
+    // on chain and its shares are delivered, and withholding it round-wide told
+    // the voter nothing except that something, somewhere, is unresolved.
+    //
+    // A blocked bundle contributes nothing to the view either way. Its weight
+    // was never cast, so showing its stored choice would report a vote that did
+    // not happen, and letting it disagree with a confirmed sibling would render
+    // the proposal as undecided inside a display headed "completed". A lone
+    // blocked bundle therefore shows no completed view at all. The round is
+    // still not `Done`, and the chain's own words about the refusal reach the
+    // host on the blocked bundle's `DelegationStatus`.
+    let cast_for_display = |bundle_index: u32| {
+        !snapshot
+            .rejection_blocked_bundles
+            .contains_key(&bundle_index)
+    };
+    let displayed_vote_choices: BTreeMap<(u32, u32), u32> = vote_choices
+        .iter()
+        .filter(|((bundle_index, _), _)| cast_for_display(*bundle_index))
+        .map(|(&key, &choice)| (key, choice))
+        .collect();
+    // Dropping a blocked bundle must not quietly change what a proposal reads
+    // as. `completed_vote_display` renders a proposal with no usable choice as
+    // `None`, which is also how a skipped proposal renders, so a proposal whose
+    // only cast sits behind the block would appear as one the voter chose to
+    // skip. Rather than say that, the whole view is withheld: some proposal's
+    // answer is genuinely unknown until the block is resolved.
+    let every_cast_proposal_still_readable = vote_choices
+        .keys()
+        .filter(|key| !stale_vote_keys.contains(key))
+        .all(|&(bundle_index, proposal_id)| {
+            cast_for_display(bundle_index)
+                || displayed_vote_choices
+                    .keys()
+                    .any(|&(displayed_bundle, displayed_proposal)| {
+                        displayed_proposal == proposal_id
+                            && !stale_vote_keys.contains(&(displayed_bundle, proposal_id))
+                    })
+        });
+    let show_completed_vote = completed_for_display
+        || (!unfinished_work
+            && every_cast_proposal_still_readable
+            && vote_artifact_over(&cast_for_display));
+    // The timestamp answers "when did this vote happen", so it is read from the
+    // same bundles the choices are, not from a blocked bundle's earlier attempt.
     let voted_at = snapshot
         .shares
         .iter()
+        .filter(|share| cast_for_display(share.bundle_index))
         .map(|share| share.created_at)
         .filter(|created_at| *created_at > 0)
         .max();
-    let completed_vote_display = completed_for_display.then(|| {
+    let completed_vote_display = show_completed_vote.then(|| {
         completed_vote_display(
             proposal_ids,
             intents,
-            &vote_choices,
+            &displayed_vote_choices,
             stale_vote_keys,
             voted_at,
         )

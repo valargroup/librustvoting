@@ -494,6 +494,8 @@ pub fn record_delivery_fixture(
         accepted_urls: accepted_urls.to_vec(),
         ambiguous_urls: ambiguous_urls.to_vec(),
         target_count,
+        // A durable record describes placements, not the pass that made them.
+        local_capacity_exhausted: false,
     };
     record_delivery_impl(
         db,
