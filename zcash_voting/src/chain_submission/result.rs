@@ -50,11 +50,10 @@ pub enum ChainSubmissionDiagnosticKind {
     ReconciliationPending,
     InvalidProtocolResponse,
     StorageFailure,
-    /// The vote-chain router itself refused the route: HTTP 404 or 405
-    /// carrying the gateway's own `{"error": ...}` envelope. Only the gateway
-    /// writes that envelope, and it never answers a mounted mutation route
-    /// with either status, so the request reached the router and no handler
-    /// decoded it. Nothing was dispatched.
+    /// A mutation returned HTTP 404 or 405 with the gateway's `{"error": ...}`
+    /// shape. This usually means the endpoint does not serve the route, but an
+    /// intermediary can reproduce the same response after forwarding the
+    /// request, so dispatch remains ambiguous.
     EndpointUnsupported,
     /// A mutation answer that looks like a missing route but cannot be
     /// attributed to the router: an HTML 200 fallback page, or a 404/405

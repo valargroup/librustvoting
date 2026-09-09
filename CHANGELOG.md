@@ -24,15 +24,12 @@ This release is `zcash_voting` 4.0.0.
   so the next run casts a fresh batch with the same delegation setup. A
   rejection after an ambiguous POST, or a code-2 rejection, keeps the row
   recoverable as before.
-- A vote-chain POST answered 404 or 405 in the gateway's own error envelope is
-  classified as definitely unsent with the `endpoint_unsupported` diagnostic and
-  a `Protocol` failure naming the route: the reservation is released and the
-  bundle stays admissible, so a chain that does not yet serve the route cannot
-  lock a ballot. Every other route-shaped answer — an HTML fallback page, or a
-  404/405 from something other than the router — carries the new
-  `route_answer_replaced` diagnostic and preserves dispatch ambiguity and
-  durable recovery, because a proxy may replace a response after forwarding the
-  request.
+- Every route-shaped vote-chain POST response preserves dispatch ambiguity and
+  durable recovery, including a 404/405 with the gateway's exact JSON error
+  shape. That shape carries `endpoint_unsupported`; HTML fallback pages and
+  other 404/405 responses carry `route_answer_replaced`. An intermediary can
+  reproduce either response after forwarding the POST, so neither releases the
+  reservation or unlocks ballot changes.
 - Combined rejection retirement clamps timestamps across wall-clock rollback,
   preserving atomic cleanup and the rejection streak. A new delegation
   generation starts its own timestamps.

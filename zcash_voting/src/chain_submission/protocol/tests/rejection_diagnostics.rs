@@ -220,21 +220,20 @@ async fn an_oversized_fallback_page_preserves_dispatch_ambiguity_and_size_valida
 }
 
 #[tokio::test]
-async fn a_router_404_or_405_in_the_gateway_envelope_is_definitely_unsent() {
-    // The gateway writes `application/json` with a lone `error` field on every
-    // response it produces, and never answers a mounted mutation route with
-    // either status. That combination is the router speaking before any
-    // handler ran, so the body was never decoded.
+async fn a_gateway_shaped_404_or_405_preserves_dispatch_ambiguity() {
+    // A forwarding proxy can reproduce the gateway's exact error shape after
+    // upstream accepted the POST. Shape validation cannot authenticate which
+    // component wrote the response.
     for status in [404, 405] {
         let transport = Arc::new(ScriptedTransport::default());
         transport.queue(Ok(json(
             status,
-            r#"{"error":"route not found"}"#.to_string(),
+            r#"{"error":"upstream response replaced"}"#.to_string(),
         )));
         let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
         let outcome = client.submit_delegation(0, &delegation()).await;
-        let PostAttemptOutcome::EndpointUnsupported(diagnostic) = outcome else {
-            panic!("status {status}: expected a definite router refusal, got {outcome:?}");
+        let PostAttemptOutcome::PossiblyDispatched(diagnostic) = outcome else {
+            panic!("status {status}: expected dispatch ambiguity, got {outcome:?}");
         };
         assert_eq!(
             diagnostic.kind(),
@@ -243,19 +242,18 @@ async fn a_router_404_or_405_in_the_gateway_envelope_is_definitely_unsent() {
         assert!(
             diagnostic
                 .message()
-                .contains("does not serve /shielded-vote/v1/delegate-vote"),
+                .contains("may not serve /shielded-vote/v1/delegate-vote"),
             "{}",
             diagnostic.message()
         );
+        assert!(diagnostic.message().contains("may have reached the chain"));
     }
 }
 
 #[tokio::test]
 async fn a_404_or_405_outside_the_gateway_envelope_preserves_dispatch_ambiguity() {
-    // Without the gateway's envelope the status alone cannot say whether a
-    // router rejected the request before dispatch or a proxy replaced the
-    // answer after forwarding it. A JSON body of some other shape is a proxy's
-    // JSON, not the gateway's.
+    // Every response after dispatch is ambiguous. A response outside the
+    // gateway's shape receives the general replaced-answer diagnostic.
     for (status, body, content_type) in [
         (
             404,

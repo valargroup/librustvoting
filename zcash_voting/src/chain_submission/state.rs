@@ -26,12 +26,13 @@ impl SubmissionRecordState {
     /// True for a hashless `Recovering` row created by a possibly-dispatched
     /// POST, which may reserve the next same-generation POST directly.
     ///
-    /// `AmbiguousDispatch` (timeout, transport ambiguity, interruption
-    /// after dispatch, abandoned reservation), `RouteAnswerReplaced` (a
-    /// possibly replaced response), and `InvalidProtocolResponse`
-    /// (an unusable or malformed response after dispatch, including a hash
-    /// owned by another generation) are dispatch ambiguities. A definite
-    /// rejection lands here with `ChainRejected` and never reserves this way.
+    /// `AmbiguousDispatch` (timeout, transport ambiguity, interruption after
+    /// dispatch, abandoned reservation), `EndpointUnsupported` and
+    /// `RouteAnswerReplaced` (possibly replaced route responses), and
+    /// `InvalidProtocolResponse` (an unusable or malformed response after
+    /// dispatch, including a hash owned by another generation) are dispatch
+    /// ambiguities. A definite rejection lands here with `ChainRejected` and
+    /// never reserves this way.
     pub(super) fn permits_ambiguous_retry(&self) -> bool {
         matches!(
             self,
@@ -42,6 +43,7 @@ impl SubmissionRecordState {
                 ambiguity_diagnostic.kind(),
                 ChainSubmissionDiagnosticKind::AmbiguousDispatch
                     | ChainSubmissionDiagnosticKind::InvalidProtocolResponse
+                    | ChainSubmissionDiagnosticKind::EndpointUnsupported
                     | ChainSubmissionDiagnosticKind::RouteAnswerReplaced
             )
         )
@@ -54,9 +56,9 @@ impl SubmissionRecordState {
     /// enters `Recovering` and replaced only by a later observation that is
     /// itself dispatch evidence, so it survives restarts:
     ///
-    /// - `AmbiguousDispatch`, `InvalidProtocolResponse`, and
-    ///   `RouteAnswerReplaced` record a POST whose delivery or response was
-    ///   lost or possibly replaced;
+    /// - `AmbiguousDispatch`, `InvalidProtocolResponse`,
+    ///   `EndpointUnsupported`, and `RouteAnswerReplaced` record a POST whose
+    ///   delivery or response was lost or possibly replaced;
     /// - `TrackingWindowExpired` records an accepted hash that never resolved.
     ///
     /// `ChainRejected` records a definite outcome: a rejected POST or a
@@ -74,6 +76,7 @@ impl SubmissionRecordState {
                 ambiguity_diagnostic.kind(),
                 ChainSubmissionDiagnosticKind::AmbiguousDispatch
                     | ChainSubmissionDiagnosticKind::InvalidProtocolResponse
+                    | ChainSubmissionDiagnosticKind::EndpointUnsupported
                     | ChainSubmissionDiagnosticKind::RouteAnswerReplaced
                     | ChainSubmissionDiagnosticKind::TrackingWindowExpired
             )
@@ -559,6 +562,7 @@ mod tests {
         for kind in [
             ChainSubmissionDiagnosticKind::AmbiguousDispatch,
             ChainSubmissionDiagnosticKind::InvalidProtocolResponse,
+            ChainSubmissionDiagnosticKind::EndpointUnsupported,
             ChainSubmissionDiagnosticKind::RouteAnswerReplaced,
             ChainSubmissionDiagnosticKind::TrackingWindowExpired,
         ] {
@@ -568,9 +572,6 @@ mod tests {
             ChainSubmissionDiagnosticKind::ChainRejected,
             ChainSubmissionDiagnosticKind::ReconciliationPending,
             ChainSubmissionDiagnosticKind::StorageFailure,
-            // A router refusal proves the body was never decoded, so it is
-            // not dispatch evidence.
-            ChainSubmissionDiagnosticKind::EndpointUnsupported,
         ] {
             assert!(!recovering(kind).has_unresolved_dispatch(), "{kind:?}");
         }

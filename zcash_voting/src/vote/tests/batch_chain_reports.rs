@@ -204,20 +204,21 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                     ObservationOutcome::Pending
                 }
                 "missing_route" => {
-                    // The vote-chain router refused the route in its own error
-                    // envelope, so nothing decoded the body. Plain and reported
-                    // calls must both release the reservation and report a
-                    // protocol failure naming the route.
-                    let failure = result.as_ref().expect_err("a router refusal fails");
-                    assert_eq!(failure.kind(), crate::ChainSubmissionFailureKind::Protocol);
-                    assert!(failure.strongest_state().is_none(), "{result:?}");
+                    // The gateway-shaped response suggests an unsupported
+                    // route, but a proxy could have produced it after
+                    // forwarding the POST. Plain and reported calls must both
+                    // preserve recovery.
                     assert!(
-                        failure
-                            .message()
-                            .contains("does not serve /shielded-vote/v1/cast-vote-batch"),
+                        matches!(
+                            &result,
+                            Ok(ChainSubmissionResult::Pending(crate::ChainSubmissionPending::Recovering {
+                                candidate_transaction_hash: None, diagnostic,
+                            })) if diagnostic.kind() == crate::ChainSubmissionDiagnosticKind::EndpointUnsupported
+                                && diagnostic.message().contains("may not serve /shielded-vote/v1/cast-vote-batch")
+                        ),
                         "{result:?}"
                     );
-                    ObservationOutcome::Failed
+                    ObservationOutcome::Pending
                 }
                 "replaced_route" => {
                     // A proxy may replace the response after forwarding the
@@ -307,15 +308,15 @@ async fn batch_reports_match_plain_calls_for_confirmation_pending_rejection_and_
                     .iter()
                     .any(|r| r.outcome == ObservationOutcome::Rejected));
             }
-            // A router refusal and a replaced answer both name a route the
-            // node did not serve, but only the first proves non-dispatch, and
-            // the transport observations must keep them apart.
+            // Both route-shaped answers preserve dispatch ambiguity. Their
+            // diagnostic kinds still distinguish a gateway-shaped response
+            // from a generic replacement for operator troubleshooting.
             if scenario == "missing_route" {
                 assert!(diagnostics
                     .records
                     .iter()
-                    .any(|r| r.outcome == ObservationOutcome::Failed
-                        && r.error_kind.as_deref() == Some("EndpointUnsupported")));
+                    .any(|r| r.outcome == ObservationOutcome::PossiblyDispatched
+                        && r.error_kind.as_deref() == Some("PossiblyDispatched")));
             }
             if scenario == "replaced_route" {
                 assert!(diagnostics

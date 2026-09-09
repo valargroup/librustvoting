@@ -13,10 +13,14 @@ async fn replaced_post_response_keeps_combined_recovery_and_ballot_locked() {
     // The transport has received the complete POST when it returns this
     // response. A forwarding proxy can replace the response after the chain
     // accepted the envelope; neither HTML nor an error status proves absence.
-    for (status, content_type) in [
-        (200, "text/html"),
-        (404, "application/json"),
-        (405, "text/plain"),
+    for (status, content_type, response_body) in [
+        (200, "text/html", "<html>replacement response</html>"),
+        (
+            404,
+            "application/json",
+            r#"{"error":"upstream response replaced"}"#,
+        ),
+        (405, "text/plain", "replacement response"),
     ] {
         let (db, request) = fixture(2);
         let before =
@@ -29,7 +33,7 @@ async fn replaced_post_response_keeps_combined_recovery_and_ballot_locked() {
             },
             posts: Mutex::new(vec![ChainHttpResponse::new(
                 status,
-                b"<html>replacement response</html>".to_vec(),
+                response_body.as_bytes().to_vec(),
                 Some(content_type.to_owned()),
                 Vec::new(),
             )]),

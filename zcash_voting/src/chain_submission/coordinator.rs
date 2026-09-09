@@ -284,11 +284,6 @@ where
         let observations = control.observations();
 
         let mut ambiguity_seen = is_retryable_dispatch_ambiguity(&reserved);
-        let mut refusing_endpoints = std::collections::BTreeSet::new();
-        // A router refusal is an immediate answer from a node that will never
-        // serve the route, not congestion, so rotating to the next node waits
-        // for nothing.
-        let mut rotate_without_backoff = false;
         for attempt_index in first_attempt_index..self.policy.maximum_post_attempts {
             let observations = observations
                 .attempt(u32::try_from(attempt_index.saturating_add(1)).unwrap_or(u32::MAX));
@@ -432,50 +427,6 @@ where
                         diagnostic.message(),
                     ));
                 }
-                PostAttemptOutcome::EndpointUnsupported(diagnostic) => {
-                    // The vote-chain router answered in its own error
-                    // envelope, so nothing decoded the body and nothing was
-                    // dispatched: the fresh reservation is released exactly as
-                    // for a definitely-unsent attempt. Another configured node
-                    // may still serve the route, so the remaining attempts
-                    // rotate on; once every node has refused, or the budget is
-                    // spent, the invocation stops instead of backing off
-                    // against an answer that cannot change. The failure is a
-                    // protocol failure, not a transport one: the network works,
-                    // the node speaks an older protocol.
-                    refusing_endpoints.insert(endpoint_index);
-                    rotate_without_backoff = true;
-                    if ambiguity_seen {
-                        reserved = self.reconcile_with_durable_state(
-                            derived.generation(),
-                            SubmissionObservation::DefinitelyUnsent,
-                            Some(ChainSubmissionDiagnostic::from_redacted_message(
-                                ChainSubmissionDiagnosticKind::ReconciliationPending,
-                                diagnostic.message(),
-                            )),
-                            ChainSubmissionState::Recovering,
-                        )?;
-                    } else {
-                        self.remove_fresh_reservation(derived.generation())?;
-                    }
-                    let every_node_refused =
-                        refusing_endpoints.len() >= self.protocol.endpoint_count();
-                    if every_node_refused || attempt_index + 1 == self.policy.maximum_post_attempts
-                    {
-                        return Err(if ambiguity_seen {
-                            ChainSubmissionFailure::with_durable_state(
-                                ChainSubmissionFailureKind::Protocol,
-                                ChainSubmissionState::Recovering,
-                                diagnostic.message(),
-                            )
-                        } else {
-                            ChainSubmissionFailure::without_state(
-                                ChainSubmissionFailureKind::Protocol,
-                                diagnostic.message(),
-                            )
-                        });
-                    }
-                }
                 PostAttemptOutcome::DefinitelyUnsent(error) => {
                     if ambiguity_seen {
                         reserved = self.reconcile_with_durable_state(
@@ -514,13 +465,7 @@ where
             if attempt_index + 1 == self.policy.maximum_post_attempts {
                 return reserved.public_result();
             }
-            // A rotation past an answer that cannot change waits for nothing,
-            // whether or not the row already carries dispatch ambiguity.
-            let backoff = if std::mem::take(&mut rotate_without_backoff) {
-                Duration::ZERO
-            } else {
-                self.policy.retry_backoffs[attempt_index]
-            };
+            let backoff = self.policy.retry_backoffs[attempt_index];
             if ambiguity_seen {
                 reserved = match self
                     .reserve_ambiguous_retry_after_backoff(
@@ -574,10 +519,6 @@ where
 
     /// Waits `backoff`, then durably reserves the next same-generation POST
     /// for a hashless row that already carries dispatch ambiguity.
-    ///
-    /// The caller chooses the wait so that a rotation past an answer that
-    /// cannot change (a router refusal) passes `Duration::ZERO`.
-    ///
     /// Interruption during the backoff leaves the row as it is; the durable
     /// ambiguity is returned so the caller can report it.
     async fn reserve_ambiguous_retry_after_backoff(
@@ -1367,26 +1308,6 @@ where
                 return Err(ChainSubmissionFailure::with_durable_state(
                     ChainSubmissionFailureKind::Protocol,
                     record.durable_state(),
-                    diagnostic.message(),
-                ));
-            }
-            // The retry never left the node's front door, so the row keeps
-            // its earlier dispatch ambiguity untouched; the answer is reported
-            // as a protocol failure because no node in rotation serves the
-            // route this generation needs.
-            PostAttemptOutcome::EndpointUnsupported(diagnostic) => {
-                self.reconcile_with_durable_state(
-                    derived.generation(),
-                    SubmissionObservation::DefinitelyUnsent,
-                    Some(ChainSubmissionDiagnostic::from_redacted_message(
-                        ChainSubmissionDiagnosticKind::ReconciliationPending,
-                        diagnostic.message(),
-                    )),
-                    ChainSubmissionState::Recovering,
-                )?;
-                return Err(ChainSubmissionFailure::with_durable_state(
-                    ChainSubmissionFailureKind::Protocol,
-                    ChainSubmissionState::Recovering,
                     diagnostic.message(),
                 ));
             }

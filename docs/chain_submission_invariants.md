@@ -1944,40 +1944,26 @@ recovery confirms a combined generation from the same final-VAN-plus-vote-leaves
 layout as an ordinary batch without inventing a hash
 (`exact_recovery_confirms_a_combined_batch_from_the_tree`).
 
-### A route answer is definite only when the router itself wrote it
+### Route answers preserve dispatch ambiguity
 
-A 404 or 405 can mean the vote-chain router refused an unmounted route before
-any handler ran, or it can mean something in front of the node replaced an
-answer after already forwarding the POST upstream. The two need opposite
-treatment, so the classification turns on who wrote the response, not on the
-status alone.
+HTTP 404/405 and HTTP 200 HTML responses can indicate an unsupported mutation
+route, but no unsigned response shape authenticates which network component
+wrote it. A proxy can forward the POST upstream and then reproduce the
+gateway's exact `application/json` response with a lone `error` field.
+`deny_unknown_fields` validates only that shape; it cannot prove that the
+vote-chain router rejected the request before a handler ran.
 
-The gateway writes `application/json` on every response it produces, its errors
-carry a lone `error` field and nothing else, and it never answers a mounted
-mutation route with 404 or 405. A 404 or 405 in that envelope is therefore the
-router speaking before any handler ran: the body was never decoded, so the
-attempt is `EndpointUnsupported` — definitely unsent, never ambiguous. A fresh
-reservation is released, the invocation rotates to the next configured node
-without waiting out a backoff against an answer that cannot change, and stops
-once every node has refused or the budget is spent; the caller receives a
-`Protocol` failure whose message names the route. This is what keeps a chain
-that has not yet been upgraded to serve a route from locking the bundle: no
-durable row is written, so the ballot stays editable and the same generation is
-admitted again once the route exists
-(`a_router_404_or_405_in_the_gateway_envelope_is_definitely_unsent`,
-`a_router_refusal_releases_the_reservation_and_leaves_no_row`).
-
-Every other route-shaped answer is `RouteAnswerReplaced` and preserves dispatch
-ambiguity: an HTML body with HTTP 200, which is a front end's fallback page
-(production answered exactly that for every batch route on 2026-09-08), and any
-404 or 405 outside the gateway's envelope, including a proxy's own JSON error.
-A proxy can produce either after the chain already accepted the envelope, so
-the SDK must not delete the reservation, unlock ballot changes, or retire
-recovery material because of one. The bounded retry loop, backoff and rotation
-apply unchanged; exhausting the budget leaves the generation durably hashless
-`Recovering`. A later rejection does not erase that ambiguity, and a later
-usable hash or exact-tree match can still confirm the same generation. There is
-no fallback to separate delegation and cast POSTs.
+Every route-shaped answer therefore preserves dispatch ambiguity. A 404/405 in
+the gateway's error shape carries `EndpointUnsupported` because that is the
+most useful operator diagnosis; an HTML 200 fallback or any 404/405 outside
+that shape carries `RouteAnswerReplaced`. Both transition the generation
+durably to hashless `Recovering`. The SDK must not delete its reservation,
+unlock ballot changes, or retire recovery material because of either response.
+The bounded retry loop, backoff and endpoint rotation apply unchanged;
+exhausting the budget leaves the generation recoverable for a later invocation.
+A later rejection does not erase the earlier ambiguity, and a later usable hash
+or exact-tree match can still confirm the same generation. There is no fallback
+to separate delegation and cast POSTs.
 
 The response-size limit is applied before either classification, so an oversized
 body reaches the ordinary response-limit diagnostic rather than being read as a
@@ -1985,8 +1971,8 @@ route answer. Every other non-JSON or unexpected-status answer stays ambiguous
 as before.
 
 Regression coverage:
-`a_router_404_or_405_in_the_gateway_envelope_is_definitely_unsent`,
-`a_router_refusal_releases_the_reservation_and_leaves_no_row`,
+`a_gateway_shaped_404_or_405_preserves_dispatch_ambiguity`,
+`a_forwarded_post_with_a_gateway_shaped_replacement_keeps_recovery`,
 `an_html_200_from_a_proxy_preserves_dispatch_ambiguity`,
 `a_404_or_405_outside_the_gateway_envelope_preserves_dispatch_ambiguity`,
 `an_oversized_fallback_page_preserves_dispatch_ambiguity_and_size_validation`,

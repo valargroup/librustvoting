@@ -85,9 +85,6 @@ pub(super) enum PostAttemptOutcome {
     },
     LocalFailure(ChainSubmissionDiagnostic),
     DefinitelyUnsent(ChainTransportError),
-    /// The vote-chain router refused the route in its own error envelope, so
-    /// nothing decoded the body and nothing was dispatched.
-    EndpointUnsupported(ChainSubmissionDiagnostic),
     PossiblyDispatched(ChainSubmissionDiagnostic),
 }
 
@@ -391,10 +388,6 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             PostAttemptOutcome::DefinitelyUnsent(_) => {
                 (crate::ObservationOutcome::Failed, Some("DefinitelyUnsent"))
             }
-            PostAttemptOutcome::EndpointUnsupported(_) => (
-                crate::ObservationOutcome::Failed,
-                Some("EndpointUnsupported"),
-            ),
             PostAttemptOutcome::LocalFailure(_) => {
                 (crate::ObservationOutcome::Failed, Some("Protocol"))
             }
@@ -510,8 +503,8 @@ fn parse_post_response(
     endpoint: &str,
     expected_batch_digest: Option<[u8; 32]>,
 ) -> PostAttemptOutcome {
-    if let Some(diagnostic) = router_refusal(&response, endpoint) {
-        return PostAttemptOutcome::EndpointUnsupported(diagnostic);
+    if let Some(diagnostic) = gateway_shaped_route_answer(&response, endpoint) {
+        return PostAttemptOutcome::PossiblyDispatched(diagnostic);
     }
     if let Some(diagnostic) = replaced_route_answer(&response, endpoint) {
         return PostAttemptOutcome::PossiblyDispatched(diagnostic);
@@ -651,20 +644,16 @@ fn parse_status_response(
     }
 }
 
-/// Recognizes a mutation answer that the vote-chain router itself produced.
+/// Recognizes a mutation answer shaped like the vote-chain gateway's error.
 ///
-/// The gateway writes `application/json` on every response it produces,
-/// including its errors, which carry a single `error` field and nothing else;
-/// it never answers a mounted mutation route with 404 or 405. A 404 or 405 in
-/// that envelope therefore came from the router before any handler ran, so the
-/// request body was never decoded and the attempt is definitely unsent. The
-/// envelope, rather than the status or the content type alone, is what carries
-/// the attribution: a proxy that happens to emit JSON errors cannot be mistaken
-/// for the gateway, and its answer stays ambiguous.
+/// The gateway uses this shape for an unmounted route, but the shape does not
+/// authenticate its writer: a forwarding proxy can reproduce it after the
+/// upstream chain accepted the POST. The answer therefore identifies a likely
+/// unsupported endpoint for diagnostics while preserving dispatch ambiguity.
 ///
 /// Oversized bodies return `None` so the ordinary response-limit diagnostic
 /// still owns them.
-fn router_refusal(
+fn gateway_shaped_route_answer(
     response: &ChainHttpResponse,
     endpoint: &str,
 ) -> Option<ChainSubmissionDiagnostic> {
@@ -679,9 +668,9 @@ fn router_refusal(
     Some(ChainSubmissionDiagnostic::from_redacted_message(
         ChainSubmissionDiagnosticKind::EndpointUnsupported,
         format!(
-            "vote-chain endpoint unsupported: this node does not serve /{}/{endpoint} \
-             (HTTP {status}, vote-chain error envelope); it needs a vote-sdk release that \
-             includes the route",
+            "vote-chain endpoint may not serve /{}/{endpoint} \
+             (HTTP {status}, gateway-shaped error envelope); the POST may have reached the \
+             chain; check the gateway route and vote-sdk release",
             API_PREFIX.join("/")
         ),
     ))
@@ -814,10 +803,8 @@ struct TransactionStatusJson {
 
 /// The gateway's error envelope: a lone `error` field and nothing else.
 ///
-/// `deny_unknown_fields` is what makes the shape evidence rather than a guess.
-/// It identifies a "tx not found" lookup answer and, on a mutation, a router
-/// refusal that proves the request body was never decoded, so anything else
-/// that emits JSON errors cannot be mistaken for the gateway.
+/// `deny_unknown_fields` identifies the expected shape but does not authenticate
+/// which network component wrote it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GatewayErrorJson {

@@ -1918,13 +1918,12 @@ planned; every share the recast does plan follows the timeout, placement,
 ambiguous-POST and durable delivery rules unchanged.
 `docs/round_orchestration_invariants.md` is the source of truth for the cap.
 
-A replaced chain POST response — an HTML 200 fallback page, or a 404/405 that
-did not come from the vote-chain router's own error envelope — is not a definite
-rejection. It preserves the combined generation and its recovery material; a
-later rejection cannot erase that dispatch ambiguity. This keeps helper delivery
-recoverable if the envelope already reached the chain. A router refusal in the
-gateway's envelope is the separate, definite case: nothing was dispatched, so no
-generation and no helper work exist to recover.
+A route-shaped chain POST response — an HTML 200 fallback page or any 404/405,
+including the gateway's exact JSON error shape — is not a definite rejection.
+An intermediary can reproduce every unsigned shape after forwarding the POST,
+so the response preserves the combined generation and its recovery material; a
+later rejection cannot erase that dispatch ambiguity. This keeps helper
+delivery recoverable if the envelope already reached the chain.
 `replaced_post_response_keeps_combined_recovery_and_ballot_locked` and
 `rejection_after_replaced_post_response_cannot_retire_combined_recovery` cover
 that boundary. The chain-submission specification owns the response

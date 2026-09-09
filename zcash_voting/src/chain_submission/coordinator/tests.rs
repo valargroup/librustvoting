@@ -2197,23 +2197,20 @@ async fn a_fallback_response_keeps_the_generation_recoverable() {
     );
 }
 
-fn router_route_refusal() -> ChainHttpResponse {
-    // The gateway's own error envelope: `application/json` with a lone `error`
-    // field. Only the router writes this, and never for a mounted route.
-    ChainHttpResponse::json(404, br#"{"error":"route not found"}"#.to_vec())
+fn gateway_shaped_replacement() -> ChainHttpResponse {
+    ChainHttpResponse::json(404, br#"{"error":"upstream response replaced"}"#.to_vec())
 }
 
 #[tokio::test]
-async fn a_router_refusal_releases_the_reservation_and_leaves_no_row() {
-    // The chain has not been upgraded to serve the route. Nothing decoded the
-    // body, so the generation must stay admissible: a durable hashless
-    // `Recovering` row here would lock the ballot and the delegation behind
-    // an envelope the chain never saw.
+async fn a_forwarded_post_with_a_gateway_shaped_replacement_keeps_recovery() {
+    // The proxy returned the gateway's exact JSON shape after forwarding the
+    // POST. The response cannot prove non-dispatch, so the reservation and
+    // generation must remain durable.
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived(identity.clone(), 1));
     let transport = Arc::new(ScriptedTransport::default());
-    transport.queue(Ok(router_route_refusal()));
+    transport.queue(Ok(gateway_shaped_replacement()));
     let coordinator = coordinator(
         Arc::clone(&transport),
         Arc::clone(&store),
@@ -2221,28 +2218,29 @@ async fn a_router_refusal_releases_the_reservation_and_leaves_no_row() {
         10,
     );
 
-    let failure = coordinator
+    let submission_result = coordinator
         .advance(
             StoreAdvancementRequest::vote(identity.clone()),
             &ManualControl::default(),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Protocol);
-    assert!(failure.strongest_state().is_none());
-    assert!(
-        failure.message().contains("does not serve"),
-        "{}",
-        failure.message()
-    );
-    assert!(
-        store.record(&identity).is_none(),
-        "a refused route must not leave a durable row"
-    );
+    assert!(matches!(
+        submission_result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ref diagnostic,
+            ..
+        }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::EndpointUnsupported
+    ));
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+    assert_eq!(record.committed_post_reservations(), 1);
     assert_eq!(transport.methods(), vec!["POST"], "no retry, no poll");
 
-    // The upgraded chain accepts the same generation on the next pass.
+    // The next pass retries the same durable generation rather than admitting
+    // a replacement that could encode a changed ballot.
     let upgraded = Arc::new(ScriptedTransport::default());
     upgraded.queue(Ok(accepted()));
     upgraded.queue(Ok(pending()));
