@@ -43,6 +43,7 @@ fn config(run_dir: &std::path::Path) -> BenchRunConfig {
         vote_end_time_seconds: 1_800_000_000,
         bundle_concurrency: 3,
         proof_concurrency: 3,
+        chain_repoll_milliseconds: 2000,
         tracking_budget_seconds: 30 * 60,
         confirm_concurrency: 1,
         max_dispatches: 8_192,

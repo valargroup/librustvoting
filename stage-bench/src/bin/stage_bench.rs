@@ -114,6 +114,13 @@ struct RunArgs {
     #[arg(long)]
     budget: Option<u64>,
 
+    /// Milliseconds between polls while a chain submission is still tracking.
+    /// The SDK defaults to 2000. A chain advance is mostly waiting, so a
+    /// shorter cadence separates the host's polling interval from the chain's
+    /// own block time; it cannot make a block arrive sooner.
+    #[arg(long, default_value_t = 2000)]
+    chain_repoll_ms: u64,
+
     /// Seconds the confirmation phase may run. Confirmation is background work
     /// a wallet spreads across the voting window, so this bounds the benchmark,
     /// not the round; an expiry is reported as an incomplete tail.
@@ -207,6 +214,10 @@ async fn run(args: RunArgs) -> Result<()> {
     anyhow::ensure!(
         args.confirm_concurrency >= 1,
         "--confirm-concurrency must be at least 1"
+    );
+    anyhow::ensure!(
+        args.chain_repoll_ms >= 1,
+        "--chain-repoll-ms must be at least 1"
     );
     anyhow::ensure!(
         (1..=MAX_PROOF_CONCURRENCY).contains(&args.proof_concurrency),
@@ -381,6 +392,7 @@ fn build_config(
         vote_end_time_seconds: round.vote_end_time_seconds,
         bundle_concurrency: args.bundle_concurrency,
         proof_concurrency: args.proof_concurrency,
+        chain_repoll_milliseconds: args.chain_repoll_ms,
         tracking_budget_seconds: args.tracking_budget,
         confirm_concurrency: args.confirm_concurrency,
         max_dispatches: max_dispatches(ballot.len()),

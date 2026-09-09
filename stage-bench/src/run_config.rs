@@ -61,6 +61,14 @@ pub struct BenchRunConfig {
     /// Upper bound on driver dispatches, so a plan that never shrinks ends the
     /// run instead of hanging the benchmark.
     pub max_dispatches: usize,
+    /// Milliseconds between polls while a chain submission is still tracking.
+    ///
+    /// `ChainAdvancePolicy::pending_repoll`, which the SDK defaults to two
+    /// seconds. A chain advance is mostly waiting rather than network, so this
+    /// separates the host's polling cadence from the chain's own block time —
+    /// lowering it cannot make a block arrive sooner, and the difference
+    /// between the two is exactly what a run at a shorter cadence measures.
+    pub chain_repoll_milliseconds: u64,
     /// Wall-clock ceiling on the confirmation phase, in seconds.
     ///
     /// The benchmark's bound, not the round's: a healthy host confirms across

@@ -66,6 +66,7 @@ the benchmark before.
 | `--helpers N` | 1 | 1 is the real staging primary; 2 to 10 build a synthetic fleet routed onto it. |
 | `--bundle-concurrency N` | 3 | Bundles advanced at once; the SDK's own default. Use 1 for a cold-PIR run. |
 | `--proof-concurrency N` | 3 | Vote-commitment proofs built at once in a bundle; 1–15. |
+| `--chain-repoll-ms <ms>` | 2000 | Poll interval while a chain submission is tracking. |
 | `--vote-window <s>` | 21600 | Seconds until the round's vote end. |
 | `--tracking-budget <s>` | 1800 | Seconds the confirmation phase may run. |
 | `--confirm-concurrency N` | 1 | 1 = shipped tracker. Above 1 = concurrent focused confirmation, an experiment. |
@@ -201,6 +202,29 @@ from 14.2 s to 9.5 s, so it is a real but ~1.5x win, not 3x.
 
 Delivery is not the lever in either run: 523 s of accumulated work landed in
 about 16 s of bursts at the full 32 slots.
+
+## Chain advance: cadence versus block time
+
+`ChainAdvancePolicy::pending_repoll` defaults to 2 s, and a chain advance is
+mostly waiting rather than network. `--chain-repoll-ms` separates the two.
+Measured across two 37-proposal rounds:
+
+| | 2000 ms | 500 ms |
+| --- | --- | --- |
+| chain advance, accumulated | 21.1 s | 15.3 s |
+| — of which network (`post_attempt` + `status_attempt`) | 8.7 s | 9.0 s |
+| — of which waiting | 12.4 s | 6.3 s |
+
+Network cost is flat and the wait halves, so roughly half the original gap was
+the host's own polling interval and the remaining ~6 s is block time. Lowering
+the cadence cannot make a block arrive sooner; it only stops the host sleeping
+past one that already has.
+
+**The same pair also shows why single runs cannot be trusted.** The 500 ms run's
+overall drive was *slower* — 77.5 s against 58.0 s — because accumulated batch
+preparation rose from 9.5 s to 25.9 s on a machine that was busier, an axis the
+flag does not touch. Read one phase against itself across runs; do not read a
+total. Repeat a comparison before believing it.
 
 ## The run directory
 

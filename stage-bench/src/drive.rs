@@ -215,6 +215,10 @@ pub async fn drive(config: &BenchRunConfig) -> Result<BenchOutcome> {
             pir,
         }),
         max_proof_concurrency: config.proof_concurrency,
+        chain_policy: ChainAdvancePolicy {
+            pending_repoll: Duration::from_millis(config.chain_repoll_milliseconds),
+            ..ChainAdvancePolicy::default()
+        },
     };
 
     let options = ObservabilityOptions {
@@ -336,6 +340,7 @@ struct Host {
     vote_end_time_seconds: u64,
     delegation: Option<DelegationStepInputs>,
     max_proof_concurrency: usize,
+    chain_policy: ChainAdvancePolicy,
 }
 
 impl RoundHostSource for Host {
@@ -351,7 +356,7 @@ impl RoundHostSource for Host {
             vote_end_time_seconds: Some(self.vote_end_time_seconds),
             vote_tree_node_urls: self.vote_tree_urls.clone(),
             delegation: self.delegation.clone(),
-            chain_policy: ChainAdvancePolicy::default(),
+            chain_policy: self.chain_policy.clone(),
             max_proof_concurrency: self.max_proof_concurrency,
         }
     }

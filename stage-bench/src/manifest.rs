@@ -40,6 +40,9 @@ pub struct Manifest {
     /// Vote-commitment proofs built at once within a bundle.
     #[serde(default)]
     pub proof_concurrency: usize,
+    /// Milliseconds between chain-submission polls.
+    #[serde(default)]
+    pub chain_repoll_milliseconds: u64,
     /// Seconds the confirmation phase was allowed.
     ///
     /// Defaulted on read so a directory archived before this field existed still
@@ -103,6 +106,7 @@ impl Manifest {
             synthetic_fleet: !config.fleet.configured_urls().is_empty(),
             bundle_concurrency: config.bundle_concurrency,
             proof_concurrency: config.proof_concurrency,
+            chain_repoll_milliseconds: config.chain_repoll_milliseconds,
             tracking_budget_seconds: config.tracking_budget_seconds,
             confirm_concurrency: config.confirm_concurrency,
             max_dispatches: config.max_dispatches,
