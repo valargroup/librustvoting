@@ -37,6 +37,20 @@ pub struct Manifest {
     /// Whether the fleet was synthetic names routed onto one real backend.
     pub synthetic_fleet: bool,
     pub bundle_concurrency: usize,
+    /// Seconds the confirmation phase was allowed.
+    ///
+    /// Defaulted on read so a directory archived before this field existed still
+    /// analyses. A run directory outlives the code that wrote it, and refusing
+    /// to read an older one would throw away the measurement it holds.
+    #[serde(default)]
+    pub tracking_budget_seconds: u64,
+    /// Focused confirmations driven at once. Above 1 the confirmation numbers
+    /// describe an experiment, not the shipped tracker.
+    ///
+    /// Defaulted on read, and defaulting to zero rather than one: an older
+    /// manifest cannot say which mode ran, and zero is visibly not a mode.
+    #[serde(default)]
+    pub confirm_concurrency: usize,
     pub max_dispatches: usize,
     pub max_records: usize,
     /// Seconds between provisioning and the round's vote end.
@@ -85,6 +99,8 @@ impl Manifest {
             configured_helpers: config.endpoints.helper_urls.len(),
             synthetic_fleet: !config.fleet.configured_urls().is_empty(),
             bundle_concurrency: config.bundle_concurrency,
+            tracking_budget_seconds: config.tracking_budget_seconds,
+            confirm_concurrency: config.confirm_concurrency,
             max_dispatches: config.max_dispatches,
             max_records: config.max_records,
             vote_window_seconds,

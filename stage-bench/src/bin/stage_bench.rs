@@ -101,6 +101,19 @@ struct RunArgs {
     #[arg(long)]
     budget: Option<u64>,
 
+    /// Seconds the confirmation phase may run. Confirmation is background work
+    /// a wallet spreads across the voting window, so this bounds the benchmark,
+    /// not the round; an expiry is reported as an incomplete tail.
+    #[arg(long, default_value_t = 30 * 60)]
+    tracking_budget: u64,
+
+    /// Focused confirmations to drive at once. 1 uses the shipped background
+    /// tracker, whose pass polls shares one at a time. Above 1 replaces it with
+    /// concurrent per-share confirmation — an experiment that measures what
+    /// that serial walk costs, not shipped behaviour.
+    #[arg(long, default_value_t = 1)]
+    confirm_concurrency: usize,
+
     /// Detailed records retained per reported invocation. A capped capture
     /// cannot support a peak-concurrency claim, and says so.
     #[arg(long, default_value_t = 262_144)]
@@ -178,6 +191,18 @@ async fn run(args: RunArgs) -> Result<()> {
         args.bundle_concurrency >= 1,
         "--bundle-concurrency must be at least 1"
     );
+    anyhow::ensure!(
+        args.confirm_concurrency >= 1,
+        "--confirm-concurrency must be at least 1"
+    );
+    if args.confirm_concurrency > 1 {
+        eprintln!(
+            "bench: confirming {} shares at a time through focused confirmation. This \
+             replaces the shipped tracker and measures what its serial walk costs; it is \
+             not a measurement of shipped behaviour.",
+            args.confirm_concurrency
+        );
+    }
 
     let started_at_unix = now_unix();
     let preflight = preflight::resolve().await?;
@@ -326,6 +351,8 @@ fn build_config(
         fleet,
         vote_end_time_seconds: round.vote_end_time_seconds,
         bundle_concurrency: args.bundle_concurrency,
+        tracking_budget_seconds: args.tracking_budget,
+        confirm_concurrency: args.confirm_concurrency,
         max_dispatches: max_dispatches(ballot.len()),
         max_records: args.max_records,
         run_dir: run_dir.to_path_buf(),
@@ -374,9 +401,16 @@ fn max_dispatches(proposals: usize) -> usize {
 fn default_budget(config: &BenchRunConfig) -> u64 {
     const PER_PROPOSAL_SECONDS: u64 = 40;
     const FLOOR_SECONDS: u64 = 60 * 60;
+    const BUDGET_HEADROOM_SECONDS: u64 = 120;
     let proposals = config.ballot.len() as u64;
     let bundles = ASSUMED_BUNDLES as u64;
+    // The confirmation budget is spent inside the same child, so the worker's
+    // bound has to cover it as well as the drive, plus room to write the
+    // outcome. A worker killed one second before it reports has measured
+    // everything and delivered nothing.
     (proposals * bundles * PER_PROPOSAL_SECONDS).max(FLOOR_SECONDS)
+        + config.tracking_budget_seconds
+        + BUDGET_HEADROOM_SECONDS
 }
 
 fn now_unix() -> u64 {

@@ -30,6 +30,7 @@
 //! it provisions real rounds, so it must never run as part of `make test`.
 
 pub mod ballot;
+pub mod confirm;
 pub mod drive;
 pub mod events;
 pub mod manifest;
@@ -71,6 +72,21 @@ pub fn read_snapshots(run_dir: &Path) -> Result<Vec<CapturedSnapshot>> {
     for index in 0..MAX_TRACKING_SNAPSHOTS {
         names.push(format!("tracking.{index}.observability.json"));
     }
+    // The concurrent confirmation mode writes one array of per-share snapshots
+    // rather than a file each; every other capture is a single snapshot.
+    let sweeps = run_dir.join(CONFIRM_SNAPSHOTS);
+    if sweeps.exists() {
+        let raw = std::fs::read(&sweeps).context("reading the confirmation snapshots")?;
+        let decoded: Vec<OperationObservability> =
+            serde_json::from_slice(&raw).context("decoding the confirmation snapshots")?;
+        for (index, snapshot) in decoded.into_iter().enumerate() {
+            snapshots.push(CapturedSnapshot {
+                source: format!("{CONFIRM_SNAPSHOTS}#{index}"),
+                snapshot,
+            });
+        }
+    }
+
     for name in names {
         let path = run_dir.join(&name);
         if !path.exists() {
@@ -92,3 +108,6 @@ pub fn read_snapshots(run_dir: &Path) -> Result<Vec<CapturedSnapshot>> {
 /// own anchor, and a shuffled read would still be correct but would make two
 /// runs of the same shape print their invocations differently.
 const MAX_TRACKING_SNAPSHOTS: usize = 16;
+
+/// The concurrent confirmation mode's per-share snapshots, as one array.
+pub const CONFIRM_SNAPSHOTS: &str = "confirm.observability.json";

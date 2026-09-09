@@ -15,7 +15,13 @@ This release is `zcash_voting` 4.0.0.
   replayed vote-manager round export — drives a complete vote, and reports
   per-phase and per-proposal timings with the concurrency each phase reached.
   This automates the capture procedure in `docs/helper_delivery_benchmark.md`,
-  which previously had to be performed by hand. Outside the workspace default
+  which previously had to be performed by hand. Delivery and confirmation are
+  reported separately, because a wallet waits on the first and spreads the
+  second across the voting window; the confirmation tail is bounded by
+  `--tracking-budget` and reported as incomplete when that expires.
+  `--confirm-concurrency` drives concurrent focused confirmations to measure
+  what the tracker's serial per-share walk costs, and is labelled an experiment
+  wherever its numbers appear. Outside the workspace default
   members: it provisions real rounds over the network and never runs under
   `make check` or `make test`.
 

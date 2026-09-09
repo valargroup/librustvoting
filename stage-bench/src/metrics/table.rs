@@ -27,6 +27,14 @@ pub fn render(manifest: &Manifest, metrics: &Metrics) -> String {
         manifest.configured_helpers,
         manifest.bundle_concurrency
     );
+    if manifest.confirm_concurrency > 1 {
+        let _ = writeln!(
+            out,
+            "confirmation: EXPERIMENT — {} focused confirmations at a time, replacing the \
+             shipped tracker. Not a measurement of shipped behaviour.",
+            manifest.confirm_concurrency
+        );
+    }
     let _ = writeln!(
         out,
         "quiescence {} ({} of {} proposals complete), drive {:.1}s, tracking {:.1}s",

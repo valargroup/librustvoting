@@ -52,6 +52,19 @@ pub struct BenchRunConfig {
     /// Upper bound on driver dispatches, so a plan that never shrinks ends the
     /// run instead of hanging the benchmark.
     pub max_dispatches: usize,
+    /// Wall-clock ceiling on the confirmation phase, in seconds.
+    ///
+    /// The benchmark's bound, not the round's: a healthy host confirms across
+    /// the whole voting window. When it expires the run reports the tail as
+    /// explicitly incomplete rather than pretending the round settled.
+    pub tracking_budget_seconds: u64,
+    /// Focused confirmations driven at once, or 1 for the shipped tracker.
+    ///
+    /// Above one this replaces `ShareTrackingDriver` with concurrent
+    /// `confirm_pending_share` calls — an experiment measuring what the serial
+    /// walk costs, not a measurement of shipped behaviour. See
+    /// [`crate::confirm`].
+    pub confirm_concurrency: usize,
     /// Detailed records retained per reported invocation.
     ///
     /// A run whose records are capped cannot support a peak-concurrency claim,

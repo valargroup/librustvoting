@@ -42,6 +42,8 @@ fn config(run_dir: &std::path::Path) -> BenchRunConfig {
         fleet: HelperFleetPlan::none(),
         vote_end_time_seconds: 1_800_000_000,
         bundle_concurrency: 1,
+        tracking_budget_seconds: 30 * 60,
+        confirm_concurrency: 1,
         max_dispatches: 8_192,
         max_records: 262_144,
         run_dir: run_dir.to_path_buf(),
@@ -144,6 +146,11 @@ fn a_manifest_records_the_workload_beside_the_numbers() {
     manifest.write(&run_dir).expect("writing the manifest");
 
     let read = Manifest::read(&run_dir).expect("reading it back");
+    assert_eq!(
+        read.confirm_concurrency, 1,
+        "the shipped tracker, not the experiment"
+    );
+    assert_eq!(read.tracking_budget_seconds, 30 * 60);
     assert_eq!(read.proposals, 37);
     assert_eq!(read.bundles, 3);
     assert_eq!(read.ballot.len(), 37);
@@ -250,6 +257,60 @@ fn an_incomplete_capture_is_announced_in_the_table() {
     assert!(table.contains("INCOMPLETE CAPTURE"));
     assert!(table.contains("12 records"));
     assert!(table.contains("3 stage starts"));
+
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+/// The concurrent confirmation mode writes one array, not a file per share.
+///
+/// Each focused confirmation freezes its own report and their record ids are
+/// invocation-local, so they cannot be merged into one snapshot. Reading them
+/// back as separate captures is what keeps the timeline honest.
+#[test]
+fn confirmation_snapshots_expand_from_their_array() {
+    let run_dir = scratch("confirm");
+
+    let one = |anchor: u64| {
+        serde_json::json!({
+            "operation": "confirm_pending_share",
+            "started_at_unix_us": anchor,
+            "round_id": "r",
+            "elapsed_us": 1_000u64,
+            "outcome": "succeeded",
+            "records": [{
+                "id": 1, "parent_id": null, "stage": "helper::share_status",
+                "attribution": { "bundle_index": 0, "proposal_id": 1, "share_index": 0 },
+                "started_after_us": 0, "elapsed_us": 900, "outcome": "succeeded",
+                "error_kind": null, "http_status": null, "endpoint_index": 0, "attempt": null
+            }],
+            "summaries": [], "records_dropped": 0,
+            "summary_updates_dropped": 0, "active_stages_dropped": 0
+        })
+    };
+    std::fs::write(
+        run_dir.join(stage_bench::CONFIRM_SNAPSHOTS),
+        serde_json::to_vec(&serde_json::json!([one(1_000), one(2_000), one(3_000)]))
+            .expect("encoding the array"),
+    )
+    .expect("writing the array");
+
+    let snapshots = stage_bench::read_snapshots(&run_dir).expect("reading them back");
+    assert_eq!(snapshots.len(), 3);
+    assert!(snapshots[0]
+        .source
+        .starts_with(stage_bench::CONFIRM_SNAPSHOTS));
+    assert_eq!(
+        snapshots[2].source,
+        format!("{}#2", stage_bench::CONFIRM_SNAPSHOTS)
+    );
+
+    let metrics = Metrics::derive(&snapshots, &[]);
+    let stage = metrics
+        .stage("helper::share_status")
+        .expect("the status stage");
+    assert_eq!(stage.calls, 3);
+    // Anchored a microsecond apart each, so they do not collapse onto one instant.
+    assert_eq!(stage.wall_span_us, 2_900);
 
     let _ = std::fs::remove_dir_all(&run_dir);
 }

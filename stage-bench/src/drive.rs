@@ -57,13 +57,6 @@ type BenchRoute = HelperFleetRoute<zcash_voting::transport::DirectRoute>;
 /// round's vote end. A benchmark needs an answer inside its own budget.
 const MAX_TRACKING_PASSES: u32 = 40;
 
-/// Wall-clock ceiling on background tracking for one run.
-///
-/// Dropping the future is a supported way to end a tracking run — it releases
-/// the round's admission — so racing it is not a leak. What tracking managed
-/// before the budget expired is durable, and the metrics still describe it.
-const TRACKING_BUDGET: Duration = Duration::from_secs(15 * 60);
-
 /// Drives the round described by `config` and returns what it did.
 ///
 /// Writes every observability snapshot, the phase-event log, and the outcome
@@ -241,18 +234,47 @@ pub async fn drive(config: &BenchRunConfig) -> Result<BenchOutcome> {
         .into_parts();
     let round_drive_seconds = started.elapsed().as_secs_f64();
     events.record(PhaseEvent::phase("round::drive_finished"));
+    // Announced here, not only in the final table. Delivery is the phase a host
+    // actually waits on; everything after it is background work the product
+    // spreads across the voting window, and a terminal that went quiet at this
+    // point looked to a reader exactly like a hang.
+    eprintln!(
+        "bench: delivery finished in {round_drive_seconds:.1}s — {} of {} proposals, \
+         {} shares placed. Confirmation follows and is background work.",
+        report.tally.completed_proposals,
+        report.tally.total_proposals,
+        placed_shares(&database, &config.round_id),
+    );
     // Written before anything can fail on the domain result: diagnostics that
     // survive only a successful run cannot explain an unsuccessful one.
     save_snapshot(&config.run_dir, "round.observability.json", snapshot);
 
     let mut tracking = Vec::new();
     let tracking_started = Instant::now();
-    match track_shares(&database, config, &route, &events, options).await {
-        Ok((summary, snapshot)) => {
-            save_snapshot(&config.run_dir, "tracking.0.observability.json", snapshot);
-            tracking.push(summary);
+    let budget = Duration::from_secs(config.tracking_budget_seconds);
+    if config.confirm_concurrency > 1 {
+        // The experiment, never beside the shipped path: a round admits one
+        // run, and interleaving the two would double helper traffic for no
+        // added progress.
+        match confirm_shares_concurrently(&database, config, &route, &events, budget).await {
+            Ok(run) => {
+                save_snapshots(
+                    &config.run_dir,
+                    "confirm.observability.json",
+                    &run.snapshots,
+                );
+                tracking.push(run.summary);
+            }
+            Err(error) => eprintln!("bench: concurrent confirmation stopped early: {error}"),
         }
-        Err(error) => eprintln!("bench: background share tracking stopped early: {error}"),
+    } else {
+        match track_shares(&database, config, &route, &events, options, budget).await {
+            Ok((summary, snapshot)) => {
+                save_snapshot(&config.run_dir, "tracking.0.observability.json", snapshot);
+                tracking.push(summary);
+            }
+            Err(error) => eprintln!("bench: background share tracking stopped early: {error}"),
+        }
     }
     let tracking_seconds = tracking_started.elapsed().as_secs_f64();
 
@@ -348,6 +370,7 @@ async fn track_shares(
     route: &Arc<BenchRoute>,
     events: &EventLog,
     options: ObservabilityOptions,
+    budget: Duration,
 ) -> Result<(TrackingSummary, Option<OperationObservability>)> {
     let client = HelperClient::new(
         Arc::new(HyperTransport::with_shared_route(Arc::clone(route))),
@@ -366,36 +389,72 @@ async fn track_shares(
         vote_end_time_seconds: Some(config.vote_end_time_seconds),
     });
     let reporter = ShareTrackingReporterBridge::new(|event: ShareTrackingEvent| {
+        // Echoed as well as logged. A pass over a large round takes minutes and
+        // the tracker emits nothing inside one, so a terminal with no output
+        // here is indistinguishable from a wedged process.
+        match &event {
+            ShareTrackingEvent::PassFinished { pass, report } => eprintln!(
+                "bench: tracking pass {pass}: {} confirmed, {} resubmitted, {} ambiguous",
+                report.confirmed.len(),
+                report.resubmitted.len(),
+                report.ambiguous.len()
+            ),
+            ShareTrackingEvent::PassFailed { pass, message, .. } => {
+                eprintln!("bench: tracking pass {pass} failed: {message}")
+            }
+            ShareTrackingEvent::AwaitingNextPass { delay, .. } => eprintln!(
+                "bench: tracking waiting {}s for the next pass",
+                delay.as_secs()
+            ),
+            _ => {}
+        }
         events.record(tracking_event(&event));
     });
     let control = ChainSubmissionControl::new(0);
 
     events.record(PhaseEvent::phase("tracking::started"));
     let driver = ShareTrackingDriver::new(database, &client, &config.round_id).with_policy(policy);
-    let Ok(reported) = tokio::time::timeout(
-        TRACKING_BUDGET,
-        driver.run_with_report(&host, &control, &reporter, Some(options)),
-    )
-    .await
-    else {
-        // The budget is the benchmark's, not the round's. What tracking managed
-        // before it expired is real and durable; there is simply no snapshot to
-        // describe it, which the empty summary says plainly.
-        eprintln!("bench: background share tracking hit its {TRACKING_BUDGET:?} budget");
-        return Ok((
-            TrackingSummary {
-                quiescence: "BenchBudgetExpired".to_string(),
-                ..TrackingSummary::default()
-            },
-            None,
-        ));
+
+    // Cancelled, not timed out. Racing the run against a `tokio::time::timeout`
+    // drops its future, and a dropped invocation never freezes its report — so
+    // the budget that bounds a large round is exactly the case whose
+    // confirmation diagnostics would be lost, which is what an earlier
+    // 37-proposal run did. Cancelling through the control lets the driver
+    // return normally with everything it observed.
+    let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let deadline = {
+        let control = control.clone();
+        let expired = Arc::clone(&expired);
+        tokio::spawn(async move {
+            tokio::time::sleep(budget).await;
+            expired.store(true, std::sync::atomic::Ordering::Relaxed);
+            control.cancel();
+        })
     };
+
+    let reported = driver
+        .run_with_report(&host, &control, &reporter, Some(options))
+        .await;
+    deadline.abort();
     events.record(PhaseEvent::phase("tracking::finished"));
 
+    if expired.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "bench: background share tracking hit its {budget:?} budget; the confirmation \
+             tail below is incomplete. Raise --tracking-budget, or use \
+             --confirm-concurrency to measure the tail's floor."
+        );
+    }
+
     let (report, snapshot) = reported.into_parts();
+    let quiescence = if expired.load(std::sync::atomic::Ordering::Relaxed) {
+        format!("BenchBudgetExpired({:?})", report.quiescence)
+    } else {
+        format!("{:?}", report.quiescence)
+    };
     Ok((
         TrackingSummary {
-            quiescence: format!("{:?}", report.quiescence),
+            quiescence,
             passes: report.passes,
             confirmed: report.confirmed.len(),
             resubmitted: report.resubmitted.len(),
@@ -404,6 +463,63 @@ async fn track_shares(
         },
         snapshot,
     ))
+}
+
+/// Shares the round has durably placed, for the delivery announcement.
+///
+/// Read from durable state rather than counted from the report: the report's
+/// deliveries describe what this run dispatched, and a resumed round's earlier
+/// placements are just as real.
+fn placed_shares(database: &Arc<VotingDb>, round_id: &str) -> usize {
+    zcash_voting::share::list(database, round_id)
+        .map(|shares| shares.len())
+        .unwrap_or_default()
+}
+
+/// Runs the concurrent focused-confirmation experiment over this round.
+///
+/// See [`crate::confirm`] for why this is a separate mode and what its numbers
+/// are not. The helper client is built on the same shared route as delivery, so
+/// a synthetic fleet applies here too.
+async fn confirm_shares_concurrently(
+    database: &Arc<VotingDb>,
+    config: &BenchRunConfig,
+    route: &Arc<BenchRoute>,
+    events: &EventLog,
+    budget: Duration,
+) -> Result<crate::confirm::ConfirmationRun> {
+    let client = HelperClient::new(
+        Arc::new(HyperTransport::with_shared_route(Arc::clone(route))),
+        HelperHealth::default(),
+    );
+    crate::confirm::confirm_concurrently(
+        &crate::confirm::ConfirmationTarget {
+            database,
+            client: &client,
+            round_id: &config.round_id,
+            helper_urls: &config.endpoints.helper_urls,
+        },
+        config.confirm_concurrency,
+        budget,
+        events,
+    )
+    .await
+}
+
+/// Persists a sweep's per-share snapshots as one array.
+///
+/// One file rather than a thousand: each focused confirmation freezes its own
+/// report, and their record ids are invocation-local, so they cannot be merged
+/// into a single snapshot without colliding.
+fn save_snapshots(run_dir: &std::path::Path, name: &str, snapshots: &[OperationObservability]) {
+    match serde_json::to_vec(snapshots) {
+        Ok(encoded) => {
+            if let Err(error) = std::fs::write(run_dir.join(name), encoded) {
+                eprintln!("bench: could not write {name}: {error}");
+            }
+        }
+        Err(error) => eprintln!("bench: could not encode {name}: {error}"),
+    }
 }
 
 /// Carries a previous round's cached PIR proofs and padded-slot secrets in.
