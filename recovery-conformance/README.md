@@ -653,7 +653,8 @@ active for fourteen days. Existing on-chain rounds retain their original expiry.
 ## Current adaptation verification
 
 `make recovery-conformance-unit NEXTEST_PROFILE=ci` passed 112 hermetic tests.
-The SDK default suite passed 1,632 tests (nine configured skips). A complete
+Before rebasing onto `main` with #312, the SDK default suite passed 1,632 tests
+(nine configured skips). A complete
 19-stage crash matrix and all five helper-fleet scenarios have passed during
 adaptation. Focused recovery also confirmed all 144 shares without changing
 previously confirmed chain-submission rows after a background tracking pause.

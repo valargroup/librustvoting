@@ -483,7 +483,13 @@ fn only_the_last_recoverable_background_budget_pause_is_resumed() {
         share_tracking: vec![paused.clone()],
     };
     assert!(outcome.needs_background_recovery());
-    for reason in ["Cancelled", "Failures", "ChainTerminal", "PassBudgetExhausted", "TargetRecovered"] {
+    for reason in [
+        "Cancelled",
+        "Failures",
+        "ChainTerminal",
+        "PassBudgetExhausted",
+        "TargetRecovered",
+    ] {
         outcome.quiescence_kind = reason.into();
         assert!(!outcome.needs_background_recovery());
     }
