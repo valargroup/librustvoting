@@ -37,40 +37,15 @@ fn every_crash_stage_is_reached_and_recovers() {
         }
         matrix::Run::Completed(report) => {
             report.print();
-            // Green means every stage ran and passed. An empty failure list is
-            // also what a run that exercised nothing produces, so absence of
-            // failure is never on its own the evidence.
-            assert!(
-                report.attempted > 0,
-                "the matrix attempted no stages; RECOVERY_CONFORMANCE_STAGES                  may name only stages this build does not have"
-            );
-            assert!(
-                report.failed.is_empty(),
-                "{} of {} stages failed conformance",
-                report.failed.len(),
-                report.attempted
-            );
-            // A skip is a stage that proved nothing. Transport trouble, an
-            // exhausted budget and a seam that stopped firing all arrive here,
-            // and none of them is a reason to call the run conformant.
-            assert!(
-                report.skipped.is_empty(),
-                "{} of {} stages were skipped and so proved nothing: {:?}",
-                report.skipped.len(),
-                report.attempted,
-                report
-                    .skipped
-                    .iter()
-                    .map(|(stage, why)| format!("{stage}: {why}"))
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                report.passed.len(),
-                report.attempted,
-                "only {} of {} attempted stages passed",
-                report.passed.len(),
-                report.attempted
-            );
+            recovery_conformance::matrix_coverage::MatrixCoverage {
+                attempted: report.attempted,
+                passed: report.passed.len(),
+                failed: report.failed.len(),
+                skipped: report.skipped.len(),
+                excluded: 0,
+            }
+            .validate()
+            .expect("incomplete live conformance coverage");
         }
     }
 }

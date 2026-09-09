@@ -22,19 +22,22 @@ use zcash_voting::{
     delegate::{gather_delegation_lwd_inputs, ResolveDelegationLwdParams},
     delegation_pipeline::{DelegationPipeline, SqliteWalletDbOpener},
     round::VotingDb,
-    round_drive::{FailureIsolation, RoundDrivePolicy, RoundDriver, RoundHostSource},
+    round_drive::{
+        FailureIsolation, RoundDriveEvent, RoundDrivePolicy, RoundDriveReporter,
+        RoundDriveReporterBridge, RoundDriver, RoundHostSource,
+    },
     session::Decision,
     share_policy::ShareTimingPolicy,
     BallotIntent, ChainAdvancePolicy, ChainSubmissionClientConfig, ChainSubmissionControl,
     DelegationSigner, DelegationStepInputs, HelperClient, HelperHealth, HyperTransport, PirFleet,
-    ProposalRosterEntry, RoundBinding, RoundExecutor, RoundHostContext, ShareTrackingDrivePolicy,
-    ShareTrackingDriver, ShareTrackingEvent, ShareTrackingHostContext,
+    ProposalRosterEntry, RoundBinding, RoundExecutor, RoundHostContext, RoundStepProgress,
+    ShareTrackingDrivePolicy, ShareTrackingDriver, ShareTrackingEvent, ShareTrackingHostContext,
     ShareTrackingHostSourceBridge, ShareTrackingQuiescence, ShareTrackingReporterBridge,
 };
 
 use crate::child::{CrashHelperTransport, CrashLog, CrashReporter, CrashTarget, CrashTransport};
 use crate::helper_fleet::HelperFleetRoute;
-use crate::stall::{RequestClassifier, StallingRoute};
+use crate::stall::{RequestClassifier, StallTarget, StallingRoute};
 
 /// The route every transport in a run shares.
 ///
@@ -92,6 +95,10 @@ pub async fn drive_round(config: &RoundRunConfig) -> Result<RunOutcome> {
         .get_bundle_count(&config.round_id)
         .map_err(voting_error)?;
     if existing_bundles > 0 {
+        anyhow::ensure!(
+            existing_bundles as usize == crate::provisioning::EXPECTED_BUNDLE_COUNT,
+            "resumed conformance round has an unexpected bundle count: {existing_bundles}"
+        );
         eprintln!("run: resuming a round with {existing_bundles} bundles; setup not repeated");
         return drive(config, database, round, log).await;
     }
@@ -108,28 +115,26 @@ pub async fn drive_round(config: &RoundRunConfig) -> Result<RunOutcome> {
     )
     .await
     .map_err(voting_error)?;
+    anyhow::ensure!(
+        selected.notes.len() == crate::provisioning::EXPECTED_VOTER_NOTES,
+        "conformance voter must hold {} eligible notes, found {}",
+        crate::provisioning::EXPECTED_VOTER_NOTES,
+        selected.notes.len()
+    );
     let layout = database
         .ensure_bundles(&config.round_id, &selected.voting_note_infos())
         .map_err(voting_error)?;
+    anyhow::ensure!(
+        layout.bundle_count as usize == crate::provisioning::EXPECTED_BUNDLE_COUNT,
+        "conformance voter must produce {} bundles, found {}",
+        crate::provisioning::EXPECTED_BUNDLE_COUNT,
+        layout.bundle_count
+    );
     eprintln!(
         "run: {} notes -> {} bundles",
         selected.notes.len(),
         layout.bundle_count
     );
-
-    // Seeded after the bundles exist and before the driver precomputes, which
-    // is the only window where it can take effect.
-    if let Some(template) = &config.warm_pir_from {
-        match seed_precompute(&config.sidecar, template, &config.round_id) {
-            Ok(seeded) => eprintln!(
-                "run: seeded {} PIR proofs and {} padded-slot secret sets",
-                seeded.proofs, seeded.padded_bundles
-            ),
-            // Not fatal: a cold run still works, it is only slower and more
-            // exposed to a stalled endpoint.
-            Err(error) => eprintln!("run: precompute not seeded: {error}"),
-        }
-    }
 
     drive(config, database, round, log).await
 }
@@ -144,36 +149,69 @@ async fn drive(
     round: crate::provisioning::ChainRound,
     log: Arc<CrashLog>,
 ) -> Result<RunOutcome> {
-    let seed = signing::voter_seed()?;
-    let hotkey =
-        signing::voting_hotkey(&seed, &config.account_uuid, &config.round_id, ZCASH_NETWORK)?;
+    // Seed after layout on both fresh and resumed runs. Existing padding is
+    // never overwritten; the PIR fault omits proofs but retains stable dummies.
+    if let Some(template) = &config.warm_pir_from {
+        let proof_cache = if config.stall.target == Some(crate::stall::StallTarget::PirQuery) {
+            crate::precompute::ProofCacheSeed::Cold
+        } else {
+            crate::precompute::ProofCacheSeed::Warm
+        };
+        match crate::precompute::seed_precompute(
+            &config.sidecar,
+            template,
+            &config.round_id,
+            proof_cache,
+        ) {
+            Ok(seeded) => eprintln!(
+                "run: seeded {} PIR proofs and {} padded-slot secret sets",
+                seeded.proofs, seeded.padded_bundles
+            ),
+            // Not fatal: a cold run still works, it is only slower and more
+            // exposed to a stalled endpoint.
+            Err(error) => eprintln!("run: precompute not seeded: {error}"),
+        }
+    }
 
-    let lwd = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
-        lightwalletd_url: &config.endpoints.lightwalletd,
-        network: ZCASH_NETWORK,
-        round_params: round.params.clone(),
-        round_name: "recovery-conformance",
-    })
-    .await
-    .map_err(voting_error)?;
+    let target_recovery = config.mode == crate::run_config::RunMode::RecoverCombined;
+    let stop_after_share_outcome = config.mode == crate::run_config::RunMode::ObserveHelperOutage
+        || config.stall.armed_target() == Some(StallTarget::SharePost);
+    let signing_inputs = if target_recovery {
+        None
+    } else {
+        let seed = signing::voter_seed()?;
+        let hotkey =
+            signing::voting_hotkey(&seed, &config.account_uuid, &config.round_id, ZCASH_NETWORK)?;
 
-    let pipeline = DelegationPipeline::new(
-        Arc::clone(&database),
-        SqliteWalletDbOpener::new(
-            config
-                .wallet_db
-                .to_str()
-                .context("wallet path is not UTF-8")?
-                .to_string(),
-            ZCASH_NETWORK,
-        ),
-        lwd,
-        &config.account_uuid,
-        Some(hotkey.clone()),
-        zcash_voting::recoverable_bundle_policy_v1(),
-        None,
-    )
-    .map_err(voting_error)?;
+        let lwd = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
+            lightwalletd_url: &config.endpoints.lightwalletd,
+            network: ZCASH_NETWORK,
+            round_params: round.params.clone(),
+            round_name: "recovery-conformance",
+        })
+        .await
+        .map_err(voting_error)?;
+
+        let pipeline = DelegationPipeline::new(
+            Arc::clone(&database),
+            SqliteWalletDbOpener::new(
+                config
+                    .wallet_db
+                    .to_str()
+                    .context("wallet path is not UTF-8")?
+                    .to_string(),
+                ZCASH_NETWORK,
+            ),
+            lwd,
+            &config.account_uuid,
+            Some(hotkey.clone()),
+            zcash_voting::recoverable_bundle_policy_v1(),
+            None,
+        )
+        .map_err(voting_error)?;
+
+        Some((seed, hotkey, pipeline))
+    };
 
     let armed = config.armed_stage();
     // The crash seams wrap the same transports a host would use, so the
@@ -211,14 +249,31 @@ async fn drive(
         Arc::clone(&log),
     );
 
+    let chain_stall = matches!(
+        config.stall.armed_target(),
+        Some(
+            StallTarget::DelegationPost
+                | StallTarget::VotePost
+                | StallTarget::DelegateAndCastPost
+                | StallTarget::TransactionLookup
+                | StallTarget::CommitmentTreeRead
+        )
+    );
+    let mut chain_config = ChainSubmissionClientConfig::for_network(
+        ZCASH_NETWORK,
+        config.endpoints.vote_servers.clone(),
+    )
+    .with_vote_chain_id(crate::environment::STAGING_CHAIN_ID);
+    if chain_stall {
+        // Exercise the full request deadline once. Repeating a permanently
+        // hung POST across endpoints adds minutes without another assertion.
+        // The subsequent unarmed recovery restores the default retry budget.
+        chain_config = chain_config.with_post_attempts(1, Vec::new());
+    }
     let executor = RoundExecutor::with_transport(
         Arc::clone(&database),
         chain_transport,
-        ChainSubmissionClientConfig::for_network(
-            ZCASH_NETWORK,
-            config.endpoints.vote_servers.clone(),
-        )
-        .with_vote_chain_id(crate::environment::STAGING_CHAIN_ID),
+        chain_config,
         helper_client,
     )
     .map_err(|error| anyhow::anyhow!("building the executor: {error:?}"))?
@@ -236,13 +291,23 @@ async fn drive(
         round_id: config.round_id.clone(),
         network: ZCASH_NETWORK,
         proposals: roster(),
-        hotkey_secret: Some(zeroize::Zeroizing::new(hotkey.stored_secret().to_vec())),
+        hotkey_secret: signing_inputs
+            .as_ref()
+            .map(|(_, hotkey, _)| zeroize::Zeroizing::new(hotkey.stored_secret().to_vec())),
     })
     .map_err(voting_error)?;
 
-    executor
-        .set_ballot_intents(&ballot())
-        .map_err(voting_error)?;
+    if !target_recovery {
+        executor
+            .set_ballot_intents(&ballot())
+            .map_err(voting_error)?;
+    } else {
+        let plan = executor.plan().map_err(voting_error)?;
+        anyhow::ensure!(
+            matches!(plan.next_steps.first(), Some(zcash_voting::session::NextStep::AdvanceVoteBatch { bundle_index, proposal_id }) if *bundle_index == config.target.bundle_index && *proposal_id == config.target.proposal_id),
+            "signerless run must select the persisted target batch first"
+        );
+    }
 
     let pir = Arc::new(
         PirFleet::new(
@@ -256,15 +321,15 @@ async fn drive(
     let host = Host {
         helper_urls: config.endpoints.helper_urls.clone(),
         vote_tree_urls: config.endpoints.vote_servers.clone(),
-        delegation: DelegationStepInputs {
+        delegation: signing_inputs.map(|(seed, _, pipeline)| DelegationStepInputs {
             driver: Arc::new(pipeline),
             signer: DelegationSigner::Software(signing::software_signer(seed)),
             pir,
-        },
-        chain_policy: chain_policy_for(armed),
+        }),
+        chain_policy: chain_policy_for(armed, chain_stall),
     };
 
-    let reporter = CrashReporter::new(
+    let crash_reporter = CrashReporter::new(
         armed,
         CrashTarget {
             bundle_index: config.target.bundle_index,
@@ -280,7 +345,7 @@ async fn drive(
     // unreachable on precisely the runs that need it. The driver polls the
     // abandoned share until its budget runs out instead.
     let mut share_tracking = Vec::new();
-    if armed.is_none() {
+    if armed.is_none() && !target_recovery && !stop_after_share_outcome {
         match recover_pending_shares(&database, config, &route_for_helpers).await {
             Ok(summary) => share_tracking.push(summary),
             Err(error) => eprintln!("run: background share tracking stopped early: {error}"),
@@ -288,14 +353,39 @@ async fn drive(
     }
 
     let control = ChainSubmissionControl::new(0);
+    let reporter = RoundDriveReporterBridge::new(|event| {
+        // Refused and timed-out deliveries stay Pending, so the normal driver
+        // deliberately retries them. Outage and share-POST stall fixtures need
+        // one completed delivery observation before restoring networking.
+        // Host cancellation preserves the SDK's completed durable effects.
+        if stop_after_share_outcome
+            && matches!(
+                &event,
+                RoundDriveEvent::StepProgress {
+                    progress: RoundStepProgress::ShareOutcome(_),
+                    ..
+                }
+            )
+        {
+            control.cancel();
+        }
+        crash_reporter.report(event);
+    });
     let report = RoundDriver::new(&executor)
-        .with_policy(policy(armed.is_some(), config.max_dispatches))
+        .with_policy(policy(
+            armed.is_some() || target_recovery,
+            if target_recovery {
+                1
+            } else {
+                config.max_dispatches
+            },
+        ))
         .run(&host, &control, &reporter)
         .await;
 
     // Again afterwards: the drive itself can leave a share placed but
     // unconfirmed, and the round is not settled until tracking says so.
-    if armed.is_none() {
+    if armed.is_none() && !target_recovery && !stop_after_share_outcome {
         match recover_pending_shares(&database, config, &route_for_helpers).await {
             Ok(summary) => share_tracking.push(summary),
             Err(error) => eprintln!("run: background share tracking stopped early: {error}"),
@@ -318,6 +408,26 @@ async fn drive(
         dispatches: 0,
         share_tracking,
     };
+    let mut outcome = outcome;
+    if target_recovery {
+        let snapshot = crate::assertions::DurableSnapshot::read(&config.sidecar)?;
+        let bundle = snapshot
+            .combined
+            .iter()
+            .find(|b| {
+                b.bundle_index == config.target.bundle_index
+                    && b.round_id == config.round_id
+                    && b.wallet_id == config.account_uuid
+            })
+            .context("signerless target disappeared")?;
+        outcome.quiescence_kind = if bundle.assert_confirmed(&proposal_ids()).is_ok() {
+            "TargetRecovered"
+        } else {
+            "TargetRecoveryPending"
+        }
+        .to_string();
+        outcome.quiescence = outcome.quiescence_kind.clone();
+    }
     outcome.write(&config.outcome)?;
     Ok(outcome)
 }
@@ -386,7 +496,7 @@ fn quiescence_kind(quiescence: &zcash_voting::round_drive::RoundQuiescence) -> S
 struct Host {
     helper_urls: Vec<String>,
     vote_tree_urls: Vec<String>,
-    delegation: DelegationStepInputs,
+    delegation: Option<DelegationStepInputs>,
     chain_policy: ChainAdvancePolicy,
 }
 
@@ -402,10 +512,10 @@ struct Host {
 /// observable: the episode ends while the submission is still pending and
 /// reports it. This is ordinary host configuration, not a test hook — a host
 /// that wants to interleave work uses a short policy for exactly this reason —
-/// and it is applied only for the stage that needs it, so every other run keeps
-/// the shipped cadence.
-fn chain_policy_for(armed: Option<CrashStage>) -> ChainAdvancePolicy {
-    if armed == Some(CrashStage::AfterTracking) {
+/// and it also bounds chain stall episodes to one pass through the full SDK
+/// request deadline. Unarmed recovery keeps the shipped cadence.
+fn chain_policy_for(armed: Option<CrashStage>, chain_stall: bool) -> ChainAdvancePolicy {
+    if armed == Some(CrashStage::AfterTracking) || chain_stall {
         return ChainAdvancePolicy {
             max_passes: 1,
             ..ChainAdvancePolicy::default()
@@ -425,7 +535,7 @@ impl RoundHostSource for Host {
             ceremony_start_seconds: None,
             vote_end_time_seconds: None,
             vote_tree_node_urls: self.vote_tree_urls.clone(),
-            delegation: Some(self.delegation.clone()),
+            delegation: self.delegation.clone(),
             chain_policy: self.chain_policy.clone(),
             max_proof_concurrency: 1,
         }
@@ -435,7 +545,7 @@ impl RoundHostSource for Host {
 /// How long an interrupted share attempt waits before it may be retried.
 ///
 /// Both bounds of the policy are set to this, so the threshold is exactly this
-/// value rather than a quarter of a fourteen-day window clamped to an hour.
+/// value rather than a quarter of the remaining round window.
 /// Long enough that a retry is a considered recovery rather than an immediate
 /// double-send, short enough that a test can watch it happen.
 const SHARE_RETRY_AFTER_SECONDS: u64 = 45;
@@ -443,7 +553,7 @@ const SHARE_RETRY_AFTER_SECONDS: u64 = 45;
 /// Wall-clock ceiling on background tracking for one run.
 ///
 /// The driver itself has no wall bound, and correctly so: a healthy run ends at
-/// the round's vote end, which for these rounds is fourteen days out. A
+/// the round's vote end, which for these rounds is one hour after creation. A
 /// conformance run needs an answer inside a test budget, so the run is raced
 /// against this instead. Dropping the future is a supported way to end a run —
 /// it releases the round's admission — so the race is not a leak.
@@ -452,9 +562,8 @@ const SHARE_TRACKING_BUDGET: Duration = Duration::from_secs(8 * 60);
 /// Tracking passes before the run gives up, whatever the clock says.
 ///
 /// `max_passes` is `None` by default because vote end is what ends a healthy
-/// run. Here it is the only bound with the right shape: these rounds close
-/// fourteen days out, so nothing else would stop a run that is polling a share
-/// no helper will ever confirm.
+/// run. Here it gives a bounded pass count independently of the one-hour round
+/// window, including when a share has no helper that will ever confirm it.
 const MAX_TRACKING_PASSES: u32 = 60;
 
 /// How long a failed pass waits before the next one is attempted.
@@ -504,9 +613,9 @@ const MAX_CONSECUTIVE_TRACKING_FAILURES: u32 = 6;
 /// # Timing
 ///
 /// A share becomes retryable after a quarter of the remaining vote window,
-/// bounded by the policy. These rounds close fourteen days out, so the shipped
-/// bound clamps that to a full hour and no crash stage could observe its own
-/// recovery inside any sane test budget.
+/// bounded by the policy. With a one-hour round, the default can delay a lost
+/// POST for many minutes. The explicit threshold makes recovery observable
+/// within the case budget.
 ///
 /// `max_overdue_threshold_seconds` is therefore lowered here. It changes *when*
 /// a retry becomes allowed, not whether the retry is duplicate-safe. Supplying
@@ -675,80 +784,6 @@ fn pir_layout() -> zcash_voting::config::PirLayout {
         tier1_layers: 7,
         poly_len: 4096,
     }
-}
-
-/// What a template supplied.
-pub struct SeededPrecompute {
-    pub proofs: usize,
-    pub padded_bundles: usize,
-}
-
-/// Carries a previous round's precompute into this one.
-///
-/// Two things are copied, and the second is what makes the first useful:
-///
-/// - `pir_proof_cache` rows, keyed by `(wallet, network, tree root, nullifier)`
-///   and therefore **not** round-specific: a proof fetched for one round is
-///   valid for any round over the same snapshot.
-/// - `bundles.padded_note_secrets`, which decide the dummy nullifiers a bundle
-///   pads its slots with. `ensure_padded_secrets` samples them only when
-///   absent, so seeding them makes this round pad with the same nullifiers the
-///   cached proofs were fetched for. Without this the cache misses every padded
-///   slot and the run refetches them — which is exactly what an earlier version
-///   of this suite did, seeding proofs that could never be hit.
-///
-/// The privacy cost is real and bounded to this harness: padding exists so an
-/// observer cannot tell a bundle's real notes from its dummies, and reusing
-/// dummies across rounds lets one correlate them. That is acceptable only for a
-/// disposable test wallet whose seed is shared with a test suite, and must
-/// never be done for a wallet holding anything.
-fn seed_precompute(
-    sidecar: &std::path::Path,
-    template: &std::path::Path,
-    round_id: &str,
-) -> Result<SeededPrecompute> {
-    let connection = rusqlite::Connection::open(sidecar).context("opening the sidecar")?;
-    connection
-        .execute(
-            "ATTACH DATABASE ?1 AS warm",
-            rusqlite::params![template.to_str().context("template path is not UTF-8")?],
-        )
-        .context("attaching the template")?;
-
-    let proofs = connection
-        .execute(
-            "INSERT OR IGNORE INTO pir_proof_cache SELECT * FROM warm.pir_proof_cache",
-            [],
-        )
-        .context("copying cached PIR proofs")?;
-
-    // Matched by bundle index within the wallet: bundle rows are round-keyed,
-    // so the secrets move across rounds rather than being copied wholesale.
-    let padded_bundles = connection
-        .execute(
-            "UPDATE bundles SET padded_note_secrets = (
-                 SELECT w.padded_note_secrets FROM warm.bundles w
-                 WHERE w.bundle_index = bundles.bundle_index
-                   AND w.wallet_id = bundles.wallet_id
-                   AND w.padded_note_secrets IS NOT NULL
-             )
-             WHERE round_id = ?1
-               AND padded_note_secrets IS NULL
-               AND EXISTS (
-                 SELECT 1 FROM warm.bundles w
-                 WHERE w.bundle_index = bundles.bundle_index
-                   AND w.wallet_id = bundles.wallet_id
-                   AND w.padded_note_secrets IS NOT NULL
-               )",
-            rusqlite::params![round_id],
-        )
-        .context("copying padded-slot secrets")?;
-
-    let _ = connection.execute("DETACH DATABASE warm", []);
-    Ok(SeededPrecompute {
-        proofs,
-        padded_bundles,
-    })
 }
 
 fn voting_error(error: zcash_voting::VotingError) -> anyhow::Error {

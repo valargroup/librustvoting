@@ -28,6 +28,7 @@ use crate::stages::CrashStage;
 /// projection bug cannot hide one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableSnapshot {
+    pub combined: Vec<crate::combined::CombinedBundle>,
     /// One row per chain submission, identity included.
     ///
     /// Identity is what makes "no second POST" checkable. Counting alone
@@ -185,8 +186,21 @@ pub struct RoundShape {
 impl DurableSnapshot {
     /// Reads the snapshot from a sidecar path, opening its own connection.
     pub fn read(sidecar: &std::path::Path) -> Result<Self> {
-        let connection =
-            rusqlite::Connection::open(sidecar).context("opening the sidecar for inspection")?;
+        let mut connection = rusqlite::Connection::open_with_flags(
+            sidecar,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .context("opening the sidecar for inspection")?;
+        let connection = connection.transaction()?;
+        let scopes: i64 = connection.query_row(
+            "select count(*) from (select distinct wallet_id, round_id from rounds)",
+            [],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            scopes == 1,
+            "conformance sidecar must contain exactly one wallet/round"
+        );
         let mut statement = connection
             .prepare(
                 "select kind, bundle_index, proposal_id, hex(generation_digest), state,
@@ -222,6 +236,7 @@ impl DurableSnapshot {
                 .unwrap_or(0)
         };
         Ok(Self {
+            combined: crate::combined::CombinedBundle::read_all(&connection)?,
             submissions,
             bundles: count("bundles"),
             proofs: count("proofs"),
@@ -584,13 +599,13 @@ pub fn assert_plans_precede_broadcast(snapshot: &DurableSnapshot) -> Result<()> 
 /// it can confirm is by scanning the commitment tree for its generation. Seeing
 /// `tree` here is what separates "recovery worked" from "the wallet happened to
 /// still hold a usable hash".
-pub fn confirmation_source(sidecar: &std::path::Path) -> Result<Option<String>> {
+pub fn confirmation_source(sidecar: &std::path::Path, bundle: u32) -> Result<Option<String>> {
     let connection = rusqlite::Connection::open(sidecar).context("opening the sidecar")?;
     Ok(connection
         .query_row(
             "select confirmation_source from chain_submissions
-             where kind IN ('delegation','delegate_and_cast_vote_batch') and confirmation_source is not null limit 1",
-            [],
+             where kind = 'delegate_and_cast_vote_batch' and bundle_index=?1 and confirmation_source is not null",
+            [bundle],
             |row| row.get::<_, String>(0),
         )
         .ok())
@@ -634,13 +649,16 @@ pub fn assert_confirmed_by_a_legal_route(source: Option<&str>) -> Result<()> {
 }
 
 /// The transaction hash a submission finally confirmed on.
-pub fn confirmed_transaction_hash(sidecar: &std::path::Path) -> Result<Option<String>> {
+pub fn confirmed_transaction_hash(
+    sidecar: &std::path::Path,
+    bundle: u32,
+) -> Result<Option<String>> {
     let connection = rusqlite::Connection::open(sidecar).context("opening the sidecar")?;
     let hash = connection
         .query_row(
-            "select confirmed_transaction_hash from chain_submissions
-             where kind IN ('delegation','delegate_and_cast_vote_batch') and confirmed_transaction_hash is not null limit 1",
-            [],
+            "select lower(hex(confirmed_transaction_hash)) from chain_submissions
+             where kind = 'delegate_and_cast_vote_batch' and bundle_index=?1 and confirmed_transaction_hash is not null",
+            [bundle],
             |row| row.get::<_, String>(0),
         )
         .ok();
@@ -815,6 +833,10 @@ pub fn assert_untouched_bundles_did_not_reserve(
 /// See [`DurableSnapshot::shape`] for what is compared and what is
 /// deliberately allowed to differ between two distinct rounds.
 pub fn assert_matches_control(terminal: &DurableSnapshot, control: &DurableSnapshot) -> Result<()> {
+    if !terminal.combined.is_empty() || !control.combined.is_empty() {
+        crate::combined::assert_combined_terminal(terminal, &crate::round_run::proposal_ids())?;
+        crate::combined::assert_combined_terminal(control, &crate::round_run::proposal_ids())?;
+    }
     anyhow::ensure!(
         terminal.shape() == control.shape(),
         "A3 VIOLATED: the resumed round does not match the uncrashed control.\n  \
@@ -1262,6 +1284,7 @@ pub fn assert_a_stalled_submission_survived(
     }
     let kind = match target {
         crate::stall::StallTarget::DelegationPost => "delegation",
+        crate::stall::StallTarget::DelegateAndCastPost => "delegate_and_cast_vote_batch",
         _ => "vote",
     };
     anyhow::ensure!(

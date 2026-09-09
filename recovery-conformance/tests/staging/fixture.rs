@@ -31,11 +31,10 @@ pub const PIR_BASE: &str = "https://stage.pir.valargroup.org";
 
 /// How long after provisioning the round's vote closes.
 ///
-/// Share recovery treats a share as overdue after a quarter of the remaining
-/// vote window, so this also sets how long an interrupted attempt waits before
-/// it may be retried — bounded by the timing policy the suite passes to
-/// background tracking.
-pub const VOTE_WINDOW_SECONDS: i64 = 14 * 24 * 3600;
+/// One hour leaves room for a bounded stall and recovery while keeping test
+/// rounds from remaining active on staging for days. Share retries still use
+/// the host's explicit 45-second timing policy, independently of this window.
+pub const VOTE_WINDOW_SECONDS: i64 = 60 * 60;
 
 /// Everything the matrix needs, resolved once.
 pub struct Fixture {
@@ -345,6 +344,8 @@ pub fn config_for(
     let log_suffix = match mode {
         RunMode::Armed { .. } => "crashlog.jsonl",
         RunMode::Unarmed => "resume.crashlog.jsonl",
+        RunMode::RecoverCombined => "signerless.crashlog.jsonl",
+        RunMode::ObserveHelperOutage => "outage.crashlog.jsonl",
     };
     RoundRunConfig {
         sidecar: sidecar.to_path_buf(),
@@ -397,5 +398,10 @@ pub async fn build_control(
         "the control run ended at {} rather than quiescence",
         outcome.quiescence
     );
-    DurableSnapshot::read(&sidecar)
+    let snapshot = DurableSnapshot::read(&sidecar)?;
+    recovery_conformance::combined::assert_combined_terminal(
+        &snapshot,
+        &recovery_conformance::round_run::proposal_ids(),
+    )?;
+    Ok(snapshot)
 }

@@ -2,6 +2,37 @@
 
 Staging crash-recovery conformance for `zcash_voting`.
 
+The current live matrices exercise fresh **combined delegation-and-cast batches**
+from PR #309: three bundles, each casting the three-proposal ballot in one
+transaction. The crash matrix runs first during adaptation; acceptance requires
+one complete crash/stall/fleet run on the final code.
+
+`delegate-and-cast-post` replaces the standalone `delegation-post` and `vote-post`
+selections for live stalls. Legacy routes retain hermetic classification tests.
+`after-tree-sync` is not a fresh-combined crash stage: the first witness is
+synthetic. The tree-read stall instead starts from a real hashless combined
+submission. The first reopen marks its interrupted reservation as recovering;
+the next reopen must actually request the commitment tree. Both invocations
+share one stall budget. The PIR stall
+starts without the warm proof cache while retaining the control’s padded-note
+setup. Its fault-free resume imports the control’s valid snapshot-bound proofs,
+as other cases do, without changing persisted padding. A missed fault is always
+a failure.
+
+`lightwalletd` remains an explicit coverage exclusion: the shared route cannot
+intercept tonic. It is reported separately and is never counted as passed.
+Every other selected case must run and pass, including setup and recovery.
+
+Snapshots scope every member and authorization to its wallet, round, and bundle.
+They require the complete ordered batch, helper plans before fresh dispatch, and
+atomic confirmation of the final VAN and all vote positions. A persisted target
+also resumes through the round driver in a child with no voter mnemonic,
+delegation driver, signer, or hotkey, before the remaining bundles run normally.
+Previous child logs and outcomes are archived on retry.
+
+The historical verification tables below predate this adaptation and do not
+count toward its full-suite gate.
+
 ## Why this exists
 
 The crate's ~1400 unit tests prove that durable rows are written in the right
@@ -57,7 +88,7 @@ Not part of `make test` and not in CI: it needs the network and it kills
 processes.
 
 ```bash
-infisical run --env=staging -- make recovery-conformance   # all three matrices
+infisical run --projectId=40862c6d-a089-4355-b405-0477be0ee3b1 --env=staging -- make recovery-conformance   # all three matrices
 make recovery-conformance-check                            # type-check and lint
 ```
 
@@ -67,14 +98,13 @@ helper traffic of a one-helper round. A change that can only affect one axis
 should pay for one axis:
 
 ```bash
-infisical run --env=staging -- make recovery-conformance-crash
-infisical run --env=staging -- make recovery-conformance-stalls
-infisical run --env=staging -- make recovery-conformance-fleet
+infisical run --projectId=40862c6d-a089-4355-b405-0477be0ee3b1 --env=staging -- make recovery-conformance-crash
+infisical run --projectId=40862c6d-a089-4355-b405-0477be0ee3b1 --env=staging -- make recovery-conformance-stalls
+infisical run --projectId=40862c6d-a089-4355-b405-0477be0ee3b1 --env=staging -- make recovery-conformance-fleet
 ```
 
 The hermetic tests run under every one of these, and under
-`RECOVERY_CONFORMANCE_WITHOUT_STAGING=1 cargo nextest run -p
-recovery-conformance` with no staging access at all. They cover the taxonomies,
+`make recovery-conformance-unit NEXTEST_PROFILE=ci` with no staging access at all. They cover the taxonomies,
 the placement arithmetic, the orchestration logic, and — importantly — the two
 fault wrappers themselves (`tests/fault_routes.rs`). Those wrappers are the
 load-bearing mechanism of both new axes: one that quietly delegated its armed
@@ -84,7 +114,7 @@ live matrices running, reporting green, and proving nothing.
 To re-run only the stages a change could affect:
 
 ```bash
-infisical run --env=staging -- env \
+infisical run --projectId=40862c6d-a089-4355-b405-0477be0ee3b1 --env=staging -- env \
   RECOVERY_CONFORMANCE_STAGES=after-vote-broadcast,after-vote-confirmed \
   make recovery-conformance
 ```
@@ -143,19 +173,18 @@ crash.
 | `after-note-selection` | bundles only; notes chosen, nothing written yet |
 | `after-pczt` | `bundles.pczt_sighash` + TX1 effects, write-once |
 | `after-proof` | `proofs` row |
-| `after-signing` | proof + any Keystone signature |
+| `after-signing` | delegation signed in memory; no durable cast batch |
 | `before-broadcast` | `chain_submissions` `submitting`, bytes never sent |
 | `after-broadcast-unread` | `submitting`, transaction may be on chain, no hash |
 | `after-broadcast-read` | as above; the real response is captured for the parent |
 | `after-tracking` | `tracking` + candidate hash — needs a one-pass chain policy, see below |
-| `before-cast` | delegation confirmed |
-| `after-tree-sync` | delegation confirmed; cached tree synced |
+| `before-cast` | delegation proof prepared; terminal ballot ready for a combined cast |
 | `after-vote-proof` | nothing new — the proof is lost by design |
-| `after-vote-commit` | `votes.commitment_bundle_json`, no POST reserved; the seam is the fleet preflight |
+| `after-vote-commit` | complete combined authorization and every vote recovery; no helper plans or POST reservation |
 | `after-helper-plans` | `helper_share_plans` + `round_immediate_share` |
 | `before-vote-broadcast` | vote `submitting`, bytes never sent |
 | `after-vote-broadcast` | vote `submitting`, POST dispatched |
-| `after-vote-confirmed` | `confirmed` + `votes.vc_tree_position` |
+| `after-vote-confirmed` | delegation and every vote confirmed together, with final VAN and contiguous VC positions |
 | `before-share-post` | `share_delegations.attempting_urls` |
 | `after-share-post` | `attempting_urls`; helper answered, outcome unwritten |
 | `after-share-accepted` | `sent_to_urls` |
@@ -182,8 +211,7 @@ and a run that never ends is the finding.
 | --- | --- | --- |
 | `lightwalletd` | every lightwalletd RPC | 20s unary, 10s connect |
 | `pir-query` | any PIR request | 60s request budget |
-| `delegation-post` | `POST .../delegate-vote` | 150s |
-| `vote-post` | `POST .../cast-vote` | 150s |
+| `delegate-and-cast-post` | `POST .../delegate-and-cast-vote-batch` | 150s |
 | `transaction-lookup` | `GET .../tx/{hash}` | 10s |
 | `commitment-tree-read` | `GET .../commitment-tree/...` | 60s |
 | `helper-preflight` | `GET .../status` | 30s hard |
@@ -266,8 +294,12 @@ Three details in that table are load-bearing:
   `half-then-other-half` passed exactly that way — all 144 shares confirmed on
   the first half, the second half never contacted, every assertion holding
   trivially against a completed round. The crash is what leaves work owed.
-  `whole-fleet-down` is the exception because nothing is reachable there, so the
-  outstanding work is guaranteed by the fleet itself.
+  `whole-fleet-down` guarantees outstanding work because nothing is reachable.
+  Its opening drive uses host cancellation after the first helper delivery
+  result, preserving refused delivery work before the fleet is restored. This
+  avoids spending the entire dispatch budget retrying an intentionally dead
+  fleet. The test requires the cancellation boundary, observed refusals, and
+  unaccepted durable share rows before recovery can count.
 - **The crash lands after an acceptance, not before one.** `after-share-post`
   fires at the first POST, before anything has been taken, and a first half
   holding nothing makes "those acceptances survive the flip" a claim about an
@@ -468,7 +500,7 @@ because a broader one would retry past real findings.
 episode's *terminal* outcome — not one event per poll. Under the shipped
 45-pass policy an episode polls until the submission confirms, so a stage
 waiting to observe one *still tracking* can never fire. The run therefore arms a
-single-pass chain policy for `after-tracking` alone; every other stage keeps the
+single-pass chain policy for `after-tracking` and chain stall injections; other crash stages keep the
 shipped cadence, so the control it is compared against is unaffected.
 
 ### Reaching after-vote-commit
@@ -615,7 +647,22 @@ own. There is no mock prover — the `test-fixtures` seeding helpers skip
 proving, which is exactly what this suite must not do — so this isolation is
 expensive but required for the terminal convergence oracle.
 
-## Verification record
+New conformance rounds close one hour after provisioning, rather than remaining
+active for fourteen days. Existing on-chain rounds retain their original expiry.
+
+## Current adaptation verification
+
+`make recovery-conformance-unit NEXTEST_PROFILE=ci` passed 112 hermetic tests.
+The SDK default suite passed 1,632 tests (nine configured skips). A complete
+19-stage crash matrix and all five helper-fleet scenarios have passed during
+adaptation. Focused recovery also confirmed all 144 shares without changing
+previously confirmed chain-submission rows after a background tracking pause.
+
+Final validation is in progress; no complete full-suite result is claimed yet.
+Live runs build the worker explicitly and use
+`RECOVERY_CONFORMANCE_ARGS=--no-capture` to retain per-case diagnostics.
+
+## Historical verification record
 
 ### Full three-axis runs
 
@@ -790,8 +837,8 @@ scenarios depend on fall out of the change: the host's helper fleet is re-read
 share — which is the only record of where a run *declined* to send again.
 
 **Why a run is bounded by the suite rather than by the driver.** A healthy
-tracking run ends at the round's vote end, which for these rounds is fourteen
-days out. The suite races it against its own budget instead; dropping the future
+tracking run ends at the round's vote end, which for these rounds is one hour after
+creation. The suite races it against its own budget instead; dropping the future
 is a supported way to end a run, so the race is not a leak.
 
 
@@ -813,3 +860,29 @@ inspected would simply be a completed round. `run_until_crash` therefore
 requires `SIGABRT` at the armed stage and rejects the
 `EXIT_STAGE_NEVER_REACHED` exit, so a stage that stops firing fails loudly
 instead of decaying into a no-op.
+
+A normal conformance resume that stops only with `HelperDeliveryIncomplete`
+reopens the same sidecar within the existing six-attempt bound. Background
+tracking can confirm the attempted member while later members of its combined
+unit still owe initial delivery; another round drive executes those obligations.
+A mixed failure or exhausted bound remains a failure, and terminal checks still
+require every member and all 144 shares.
+
+Chain stall injections use one POST attempt and one advancement pass, with the
+SDK's full request deadlines. This avoids repeating a permanently hung request
+through nested retry budgets. Fault-free recovery restores the default POST
+and advancement policies and must still confirm the complete round.
+
+If the foreground finishes but the last background tracking run reaches the
+harness time budget, the parent reopens the same sidecar within its existing
+six-attempt bound. This does not accept cancellation, mixed failures, or
+unrecoverable shares as progress. The final comparison still requires all
+144 shares confirmed; exhaustion remains a failure. The regression
+`only_the_last_recoverable_background_budget_pause_is_resumed` pins this rule.
+
+The share-POST stall uses host cancellation after the first completed delivery
+result, just like the whole-fleet outage fixture. It still requires an observed
+hung request and its SDK deadline; a request that never completes cannot reach
+that cancellation point. Background recovery is deferred to the unarmed resume,
+which must confirm every share. This bounds the fault episode without repeating
+permanent delivery failures for the rest of the round.

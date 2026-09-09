@@ -227,13 +227,61 @@ async fn exercise(
         MAX_DISPATCHES,
         &Faults::stall(plan),
     );
+    if target == StallTarget::CommitmentTreeRead {
+        // Fresh combined casts use a synthetic witness and need no tree read.
+        // Leave an actual hashless dispatch so normal recovery must scan the tree.
+        let seed = config_for(
+            fixture,
+            &sidecar,
+            round,
+            RunMode::Armed {
+                stage: recovery_conformance::CrashStage::AfterBroadcastRead,
+            },
+            MAX_DISPATCHES,
+            &Faults::none(),
+        );
+        recovery_conformance::child::run_until_crash(&fixture.worker, &seed).map_err(|error| {
+            Outcome::Failed(format!("seeding hashless tree recovery: {error:#}"))
+        })?;
+    }
     // The stalled run and the resume are both unarmed, so both would otherwise
     // write to the same log and the resume would truncate the evidence that the
     // stall fired at all. Separating them keeps that evidence independent of the
     // order these two calls happen to be written in.
     armed.crash_log = sidecar.with_extension("stall.crashlog.jsonl");
-    let stalled = run_until_the_stall_resolves(&fixture.worker, &armed, budget)
+    let mut stalled = run_until_the_stall_resolves(&fixture.worker, &armed, budget)
         .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+    if target == StallTarget::CommitmentTreeRead
+        && stalled.ended_itself
+        && StallRecord::from_observations(&stalled.observations).is_empty()
+        && stalled.outcome.as_ref().is_some_and(|outcome| {
+            outcome.quiescence_kind == "ChainRecoveryStalled" && outcome.failures.is_empty()
+        })
+    {
+        // Reopening an interrupted reservation first marks it Recovering and
+        // returns without network reconciliation. Re-enter exactly once to
+        // reach the scan, charging both invocations to the same stall budget.
+        let interrupted = DurableSnapshot::read(&sidecar)
+            .map_err(|error| Outcome::Failed(format!("unreadable sidecar: {error:#}")))?;
+        if !interrupted.submissions.iter().any(|submission| {
+            submission.bundle_index == i64::from(armed.target.bundle_index)
+                && submission.kind == "delegate_and_cast_vote_batch"
+                && submission.state == "recovering"
+                && !submission.has_candidate_hash
+        }) {
+            return Err(Outcome::Failed(
+                "tree recovery did not preserve the interrupted hashless generation".into(),
+            ));
+        }
+        let initialization_elapsed = stalled.elapsed;
+        let remaining = budget.checked_sub(initialization_elapsed).ok_or_else(|| {
+            Outcome::Failed("interrupted reservation exhausted the tree stall budget".into())
+        })?;
+        eprintln!("  {target}: interrupted reservation is recovering; re-entering for tree scan");
+        stalled = run_until_the_stall_resolves(&fixture.worker, &armed, remaining)
+            .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+        stalled.elapsed += initialization_elapsed;
+    }
     warm_from(fixture, &sidecar);
 
     // (1) the stall fired, and at the point it was asked to

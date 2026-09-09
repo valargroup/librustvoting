@@ -231,6 +231,16 @@ async fn exercise(
 
     // (g) the stage's own durable expectations
     let bundle = default_target().bundle_index;
+    recovery_conformance::combined::assert_combined_stage(
+        stage,
+        &plan,
+        &after_crash,
+        &fixture_account(),
+        &round.round_id,
+        bundle,
+        &proposal_ids(),
+    )
+    .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     assert_stage_state(stage, &plan, &after_crash, bundle)
         .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     assert_plans_precede_broadcast(&after_crash)
@@ -274,6 +284,28 @@ async fn exercise(
     if stage.settles_on_chain_before_resume() {
         eprintln!("  {stage}: waiting {CHAIN_INCLUSION_WAIT:?} for the dispatched transaction");
         tokio::time::sleep(CHAIN_INCLUSION_WAIT).await;
+    }
+
+    // First recover only this durable unit with no signer or hotkey available.
+    if after_crash.combined.iter().any(|b| {
+        b.bundle_index == bundle && !b.authorizations.is_empty() && b.van_position.is_none()
+    }) {
+        let signerless = config_for(
+            fixture,
+            &sidecar,
+            round,
+            RunMode::RecoverCombined,
+            1,
+            &Faults::none(),
+        );
+        let recovered = run_to_quiescence(&fixture.worker, &signerless)
+            .map_err(|error| Outcome::Failed(format!("signerless recovery: {error:#}")))?;
+        if recovered.quiescence_kind != "TargetRecovered" || !recovered.failures.is_empty() {
+            return Err(Outcome::Failed(format!(
+                "signerless target recovery failed: {}",
+                recovered.quiescence
+            )));
+        }
     }
 
     // (h) resume to quiescence in a new process
@@ -345,8 +377,8 @@ async fn exercise(
     // or by re-POSTing the same generation. The route is reported every run:
     // it is not assertable, but a change in it should not pass unseen.
     if stage == CrashStage::AfterBroadcastUnread {
-        let source =
-            confirmation_source(&sidecar).map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+        let source = confirmation_source(&sidecar, bundle)
+            .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
         eprintln!("  {stage}: confirmation source {:?}", source.as_deref());
         assert_confirmed_by_a_legal_route(source.as_deref())
             .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
@@ -358,9 +390,9 @@ async fn exercise(
     // sent, which counting alone cannot show.
     if let Some(body) = crash.dispatched_response_body() {
         if let Some(dispatched) = dispatched_transaction_hash(body) {
-            let confirmed = confirmed_transaction_hash(&sidecar)
+            let confirmed = confirmed_transaction_hash(&sidecar, bundle)
                 .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
-            let source = confirmation_source(&sidecar)
+            let source = confirmation_source(&sidecar, bundle)
                 .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
             eprintln!(
                 "  {stage}: dispatched {dispatched}, confirmed {} via {}",
@@ -376,6 +408,10 @@ async fn exercise(
         }
     }
 
+    recovery_conformance::combined::assert_preserved_combined(&after_crash, &terminal)
+        .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+    recovery_conformance::combined::assert_combined_terminal(&terminal, &proposal_ids())
+        .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     // (j) the terminal shape must match the uncrashed control
     if let Err(error) = assert_matches_control(&terminal, control) {
         return Err(Outcome::Failed(format!("{error:#}")));

@@ -66,7 +66,7 @@ fn only_lightwalletd_is_unreachable_through_the_route() {
 }
 
 #[test]
-fn only_the_two_transaction_posts_can_leave_a_submission_in_doubt() {
+fn the_live_combined_post_can_leave_a_submission_in_doubt() {
     let carrying: Vec<_> = StallTarget::ALL
         .iter()
         .copied()
@@ -74,7 +74,7 @@ fn only_the_two_transaction_posts_can_leave_a_submission_in_doubt() {
         .collect();
     assert_eq!(
         carrying,
-        vec![StallTarget::DelegationPost, StallTarget::VotePost],
+        vec![StallTarget::DelegateAndCastPost],
         "only a POST that carries a transaction can leave one possibly delivered"
     );
 }
@@ -116,6 +116,11 @@ fn the_default_point_is_the_conservative_one() {
 fn each_endpoint_is_classified_as_the_target_that_names_it() {
     let classifier = classifier();
     let cases = [
+        (
+            "POST",
+            "/shielded-vote/v1/delegate-and-cast-vote-batch",
+            StallTarget::DelegateAndCastPost,
+        ),
         (
             "POST",
             "/shielded-vote/v1/delegate-vote",

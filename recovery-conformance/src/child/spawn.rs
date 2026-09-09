@@ -107,7 +107,10 @@ pub fn run_to_quiescence(worker: &Path, config: &RoundRunConfig) -> Result<RunOu
                 // re-driving is what a host does, so the matrix does it too
                 // rather than reporting the SDK's own retry advice as a
                 // failure.
-                if outcome.quiescence_kind == "ChainRecoveryStalled" {
+                if outcome.quiescence_kind == "ChainRecoveryStalled"
+                    || (outcome.quiescence_kind == "TargetRecoveryPending"
+                        && outcome.failures.is_empty())
+                {
                     last = outcome.quiescence.clone();
                     eprintln!(
                         "  resume attempt {attempt}/{INFRASTRUCTURE_ATTEMPTS}: chain recovery \
@@ -131,6 +134,26 @@ pub fn run_to_quiescence(worker: &Path, config: &RoundRunConfig) -> Result<RunOu
                 if outcome.is_environmental() && !outcome.is_terminal_success() {
                     last = describe_environment_failure(config);
                     eprintln!("  resume attempt {attempt}/{INFRASTRUCTURE_ATTEMPTS}: {last}");
+                    continue;
+                }
+                if outcome.needs_background_recovery() {
+                    last = "background share tracking exhausted the suite time budget".into();
+                    eprintln!(
+                        "  resume attempt {attempt}/{INFRASTRUCTURE_ATTEMPTS}: {last}; \
+                         reopening the same sidecar for remaining confirmations"
+                    );
+                    continue;
+                }
+                if outcome.needs_helper_recovery() {
+                    // A confirmed combined unit can finish one member's helper
+                    // delivery incompletely and leave later members untouched.
+                    // Background tracking settles existing rows; reopening the
+                    // driver is what executes those remaining obligations.
+                    last = format!("incomplete helper delivery: {:?}", outcome.failures);
+                    eprintln!(
+                        "  resume attempt {attempt}/{INFRASTRUCTURE_ATTEMPTS}: helper delivery \
+                         incomplete; reopening the same sidecar for remaining obligations"
+                    );
                     continue;
                 }
                 return Ok(outcome);
@@ -213,7 +236,7 @@ fn attempt_crash(
         }
         CrashOutcome::StageNeverReached | CrashOutcome::Completed => {
             return Err(AttemptFailure::Fatal(anyhow::anyhow!(
-                "the round finished without reaching stage {stage}; the test would have \
+                "stage {stage} was never reached; the round finished without its crash; the test would have \
                  asserted against a completed round rather than a crashed one"
             )))
         }
@@ -345,6 +368,17 @@ fn spawn_bounded(
     config: &RoundRunConfig,
     budget: Duration,
 ) -> Result<Option<std::process::ExitStatus>> {
+    // Preserve prior attempts instead of losing the evidence when the child
+    // creates its next log and outcome. Only public diagnostics are copied.
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for artifact in [&config.crash_log, &config.outcome] {
+        if artifact.exists() {
+            let archive =
+                artifact.with_extension(format!("attempt-{}-{attempt}", std::process::id()));
+            std::fs::copy(artifact, archive).context("preserving previous worker evidence")?;
+        }
+    }
     let config_path = config.sidecar.with_extension("run.json");
     config
         .write(&config_path)
@@ -352,8 +386,12 @@ fn spawn_bounded(
     // The child inherits this process's environment, which is how the voter
     // seed reaches it. It is never written into the config file above nor
     // passed as an argument.
-    let mut child = Command::new(worker)
-        .arg(&config_path)
+    let mut command = Command::new(worker);
+    command.arg(&config_path);
+    if config.mode == crate::run_config::RunMode::RecoverCombined {
+        command.env_remove(crate::environment::VOTER_SEED_VAR);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawning {}", worker.display()))?;
 

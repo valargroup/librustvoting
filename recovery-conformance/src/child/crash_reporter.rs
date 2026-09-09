@@ -191,10 +191,13 @@ impl CrashReporter {
             // A delegation and a vote both report a bare `ChainOutcome`, and
             // both can be on the target bundle, so matching the outcome alone
             // would let a vote's confirmation fire the delegation stage.
-            (CrashStage::AfterTracking, RoundStepProgress::ChainOutcome(_)) => true,
-            (CrashStage::AfterVoteConfirmed, RoundStepProgress::ChainOutcome(_)) => {
-                !is_delegation(step)
+            (CrashStage::AfterTracking, RoundStepProgress::ChainOutcome(outcome)) => {
+                outcome.durable_state() == Some(zcash_voting::ChainSubmissionState::Tracking)
             }
+            (
+                CrashStage::AfterVoteConfirmed,
+                RoundStepProgress::ChainOutcome(zcash_voting::ChainSubmissionResult::Confirmed(_)),
+            ) => !is_delegation(step),
 
             // `Signing` is the last stage before anything about the vote is
             // written, so it is the point where the proof is finished and

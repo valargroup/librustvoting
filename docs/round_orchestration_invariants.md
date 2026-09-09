@@ -1012,3 +1012,29 @@ Conformance is demonstrated by behavior. Tests cover:
   re-derived once a row exists?
 - Does a new failure constructor take the step ledger?
 - Is the corresponding conformance test named in this document?
+
+
+### Live combined recovery conformance
+
+The `recovery-conformance` matrices exercise fresh combined rounds. Their scoped
+snapshots require the complete authorization and ordered membership, helper plans
+before a fresh POST, and the final VAN plus every contiguous vote position at
+confirmation. Crash resumes preserve already-persisted PCZT/proof fingerprints,
+authorization, and batch membership. A target-only round-driver pass removes the
+voter mnemonic and supplies no signing inputs before normal round completion.
+
+`recovery-conformance/tests/combined_recovery.rs` rejects missing authorization,
+partial membership or confirmation, wrong generation metadata, missing helper
+plans, and evidence belonging to another wallet. The combined POST fault wrapper
+is exercised on both sides of dispatch by
+`combined_post_stalls_on_the_selected_side_of_dispatch`. Live tree-read stalls
+start from a real hashless dispatch because a fresh combined cast does not need
+the initial tree synchronization of a standalone delegation.
+
+Early delegation preparation forwards the selection, PCZT and proof progress
+sequence through the supplied reporter. In particular, `PcztBuilding` precedes
+the PCZT write and `PcztBuilt` follows it; the fresh combined preparation path
+must not replace this reporter with a no-op. The live `after-note-selection`
+and `after-pczt` stages depend on those boundaries. The hermetic
+`proof_preparation_reports_selection_before_a_preparation_failure` test also
+pins the start event when preparation fails before setup.

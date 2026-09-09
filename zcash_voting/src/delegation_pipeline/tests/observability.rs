@@ -39,3 +39,34 @@ fn keystone_reports_preserve_preparation_failures_and_bundle_identity() {
         }
     }
 }
+
+#[test]
+fn proof_preparation_reports_selection_before_a_preparation_failure() {
+    use crate::{
+        delegate::DelegationProgress, types::DelegationProgressBridge, HyperTransport, PirFleet,
+    };
+    use std::sync::{Arc, Mutex};
+
+    let pipeline = pipeline_with_round();
+    let pir = PirFleet::new(
+        &["https://pir.invalid".to_string()],
+        crate::config::PirLayout {
+            pir_depth: pir_types::COMPILED_PIR_LAYOUT.pir_depth as u32,
+            tier0_layers: pir_types::COMPILED_PIR_LAYOUT.tier0_layers as u32,
+            tier1_layers: pir_types::COMPILED_PIR_LAYOUT.tier1_layers as u32,
+            poly_len: pir_types::DEFAULT_YPIR_POLY_LEN as u32,
+        },
+        Arc::new(HyperTransport::new()),
+    )
+    .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    let progress = DelegationProgressBridge::new(move |event| recorded.lock().unwrap().push(event));
+    // This fixture cannot prepare a bundle. The host must still see that
+    // selection began, without a fictitious PCZT/proof completion event.
+    assert!(pipeline.ensure_proof(0, &pir, &progress).is_err());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![DelegationProgress::SelectingNotes]
+    );
+}
