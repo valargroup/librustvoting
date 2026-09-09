@@ -34,6 +34,31 @@ fleets, derive the expected accepted placements from each persisted target. Keep
 HTTP attempts, queued/duplicate acknowledgements, accepted placements, failed
 attempts, ambiguous outcomes, and recovery POSTs as separate counts.
 
+## Running it
+
+`stage-bench` performs this capture as one command. It provisions the round,
+drives the vote, saves every snapshot, and derives the delivery comparison and
+per-proposal breakdown described below:
+
+```bash
+infisical run --projectId=40862c6d-a089-4355-b405-0477be0ee3b1 --env=staging -- \
+  make stage-bench STAGE_BENCH_ARGS="run --proposals 37"
+```
+
+Each run writes a directory holding the manifest, the raw
+`OperationObservability` snapshots, the phase-event log, the outcome, and the
+derived `metrics.json`; `stage-bench analyze <run-dir>` re-derives the report
+without touching the network. `stage-bench/README.md` documents the flags and
+what each one changes about the measurement. The manual capture below remains
+the specification the tool implements, and the definitions in it are what the
+code computes — read it before believing a number, and before changing one.
+
+Two conditions the tool controls that this document assumes: the build is always
+release, because a debug ZKP2 proof measures the compiler rather than the SDK;
+and the vote window is recorded in the manifest, because the SDK's last-moment
+window is a fraction of the round and two runs with different windows ran
+different share schedules.
+
 ## Capture
 
 Retain serialized `OperationObservability` snapshots and the authoritative domain

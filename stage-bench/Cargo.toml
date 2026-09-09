@@ -1,0 +1,45 @@
+[package]
+name = "stage-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Multi-proposal staging benchmark for `zcash_voting`.
+#
+# Deliberately outside the workspace `default-members`, for the same reason
+# `recovery-conformance` is: it provisions real rounds on the staging vote
+# chain and drives them over the network, so it must never be pulled into
+# `make check` or `make test`.
+
+[features]
+default = ["zakura"]
+lrz = [
+    "zcash_voting/lrz",
+    "recovery-conformance/lrz",
+    "voting-crypto-deps/lrz",
+]
+zakura = [
+    "zcash_voting/zakura",
+    "recovery-conformance/zakura",
+    "voting-crypto-deps/default",
+]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+recovery-conformance = { path = "../recovery-conformance", default-features = false }
+rusqlite = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+voting-crypto-deps = { workspace = true }
+zcash_voting = { path = "../zcash_voting", default-features = false }
+zeroize = "1"
+
+[[bin]]
+name = "stage-bench"
+path = "src/bin/stage_bench.rs"
+
+[[bin]]
+name = "stage-bench-worker"
+path = "src/bin/stage_bench_worker.rs"

@@ -20,7 +20,8 @@ NEXTEST_PROFILE ?= agent
 
 .PHONY: help check test test-lrz test-vct doc-test proofs msrv fmt clippy \
 	recovery-conformance-check recovery-conformance recovery-conformance-crash \
-	recovery-conformance-stalls recovery-conformance-fleet
+	recovery-conformance-stalls recovery-conformance-fleet \
+	stage-bench-check stage-bench-worker stage-bench stage-bench-unit
 
 help: ## Show the canonical build and test targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -116,6 +117,36 @@ recovery-conformance-fleet: recovery-conformance-worker ## Run only the staging 
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
 		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked $(RECOVERY_CONFORMANCE_ARGS) \
 		-E 'not (binary(staging_conformance) or binary(stall_conformance))'
+
+# Multi-proposal staging benchmark. Excluded from APP_PACKAGES for the same
+# reason `recovery-conformance` is: it provisions real rounds on the staging
+# vote chain and drives them over the network. It shares the Zakura target dir
+# so it reuses the main build's artifacts.
+STAGE_BENCH_PACKAGE = -p stage-bench
+
+# Arguments for `make stage-bench`, e.g.
+#   STAGE_BENCH_ARGS="run --proposals 37 --helpers 2"
+STAGE_BENCH_ARGS ?= run
+
+stage-bench-check: ## Type-check and lint the staging benchmark
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo clippy $(STAGE_BENCH_PACKAGE) --all-targets --locked
+
+stage-bench-worker: ## Build the release worker the benchmark CLI spawns
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo build --release $(STAGE_BENCH_PACKAGE) --bin stage-bench-worker --locked
+
+# Release, always. A debug ZKP2 proof takes minutes where a release proof takes
+# seconds, so a debug run's phase table measures the compiler rather than the
+# SDK. The CLI records the profile in every run manifest for the same reason.
+stage-bench: stage-bench-worker ## Run the staging benchmark (network, slow); see STAGE_BENCH_ARGS
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo run --release $(STAGE_BENCH_PACKAGE) --bin stage-bench --locked -- $(STAGE_BENCH_ARGS)
+
+stage-bench-unit: ## Run hermetic benchmark tests (no staging)
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(STAGE_BENCH_PACKAGE) --locked \
+		--test ballot --test metrics --test run_directory
 
 .PHONY: recovery-conformance-unit
 recovery-conformance-unit: ## Run hermetic crash-recovery harness tests (no staging)

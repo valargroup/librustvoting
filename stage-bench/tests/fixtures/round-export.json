@@ -1,0 +1,62 @@
+{
+  "schema": "v1",
+  "round": {
+    "id": "d8cedf49-e4c0-430e-b02c-f6392f1aada9",
+    "name": "General Knowledge Quiz",
+    "status": "draft",
+    "settings": {
+      "description": "A neutral quiz.",
+      "snapshotHeight": "4245460",
+      "endTime": "2026-09-09T19:27:00.000Z",
+      "openUntilClosed": true,
+      "defaultProposalType": "binary",
+      "defaultLabels": ["Yes", "No"],
+      "discussionURL": ""
+    },
+    "proposals": [
+      {
+        "index": 0,
+        "id": "de881f3c-a745-47db-84d6-a1439885c960",
+        "title": "Is 12 an even number?",
+        "description": "Select the correct answer.",
+        "type": "binary",
+        "options": [
+          { "id": "2273e334-14ed-4190-a47c-11afbf779e3a", "label": "Yes", "description": "" },
+          { "id": "c12b3437-c7b1-4690-a84d-50fefeb9029f", "label": "No", "description": "" }
+        ],
+        "zipNumber": "",
+        "forumURL": "",
+        "metadata": [{ "key": "category", "value": "Basic Mathematics" }]
+      },
+      {
+        "index": 1,
+        "id": "30a96645-f778-45e1-8509-8b09be1bc03d",
+        "title": "What is 7 + 8?",
+        "description": "Select the correct answer.",
+        "type": "multi-choice",
+        "options": [
+          { "id": "db333aa9-bd44-43c9-8c36-47f2b5c4ad04", "label": "13", "description": "" },
+          { "id": "4fa9b69b-0d22-4d1e-b070-4de70953db09", "label": "14", "description": "" },
+          { "id": "5fa9b69b-0d22-4d1e-b070-4de70953db10", "label": "15", "description": "" }
+        ],
+        "zipNumber": "",
+        "forumURL": ""
+      },
+      {
+        "index": 2,
+        "id": "40a96645-f778-45e1-8509-8b09be1bc03e",
+        "title": "Which continent is Egypt mostly in?",
+        "description": "",
+        "type": "multi-choice",
+        "options": [
+          { "id": "a1", "label": "Africa", "description": "" },
+          { "id": "a2", "label": "Asia", "description": "" },
+          { "id": "a3", "label": "Europe", "description": "" },
+          { "id": "a4", "label": "South America", "description": "" }
+        ],
+        "zipNumber": "",
+        "forumURL": ""
+      }
+    ]
+  }
+}
