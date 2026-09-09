@@ -104,3 +104,75 @@ fn a_deployment_with_no_pir_endpoints_is_refused_up_front() {
         Err(StageConfigError::NoPirEndpoints)
     ));
 }
+
+// --- endpoints built from a deployment -------------------------------------
+
+use recovery_conformance::helper_fleet::{HelperFleetPlan, SYNTHETIC_HELPER_URLS};
+use recovery_conformance::round_run::{endpoints_from, endpoints_with_fleet, helper_backend};
+
+#[test]
+fn the_real_helper_is_the_primary_vote_server() {
+    // Helpers are not PIR. The share endpoint lives on the vote server, and
+    // only the primary answers it on staging — the secondary and the PIR host
+    // both return 404. Pointing share delivery anywhere else fails as
+    // `HelperDeliveryIncomplete`, which reads like a delivery defect rather
+    // than a misconfiguration.
+    let deployment = StageDeployment::from_json(STAGE_EXCERPT.as_bytes()).unwrap();
+    assert_eq!(
+        helper_backend(&deployment),
+        "https://stage.vote-chain-primary.valargroup.org"
+    );
+    assert_eq!(
+        endpoints_from(&deployment).helper_urls,
+        vec!["https://stage.vote-chain-primary.valargroup.org".to_string()],
+        "without a fleet the suite drives the one real helper"
+    );
+}
+
+#[test]
+fn a_fleet_plan_replaces_the_configured_helpers_entirely() {
+    // The wiring that makes a fleet visible to the SDK at all. If this fell
+    // back to the single real endpoint, the fleet matrix would drive one helper
+    // with a target count of one, every placement assertion would hold
+    // trivially, and the whole axis would report green having tested the
+    // degenerate case it exists to escape.
+    let deployment = StageDeployment::from_json(STAGE_EXCERPT.as_bytes()).unwrap();
+    let backend = helper_backend(&deployment);
+    let endpoints = endpoints_with_fleet(&deployment, &HelperFleetPlan::all_answering(&backend, 10));
+
+    assert_eq!(endpoints.helper_urls.len(), 10);
+    assert_eq!(endpoints.helper_urls, SYNTHETIC_HELPER_URLS.to_vec());
+    assert!(
+        !endpoints.helper_urls.contains(&backend),
+        "the real endpoint must not also appear as a helper; it would be an \
+         eleventh identity sharing a backend with the other ten"
+    );
+}
+
+#[test]
+fn a_fleet_plan_leaves_every_other_endpoint_alone() {
+    // Only helper delivery is redirected. Chain, PIR, and tree traffic must
+    // still reach the real staging deployment, or a fleet scenario would stop
+    // being a real round.
+    let deployment = StageDeployment::from_json(STAGE_EXCERPT.as_bytes()).unwrap();
+    let plain = endpoints_from(&deployment);
+    let fleeted = endpoints_with_fleet(
+        &deployment,
+        &HelperFleetPlan::all_answering(helper_backend(&deployment), 10),
+    );
+    assert_eq!(fleeted.vote_servers, plain.vote_servers);
+    assert_eq!(fleeted.pir_urls, plain.pir_urls);
+    assert_eq!(fleeted.chain_rpc, plain.chain_rpc);
+    assert_eq!(fleeted.lightwalletd, plain.lightwalletd);
+}
+
+#[test]
+fn an_empty_fleet_plan_keeps_the_real_helper() {
+    // What every crash and stall exercise relies on: an empty plan changes
+    // nothing about where the round sends its shares.
+    let deployment = StageDeployment::from_json(STAGE_EXCERPT.as_bytes()).unwrap();
+    assert_eq!(
+        endpoints_with_fleet(&deployment, &HelperFleetPlan::none()).helper_urls,
+        endpoints_from(&deployment).helper_urls
+    );
+}

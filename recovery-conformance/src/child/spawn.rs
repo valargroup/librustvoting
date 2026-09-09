@@ -239,6 +239,57 @@ fn attempt_crash(
     })
 }
 
+/// What one run armed with a stall did.
+pub struct StalledRun {
+    pub observations: Vec<Observation>,
+    /// How long the child ran before it ended or was killed.
+    pub elapsed: Duration,
+    /// Whether the child ended on its own rather than being killed at `budget`.
+    ///
+    /// The finding this axis exists for. A child killed at its budget is a
+    /// child whose hung request had no effective deadline, and no restart
+    /// repairs that, because nothing crashed.
+    pub ended_itself: bool,
+    /// The outcome the child wrote, when it lived long enough to write one.
+    pub outcome: Option<RunOutcome>,
+}
+
+/// Drives a child whose armed request never answers, bounded by `budget`.
+///
+/// Unlike [`run_until_crash`] this does not retry: an environment failure and a
+/// deadline that was never applied both end a run early, and repeating the run
+/// would only make the two harder to tell apart. The caller judges from
+/// `ended_itself` and the recorded stalls.
+///
+/// The budget must be well below [`CHILD_BUDGET`] or the finding is unreachable:
+/// a wedged run would be killed by the outer bound and reported as one more
+/// slow stage rather than as an unbounded request.
+pub fn run_until_the_stall_resolves(
+    worker: &Path,
+    config: &RoundRunConfig,
+    budget: Duration,
+) -> Result<StalledRun> {
+    // Created up front so a child that hangs before its first record still
+    // leaves a readable log rather than a missing file.
+    CrashLog::create(&config.crash_log)
+        .with_context(|| format!("creating {}", config.crash_log.display()))?;
+
+    let started = Instant::now();
+    let status = spawn_bounded(worker, config, budget)?;
+    let elapsed = started.elapsed();
+    let observations = CrashLog::read(&config.crash_log).unwrap_or_default();
+    // Read even when the child was killed: a run that hung on its last request
+    // may still have written an outcome for the work it completed first.
+    let outcome = RunOutcome::read(&config.outcome).ok();
+
+    Ok(StalledRun {
+        observations,
+        elapsed,
+        ended_itself: status.is_some(),
+        outcome,
+    })
+}
+
 /// A short, secret-free description of why the environment ended a run.
 fn describe_environment_failure(config: &RoundRunConfig) -> String {
     let Ok(outcome) = RunOutcome::read(&config.outcome) else {
@@ -272,6 +323,28 @@ const CHILD_POLL: Duration = Duration::from_millis(250);
 const CHAIN_ADVANCE_WAIT: Duration = Duration::from_secs(45);
 
 fn spawn(worker: &Path, config: &RoundRunConfig) -> Result<std::process::ExitStatus> {
+    spawn_bounded(worker, config, CHILD_BUDGET)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the worker exceeded its {CHILD_BUDGET:?} budget and was killed; stage={:?} \
+             bundle={} proposal={}",
+            config.armed_stage(),
+            config.target.bundle_index,
+            config.target.proposal_id
+        )
+    })
+}
+
+/// Spawns a child and waits at most `budget` for it.
+///
+/// `None` means the budget expired and the child was killed. That is an error
+/// for every ordinary run — hence [`spawn`] above — but it is the *finding* a
+/// stall exercise is looking for, so the two are separated rather than the
+/// budget being a constant one caller has to work around.
+fn spawn_bounded(
+    worker: &Path,
+    config: &RoundRunConfig,
+    budget: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
     let config_path = config.sidecar.with_extension("run.json");
     config
         .write(&config_path)
@@ -284,10 +357,10 @@ fn spawn(worker: &Path, config: &RoundRunConfig) -> Result<std::process::ExitSta
         .spawn()
         .with_context(|| format!("spawning {}", worker.display()))?;
 
-    let deadline = Instant::now() + CHILD_BUDGET;
+    let deadline = Instant::now() + budget;
     loop {
         match child.try_wait().context("waiting for the worker")? {
-            Some(status) => return Ok(status),
+            Some(status) => return Ok(Some(status)),
             None if Instant::now() >= deadline => {
                 // Killed rather than left running: a detached worker keeps
                 // holding the sidecar and its round lock, and the next attempt
@@ -295,12 +368,7 @@ fn spawn(worker: &Path, config: &RoundRunConfig) -> Result<std::process::ExitSta
                 // next retry even when this worker reached no crash stage.
                 let _ = child.kill();
                 let _ = child.wait();
-                anyhow::bail!(
-                    "the worker exceeded its {CHILD_BUDGET:?} budget and was killed;                      stage={:?} bundle={} proposal={}",
-                    config.armed_stage(),
-                    config.target.bundle_index,
-                    config.target.proposal_id
-                );
+                return Ok(None);
             }
             None => std::thread::sleep(CHILD_POLL),
         }

@@ -3,6 +3,18 @@
 # Select with `cargo nextest run -P <profile>`. The Makefile defaults to
 # `agent`; CI uses `ci`.
 
+# The three staging matrices must never run at the same time. Round creation
+# serialises chain-wide, a delegation is consumed on the vote chain and cannot
+# be replayed, and each matrix drives the shared voter wallet — so two of them
+# provisioning concurrently would either deadlock on the chain's single pending
+# ceremony or assert against each other's rounds.
+#
+# nextest runs separate test binaries in parallel by default, and there was only
+# ever one such binary before the hang and fleet axes existed. This group is
+# what keeps that assumption true now that there are three.
+[test-groups]
+staging-matrices = { max-threads = 1 }
+
 [profile.default]
 # `slow-timeout` is the guard against wedged loopback-socket tests
 # (zcash_voting/src/http_transport.rs and tests/support/helper_fleet.rs, which
@@ -33,25 +45,30 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 filter = 'test(/real_delegation_proof|zkp2/)'
 slow-timeout = { period = "300s", terminate-after = 4 }
 
-# The staging crash-recovery matrix drives real rounds: it provisions on chain,
-# waits for a validator ceremony, generates Halo2 proofs, and crashes and
-# resumes child processes. One stage can legitimately take tens of minutes, so
+# The three staging matrices drive real rounds: they provision on chain,
+# wait for a validator ceremony, generate Halo2 proofs, and crash, stall, and
+# resume child processes. One stage can legitimately take tens of minutes, so
 # the ordinary slow-timeout — 20s x 4 on the `agent` profile — would terminate
-# it long before it could reach a verdict, and every result would be a timeout
-# rather than a conformance answer.
+# them long before they could reach a verdict, and every result would be a
+# timeout rather than a conformance answer.
 #
-# `terminate-after` is deliberately omitted: the matrix bounds itself per stage
-# and kills its own children, and a runner-level kill would strand a child
-# holding a sidecar whose submission row is the only record that a transaction
-# may exist.
+# `terminate-after` is deliberately omitted: each matrix bounds itself per
+# exercise and kills its own children, and a runner-level kill would strand a
+# child holding a sidecar whose submission row is the only record that a
+# transaction may exist. This matters most for the stall matrix, whose whole
+# subject is a run that may not end on its own: it must be the matrix that
+# observes and reports that, not the runner that silently kills it.
 [[profile.default.overrides]]
-filter = 'binary(staging_conformance)'
+filter = 'binary(staging_conformance) or binary(stall_conformance) or binary(helper_fleet_conformance)'
 slow-timeout = { period = "10m" }
+test-group = 'staging-matrices'
 
 [[profile.agent.overrides]]
-filter = 'binary(staging_conformance)'
+filter = 'binary(staging_conformance) or binary(stall_conformance) or binary(helper_fleet_conformance)'
 slow-timeout = { period = "10m" }
+test-group = 'staging-matrices'
 
 [[profile.ci.overrides]]
-filter = 'binary(staging_conformance)'
+filter = 'binary(staging_conformance) or binary(stall_conformance) or binary(helper_fleet_conformance)'
 slow-timeout = { period = "10m" }
+test-group = 'staging-matrices'

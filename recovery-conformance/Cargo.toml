@@ -33,6 +33,11 @@ tonic = { version = "0.14", default-features = false }
 zeroize = "1"
 zip32 = "0.2"
 
+[dev-dependencies]
+# Only the tests build a `RouteRequest` by hand, to drive the fault wrappers
+# without a network. The SDK exposes the type but not the `Method` it carries.
+http = "1"
+
 [[bin]]
 name = "recovery-conformance-worker"
 path = "src/bin/worker.rs"

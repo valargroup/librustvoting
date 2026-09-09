@@ -43,6 +43,8 @@ fn config(mode: RunMode) -> RoundRunConfig {
         crash_log: PathBuf::from("/tmp/crash.jsonl"),
         outcome: PathBuf::from("/tmp/outcome.json"),
         max_dispatches: 512,
+        stall: Default::default(),
+        fleet: Default::default(),
         vote_end_time_seconds: 2_000_000_000,
     }
 }
@@ -76,6 +78,7 @@ fn snapshot(submissions: Vec<(&str, i64, &str, &str, i64)>) -> DurableSnapshot {
         confirmed_shares: 0,
         pczt_persisted: true,
         cached_tree: false,
+        deliveries: Vec::new(),
     }
 }
 
@@ -164,6 +167,7 @@ fn a_run_mixing_a_real_failure_with_a_stall_is_not_environmental() {
             },
         ],
         dispatches: 0,
+        share_tracking: Vec::new(),
     };
     assert!(!outcome.is_environmental());
 }
@@ -175,6 +179,7 @@ fn only_a_finished_round_counts_as_terminal_success() {
         quiescence_kind: kind.to_string(),
         failures: Vec::new(),
         dispatches: 0,
+        share_tracking: Vec::new(),
     };
     assert!(ended("NoWorkLeft").is_terminal_success());
     // Background share work is the timer's to finish; the foreground round is
@@ -253,6 +258,7 @@ fn background_share_work_is_a_finished_round_not_a_stalled_one() {
         quiescence_kind: "BackgroundShareWorkOnly".to_string(),
         failures: Vec::new(),
         dispatches: 0,
+        share_tracking: Vec::new(),
     };
     assert!(background.is_terminal_success());
     assert!(!background.is_environmental());
@@ -268,6 +274,7 @@ fn a_stalled_chain_recovery_is_not_a_finished_round() {
         quiescence_kind: "ChainRecoveryStalled".to_string(),
         failures: Vec::new(),
         dispatches: 0,
+        share_tracking: Vec::new(),
     };
     assert!(!stalled.is_terminal_success());
     // No failures recorded, so it must not be mistaken for an environment

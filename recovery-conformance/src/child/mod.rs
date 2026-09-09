@@ -22,4 +22,7 @@ pub use crash::{CrashLog, Observation, EXIT_INFRASTRUCTURE_FAILURE, EXIT_STAGE_N
 pub use crash_helper_transport::CrashHelperTransport;
 pub use crash_reporter::{CrashReporter, CrashTarget};
 pub use crash_transport::CrashTransport;
-pub use spawn::{run_to_quiescence, run_until_crash, CrashOutcome, CrashRun};
+pub use spawn::{
+    run_to_quiescence, run_until_crash, run_until_the_stall_resolves, CrashOutcome, CrashRun,
+    StalledRun,
+};

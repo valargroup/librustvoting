@@ -12,7 +12,7 @@
 //!   tests nothing about recovery, and an earlier version of this suite nearly
 //!   reported that as a violation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 
@@ -57,6 +57,12 @@ pub struct DurableSnapshot {
     pub pczt_persisted: bool,
     /// Whether a cached vote-commitment tree exists.
     pub cached_tree: bool,
+    /// Per-share helper placement, ordered by the share's durable identity.
+    ///
+    /// Deliberately not folded into the counts above. `attempting_urls` says
+    /// how many shares have an unresolved attempt; this says which helpers
+    /// hold which share, which is what a fleet scenario asserts about.
+    pub deliveries: Vec<ShareDelivery>,
 }
 
 /// One durable chain submission.
@@ -79,6 +85,88 @@ impl Submission {
     pub fn target(&self) -> (String, i64, Option<i64>) {
         (self.kind.clone(), self.bundle_index, self.proposal_id)
     }
+}
+
+/// Where one share stands with each helper it has met.
+///
+/// The counts beside this in [`DurableSnapshot`] answer "did anything happen";
+/// this answers "to whom", which is the only form the multi-URL invariants can
+/// be stated in. Driven against one helper the two are interchangeable, which
+/// is exactly why a one-URL suite could not see any of those rules.
+///
+/// The three sets are disjoint by construction in the SDK, with acceptance
+/// taking precedence over an unknown outcome and an unknown outcome over an
+/// attempt still in flight.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShareDelivery {
+    pub bundle_index: i64,
+    pub proposal_id: i64,
+    pub share_index: i64,
+    /// Helpers durably reserved before dispatch whose outcome is unresolved.
+    pub attempting: BTreeSet<String>,
+    /// Helpers that definitely accepted. Never downgraded once written.
+    pub sent: BTreeSet<String>,
+    /// Helpers that completed a POST whose outcome could not be learned.
+    pub ambiguous: BTreeSet<String>,
+    pub confirmed: bool,
+}
+
+impl ShareDelivery {
+    /// The share's durable identity.
+    pub fn key(&self) -> (i64, i64, i64) {
+        (self.bundle_index, self.proposal_id, self.share_index)
+    }
+
+    /// Helpers this share has been placed with or offered to, in any state.
+    pub fn touched(&self) -> BTreeSet<String> {
+        self.attempting
+            .union(&self.sent)
+            .chain(self.ambiguous.iter())
+            .cloned()
+            .collect()
+    }
+}
+
+/// Reads every share's helper placement from the sidecar.
+///
+/// Ordered by the share's durable identity so two snapshots of the same round
+/// compare positionally, and so a diff between a crash and its resume reads as
+/// a list of shares rather than as a reordering.
+fn read_deliveries(connection: &rusqlite::Connection) -> Result<Vec<ShareDelivery>> {
+    let mut statement = connection
+        .prepare(
+            "select bundle_index, proposal_id, share_index,
+                    attempting_urls, sent_to_urls, ambiguous_urls, confirmed
+             from share_delegations
+             order by bundle_index, proposal_id, share_index",
+        )
+        .context("querying share_delegations")?;
+    let deliveries = statement
+        .query_map([], |row| {
+            Ok(ShareDelivery {
+                bundle_index: row.get(0)?,
+                proposal_id: row.get(1)?,
+                share_index: row.get(2)?,
+                attempting: url_set(row.get(3)?),
+                sent: url_set(row.get(4)?),
+                ambiguous: url_set(row.get(5)?),
+                confirmed: row.get::<_, i64>(6)? == 1,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(deliveries)
+}
+
+/// Reads a helper URL list from its stored JSON array.
+///
+/// A missing, empty, or unparseable column is an empty set rather than an
+/// error: these columns are written as JSON arrays and start out absent, and a
+/// share that has met no helper is a normal state rather than a fault.
+fn url_set(raw: Option<String>) -> BTreeSet<String> {
+    raw.and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
 }
 
 /// The comparable shape of a finished round. See [`DurableSnapshot::shape`].
@@ -172,6 +260,7 @@ impl DurableSnapshot {
                 .unwrap_or(0)
                 > 0,
             cached_tree: count("cached_tree_state") > 0,
+            deliveries: read_deliveries(&connection)?,
         })
     }
 
@@ -857,4 +946,337 @@ fn step_bundle(step: &NextStep) -> Option<u32> {
         | NextStep::ConfirmShare { bundle_index, .. } => Some(*bundle_index),
         _ => None,
     }
+}
+
+/// A definite acceptance is durable and must never be taken back.
+///
+/// `sent_to_urls` records that a helper *said it had the share*. Nothing later
+/// — a restart, a helper going offline, a retry that fails — can make that
+/// untrue, so the set may only grow. This is the multi-URL form of `B4`: the
+/// crash matrix asserts terminal submission rows are byte-identical across a
+/// resume, and this asserts the same thing about helper placement.
+///
+/// The case it exists for is the fleet flip. When the helpers that accepted a
+/// share become unreachable and a different half comes up, the temptation for a
+/// buggy implementation is to treat "cannot reach it now" as "never had it",
+/// which would both lose the placement and licence a re-send.
+pub fn assert_acceptances_never_downgraded(
+    before: &DurableSnapshot,
+    after: &DurableSnapshot,
+) -> Result<()> {
+    let later: BTreeMap<_, _> = after
+        .deliveries
+        .iter()
+        .map(|delivery| (delivery.key(), delivery))
+        .collect();
+    for delivery in &before.deliveries {
+        let Some(now) = later.get(&delivery.key()) else {
+            anyhow::bail!(
+                "share {:?} lost its durable row entirely, so its acceptances went with it",
+                delivery.key()
+            );
+        };
+        let lost: Vec<_> = delivery.sent.difference(&now.sent).cloned().collect();
+        anyhow::ensure!(
+            lost.is_empty(),
+            "D2 VIOLATED: share {:?} no longer records {lost:?} as having accepted it; a \
+             definite acceptance is durable and may not be downgraded",
+            delivery.key()
+        );
+    }
+    Ok(())
+}
+
+/// Every share must end the round durably confirmed.
+///
+/// The completion a round actually owes, and the one a fleet cannot change:
+/// however helpers came and went, every share must end held and acknowledged.
+///
+/// # Why this is not a placement-target assertion
+///
+/// It was, and the first live run showed the target is not owed at the end of a
+/// round. A share whose fan-out reached fewer helpers than `target_count` still
+/// **confirms**, and once it is confirmed nothing repairs the shortfall:
+/// background tracking walks unconfirmed shares only, so it correctly reports
+/// `NothingToTrack` and contacts nobody. The observed case was a share
+/// confirmed with two definite acceptances against a target of five.
+///
+/// That is a statement about the protocol, not a defect this suite can call.
+/// `target_count` governs initial placement; confirmation is completion. The
+/// gap between them — a share can finish a round held by fewer helpers than the
+/// policy aimed for, with no mechanism to notice — is recorded in the README
+/// under "Not asserted yet", because it is worth a decision rather than a
+/// silent assertion either way.
+pub fn assert_every_share_is_confirmed(snapshot: &DurableSnapshot) -> Result<()> {
+    // A round with no share rows would satisfy the check below trivially. That
+    // is the vacuous pass this whole suite exists to avoid.
+    anyhow::ensure!(
+        !snapshot.deliveries.is_empty(),
+        "the round records no shares at all, so nothing about their completion can be true of it"
+    );
+    let unconfirmed: Vec<_> = snapshot
+        .deliveries
+        .iter()
+        .filter(|delivery| !delivery.confirmed)
+        .map(|delivery| delivery.key())
+        .collect();
+    anyhow::ensure!(
+        unconfirmed.is_empty(),
+        "{} share(s) ended the round unconfirmed, so the fleet's coming and going cost the \
+         round work it owed: {unconfirmed:?}",
+        unconfirmed.len()
+    );
+    Ok(())
+}
+
+/// How many helpers hold each share, least and most.
+///
+/// Reported rather than asserted, for the reason
+/// [`assert_every_share_is_confirmed`] explains. Printed every run so a change
+/// in the fleet's effective redundancy stays visible even though no rule names
+/// it.
+pub fn placement_spread(snapshot: &DurableSnapshot) -> (usize, usize) {
+    let counts = snapshot.deliveries.iter().map(|delivery| delivery.sent.len());
+    let least = counts.clone().min().unwrap_or_default();
+    let most = counts.max().unwrap_or_default();
+    (least, most)
+}
+
+/// A resumed run must not re-POST to a helper that already accepted a share,
+/// while any helper it has never tried with that share remains.
+///
+/// Stated with the condition because the unconditional claim is false, and
+/// knowing why is the point. Recovery walks untried helpers first, then
+/// interrupted ones, and only once a share is overdue does it extend to
+/// ambiguous and then to previously accepted helpers — a deliberate,
+/// duplicate-safe last resort. What must never happen is reaching for that last
+/// resort while untried helpers are still available, because that spends a
+/// re-send on a helper that already has the share and leaves the deficit
+/// unfilled.
+///
+/// This is the assertion a one-URL suite could not even express: with a single
+/// configured helper, "the helper that accepted" and "the only helper there is"
+/// are the same server.
+///
+/// # Why the evidence has to be per share
+///
+/// `contacted` is keyed by the share, not a flat set of URLs, and it must stay
+/// that way. A run legitimately POSTs many different shares to the same helper,
+/// so a fleet-wide set of "helpers this run contacted" would flag helper *H* as
+/// a premature re-send for share *A* merely because the run correctly delivered
+/// share *B* to it. Only the SDK's own tracking report carries the share
+/// identity alongside the helper; the route's contact log does not, which is
+/// why that log cannot answer this question and is not used here.
+pub fn assert_no_premature_resend_to_an_accepted_helper(
+    before: &DurableSnapshot,
+    configured: &[String],
+    contacted: &BTreeMap<(i64, i64, i64), BTreeSet<String>>,
+) -> Result<()> {
+    let fleet: BTreeSet<String> = configured.iter().cloned().collect();
+    for delivery in &before.deliveries {
+        let Some(reached) = contacted.get(&delivery.key()) else {
+            continue;
+        };
+        let untried: BTreeSet<String> = fleet.difference(&delivery.touched()).cloned().collect();
+        if untried.is_empty() {
+            // Every helper has been tried with this share, so a re-send to one
+            // that accepted is the legal last resort rather than a wasted
+            // attempt.
+            continue;
+        }
+        let resent: Vec<_> = delivery.sent.intersection(reached).cloned().collect();
+        anyhow::ensure!(
+            resent.is_empty(),
+            "D5 VIOLATED: share {:?} was re-POSTed to {resent:?}, which had already accepted \
+             it, while {} helper(s) had never been tried with it at all: {untried:?}",
+            delivery.key(),
+            untried.len()
+        );
+    }
+    Ok(())
+}
+
+/// A share must never be POSTed to a helper outside the configured fleet.
+///
+/// The confidentiality claim rests on it. A share delivered to an endpoint the
+/// host never configured is a share disclosed to a party the voter never chose,
+/// and no durable row would show it — the journal records where the wallet
+/// *believes* it sent, so a delivery to an unconfigured host is exactly the
+/// kind of thing only a contact record can catch.
+pub fn assert_no_contact_outside_the_fleet(
+    configured: &[String],
+    contacted: &BTreeSet<String>,
+) -> Result<()> {
+    let fleet: BTreeSet<&str> = configured.iter().map(String::as_str).collect();
+    let strangers: Vec<_> = contacted
+        .iter()
+        .filter(|url| !fleet.contains(url.as_str()))
+        .cloned()
+        .collect();
+    anyhow::ensure!(
+        strangers.is_empty(),
+        "a share was POSTed to {strangers:?}, which the run never configured as helpers"
+    );
+    Ok(())
+}
+
+/// Every helper whose answer the wallet could not learn must stay journaled.
+///
+/// `D1` generalized from "some helper" to "every helper of the kind the rule is
+/// about". The reservation is what makes an interrupted attempt recoverable
+/// rather than invisible, so a helper left holding a share with no durable
+/// record is a share the wallet could lose track of entirely — and with one
+/// configured helper the general and particular statements were the same.
+///
+/// # Why refusals are excluded, having once been included
+///
+/// The first live run of this assertion reported six violations, and they were
+/// this assertion's fault rather than the SDK's. A refused connection is a
+/// *definite pre-dispatch* failure: the wallet knows no request byte left, so
+/// it clears the reservation, and that is correct — there is nothing to
+/// recover, and keeping the row would make the wallet poll a helper that
+/// provably never received the share.
+///
+/// The rule only ever applied to attempts whose outcome is **unknowable**. A
+/// helper that accepted the connection and never answered is the case that
+/// matters: from the sidecar it is indistinguishable from a helper that
+/// processed the share, so the record has to survive.
+///
+/// Checked at fleet level rather than per share, because the contact record
+/// names the helper but not which share was in flight, and inventing that link
+/// would assert more than the evidence supports.
+pub fn assert_every_unanswered_helper_was_journalled(
+    snapshot: &DurableSnapshot,
+    unanswered: &BTreeSet<String>,
+) -> Result<()> {
+    let journalled: BTreeSet<String> = snapshot
+        .deliveries
+        .iter()
+        .flat_map(|delivery| delivery.touched())
+        .collect();
+    let forgotten: Vec<_> = unanswered.difference(&journalled).cloned().collect();
+    anyhow::ensure!(
+        forgotten.is_empty(),
+        "D1 VIOLATED: {forgotten:?} accepted a share POST and never answered it, yet the \
+         round holds no durable record of the attempt. From the sidecar that is \
+         indistinguishable from a helper never contacted, so nothing would ever reconcile it"
+    );
+    Ok(())
+}
+
+/// Helper placement must never exceed the fleet a run was given.
+///
+/// A cheap consistency check on the snapshot itself, so a scenario that
+/// mis-wires its fleet fails as a configuration error rather than as a
+/// mysterious placement result forty minutes later.
+pub fn assert_placement_stays_within_the_fleet(
+    snapshot: &DurableSnapshot,
+    configured: &[String],
+) -> Result<()> {
+    let fleet: BTreeSet<&str> = configured.iter().map(String::as_str).collect();
+    for delivery in &snapshot.deliveries {
+        let outside: Vec<_> = delivery
+            .touched()
+            .into_iter()
+            .filter(|url| !fleet.contains(url.as_str()))
+            .collect();
+        anyhow::ensure!(
+            outside.is_empty(),
+            "share {:?} is journaled against {outside:?}, which is not in the configured fleet",
+            delivery.key()
+        );
+    }
+    Ok(())
+}
+
+/// A run armed to hang must actually have hung, on the class it named.
+///
+/// The same rule the crash matrix applies to a stage that stops firing, and for
+/// the same reason. A run whose stall never fired would satisfy every
+/// assertion about "the state a hang left" while proving nothing, because the
+/// state inspected would simply be a healthy round.
+pub fn assert_the_stall_fired(
+    records: &[crate::stall::StallRecord],
+    target: crate::stall::StallTarget,
+    point: crate::stall::StallPoint,
+) -> Result<()> {
+    let matching: Vec<_> = records.iter().filter(|record| record.is(target)).collect();
+    anyhow::ensure!(
+        !matching.is_empty(),
+        "{target} never stopped answering; the run made no request of that class, so its \
+         crash seam has stopped firing rather than the SDK having handled a hang. Recorded \
+         instead: {:?}",
+        records.iter().map(|record| &record.target).collect::<Vec<_>>()
+    );
+    let after_dispatch = point == crate::stall::StallPoint::AfterDispatch;
+    anyhow::ensure!(
+        matching.iter().all(|record| record.after_dispatch == after_dispatch),
+        "{target} hung at the wrong point: asked for {point:?}, and the dispatch hook \
+         {} fired",
+        if after_dispatch { "never" } else { "nonetheless" }
+    );
+    Ok(())
+}
+
+/// A hung request must be ended by the SDK, not by the suite's patience.
+///
+/// The claim this whole axis exists for, and the only one a crash exercise
+/// cannot make. Nothing in this repository proved, before it, that *any*
+/// request the wallet makes carries a deadline it actually keeps — and the PIR
+/// path is the one where a host supplying its own transport has no SDK-side
+/// bound at all.
+///
+/// `allowance` is a generous multiple of the class's declared bound rather than
+/// the bound itself: a run makes many requests, several of them retried, and
+/// the claim is that the hang ends, not that it ends promptly.
+pub fn assert_the_request_was_bounded(
+    target: crate::stall::StallTarget,
+    elapsed: std::time::Duration,
+    allowance: std::time::Duration,
+) -> Result<()> {
+    anyhow::ensure!(
+        elapsed <= allowance,
+        "{target} hung for {elapsed:?} without the SDK ending it, against a declared bound of \
+         {:?} and an allowance of {allowance:?}. A request with no effective deadline wedges \
+         the round it belongs to, and no restart repairs it because nothing crashed",
+        target.declared_bound()
+    );
+    Ok(())
+}
+
+/// A hang that carried a transaction must leave its submission recoverable.
+///
+/// The conservative half, and deliberately only the half the evidence supports.
+/// A stalled POST that may have been delivered must leave the row that says a
+/// transaction might exist: a restarted process cannot prove the bytes never
+/// left, so a row that vanished would let the next pass reserve a fresh first
+/// attempt and build a second transaction spending the same notes. That is the
+/// same claim `B1` makes about a crash before broadcast.
+///
+/// What is deliberately *not* asserted is the exact state the row settles in.
+/// Normalization is lazy — it happens inside the lifecycle's next admission
+/// rather than at open — so reading a particular name here would be asserting
+/// the SDK's scheduling rather than its safety.
+pub fn assert_a_stalled_submission_survived(
+    snapshot: &DurableSnapshot,
+    target: crate::stall::StallTarget,
+    point: crate::stall::StallPoint,
+) -> Result<()> {
+    if !target.carries_a_submission() || point != crate::stall::StallPoint::AfterDispatch {
+        return Ok(());
+    }
+    let kind = match target {
+        crate::stall::StallTarget::DelegationPost => "delegation",
+        _ => "vote",
+    };
+    anyhow::ensure!(
+        snapshot
+            .submissions
+            .iter()
+            .any(|submission| submission.kind == kind),
+        "a {kind} POST hung after its bytes may have left and no submission row survived; a \
+         restarted process cannot prove the request was never delivered, so the row must \
+         outlive the hang rather than disappear with it"
+    );
+    Ok(())
 }

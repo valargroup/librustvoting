@@ -19,7 +19,8 @@ VCT_PACKAGES  := -p vote-commitment-tree -p vote-commitment-tree-client
 NEXTEST_PROFILE ?= agent
 
 .PHONY: help check test test-lrz test-vct doc-test proofs msrv fmt clippy \
-	recovery-conformance-check recovery-conformance
+	recovery-conformance-check recovery-conformance recovery-conformance-crash \
+	recovery-conformance-stalls recovery-conformance-fleet
 
 help: ## Show the canonical build and test targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -88,6 +89,24 @@ recovery-conformance-check: ## Type-check the staging crash-recovery suite
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
 		cargo clippy $(RECOVERY_CONFORMANCE_PACKAGE) --all-targets --locked
 
-recovery-conformance: ## Run the staging crash-recovery suite (network, slow)
+recovery-conformance: ## Run every staging recovery matrix: crash, hang, fleet (network, very slow)
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
 		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked
+
+# One axis at a time. The full run provisions roughly thirty-five rounds on
+# `svote-1` and takes hours, so a change that can only affect one axis should
+# pay for one axis. The hermetic tests run under every one of these.
+recovery-conformance-crash: ## Run only the staging crash matrix (network, slow)
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked \
+		-E 'not (binary(stall_conformance) or binary(helper_fleet_conformance))'
+
+recovery-conformance-stalls: ## Run only the staging hang matrix (network, slow)
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked \
+		-E 'not (binary(staging_conformance) or binary(helper_fleet_conformance))'
+
+recovery-conformance-fleet: ## Run only the staging helper-fleet matrix (network, slow)
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
+		cargo nextest run -P $(NEXTEST_PROFILE) $(RECOVERY_CONFORMANCE_PACKAGE) --locked \
+		-E 'not (binary(staging_conformance) or binary(stall_conformance))'
