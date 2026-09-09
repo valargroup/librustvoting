@@ -12,7 +12,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::helper_fleet::HelperFleetPlan;
 use crate::stages::CrashStage;
+use crate::stall::StallPlan;
 
 /// Services one run talks to.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -84,6 +86,18 @@ pub struct RoundRunConfig {
     /// this time, so background tracking cannot classify a share as overdue
     /// without it.
     pub vote_end_time_seconds: u64,
+    /// The network request this run hangs on, if any.
+    ///
+    /// Defaulted on read so a configuration written before stalls existed still
+    /// parses as a run that stalls nothing.
+    #[serde(default)]
+    pub stall: StallPlan,
+    /// The synthetic helper fleet this run drives against, if any.
+    ///
+    /// Empty means the run uses `endpoints.helper_urls` as real endpoints,
+    /// which is what every crash exercise does.
+    #[serde(default)]
+    pub fleet: HelperFleetPlan,
 }
 
 impl RoundRunConfig {
@@ -146,6 +160,51 @@ impl FailureRecord {
     }
 }
 
+/// One `(share, helper)` pair a tracking run touched.
+///
+/// The share's durable identity plus the helper URL, flattened so the parent
+/// can read it without linking the SDK's types. This is the only record of
+/// *which* helper a resumed run contacted: durable state shows where a share
+/// ended up, never where a run declined to send it again.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShareDeliveryRecord {
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub share_index: u32,
+    /// The URL the wallet believes it contacted, which for a synthetic fleet is
+    /// the synthetic name rather than the endpoint that served it.
+    pub server_url: String,
+}
+
+/// What one run's background share tracking did.
+///
+/// Carried back to the parent because the multi-URL invariants are about
+/// helper *contact*, and a run that correctly sent nothing leaves no durable
+/// trace of having decided that.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ShareTrackingSummary {
+    /// Debug rendering of `ShareTrackingQuiescence`.
+    pub quiescence: String,
+    pub passes: u32,
+    pub confirmed: usize,
+    /// Distinct helpers reached for each share, in the order first reached.
+    pub resubmitted: Vec<ShareDeliveryRecord>,
+    /// `(share, helper)` pairs whose acceptance outcome remains unknown.
+    pub ambiguous: Vec<ShareDeliveryRecord>,
+    pub unrecoverable: usize,
+}
+
+impl ShareTrackingSummary {
+    /// Every helper URL this run POSTed a share to, deduplicated.
+    pub fn contacted_urls(&self) -> std::collections::BTreeSet<String> {
+        self.resubmitted
+            .iter()
+            .chain(self.ambiguous.iter())
+            .map(|record| record.server_url.clone())
+            .collect()
+    }
+}
+
 /// What an unarmed run ended up doing.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RunOutcome {
@@ -155,6 +214,12 @@ pub struct RunOutcome {
     pub quiescence_kind: String,
     pub failures: Vec<FailureRecord>,
     pub dispatches: usize,
+    /// What background share tracking did, across every pass this run made.
+    ///
+    /// Defaulted on read: an outcome written before tracking was reported still
+    /// parses, and an armed run never writes one at all.
+    #[serde(default)]
+    pub share_tracking: Vec<ShareTrackingSummary>,
 }
 
 impl RunOutcome {

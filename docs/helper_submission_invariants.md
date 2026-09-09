@@ -1757,6 +1757,43 @@ canonical identity with `InvalidInput` before storage or network effects.
 Hosts remain responsible only for supplying the configured list from an
 authenticated configuration source.
 
+## Staging conformance coverage
+
+The rules in this document are enforced by unit tests, which run against a clean
+`drop` of the database and a scripted helper. Two of them are also exercised
+against a live staging round by `recovery-conformance/`, which is where a claim
+about *multi-helper* behaviour can first be made at all: driven against a single
+configured helper the target count is 1, the per-helper quota is the whole
+commitment, and the minimum planning pool is 1, so the placement rules in
+[Initial fan-out invariants](#initial-fan-out-invariants) and
+[Recovery invariants](#recovery-invariants) have nothing to decide.
+
+`recovery-conformance/tests/helper_fleet_conformance.rs` drives a round through
+ten configured helpers whose reachability changes between runs, and asserts:
+
+- every helper a share was POSTed to was durably journaled first, not just some
+  helper (the reservation rule at
+  [Durable record semantics](#durable-record-semantics));
+- a definite acceptance is never downgraded, including when the helper that
+  gave it becomes unreachable;
+- every share reaches its target number of definite acceptances, where the
+  scenario leaves that target reachable;
+- a resume fills only the deficit — no re-POST to a helper that already accepted
+  while an untried helper remains, which is the ordering rule at
+  [Replenishment and ordering](#replenishment-and-ordering);
+- no share is POSTed to a helper outside the configured fleet.
+
+`recovery-conformance/tests/stall_conformance.rs` covers
+[Transport and timeout invariants](#transport-and-timeout-invariants) from the
+outside: it makes one class of request never answer, below every deadline the
+SDK applies, and asserts that the run ends by itself rather than wedging. The
+helper POST, fan-out, readiness and status-poll budgets in
+[Default limits](#default-limits) are each a target there.
+
+Both are staging suites: they need the network, they kill processes, and they
+are not part of `make test`. They do not replace the unit tests for these rules,
+and a change to the rules must still update the unit tests this document cites.
+
 ## Reviewer checklist
 
 A change to helper submission or recovery should answer all of the following:

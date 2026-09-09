@@ -25,16 +25,30 @@ use zcash_voting::{
     round_drive::{FailureIsolation, RoundDrivePolicy, RoundDriver, RoundHostSource},
     session::Decision,
     share_policy::ShareTimingPolicy,
-    share_tracking::{track_pending_shares, ShareTrackingParams},
     BallotIntent, ChainAdvancePolicy, ChainSubmissionClientConfig, ChainSubmissionControl,
     DelegationSigner, DelegationStepInputs, HelperClient, HelperHealth, HyperTransport, PirFleet,
-    ProposalRosterEntry, RoundBinding, RoundExecutor, RoundHostContext,
+    ProposalRosterEntry, RoundBinding, RoundExecutor, RoundHostContext, ShareTrackingDrivePolicy,
+    ShareTrackingDriver, ShareTrackingEvent, ShareTrackingHostContext,
+    ShareTrackingHostSourceBridge, ShareTrackingQuiescence, ShareTrackingReporterBridge,
 };
 
 use crate::child::{CrashHelperTransport, CrashLog, CrashReporter, CrashTarget, CrashTransport};
+use crate::helper_fleet::HelperFleetRoute;
+use crate::stall::{RequestClassifier, StallingRoute};
+
+/// The route every transport in a run shares.
+///
+/// Named once because the type is a stack rather than a word, and because
+/// every transport must be built on the *same* value: the fleet's availability
+/// and the armed stall have to apply to helper, chain, PIR, and tree traffic
+/// alike, and two separately constructed routes would silently disagree.
+type SuiteRoute = StallingRoute<HelperFleetRoute<zcash_voting::transport::DirectRoute>>;
 use crate::environment::ZCASH_NETWORK;
 use crate::provisioning::fetch_round;
-use crate::run_config::{Endpoints, FailureRecord, RoundRunConfig, RunOutcome, Target};
+use crate::run_config::{
+    Endpoints, FailureRecord, RoundRunConfig, RunOutcome, ShareDeliveryRecord,
+    ShareTrackingSummary, Target,
+};
 use crate::signing;
 use crate::stages::CrashStage;
 
@@ -166,7 +180,22 @@ async fn drive(
     // requests that reach staging are real. An unarmed run passes `None` and
     // the wrappers become pass-throughs, which keeps the control run on the
     // same code path rather than a parallel one.
-    let route = Arc::new(zcash_voting::transport::DirectRoute::default());
+    // Two wrappers under the SDK, each doing one thing. The fleet wrapper
+    // decides which helpers exist; the stall wrapper decides which request
+    // class stops answering. Both sit *below* every deadline the SDK applies,
+    // which is what makes a bound the SDK claims into a bound this suite can
+    // watch it keep. With an empty plan each is a pass-through, so a control
+    // run and a faulted run share one code path.
+    let route = Arc::new(StallingRoute::new(
+        HelperFleetRoute::new(
+            zcash_voting::transport::DirectRoute::default(),
+            config.fleet.clone(),
+            Arc::clone(&log),
+        ),
+        config.stall.clone(),
+        RequestClassifier::new(config.endpoints.pir_urls.clone()),
+        Arc::clone(&log),
+    ));
     let route_for_helpers = Arc::clone(&route);
     let helper_client = HelperClient::new(
         Arc::new(CrashHelperTransport::new(
@@ -193,6 +222,16 @@ async fn drive(
         helper_client,
     )
     .map_err(|error| anyhow::anyhow!("building the executor: {error:?}"))?
+    // Vote-tree reads default to a *fresh* `HyperTransport` over its own
+    // route, so without this they escape both fault wrappers entirely — and
+    // silently, because the round still works. The stall matrix caught it: the
+    // `commitment-tree-read` target reported that no request of its class was
+    // ever seen, when in fact the requests were being made somewhere the
+    // wrapper could not observe. The same gap hid tree traffic from the helper
+    // fleet wrapper.
+    .with_tree_transport(Arc::new(HyperTransport::with_shared_route(Arc::clone(
+        &route,
+    ))))
     .with_binding(RoundBinding {
         round_id: config.round_id.clone(),
         network: ZCASH_NETWORK,
@@ -240,9 +279,11 @@ async fn drive(
     // `BackgroundShareWorkOnly` — so a recovery pass placed after the drive is
     // unreachable on precisely the runs that need it. The driver polls the
     // abandoned share until its budget runs out instead.
+    let mut share_tracking = Vec::new();
     if armed.is_none() {
-        if let Err(error) = recover_pending_shares(&database, config, &route_for_helpers).await {
-            eprintln!("run: background share tracking stopped early: {error}");
+        match recover_pending_shares(&database, config, &route_for_helpers).await {
+            Ok(summary) => share_tracking.push(summary),
+            Err(error) => eprintln!("run: background share tracking stopped early: {error}"),
         }
     }
 
@@ -255,8 +296,9 @@ async fn drive(
     // Again afterwards: the drive itself can leave a share placed but
     // unconfirmed, and the round is not settled until tracking says so.
     if armed.is_none() {
-        if let Err(error) = recover_pending_shares(&database, config, &route_for_helpers).await {
-            eprintln!("run: background share tracking stopped early: {error}");
+        match recover_pending_shares(&database, config, &route_for_helpers).await {
+            Ok(summary) => share_tracking.push(summary),
+            Err(error) => eprintln!("run: background share tracking stopped early: {error}"),
         }
     }
 
@@ -274,6 +316,7 @@ async fn drive(
             })
             .collect(),
         dispatches: 0,
+        share_tracking,
     };
     outcome.write(&config.outcome)?;
     Ok(outcome)
@@ -398,10 +441,35 @@ impl RoundHostSource for Host {
 const SHARE_RETRY_AFTER_SECONDS: u64 = 45;
 
 /// Wall-clock ceiling on background tracking for one run.
+///
+/// The driver itself has no wall bound, and correctly so: a healthy run ends at
+/// the round's vote end, which for these rounds is fourteen days out. A
+/// conformance run needs an answer inside a test budget, so the run is raced
+/// against this instead. Dropping the future is a supported way to end a run —
+/// it releases the round's admission — so the race is not a leak.
 const SHARE_TRACKING_BUDGET: Duration = Duration::from_secs(8 * 60);
 
 /// Tracking passes before the run gives up, whatever the clock says.
-const MAX_TRACKING_PASSES: usize = 60;
+///
+/// `max_passes` is `None` by default because vote end is what ends a healthy
+/// run. Here it is the only bound with the right shape: these rounds close
+/// fourteen days out, so nothing else would stop a run that is polling a share
+/// no helper will ever confirm.
+const MAX_TRACKING_PASSES: u32 = 60;
+
+/// How long a failed pass waits before the next one is attempted.
+///
+/// Shorter than the shipped fifteen seconds because a conformance run is
+/// racing [`SHARE_TRACKING_BUDGET`] rather than a voting window.
+const TRACKING_FAILURE_RETRY: Duration = Duration::from_secs(5);
+
+/// Consecutive failed passes before tracking reports `Failing`.
+///
+/// Far below the shipped 240. That default is sized to ride out a helper
+/// outage across an hour because nothing would restart the run; here a failing
+/// fleet is a finding the matrix should be told about promptly, and the run is
+/// bounded anyway.
+const MAX_CONSECUTIVE_TRACKING_FAILURES: u32 = 6;
 
 /// Runs the host's own background share tracking until nothing is pending.
 ///
@@ -409,14 +477,29 @@ const MAX_TRACKING_PASSES: usize = 60;
 /// unconfirmed share that some helper already accepted is the host's timer to
 /// finish, not the foreground run's. The `ConfirmShare` step it does dispatch
 /// only *polls* status — `confirm_pending_share` never re-POSTs. So the one
-/// component that recovers an interrupted attempt, `track_pending_shares`, was
-/// never running anywhere in this suite.
+/// component that recovers an interrupted attempt was never running anywhere
+/// in this suite.
 ///
 /// That is why the share crash stages could not converge. A crash around a
 /// share POST leaves exactly one helper journaled as attempted with its outcome
 /// unknown, and nothing was ever going to re-send it: the run delivered every
 /// other share and then sat polling the one it had abandoned. The D1..D5
 /// invariants describe recovery this suite was not performing.
+///
+/// # Why the driver rather than a loop of passes
+///
+/// This used to assemble its own loop out of `track_pending_shares`,
+/// `next_delay_seconds`, and a pass counter. `ShareTrackingDriver` now owns
+/// that cadence, and the pieces the loop was built from are no longer a
+/// supported way to do anything — they were a second, unenforced schedule
+/// beside the one the driver applies. A conformance suite asserting recovery
+/// behaviour must drive shares the way a host actually does, or it is
+/// asserting against a schedule no host will ever run.
+///
+/// The suite still supplies the two things a host legitimately owns: the
+/// timing thresholds, and the bounds that stop a run. Nothing here changes
+/// *whether* a retry is duplicate-safe, which is the property the share stages
+/// exist to test.
 ///
 /// # Timing
 ///
@@ -426,79 +509,120 @@ const MAX_TRACKING_PASSES: usize = 60;
 /// recovery inside any sane test budget.
 ///
 /// `max_overdue_threshold_seconds` is therefore lowered here. It changes *when*
-/// a retry becomes allowed, not whether the retry is duplicate-safe, which is
-/// the property these stages exist to test — the wallet still re-POSTs against
-/// a durable journal and still refuses to downgrade an acceptance. Supplying a
-/// timing policy is ordinary host configuration; `ShareTimingPolicy` is public
-/// for exactly this.
+/// a retry becomes allowed, not whether the retry is duplicate-safe. Supplying
+/// a timing policy is ordinary host configuration; `ShareTimingPolicy` is
+/// public for exactly this.
 async fn recover_pending_shares(
     database: &Arc<VotingDb>,
     config: &RoundRunConfig,
-    route: &Arc<zcash_voting::transport::DirectRoute>,
-) -> Result<()> {
+    route: &Arc<SuiteRoute>,
+) -> Result<ShareTrackingSummary> {
     let client = HelperClient::new(
         Arc::new(HyperTransport::with_shared_route(Arc::clone(route))),
         HelperHealth::default(),
     );
-    let policy = ShareTimingPolicy {
-        max_overdue_threshold_seconds: SHARE_RETRY_AFTER_SECONDS,
-        min_overdue_threshold_seconds: SHARE_RETRY_AFTER_SECONDS,
-        ..ShareTimingPolicy::default()
+    let policy = ShareTrackingDrivePolicy {
+        timing: ShareTimingPolicy {
+            max_overdue_threshold_seconds: SHARE_RETRY_AFTER_SECONDS,
+            min_overdue_threshold_seconds: SHARE_RETRY_AFTER_SECONDS,
+            ..ShareTimingPolicy::default()
+        },
+        failure_retry: TRACKING_FAILURE_RETRY,
+        max_consecutive_failures: MAX_CONSECUTIVE_TRACKING_FAILURES,
+        max_passes: Some(MAX_TRACKING_PASSES),
     };
-    let cancel = || false;
-    let deadline = tokio::time::Instant::now() + SHARE_TRACKING_BUDGET;
 
-    for pass in 1..=MAX_TRACKING_PASSES {
-        let report = track_pending_shares(
-            database,
-            &ShareTrackingParams {
-                round_id: &config.round_id,
-                configured_server_urls: &config.endpoints.helper_urls,
-                now_seconds: now_seconds(),
-                vote_end_time_seconds: Some(config.vote_end_time_seconds),
-                policy,
-            },
-            &client,
-            &cancel,
-        )
-        .await
-        .map_err(voting_error)?;
+    // Read once per pass, not once per run: the fleet a pass runs against is
+    // the fleet at the moment it starts, which is the seam a changing helper
+    // fleet is observed through.
+    let host = ShareTrackingHostSourceBridge::new(|| ShareTrackingHostContext {
+        configured_helper_urls: config.endpoints.helper_urls.clone(),
+        now_seconds: now_seconds(),
+        vote_end_time_seconds: Some(config.vote_end_time_seconds),
+    });
+    let reporter = ShareTrackingReporterBridge::new(|event: ShareTrackingEvent| {
+        // Only passes that did something are printed. A quiet pass per
+        // fifteen-second poll over a multi-minute budget would bury the ones
+        // that matter.
+        match event {
+            ShareTrackingEvent::PassFinished { pass, report } => {
+                if !report.confirmed.is_empty()
+                    || !report.resubmitted.is_empty()
+                    || !report.ambiguous.is_empty()
+                {
+                    eprintln!(
+                        "run: tracking pass {pass}: {} confirmed, {} resubmitted, {} ambiguous",
+                        report.confirmed.len(),
+                        report.resubmitted.len(),
+                        report.ambiguous.len()
+                    );
+                }
+            }
+            ShareTrackingEvent::PassFailed { pass, message, .. } => {
+                eprintln!("run: tracking pass {pass} failed: {message}");
+            }
+            _ => {}
+        }
+    });
+    let control = ChainSubmissionControl::new(0);
 
-        if !report.confirmed.is_empty()
-            || !report.resubmitted.is_empty()
-            || !report.ambiguous.is_empty()
-        {
-            eprintln!(
-                "run: tracking pass {pass}: {} confirmed, {} resubmitted, {} ambiguous",
-                report.confirmed.len(),
-                report.resubmitted.len(),
-                report.ambiguous.len()
-            );
+    let driver = ShareTrackingDriver::new(database, &client, &config.round_id).with_policy(policy);
+    let Ok(report) = tokio::time::timeout(
+        SHARE_TRACKING_BUDGET,
+        driver.run(&host, &control, &reporter),
+    )
+    .await
+    else {
+        // Not an error: the budget is the suite's, not the round's, and the
+        // durable state a timed-out run leaves is exactly what the assertions
+        // read. Dropping the future released the round.
+        eprintln!("run: background share tracking hit its {SHARE_TRACKING_BUDGET:?} budget");
+        // The budget is the suite's, not the round's. What tracking managed
+        // before it expired is real and durable; there is simply no report to
+        // describe it, which the empty summary says plainly.
+        return Ok(ShareTrackingSummary {
+            quiescence: "SuiteBudgetExpired".to_string(),
+            ..ShareTrackingSummary::default()
+        });
+    };
+
+    eprintln!(
+        "run: share tracking ended at {:?} after {} passes: {} confirmed, {} resubmitted, \
+         {} ambiguous, {} unrecoverable",
+        report.quiescence,
+        report.passes,
+        report.confirmed.len(),
+        report.resubmitted.len(),
+        report.ambiguous.len(),
+        report.unrecoverable.len(),
+    );
+    if let ShareTrackingQuiescence::Failing { messages } = &report.quiescence {
+        // Surfaced rather than returned. A failing fleet leaves durable state
+        // the assertions still need to read, and the matrix judges the round
+        // from that state rather than from this run's mood.
+        for message in messages {
+            eprintln!("run: tracking failure: {message}");
         }
-        // `None` is the report's way of saying nothing is pending, which is the
-        // only clean way out of this loop.
-        let Some(delay) = report.next_delay_seconds else {
-            eprintln!("run: background share tracking settled after {pass} passes");
-            return Ok(());
-        };
-        if !report.unrecoverable.is_empty() {
-            // Retrying cannot repair these, so spinning on them wastes the
-            // budget that a recoverable share still needs.
-            eprintln!(
-                "run: {} share(s) are unrecoverable and will not be retried",
-                report.unrecoverable.len()
-            );
-        }
-        if tokio::time::Instant::now() >= deadline {
-            eprintln!("run: background share tracking hit its budget after {pass} passes");
-            return Ok(());
-        }
-        tokio::time::sleep_until(
-            (tokio::time::Instant::now() + Duration::from_secs(delay.max(1))).min(deadline),
-        )
-        .await;
     }
-    Ok(())
+
+    Ok(ShareTrackingSummary {
+        quiescence: format!("{:?}", report.quiescence),
+        passes: report.passes,
+        confirmed: report.confirmed.len(),
+        resubmitted: report.resubmitted.iter().map(delivery_record).collect(),
+        ambiguous: report.ambiguous.iter().map(delivery_record).collect(),
+        unrecoverable: report.unrecoverable.len(),
+    })
+}
+
+/// Flattens one `(share, helper)` pair for the parent.
+fn delivery_record(resubmitted: &zcash_voting::share_tracking::ResubmittedShare) -> ShareDeliveryRecord {
+    ShareDeliveryRecord {
+        bundle_index: resubmitted.share.bundle_index,
+        proposal_id: resubmitted.share.proposal_id,
+        share_index: resubmitted.share.share_index,
+        server_url: resubmitted.server_url.clone(),
+    }
 }
 
 fn now_seconds() -> u64 {
@@ -627,6 +751,40 @@ fn seed_precompute(
 
 fn voting_error(error: zcash_voting::VotingError) -> anyhow::Error {
     anyhow::anyhow!("{error:?}")
+}
+
+/// The endpoint that really answers share submissions.
+///
+/// Helpers are not PIR. The share endpoint lives on the vote server
+/// (`/shielded-vote/v1/shares`), and only the primary answers it on staging —
+/// the secondary and the PIR host both return 404. This is therefore both the
+/// suite's single real helper and the backend every synthetic helper is routed
+/// to.
+pub fn helper_backend(deployment: &crate::stage_config::StageDeployment) -> String {
+    deployment
+        .vote_server_urls()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| crate::environment::STAGING_VOTE_SERVER_FALLBACK.to_string())
+}
+
+/// Endpoints whose helper fleet is `fleet`'s synthetic one.
+///
+/// The configured fleet includes helpers that are down: a helper that refuses
+/// a connection is still configured, and the SDK draws a real distinction
+/// between an unreachable helper and one removed from the fleet. Reporting only
+/// the reachable ones would quietly turn every outage scenario into a fleet
+/// contraction.
+pub fn endpoints_with_fleet(
+    deployment: &crate::stage_config::StageDeployment,
+    fleet: &crate::helper_fleet::HelperFleetPlan,
+) -> Endpoints {
+    let mut endpoints = endpoints_from(deployment);
+    let configured = fleet.configured_urls();
+    if !configured.is_empty() {
+        endpoints.helper_urls = configured;
+    }
+    endpoints
 }
 
 /// Builds the endpoint set from the published staging deployment.

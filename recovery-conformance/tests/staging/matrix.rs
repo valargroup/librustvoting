@@ -1,6 +1,5 @@
 //! Driving every crash stage against staging, in order, and judging the result.
 
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use recovery_conformance::assertions::{
@@ -11,17 +10,17 @@ use recovery_conformance::assertions::{
     confirmed_transaction_hash, deterministic_plan, dispatched_transaction_hash, DurableSnapshot,
 };
 use recovery_conformance::child::{run_to_quiescence, run_until_crash};
-use recovery_conformance::environment::{
-    Environment, LIGHTWALLETD_URLS, STAGING_CHAIN_ID, STAGING_CHAIN_RPC, ZCASH_NETWORK,
-};
-use recovery_conformance::provisioning::{provision_active_round, ChainTarget, VoteManagerKeyring};
-use recovery_conformance::round_run::{default_target, endpoints_from, proposal_ids};
-use recovery_conformance::run_config::{RoundRunConfig, RunMode};
-use recovery_conformance::stage_config::StageDeployment;
+use recovery_conformance::round_run::{default_target, proposal_ids};
+use recovery_conformance::run_config::RunMode;
 use recovery_conformance::CrashStage;
 
-/// PIR endpoint the suite reads snapshots from.
-const PIR_BASE: &str = "https://stage.pir.valargroup.org";
+#[path = "fixture.rs"]
+mod fixture;
+
+use fixture::{
+    build_control, config_for, fixture_account, prepare, provision, warm_from, Faults, Fixture,
+    ProvisionedRound,
+};
 
 /// How long one stage may take before it is abandoned.
 ///
@@ -29,14 +28,6 @@ const PIR_BASE: &str = "https://stage.pir.valargroup.org";
 /// votes, and a vote proof takes minutes. The budget exists so a wedged run
 /// fails the matrix rather than hanging it.
 const STAGE_BUDGET: Duration = Duration::from_secs(45 * 60);
-
-/// How long after provisioning the round's vote closes.
-///
-/// Share recovery treats a share as overdue after a quarter of the remaining
-/// vote window, so this also sets how long an interrupted attempt waits before
-/// it may be retried — bounded by the timing policy the suite passes to
-/// background tracking.
-const VOTE_WINDOW_SECONDS: i64 = 14 * 24 * 3600;
 
 /// How long a dispatched transaction is given to reach a block.
 ///
@@ -94,16 +85,6 @@ impl Report {
     }
 }
 
-/// Everything the matrix needs, resolved once.
-struct Fixture {
-    worker: PathBuf,
-    wallet_db: PathBuf,
-    warm_pir: Option<PathBuf>,
-    keyring: VoteManagerKeyring,
-    deployment: StageDeployment,
-    workspace: PathBuf,
-}
-
 pub fn run() -> Run {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -113,64 +94,6 @@ pub fn run() -> Run {
         Err(reason) => Run::Skipped(reason),
         Ok(fixture) => Run::Completed(runtime.block_on(drive_matrix(fixture))),
     }
-}
-
-/// Resolves credentials, the wallet, and the published deployment.
-///
-/// Anything missing skips the matrix rather than failing it: this file is one
-/// test among several in a package that must stay runnable without staging.
-async fn prepare() -> Result<Fixture, String> {
-    let worker = worker_binary().ok_or_else(|| "worker binary not built".to_string())?;
-
-    let deployment = fetch_deployment()
-        .await
-        .map_err(|error| format!("stage config unavailable: {error}"))?;
-    let environment = Environment::from_env(deployment.clone())
-        .map_err(|error| format!("credentials unavailable: {error}"))?;
-
-    let wallet_db = wallet_path();
-    if !wallet_db.exists() {
-        return Err(format!(
-            "no scanned voter wallet at {}; build one with the sync_voter example",
-            wallet_db.display()
-        ));
-    }
-    // Identity, not note count: two wallets on the same faucet can hold
-    // identical amounts, and one such pair exists on the development host.
-    let seed = recovery_conformance::signing::voter_seed()
-        .map_err(|error| format!("seed unavailable: {error}"))?;
-    match recovery_conformance::signing::wallet_matches_seed(&wallet_db, &seed) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(format!(
-                "the wallet at {} does not belong to the configured seed",
-                wallet_db.display()
-            ))
-        }
-        Err(error) => return Err(format!("cannot verify the wallet: {error}")),
-    }
-
-    let keyring = VoteManagerKeyring::import(environment.vote_manager_mnemonic())
-        .map_err(|error| format!("coordinator key unusable: {error}"))?;
-    if keyring.address() != recovery_conformance::provisioning::COORDINATOR_ADDRESS {
-        return Err(format!(
-            "the coordinator key derives {} rather than the registered coordinator",
-            keyring.address()
-        ));
-    }
-
-    let workspace =
-        std::env::temp_dir().join(format!("recovery-conformance-{}", std::process::id()));
-    std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
-
-    Ok(Fixture {
-        worker,
-        wallet_db,
-        warm_pir: warm_pir_path(),
-        keyring,
-        deployment,
-        workspace,
-    })
 }
 
 async fn drive_matrix(fixture: Fixture) -> Report {
@@ -183,7 +106,7 @@ async fn drive_matrix(fixture: Fixture) -> Report {
 
     // The control comes first: every terminal comparison is against it, so a
     // matrix without one proves only that crashes converge somewhere.
-    let control = match build_control(&fixture).await {
+    let control = match build_control(&fixture, MAX_DISPATCHES, &Faults::none()).await {
         Ok(control) => control,
         Err(error) => {
             report.failed.push((
@@ -262,7 +185,7 @@ async fn exercise(
     let sidecar = fixture.workspace.join(format!("{}.db", stage.name()));
     let _ = std::fs::remove_file(&sidecar);
 
-    let armed = config_for(fixture, &sidecar, round, RunMode::Armed { stage });
+    let armed = config_for(fixture, &sidecar, round, RunMode::Armed { stage }, MAX_DISPATCHES, &Faults::none());
 
     // (c) spawn the armed child; (d) require SIGABRT and a matching observation
     let crash = run_until_crash(&fixture.worker, &armed);
@@ -347,7 +270,7 @@ async fn exercise(
     }
 
     // (h) resume to quiescence in a new process
-    let resumed = config_for(fixture, &sidecar, round, RunMode::Unarmed);
+    let resumed = config_for(fixture, &sidecar, round, RunMode::Unarmed, MAX_DISPATCHES, &Faults::none());
     if started.elapsed() > STAGE_BUDGET {
         return Err(Outcome::Skipped(
             "stage budget exhausted before resume".to_string(),
@@ -456,84 +379,6 @@ async fn exercise(
     Ok(())
 }
 
-/// Drives a fresh round to quiescence with no crash armed.
-async fn build_control(fixture: &Fixture) -> anyhow::Result<DurableSnapshot> {
-    let round = provision(fixture).await?;
-    let sidecar = fixture.workspace.join("control.db");
-    let _ = std::fs::remove_file(&sidecar);
-    let config = config_for(fixture, &sidecar, &round, RunMode::Unarmed);
-    let outcome = run_to_quiescence(&fixture.worker, &config);
-    // Before the outcome is judged: a run that failed still fetched whatever
-    // PIR proofs it got through, and those are exactly what the next run needs
-    // in order not to fail the same way.
-    warm_from(fixture, &sidecar);
-    let outcome = outcome?;
-    anyhow::ensure!(
-        outcome.is_terminal_success(),
-        "the control run ended at {} rather than quiescence",
-        outcome.quiescence
-    );
-    DurableSnapshot::read(&sidecar)
-}
-
-/// Folds whatever a finished sidecar learned back into the warm template.
-///
-/// Called for every worker run, successful or not, and deliberately so. The
-/// template began life holding proofs for the two full bundles only, and the
-/// third bundle's slots went to the PIR fleet on every run and timed out there
-/// — which is also the fetch that would have supplied them. Refreshing only
-/// after a clean run cannot break that cycle, because the cycle is what stops
-/// a run from being clean. A failed attempt still caches the proofs it did
-/// retrieve, so accumulating across attempts converges on a complete template.
-fn warm_from(fixture: &Fixture, sidecar: &Path) {
-    let Some(template) = &fixture.warm_pir else {
-        return;
-    };
-    match refresh_warm_pir(template, sidecar) {
-        Ok(added) if added > 0 => eprintln!("run: warmed {added} more PIR proofs"),
-        Ok(_) => {}
-        Err(error) => eprintln!("run: could not refresh the PIR template: {error}"),
-    }
-}
-
-/// Folds a completed round's PIR proofs back into the warm template.
-///
-/// Seeding is one-way without this, and an incomplete template stays
-/// incomplete: the proofs it lacks are fetched live every run, and the bundle
-/// they belong to is the one that times out — which is also the fetch that
-/// would have supplied them. The observed shape was a template holding proofs
-/// for the two full bundles only, so the third bundle's slots went to the PIR
-/// fleet on every single run and failed there repeatedly.
-///
-/// Safe to accumulate across rounds for the same reason seeding is: proofs are
-/// keyed by nullifier, the padded-slot secrets that generate the synthetic ones
-/// are copied *from* this template into each new round, and a real note's
-/// nullifier does not change. `INSERT OR IGNORE` never rewrites an existing
-/// row, so a stale proof cannot be introduced by refreshing.
-///
-/// Best-effort: a failure here costs speed on the next run, nothing else.
-fn refresh_warm_pir(
-    template: &std::path::Path,
-    sidecar: &std::path::Path,
-) -> anyhow::Result<usize> {
-    let connection = rusqlite::Connection::open(template)
-        .map_err(|error| anyhow::anyhow!("opening the template: {error}"))?;
-    connection
-        .execute(
-            "ATTACH DATABASE ?1 AS finished",
-            rusqlite::params![sidecar
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("sidecar path is not UTF-8"))?],
-        )
-        .map_err(|error| anyhow::anyhow!("attaching the finished round: {error}"))?;
-    let added = connection
-        .execute(
-            "INSERT OR IGNORE INTO pir_proof_cache SELECT * FROM finished.pir_proof_cache",
-            [],
-        )
-        .map_err(|error| anyhow::anyhow!("copying cached PIR proofs: {error}"))?;
-    Ok(added)
-}
 
 /// Stages whose crash seam cannot fire, with the reason.
 ///
@@ -550,73 +395,6 @@ fn is_known_unreachable(_stage: CrashStage) -> bool {
     false
 }
 
-async fn provision(fixture: &Fixture) -> anyhow::Result<ProvisionedRound> {
-    let target = ChainTarget {
-        rpc_url: STAGING_CHAIN_RPC,
-        chain_id: STAGING_CHAIN_ID,
-    };
-    let vote_end = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64
-        + VOTE_WINDOW_SECONDS;
-    let round_id = provision_active_round(
-        &fixture.keyring,
-        PIR_BASE,
-        LIGHTWALLETD_URLS[0],
-        ZCASH_NETWORK,
-        &target,
-        vote_end,
-    )
-    .await?;
-    Ok(ProvisionedRound {
-        round_id,
-        vote_end_time_seconds: vote_end as u64,
-    })
-}
-
-/// A freshly provisioned round and the vote end it was created with.
-///
-/// The vote end travels with the round because share recovery derives its
-/// retry window from the distance to it. Recomputing it later would silently
-/// disagree with what the chain was told.
-struct ProvisionedRound {
-    round_id: String,
-    vote_end_time_seconds: u64,
-}
-
-fn config_for(
-    fixture: &Fixture,
-    sidecar: &Path,
-    round: &ProvisionedRound,
-    mode: RunMode,
-) -> RoundRunConfig {
-    RoundRunConfig {
-        sidecar: sidecar.to_path_buf(),
-        wallet_db: fixture.wallet_db.clone(),
-        warm_pir_from: fixture.warm_pir.clone(),
-        round_id: round.round_id.clone(),
-        account_uuid: fixture_account(),
-        endpoints: endpoints_from(&fixture.deployment),
-        target: default_target(),
-        mode,
-        crash_log: sidecar.with_extension("crashlog.jsonl"),
-        outcome: sidecar.with_extension("outcome.json"),
-        max_dispatches: MAX_DISPATCHES,
-        vote_end_time_seconds: round.vote_end_time_seconds,
-    }
-}
-
-/// The wallet's account UUID, which is also the sidecar's wallet scope.
-fn fixture_account() -> String {
-    std::env::var("RECOVERY_CONFORMANCE_ACCOUNT")
-        .unwrap_or_else(|_| "8b29d4e6-7940-4570-b2c2-3c7a25ba6922".to_string())
-}
-
-fn wallet_path() -> PathBuf {
-    std::env::var("RECOVERY_CONFORMANCE_WALLET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home().join(".cache/recovery-conformance/voter.db"))
-}
 
 /// The stages this run exercises, or `None` for the whole matrix.
 ///
@@ -650,37 +428,3 @@ fn selected_stages() -> Option<Vec<CrashStage>> {
     (!stages.is_empty()).then_some(stages)
 }
 
-fn warm_pir_path() -> Option<PathBuf> {
-    let path = home().join(".cache/recovery-conformance/pir-warm.db");
-    path.exists().then_some(path)
-}
-
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-}
-
-/// Locates the worker beside the test binary.
-fn worker_binary() -> Option<PathBuf> {
-    let mut directory = std::env::current_exe().ok()?;
-    directory.pop();
-    for candidate in [directory.clone(), directory.parent()?.to_path_buf()] {
-        let worker = candidate.join("recovery-conformance-worker");
-        if worker.exists() {
-            return Some(worker);
-        }
-    }
-    None
-}
-
-async fn fetch_deployment() -> anyhow::Result<StageDeployment> {
-    let output = std::process::Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            "30",
-            recovery_conformance::stage_config::STAGE_DYNAMIC_CONFIG_URL,
-        ])
-        .output()?;
-    anyhow::ensure!(output.status.success(), "fetching the stage config failed");
-    Ok(StageDeployment::from_json(&output.stdout)?)
-}

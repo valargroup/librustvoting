@@ -39,6 +39,38 @@ pub enum Observation {
     },
     /// The plan the child held immediately before dying.
     PlanBeforeCrash { next_steps: Vec<String> },
+    /// A request the run was armed to hang on stopped answering.
+    ///
+    /// Written and fsynced *before* the hanging begins, not after: a stalled
+    /// run may be ended by its budget rather than by returning, and a record
+    /// written afterwards would never exist. Without it a run that simply took
+    /// a long time would be indistinguishable from one whose stall fired.
+    ///
+    /// `timeout_milliseconds` is the deadline the SDK put on this very request,
+    /// which is what turns "the run ended" into "the run ended within the bound
+    /// the SDK claimed".
+    RequestStalled {
+        target: String,
+        url: String,
+        /// Whether the dispatch hook fired, so the SDK must treat the failure
+        /// as possibly delivered.
+        point_after_dispatch: bool,
+        timeout_milliseconds: u64,
+    },
+    /// A share POST reached a helper, named by the URL the wallet used.
+    ///
+    /// The synthetic URL, not the endpoint it was routed to: the durable
+    /// journal records what the wallet believes it contacted, and an assertion
+    /// about re-sending to an accepted helper is about that belief.
+    HelperPost { url: String, status: u16 },
+    /// A helper the run was told to treat as unreachable refused a request.
+    HelperRefused { url: String },
+    /// A helper accepted a request and never answered it.
+    ///
+    /// Distinct from a refusal on purpose: the wallet may retry elsewhere after
+    /// a refusal with nothing to carry, while a silence leaves an attempt whose
+    /// outcome it can never learn.
+    HelperUnanswered { url: String },
 }
 
 /// Append-only record of [`Observation`]s, fsynced on every write.

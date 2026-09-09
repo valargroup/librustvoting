@@ -2316,6 +2316,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hmac 0.12.1",
+ "http",
  "libc",
  "pbkdf2",
  "rusqlite",
