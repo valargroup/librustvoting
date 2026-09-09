@@ -1,4 +1,4 @@
-//! The signing material a wave needs before anything is dispatched.
+//! The signing material an admission group needs before anything is dispatched.
 //!
 //! Delegation is the one obligation the SDK cannot complete on its own: the
 //! voter's signature comes from outside. This child answers one question for
@@ -16,14 +16,14 @@ use super::selection;
 /// can dispatch anything.
 ///
 /// The answer covers **every** bundle the round still owes a delegation for,
-/// not just the ones this wave would run. A wave is bounded by the concurrency
+/// not just the ones this admission group would run. An admission group is bounded by the concurrency
 /// limit, so checking only its members would prove and broadcast the signed
-/// bundles first and report the unsigned ones one wave later — the host would
+/// bundles first and report the unsigned ones one admission group later — the host would
 /// collect signatures in several rounds, and work would already have happened
 /// before the first of them.
 ///
 /// Each admitted step is read against **its own** bundle's context, not one
-/// context taken for the wave. [`RoundHostSource`](super::RoundHostSource) is
+/// context taken for the admission group. [`RoundHostSource`](super::RoundHostSource) is
 /// sampled once per dispatch and nothing requires two samples to agree, so a
 /// single mode applied to every bundle would either broadcast one under a
 /// signer the host had stopped offering, or demand a durable row for a bundle
@@ -58,7 +58,7 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
     if required.is_empty() {
         return Ok(Vec::new());
     }
-    // A wave with no delegation work cannot be blocked by a signature: plan
+    // An admission group with no delegation work cannot be blocked by a signature: plan
     // order puts a bundle's delegation ahead of everything that depends on it,
     // so its vote and share work is not selected yet.
     let admitted: Vec<(u32, &RoundHostContext)> = dispatches
@@ -86,7 +86,7 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
                 reads_stored_material = true;
             }
             // A bundle whose own context produces its signature during the
-            // step is owed nothing, whatever the rest of the wave uses.
+            // step is owed nothing, whatever the rest of the admission group uses.
             Some(_) => signs_itself.push(*bundle_index),
         }
     }
@@ -99,14 +99,14 @@ pub(super) fn missing_signer_bundles<T: ChainTransport>(
     }
     if !reads_stored_material {
         // Nothing admitted depends on material that must already exist, so the
-        // round-wide rule has no subject: only the bundles this wave has shown
+        // round-wide rule has no subject: only the bundles this admission group has shown
         // cannot sign are owed. Reporting the rest would demand signatures for
         // bundles whose contexts nothing here has seen.
         return Ok(no_signing_inputs);
     }
 
-    // The round-wide part: bundles this wave has not reached are owed a
-    // durable row too, so the voter signs once rather than a wave at a time.
+    // The round-wide part: bundles this admission group has not reached are owed a
+    // durable row too, so the voter signs once rather than an admission group at a time.
     // A bundle with no signing inputs stays owed whatever is stored for it —
     // a durable row cannot make a step run that has no driver.
     let stored = executor.database().get_keystone_signatures(round_id)?;

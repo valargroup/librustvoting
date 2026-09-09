@@ -3,9 +3,7 @@ pub(crate) use crate::backend::{halo2_proofs, orchard, pasta_curves, zcash_keys}
 use std::collections::HashMap;
 
 use halo2_proofs::{
-    pasta::EqAffine,
     plonk,
-    poly::commitment::Params,
     transcript::{Blake2bWrite, Challenge255},
 };
 use incrementalmerkletree::Hashable;
@@ -285,36 +283,6 @@ fn parse_merkle_path(witness: &WitnessData) -> Result<MerklePath, VotingError> {
 // Main entry point
 // ================================================================
 
-// 64 MiB matches the existing proof/key warm-up threads and gives Halo2
-// synthesis/keygen enough headroom on simulator builds with smaller defaults.
-const DELEGATION_STACK_BYTES: usize = 64 * 1024 * 1024;
-
-type DelegationKeys = (
-    Params<EqAffine>,
-    plonk::ProvingKey<EqAffine>,
-    plonk::VerifyingKey<EqAffine>,
-);
-
-fn delegation_cached_keys_large_stack() -> Result<&'static DelegationKeys, VotingError> {
-    // Defense in depth: warm_proving_caches() should normally populate this,
-    // but cold callers still get large-stack keygen if warm-up was skipped.
-    std::thread::Builder::new()
-        .name("delegation-key-cache".to_string())
-        .stack_size(DELEGATION_STACK_BYTES)
-        .spawn(|| {
-            delegation_cached_keys().map_err(|e| VotingError::ProofFailed {
-                message: format!("delegation key generation failed: {e}"),
-            })
-        })
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to spawn delegation key cache thread: {e}"),
-        })?
-        .join()
-        .map_err(|_| VotingError::Internal {
-            message: "delegation key cache thread panicked".to_string(),
-        })?
-}
-
 /// Build and prove the delegation ZKP (#1).
 ///
 /// Constructs the circuit from wallet notes, Merkle witnesses, and
@@ -506,96 +474,91 @@ pub(crate) fn observe_build_and_prove_delegation(
             cached: imt_cache,
         };
 
-        // Build the delegation bundle (circuit + instance).
-        let mut rng = voting_crypto_deps::rand::rngs::OsRng;
-        let bundle = observations.measure("zkp1.circuit_build", || {
-            build_delegation_bundle(
-                real_inputs,
-                &fvk,
-                alpha,
-                output_recipient,
-                vote_round_id,
-                nc_root,
-                van_comm_rand,
-                &imt_provider,
-                &mut rng,
-                precomputed_randomness,
-            )
-            .map_err(|e| VotingError::ProofFailed {
-                message: format!("delegation bundle build failed: {e}"),
-            })
-        })?;
+        crate::proving_runtime::ensure_cache(
+            crate::proving_runtime::CacheKind::Delegation,
+            observations,
+        )?;
+        crate::proving_runtime::execute(observations, move || {
+            // Build the delegation bundle (circuit + instance).
+            let mut rng = voting_crypto_deps::rand::rngs::OsRng;
+            let bundle = observations.measure("zkp1.circuit_build", || {
+                build_delegation_bundle(
+                    real_inputs,
+                    &fvk,
+                    alpha,
+                    output_recipient,
+                    vote_round_id,
+                    nc_root,
+                    van_comm_rand,
+                    &imt_provider,
+                    &mut rng,
+                    precomputed_randomness,
+                )
+                .map_err(|e| VotingError::ProofFailed {
+                    message: format!("delegation bundle build failed: {e}"),
+                })
+            })?;
 
-        progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(0.1));
+            progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(0.1));
 
-        // Fill the downstream cache on a large-stack thread when warm-up was missed.
-        let (params, pk, _vk) =
-            observations.measure("zkp1.proving_keys", || delegation_cached_keys_large_stack())?;
+            // Fill the downstream cache on a large-stack thread when warm-up was missed.
+            let (params, pk, _vk) = observations.measure("zkp1.proving_keys", || {
+                delegation_cached_keys().map_err(|error| VotingError::ProofFailed {
+                    message: error.to_string(),
+                })
+            })?;
 
-        progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(0.5));
+            progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(0.5));
 
-        // Create the proof on a dedicated large-stack thread. For larger circuits,
-        // create_proof can also exhaust the default thread stack on simulator builds.
-        let instance_vec = bundle.instance.to_halo2_instance();
-        let circuit = bundle.circuit;
-        let proof_instance = instance_vec.clone();
-        let proof_bytes = observations.measure("zkp1.prove", || {
-            std::thread::scope(|scope| -> Result<Vec<u8>, VotingError> {
-                let handle = std::thread::Builder::new()
-                    .name("delegation-prove".to_string())
-                    .stack_size(DELEGATION_STACK_BYTES)
-                    .spawn_scoped(scope, move || -> Result<Vec<u8>, VotingError> {
-                        let instance_refs: Vec<&[vesta::Scalar]> = vec![proof_instance.as_slice()];
-                        let mut local_rng = voting_crypto_deps::rand::rngs::OsRng;
-                        let mut transcript =
-                            Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
-                        plonk::create_proof(
-                            params,
-                            pk,
-                            &[circuit],
-                            &[instance_refs.as_slice()],
-                            &mut local_rng,
-                            &mut transcript,
-                        )
-                        .map_err(|e| VotingError::ProofFailed {
-                            message: format!("create_proof failed: {e}"),
-                        })?;
-                        Ok(transcript.finalize())
-                    })
-                    .map_err(|e| VotingError::Internal {
-                        message: format!("failed to spawn delegation proving thread: {e}"),
-                    })?;
-                handle.join().map_err(|_| VotingError::Internal {
-                    message: "delegation proving thread panicked".to_string(),
-                })?
-            })
-        })?;
+            // Already admitted on a large-stack worker in the shared pool.
+            let instance_vec = bundle.instance.to_halo2_instance();
+            let circuit = bundle.circuit;
+            let proof_instance = instance_vec.clone();
+            let proof_bytes = observations.measure("zkp1.prove", || {
+                let instance_refs: Vec<&[vesta::Scalar]> = vec![proof_instance.as_slice()];
+                let mut local_rng = voting_crypto_deps::rand::rngs::OsRng;
+                let mut transcript =
+                    Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
+                plonk::create_proof(
+                    params,
+                    pk,
+                    &[circuit],
+                    &[instance_refs.as_slice()],
+                    &mut local_rng,
+                    &mut transcript,
+                )
+                .map_err(|error| VotingError::ProofFailed {
+                    message: format!("create_proof failed: {error}"),
+                })?;
+                Ok::<_, VotingError>(transcript.finalize())
+            })?;
 
-        progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(1.0));
+            progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(1.0));
 
-        // Extract public inputs as 32-byte LE arrays.
-        let public_inputs: Vec<Vec<u8>> = instance_vec
-            .iter()
-            .map(|fe| fe.to_repr().to_vec())
-            .collect();
-
-        // Extract named outputs from the instance.
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let rk_bytes: [u8; 32] = (&ak.randomize(&alpha)).into();
-
-        Ok(DelegationProofResult {
-            proof: proof_bytes,
-            public_inputs,
-            nf_signed: bundle.instance.nf_signed.to_bytes().to_vec(),
-            cmx_new: bundle.instance.cmx_new.to_repr().to_vec(),
-            gov_nullifiers: bundle
-                .instance
-                .gov_null
+            // Extract public inputs as 32-byte LE arrays.
+            let public_inputs: Vec<Vec<u8>> = instance_vec
                 .iter()
-                .map(|g| g.to_repr().to_vec())
-                .collect(),
-            van_comm: bundle.instance.van_comm.to_repr().to_vec(),
-            rk: rk_bytes.to_vec(),
+                .map(|fe| fe.to_repr().to_vec())
+                .collect();
+
+            // Extract named outputs from the instance.
+            let ak: SpendValidatingKey = fvk.clone().into();
+            let rk_bytes: [u8; 32] = (&ak.randomize(&alpha)).into();
+
+            Ok(DelegationProofResult {
+                proof: proof_bytes,
+                public_inputs,
+                nf_signed: bundle.instance.nf_signed.to_bytes().to_vec(),
+                cmx_new: bundle.instance.cmx_new.to_repr().to_vec(),
+                gov_nullifiers: bundle
+                    .instance
+                    .gov_null
+                    .iter()
+                    .map(|g| g.to_repr().to_vec())
+                    .collect(),
+                van_comm: bundle.instance.van_comm.to_repr().to_vec(),
+                rk: rk_bytes.to_vec(),
+            })
         })
     })();
     let outcome = if operation_result.is_ok() {

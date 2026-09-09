@@ -4357,6 +4357,7 @@ dependencies = [
  "pir-types",
  "prost",
  "rand 0.8.7",
+ "rayon",
  "rusqlite",
  "rustls",
  "secrecy",

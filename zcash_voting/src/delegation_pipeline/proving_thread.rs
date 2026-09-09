@@ -1,4 +1,4 @@
-//! Large-stack OS threads for proving: the async prove-and-sign entry point
+//! Blocking orchestration for the async prove-and-sign entry point
 //! and the process-lifetime proving-key warm-up.
 
 use std::sync::{Arc, OnceLock};
@@ -11,17 +11,13 @@ use crate::{
 
 use super::{DelegationPipeline, DelegationSigner, WalletDbOpener};
 
-// Matches the keygen warm-up threads in voting-circuits.
-const PROVING_STACK_BYTES: usize = 64 * 1024 * 1024;
-
 static PROVING_CACHE_WARMUP_STARTED: OnceLock<()> = OnceLock::new();
 
 impl<W: WalletDbOpener + 'static> DelegationPipeline<W> {
-    /// Proves and signs one bundle on a dedicated large-stack OS thread.
+    /// Proves and signs one bundle using blocking orchestration and shared CPU execution.
     ///
-    /// The thread is not cancelled when the returned future is dropped; it
-    /// runs the bundle to completion so durable state is never left half
-    /// written. Callers that need cancellation should decide before calling.
+    /// Dropping the future removes queued proof work. Running CPU work finishes;
+    /// subsequent signing and persistence boundaries observe interruption.
     pub async fn prove_and_sign(
         self: Arc<Self>,
         bundle_index: u32,
@@ -103,10 +99,10 @@ impl<W: WalletDbOpener + 'static> DelegationPipeline<W> {
     ) -> Result<SignedDelegationBundle, VotingError> {
         let observations = observations.clone();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("voting-delegation-prove".to_string())
-            .stack_size(PROVING_STACK_BYTES)
-            .spawn(move || {
+        let operation = crate::proving_runtime::Operation::current();
+        let _operation_owner = operation.owner();
+        crate::proving_runtime::spawn_orchestration(move || {
+            operation.enter(|| {
                 let result = self.execute_prove_and_sign_blocking(
                     bundle_index,
                     &signer,
@@ -116,9 +112,7 @@ impl<W: WalletDbOpener + 'static> DelegationPipeline<W> {
                 );
                 let _ = reply_tx.send(result);
             })
-            .map_err(|error| VotingError::Internal {
-                message: format!("failed to spawn delegation prove thread: {error}"),
-            })?;
+        })?;
         reply_rx.await.map_err(|_| VotingError::Internal {
             message: "delegation prove thread exited without a result".to_string(),
         })?
@@ -133,8 +127,8 @@ pub fn start_proving_cache_warmup() {
     if PROVING_CACHE_WARMUP_STARTED.set(()).is_err() {
         return;
     }
+    // One process-lifetime coordinator; key generation itself uses the shared pool.
     let _ = std::thread::Builder::new()
-        .name("voting-proving-cache-warmup".to_string())
-        .stack_size(PROVING_STACK_BYTES)
+        .name("voting-cache-coordinator".to_string())
         .spawn(crate::warm_proving_caches);
 }

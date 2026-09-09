@@ -71,11 +71,14 @@ impl<W: WalletDbOpener> DelegationPipeline<W> {
         signer: &DelegationSigner,
         observations: &crate::ObservationScope,
     ) -> Result<PreparedSigner, VotingError> {
+        crate::proving_runtime::check_interruption()?;
         match signer {
             DelegationSigner::Software(signer) => {
                 let request =
                     prepared.observe_signing_request(self.scoped_voting_db()?, observations)?;
+                crate::proving_runtime::check_interruption()?;
                 let sig = signer.sign(request)?;
+                crate::proving_runtime::check_interruption()?;
                 Ok(PreparedSigner::signature(sig, request.sighash))
             }
             DelegationSigner::Keystone(source) => self.keystone_signature(bundle_index, source),

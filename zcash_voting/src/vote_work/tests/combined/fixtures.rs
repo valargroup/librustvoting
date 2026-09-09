@@ -196,6 +196,7 @@ pub(super) struct Peers {
     pub deliveries: AtomicUsize,
     /// How many leading chain POSTs answer with a definite rejection.
     pub rejections: AtomicUsize,
+    pub delay: Duration,
 }
 
 impl Peers {
@@ -205,6 +206,7 @@ impl Peers {
             posts: Mutex::new(Vec::new()),
             deliveries: AtomicUsize::new(0),
             rejections: AtomicUsize::new(0),
+            delay: Duration::ZERO,
         })
     }
 }
@@ -237,6 +239,7 @@ impl ChainTransport for Peers {
             })
             .is_ok();
         Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
             if rejected {
                 return Ok(ChainHttpResponse::json(
                     422,
@@ -293,7 +296,10 @@ impl ChainTransport for Peers {
             ),
         ];
         let json = serde_json::to_vec(&serde_json::json!({"height":"10","code":0,"log":"","events":[{"type":"delegate_and_cast_vote_batch","attributes":attrs.into_iter().map(|(key,value)| serde_json::json!({"key":key,"value":value})).collect::<Vec<_>>()}]})).unwrap();
-        Box::pin(async move { Ok(ChainHttpResponse::json(200, json)) })
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            Ok(ChainHttpResponse::json(200, json))
+        })
     }
 }
 
@@ -314,6 +320,7 @@ impl HelperTransport for Peers {
         }
         self.deliveries.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
+            tokio::time::sleep(self.delay).await;
             Ok(HelperResponse::json(
                 200,
                 br#"{"status":"queued"}"#.to_vec(),

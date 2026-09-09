@@ -174,3 +174,5 @@ pub use crate::delegate_and_vote_batch::{
     persist_delegate_and_vote_batch, prepare_delegate_and_vote_batch,
     recover_delegate_and_vote_batch, DelegateAndVoteBatchRequest,
 };
+
+pub use crate::{configure_proving_runtime, ProvingConfigurationError, ProvingPolicy};

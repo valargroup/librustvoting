@@ -56,13 +56,14 @@ async fn a_failed_bundle_is_skipped_and_the_rest_of_the_round_runs() {
         "the second bundle is still dispatched after the first fails: {selected:?}"
     );
     assert_eq!(report.failures.len(), 2, "{:?}", report.failures);
-    assert_eq!(
-        report.failures[0].bundle_index,
-        Some(0),
-        "a failure names the bundle it isolated"
-    );
-    assert_eq!(report.failures[1].bundle_index, Some(1));
-    assert_eq!(report.skipped_bundles, vec![0, 1]);
+    let mut failed_bundles = report
+        .failures
+        .iter()
+        .map(|failure| failure.bundle_index.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(report.skipped_bundles, failed_bundles);
+    failed_bundles.sort_unstable();
+    assert_eq!(failed_bundles, vec![0, 1]);
     assert!(
         matches!(report.quiescence, RoundQuiescence::Failures),
         "{:?}",
@@ -76,7 +77,7 @@ async fn stop_round_ends_at_the_first_failure() {
 
     assert_eq!(
         selected.len(),
-        3,
+        2,
         "nothing runs after the first failure: {selected:?}"
     );
     assert_eq!(report.failures.len(), 1);
@@ -112,7 +113,7 @@ async fn a_skipped_bundle_is_reported_as_it_happens() {
         )
         .await;
 
-    let skipped: Vec<u32> = events
+    let mut skipped: Vec<u32> = events
         .events
         .lock()
         .unwrap()
@@ -122,5 +123,6 @@ async fn a_skipped_bundle_is_reported_as_it_happens() {
             _ => None,
         })
         .collect();
+    skipped.sort_unstable();
     assert_eq!(skipped, vec![0, 1]);
 }

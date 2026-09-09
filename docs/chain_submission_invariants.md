@@ -1165,10 +1165,36 @@ The captured host operation epoch is checked at the same pre-commit boundaries.
 
 ### Round executor lock scopes
 
-`RoundExecutor` serializes `Delegate` and `AdvanceDelegation` per
-`(wallet, round, bundle)` and every other step per `(wallet, round)`. The
-planner never emits vote work for a bundle whose delegation is still
-in flight, so the two scopes do not overlap on one bundle's lifecycle rows.
+`RoundExecutor` serializes every bundle obligation per
+`(sidecar, wallet, round, bundle)`. Different bundles can prepare, cast, advance
+chain state, and deliver initial shares concurrently. This outer exclusion is
+independent of coordinator locks: callers never hold a coordinator bundle guard
+and recursively enter the coordinator. Canonical identity locks, durable
+reservation-before-POST, immutable generations, complete atomic confirmation,
+and account/round cleanup gates retain their existing authority.
+
+Hosts may call `configure_proving_runtime(ProvingPolicy { cpu_worker_count,
+max_active_heavy_jobs })` before proving or starting cache warm-up. Both fields
+are nonzero counts and default independently to `available_parallelism()`, with
+a fallback of one. Reducing active jobs limits proof memory pressure while
+retaining internal proof parallelism on the configured workers. Identical
+configuration calls succeed; a different policy returns
+`ProvingConfigurationError::AlreadyConfigured`. Callers that do not configure
+the runtime receive the automatic defaults. The ready queue holds at most twice
+the worker count; additional callers wait outside the CPU pool. The existing
+per-batch proof ceiling remains three by default and at most fifteen.
+
+Proof and key-generation CPU work shares one SDK-owned Rayon pool with 64 MiB
+worker stacks. Internal Halo2 Rayon work remains in that pool. Key readiness and
+fair bounded admission occur outside workers, before expensive circuit state is
+allocated. Batch orchestration owns no heavy-job permit while awaiting proofs.
+Failed/cancelled preparation cannot produce partial atomic authorization;
+running non-interruptible proofs retain capacity and executor exclusion until
+completion. Durable signed generations are replayed unchanged.
+
+`every_bundle_obligation_is_bundle_scoped`,
+`independent_callers_share_the_heavy_job_limit_and_worker_pool`, and
+`one_worker_cold_caches_do_not_deadlock` cover these execution guarantees.
 
 Which facts the executor re-verifies inside each act's own transaction or
 lock, after planning from a read snapshot, is tabulated under "Check-then-act"

@@ -73,8 +73,9 @@ msrv: ## Check every package at the 1.91 MSRV
 		cargo +1.91.0 check $(VCT_PACKAGES) --all-targets \
 		--features vote-commitment-tree-client/cli --locked
 
-fmt: ## Check formatting
-	@cargo fmt --all --check
+FMT_FLAGS ?= --check
+fmt: ## Check formatting (FMT_FLAGS= applies formatting)
+	@cargo fmt --all $(FMT_FLAGS)
 
 clippy: ## Lint the default Zakura stack
 	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" \
@@ -156,3 +157,11 @@ recovery-conformance-unit: ## Run hermetic crash-recovery harness tests (no stag
 		--test crash_log --test round_shape --test orchestration \
 		--test fault_routes --test helper_fleet_plan --test stall_taxonomy \
 		--test combined_recovery --test precompute
+
+.PHONY: bench-bundle-pipelines
+bench-bundle-pipelines: ## Compare serial and five real-proof pipelines with controlled peer delays
+	@python3 "$(ROOT)/scripts/bench-bundle-pipelines.py"
+
+.PHONY: bench-bundle-pipelines-sample
+bench-bundle-pipelines-sample: ## Run one benchmark sample (normally invoked by the comparison harness)
+	@CARGO_TARGET_DIR="$(ZAKURA_TARGET_DIR)" cargo nextest run -P ci --release -p zcash_voting --locked --run-ignored ignored-only --success-output immediate -E 'test(bundle_pipeline_benchmark)'

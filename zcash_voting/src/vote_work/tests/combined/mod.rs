@@ -1,5 +1,6 @@
 //! Full executor coverage uses real ZKP2 proofs, so it runs in `make proofs`.
 
+mod benchmark;
 mod fixtures;
 
 use super::fixtures::{advance_plan_head, ROUND_ID};

@@ -44,7 +44,7 @@ fn a_repolled_step_is_taken_again_ahead_of_plan_order() {
     };
     assert_eq!(
         next_dispatches(&steps(), &[], std::slice::from_ref(&pending), 3, 3, true),
-        vec![pending],
+        vec![pending, NextStep::Delegate { bundle_index: 0 }],
         "a pending submission is polled again, not starved by an earlier step"
     );
 }
@@ -87,16 +87,13 @@ fn bundle_steps_form_a_bounded_plan_ordered_wave() {
 }
 
 #[test]
-fn a_round_step_stops_the_bundle_wave() {
+fn imported_advancement_does_not_stop_other_bundles() {
     let steps = vec![
         NextStep::Delegate { bundle_index: 0 },
         NextStep::AdvanceImportedDelegation { bundle_index: 1 },
         NextStep::Delegate { bundle_index: 2 },
     ];
-    assert_eq!(
-        next_dispatches(&steps, &[], &[], 3, 3, true),
-        vec![NextStep::Delegate { bundle_index: 0 }]
-    );
+    assert_eq!(next_dispatches(&steps, &[], &[], 3, 3, true), steps);
 }
 
 #[test]
@@ -172,18 +169,8 @@ fn the_driver_schedules_by_the_executors_own_lock_scope() {
 }
 
 #[test]
-fn only_delegation_proving_is_bundle_scoped() {
-    // Pins which variants overlap, so widening or narrowing concurrency is a
-    // deliberate edit to `round_lock::bundle_scope` and shows up here.
-    let bundle_scoped: Vec<_> = every_step_variant()
-        .into_iter()
-        .filter(|step| lock_scope(step) == StepLockScope::Bundle)
-        .collect();
-    assert_eq!(
-        bundle_scoped,
-        vec![
-            NextStep::Delegate { bundle_index: 7 },
-            NextStep::AdvanceDelegation { bundle_index: 7 },
-        ]
-    );
+fn every_bundle_obligation_is_bundle_scoped() {
+    for step in every_step_variant() {
+        assert_eq!(lock_scope(&step), StepLockScope::Bundle);
+    }
 }

@@ -598,3 +598,12 @@ after successful proof persistence.
 `storage/operations/tests/keystone_signatures.rs` covers replacement from a
 second connection after signature validation, rejection of missing or changed
 signing context, and atomic rollback including stale idempotent replays.
+
+## Shared proving execution
+
+Concurrent bundle pipelines do not change the finalized-PCZT-before-signing
+contract above. Proof/key CPU work executes in the shared SDK proving pool;
+wallet reads, PCZT persistence, and software/device signing remain outside CPU
+workers. Captured cancellation and operation epochs are rechecked before signing
+and persistence after proving. A running non-interruptible proof keeps its
+bundle exclusion through completion even if the awaiting future is dropped.

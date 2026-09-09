@@ -177,58 +177,22 @@ pub use types::{
     MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID, MIN_VOTE_OPTIONS,
 };
 
-/// Warms the process-lifetime ZKP #2 proving-key cache.
-///
-/// The warm-up runs on a large-stack thread and is safe to call repeatedly.
-pub fn warm_zkp2_proving_cache() -> Result<(), VotingError> {
-    const KEYGEN_STACK_BYTES: usize = 64 * 1024 * 1024;
+mod proving_runtime;
+pub use proving_runtime::{configure_proving_runtime, ProvingConfigurationError, ProvingPolicy};
 
-    std::thread::Builder::new()
-        .name("voting-vote-proof-cache-warmup".to_string())
-        .stack_size(KEYGEN_STACK_BYTES)
-        .spawn(|| {
-            voting_circuits::vote_proof::warm_vote_proof_keys().map_err(|e| {
-                VotingError::ProofFailed {
-                    message: format!("ZKP2 proving cache warm-up failed: {e}"),
-                }
-            })
-        })
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to spawn ZKP2 proving cache warm-up thread: {e}"),
-        })?
-        .join()
-        .map_err(|_| VotingError::Internal {
-            message: "ZKP2 proving cache warm-up thread panicked".to_string(),
-        })?
+/// Warms the shared ZKP2 cache through the process proving budget.
+pub fn warm_zkp2_proving_cache() -> Result<(), VotingError> {
+    proving_runtime::ensure_cache(
+        proving_runtime::CacheKind::Vote,
+        &ObservationScope::disabled(),
+    )
 }
 
-/// Warm process-lifetime proving-key caches used by on-device voting proofs.
-///
-/// This is intentionally best-effort at the cache layer: callers should invoke
-/// it from a background task before the first proof is needed.
+/// Best-effort initialization of both shared caches through the proving budget.
 pub fn warm_proving_caches() {
-    const KEYGEN_STACK_BYTES: usize = 64 * 1024 * 1024;
-
-    let handles = [
-        std::thread::Builder::new()
-            .name("voting-delegation-cache-warmup".to_string())
-            .stack_size(KEYGEN_STACK_BYTES)
-            .spawn(|| {
-                let _ = voting_circuits::delegation::warm_delegation_keys();
-            })
-            .expect("spawn delegation proving cache warm-up thread"),
-        std::thread::Builder::new()
-            .name("voting-vote-proof-cache-warmup".to_string())
-            .stack_size(KEYGEN_STACK_BYTES)
-            .spawn(|| {
-                let _ = voting_circuits::vote_proof::warm_vote_proof_keys();
-            })
-            .expect("spawn vote proof cache warm-up thread"),
-    ];
-
-    for handle in handles {
-        handle
-            .join()
-            .expect("proving cache warm-up thread panicked");
-    }
+    let _ = proving_runtime::ensure_cache(
+        proving_runtime::CacheKind::Delegation,
+        &ObservationScope::disabled(),
+    );
+    let _ = warm_zkp2_proving_cache();
 }

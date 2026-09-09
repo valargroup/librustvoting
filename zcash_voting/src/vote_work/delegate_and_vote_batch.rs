@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use super::{
     round_lock::HeldRoundLock, step_ledger::StepLedger, step_scope::StepScope,
-    steps::PROVING_STACK_BYTES, vote_completion::CompletionEntry, RoundExecutor, RoundStepFailure,
-    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
+    vote_completion::CompletionEntry, RoundExecutor, RoundStepFailure, RoundStepFailureKind,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
 };
 use crate::{
     vote::{DraftVote, VoteSigner},
@@ -40,10 +40,20 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let observations = scope.observations.clone();
         let (updates, mut events) = tokio::sync::mpsc::unbounded_channel();
         let (complete, mut completion) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("voting-delegate-cast".to_string())
-            .stack_size(PROVING_STACK_BYTES)
-            .spawn(move || {
+        let operation = crate::proving_runtime::Operation::controlled(
+            format!(
+                "{}:{}:{}:{}",
+                self.database.sidecar_id(),
+                scope.wallet_id,
+                scope.round_id,
+                bundle_index
+            ),
+            scope.chain().clone(),
+            scope.entry_epoch(),
+        );
+        let _operation_owner = operation.owner();
+        tokio::task::spawn_blocking(move || {
+            operation.enter(|| {
                 let _held_lock = held_lock;
                 let mut signed_delegation = None;
                 let outcome = (|| {
@@ -67,6 +77,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     let vote_progress = crate::types::VoteCommitStageBridge::new(move |stage| {
                         let _ = updates.send(RoundStepProgress::VoteCommit(stage));
                     });
+                    crate::proving_runtime::check_interruption()?;
                     let prepared = crate::vote::prepare_delegate_and_vote_batch(
                         &db,
                         VoteSigner::hotkey(&hotkey),
@@ -80,6 +91,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                         },
                         &observations,
                     )?;
+                    crate::proving_runtime::check_interruption()?;
                     let batch = crate::vote::observe_persist_prepared_atomic_vote_batch(
                         &db,
                         prepared,
@@ -89,15 +101,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 })();
                 let _ = complete.send((signed_delegation, outcome));
             })
-            .map_err(|error| {
-                self.step_failure(
-                    RoundStepFailureKind::InvariantViolation,
-                    Some(&scope.step),
-                    None,
-                    &ledger,
-                    format!("spawn combined prover: {error}"),
-                )
-            })?;
+        });
         let outcome = loop {
             tokio::select! {
                 Some(update) = events.recv() => progress.report(update),
@@ -117,6 +121,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
             )
         })?;
         let ledger = signed.map(StepLedger::with_delegation).unwrap_or_default();
+        if scope.interrupted() {
+            return self.step_cancelled(scope, ledger);
+        }
         let batch =
             batch.map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
         progress.report(RoundStepProgress::DelegateAndVoteBatchPersisted { bundle_index });

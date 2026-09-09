@@ -23,24 +23,20 @@ const ROUND_LOCK_CANCEL_CHECK_MILLISECONDS: u64 = 50;
 /// silently defaulting to the round scope.
 pub(crate) fn bundle_scope(step: &NextStep) -> Option<u32> {
     match step {
-        NextStep::Delegate { bundle_index } | NextStep::AdvanceDelegation { bundle_index } => {
-            Some(*bundle_index)
-        }
-        // Imported delegation advancement is chain work on the round's
-        // submission rows, not proving; it takes the round scope like every
-        // other chain and share step.
-        NextStep::AdvanceImportedDelegation { .. }
-        | NextStep::CastVote { .. }
-        | NextStep::AdvanceVote { .. }
-        | NextStep::AdvanceVoteBatch { .. }
-        | NextStep::SubmitShares { .. }
-        | NextStep::ConfirmShare { .. } => None,
+        NextStep::Delegate { bundle_index }
+        | NextStep::AdvanceDelegation { bundle_index }
+        | NextStep::AdvanceImportedDelegation { bundle_index }
+        | NextStep::CastVote { bundle_index, .. }
+        | NextStep::AdvanceVote { bundle_index, .. }
+        | NextStep::AdvanceVoteBatch { bundle_index, .. }
+        | NextStep::SubmitShares { bundle_index, .. }
+        | NextStep::ConfirmShare { bundle_index, .. } => Some(*bundle_index),
     }
 }
 
 /// `(sidecar connection, wallet_id, round_id, bundle)`. `None` is the
-/// round-wide scope used by chain and share steps; `Some(bundle)` scopes
-/// delegation work so bundles prove and sign concurrently. The connection id
+/// legacy round-wide scope; all current obligations use `Some(bundle)` so
+/// independent bundle pipelines can progress concurrently. The connection id
 /// keeps two independently opened sidecars that share a wallet id from
 /// serializing against each other.
 type RoundLockKey = (u64, String, String, Option<u32>);

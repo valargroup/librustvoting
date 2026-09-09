@@ -16,8 +16,8 @@ use crate::{
 
 use super::{
     round_lock::HeldRoundLock, step_ledger::StepLedger, step_scope::StepScope,
-    steps::PROVING_STACK_BYTES, vote_completion::CompletionEntry, RoundExecutor, RoundStepFailure,
-    RoundStepFailureKind, RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
+    vote_completion::CompletionEntry, RoundExecutor, RoundStepFailure, RoundStepFailureKind,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
 };
 
 impl<T: ChainTransport> RoundExecutor<T> {
@@ -132,57 +132,36 @@ impl<T: ChainTransport> RoundExecutor<T> {
             })
             .await?
         };
-        let mut height = None;
-        let mut last_failure = None;
-        for node_url in &node_urls {
-            let db = Arc::clone(&self.database);
-            let sync_tree = Arc::clone(&tree);
-            let sync_round_id = round_id.clone();
-            let node_url = node_url.clone();
-            // The sync and its failure cleanup run in one detached closure
-            // that also holds the round lock, so a dropped step future cannot
-            // leave a partially appended tree behind for the next pass.
-            let held_lock = Arc::clone(lock);
-            let synced = self
-                .blocking(scope, "vote tree sync", move || {
-                    let _held_lock = held_lock;
-                    sync_round_with_cleanup(&sync_tree, &db, &sync_round_id, &node_url)
-                })
-                .await;
-            match synced {
-                Ok(synced) => {
-                    height = Some(synced);
-                    break;
-                }
-                Err(failure) => {
-                    // A host that cancelled while the request was in flight
-                    // asked for the step to stop; report that, not the
-                    // transport error the cancellation produced.
-                    if scope.interrupted() {
-                        return self.step_cancelled(scope, ledger);
-                    }
-                    last_failure = Some(failure);
-                }
-            }
-        }
-        let Some(height) = height else {
-            return Err(last_failure.expect("at least one node URL was tried"));
-        };
-        progress.report(RoundStepProgress::TreeSynced { height });
         let witness = {
             let db = Arc::clone(&self.database);
-            let witness_tree = Arc::clone(&tree);
             let witness_round_id = round_id.clone();
-            self.blocking(scope, "VAN witness", move || {
-                witness_tree.generate_van_witness(&db, &witness_round_id, bundle_index, height)
+            let held_lock = Arc::clone(lock);
+            let operation = crate::proving_runtime::Operation::controlled(
+                format!("tree:{}:{}", self.database.sidecar_id(), scope.round_id),
+                scope.chain().clone(),
+                scope.entry_epoch(),
+            );
+            let _operation_owner = operation.owner();
+            self.blocking(scope, "vote tree sync and witness", move || {
+                operation.enter(|| {
+                    let _held_lock = held_lock;
+                    tree.sync_and_witness(&db, &witness_round_id, bundle_index, &node_urls)
+                })
             })
-            .await?
+            .await
         };
         if scope.interrupted() {
             return self.step_cancelled(scope, ledger);
         }
+        let witness = witness?;
+        progress.report(RoundStepProgress::TreeSynced {
+            height: witness.anchor_height,
+        });
+        if scope.interrupted() {
+            return self.step_cancelled(scope, ledger);
+        }
 
-        // Proving runs on a dedicated large-stack thread; stages stream back.
+        // Blocking orchestration submits CPU jobs to the shared pool; stages stream back.
         let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel::<VoteCommitStage>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let db = Arc::clone(&self.database);
@@ -193,10 +172,20 @@ impl<T: ChainTransport> RoundExecutor<T> {
         let held_lock = Arc::clone(lock);
         let proving_round_id = round_id.clone();
         let observations = scope.observations.clone();
-        std::thread::Builder::new()
-            .name("voting-vote-commit".to_string())
-            .stack_size(PROVING_STACK_BYTES)
-            .spawn(move || {
+        let operation = crate::proving_runtime::Operation::controlled(
+            format!(
+                "{}:{}:{}:{}",
+                self.database.sidecar_id(),
+                scope.wallet_id,
+                scope.round_id,
+                bundle_index
+            ),
+            scope.chain().clone(),
+            scope.entry_epoch(),
+        );
+        let _operation_owner = operation.owner();
+        tokio::task::spawn_blocking(move || {
+            operation.enter(|| {
                 let _held_lock = held_lock;
                 let result = (|| {
                     let hotkey =
@@ -204,6 +193,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                     let stages = VoteCommitStageBridge::new(move |stage| {
                         let _ = stage_tx.send(stage);
                     });
+                    crate::proving_runtime::check_interruption()?;
                     let prepared = crate::vote::observe_prepare_vote_work(
                         &db,
                         VoteSigner::hotkey(&hotkey),
@@ -221,15 +211,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 })();
                 let _ = done_tx.send(result);
             })
-            .map_err(|error| {
-                self.step_failure(
-                    RoundStepFailureKind::InvariantViolation,
-                    Some(&scope.step),
-                    None,
-                    &ledger,
-                    format!("failed to spawn vote commit thread: {error}"),
-                )
-            })?;
+        });
         tokio::pin!(done_rx);
         let recovery = loop {
             tokio::select! {
@@ -251,6 +233,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
         };
         while let Ok(stage) = stage_rx.try_recv() {
             progress.report(RoundStepProgress::VoteCommit(stage));
+        }
+        if scope.interrupted() {
+            return self.step_cancelled(scope, ledger);
         }
         let recovery = recovery
             .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;
@@ -349,27 +334,4 @@ pub(super) fn canonical_vote_tree_node_urls(
             Ok(node_url.trim_end_matches('/').to_string())
         })
         .collect()
-}
-
-/// Syncs one round from `node_url` and, on failure, drops the round's cached
-/// tree before returning, so neither the next node nor the next pass inherits
-/// a partially appended or mismatched tree. Runs to completion on the
-/// blocking thread even if the awaiting future was dropped.
-fn sync_round_with_cleanup(
-    tree: &crate::tree_sync::VoteTreeSync,
-    db: &crate::round::VotingDb,
-    round_id: &str,
-    node_url: &str,
-) -> Result<u32, VotingError> {
-    match tree.sync(db, round_id, node_url) {
-        Ok(height) => Ok(height),
-        Err(sync_error) => match tree.reset(round_id) {
-            Ok(()) => Err(sync_error),
-            Err(reset_error) => Err(VotingError::Internal {
-                message: format!(
-                    "{sync_error}; resetting the cached vote tree also failed: {reset_error}"
-                ),
-            }),
-        },
-    }
 }

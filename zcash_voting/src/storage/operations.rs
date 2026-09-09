@@ -94,6 +94,7 @@ fn persist_delegation_proof_result(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::from_sqlite("failed to begin proof result transaction", &e))?;
+    crate::proving_runtime::check_interruption()?;
     let stored_sighash = queries::load_pczt_sighash(&tx, round_id, wallet_id, bundle_index)?;
     if stored_sighash != expected_pczt_sighash {
         return Err(VotingError::InvalidInput {
@@ -126,6 +127,7 @@ fn persist_delegation_proof_result(
         wallet_id,
         RoundPhase::DelegationProved,
     )?;
+    crate::proving_runtime::check_interruption()?;
     tx.commit()
         .map_err(|e| VotingError::from_sqlite("failed to commit proof result transaction", &e))
 }
@@ -2066,6 +2068,7 @@ impl VotingDb {
         // Persist proof bytes, public inputs, and phase together. The public
         // inputs are checked against the PCZT fields before any partial proof
         // success state is committed.
+        crate::proving_runtime::check_interruption()?;
         let mut conn = self.conn();
         persist_delegation_proof_result(
             &mut conn,

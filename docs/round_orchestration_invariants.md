@@ -228,7 +228,7 @@ persisted recovery bundles rather than from the constant.
   the batch reconciliation, never a standalone `AdvanceDelegation`.
 - Existing standalone and imported delegations retain their prerequisites.
   Terminal-ballot signing preflight covers fresh combined casts before the
-  wave starts. Early proof preparation needs a driver but no signature.
+  admission group starts. Early proof preparation needs a driver but no signature.
 - `a_delegate_step_cancelled_after_preparation_keeps_the_proof_without_signing`
   and `a_partly_decided_ballot_still_runs_the_delegation_prerequisite` pin the
   early-preparation boundary. `combined_lifecycle_confirms_delegation_and_every_vote_together`
@@ -399,12 +399,12 @@ own write transaction or lock:
 
 | Obligation | Serialized by | Re-verified at act time |
 |---|---|---|
-| `Retire` | round lock | the row is still `tx_hash IS NULL AND vc_tree_position IS NULL` and not lifecycle-owned, inside `BEGIN IMMEDIATE`; batch members are expanded from the durable batch, not the snapshot |
-| `Cast` | round lock | retirement as above; the bound hotkey is the bundle's confirmed delegation target; the vote end has not passed on the host clock; the persist step refuses a vote whose recovery bundle appeared meanwhile |
-| `ReconcileChain` | round lock, then the chain lifecycle's own generation lock | the generation digest compare-and-swap of the chain lifecycle |
-| `Deliver` | round lock | plan creation under `BEGIN IMMEDIATE` with the `commitment_bundle_json` compare-and-swap; designation compare-and-swap; `CommittedVote::confirmed` re-reads the generation |
-| `Confirm` | per-share operation lock | the helper specification's quorum rules |
-| `Delegate`, `AdvanceDelegation` | bundle lock | the delegation pipeline and coordinator |
+| `Retire` | bundle lock | the row is still `tx_hash IS NULL AND vc_tree_position IS NULL` and not lifecycle-owned, inside `BEGIN IMMEDIATE`; batch members are expanded from the durable batch, not the snapshot |
+| `Cast` | bundle lock | retirement as above; the bound hotkey is the bundle's confirmed delegation target; the vote end has not passed on the host clock; the persist step refuses a vote whose recovery bundle appeared meanwhile |
+| `ReconcileChain` | bundle lock, then the chain lifecycle's own generation lock | the generation digest compare-and-swap of the chain lifecycle |
+| `Deliver` | bundle lock | plan creation under `BEGIN IMMEDIATE` with the `commitment_bundle_json` compare-and-swap; designation compare-and-swap; `CommittedVote::confirmed` re-reads the generation |
+| `Confirm` | bundle lock, then per-share operation lock | the helper specification's quorum rules |
+| `Delegate`, `AdvanceDelegation`, `AdvanceImportedDelegation` | bundle lock | the delegation pipeline and coordinator |
 
 A vote has reached the chain when **either** witness of its confirmation is
 present: `tx_hash IS NOT NULL OR vc_tree_position IS NOT NULL`. Hash
@@ -541,22 +541,36 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   boundary, so the step that follows plans against the clock it actually runs
   under. This does not weaken "scope is captured once": each step still
   captures one context at entry and reads it for its whole duration.
-- **Round-locked obligations never run concurrently; bundle-locked ones may.**
-  Two round-locked steps in flight would queue on one lock and gain nothing but
-  a held proving thread. One fresh plan admits an ordered wave of distinct
-  bundle-locked steps up to `max_bundle_concurrency` and the remaining dispatch
-  budget; the wave stops before the first round-locked step. Every admitted
-  step captures its own host context. Results are folded in dispatch order
-  after the complete wave drains, so every durable effect is retained.
-- **Scheduling and locking read one table, not two.** `round_lock::bundle_scope`
-  is the single definition of which lock a step takes; the executor locks with
-  it and the driver schedules with it. They must not be two matches that can
-  drift, because a driver that believed a round-locked step was bundle-locked
-  would admit a wave of steps that then serialize on one lock, each holding a
-  proving worker open for the wait. The bundle a wave deduplicates on is the
-  same bundle the executor locks, so no two admitted steps can contend
+- **All bundle obligations share rolling admission.** At most
+  `max_bundle_concurrency` obligations run at once (default five), and at most
+  one belongs to each bundle. Proposal anchors resolving to the same atomic
+  cast are one dispatch. Reserve dispatch budget before launching an executor
+  call, including calls that eventually return `NoWork`.
+  On each completion, retain its effects before invoking host completion
+  callbacks, re-read the authoritative plan, and refill capacity immediately.
+  Due re-polls lead, followed by ready continuations of previously admitted
+  bundles, then new bundles in stable plan order. Re-poll deadlines belong to
+  individual obligations; delayed obligations release execution capacity.
+  `StopRound` always admits one obligation at a time. Under `SkipBundle`, a
+  failure excludes its bundle while healthy bundles continue.
+  Run-wide terminal conditions stop admission and drain already-admitted work.
+  Completion events follow completion order; aggregate effects retain dispatch
+  sequence and canonical proposal order. Cancellation outranks other terminal
+  outcomes; among terminal outcomes from admitted operations, the earliest
+  dispatch sequence selects the final reason.
+  (`a_finished_pipeline_refills_while_an_original_bundle_remains_blocked`,
+  `one_bundle_slot_keeps_bundle_steps_serial`,
+  `dispatch_budget_is_not_overshot_by_concurrent_launches`,
+  `stop_round_ends_at_the_first_failure`).
+- **Scheduling and locking read one table.** `round_lock::bundle_scope` is
+  authoritative for executor exclusion. Casts, imported delegation advancement,
+  chain reconciliation, delivery, and confirmation are bundle-scoped, with
+  per-share locks beneath delivery and tracking. Executor exclusion is separate
+  from the chain coordinator's account/round → bundle → submission identities →
+  database order. Round-wide designation, snapshots, generation checks, phase
+  high-water marks, and deletion gates retain their transactional protection
   (`the_driver_schedules_by_the_executors_own_lock_scope`,
-  `only_delegation_proving_is_bundle_scoped`).
+  `every_bundle_obligation_is_bundle_scoped`).
 - **An abandoned run reports only that it was abandoned.** Every pre-dispatch
   early return describes a state of the round, and a run the host has left must
   not describe one — there is no dispatch after it whose epoch binding could
@@ -577,19 +591,13 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   This guard has no conformance test: a cancellation observable on the error
   path is observable at the check one statement earlier unless it lands inside
   the read itself, and nothing in the API can place it there deterministically.
-- **A report describes the round the run left, not the one it found.** A wave
-  makes durable progress and can then stop the run, so the plan and tally read
-  before it no longer describe the round: a rejection the wave persisted would
-  still be listed as a step to run, and a proposal whose vote confirmed would
-  still count as incomplete. Both are refreshed from durable state before a
-  wave-ending quiescence is reported, and before a cancellation observed on the
-  pass after a wave — that return owes the refresh for the same reason, and a
-  run cancelled before it dispatched anything has nothing to refresh and reads
-  nothing. The refresh is best effort: a run stops for a reason the wave
-  produced, and a failed re-read is not that reason, so the pre-wave values
-  stand rather than replacing it
-  (`a_rejected_submission_stops_the_run_carrying_its_diagnostic`,
-  `a_run_cancelled_after_a_wave_still_reports_what_the_wave_did`).
+- **A report describes the round the run left.** Completion effects enter the
+  ledger immediately. After admitted operations drain, the driver refreshes
+  the final plan and tally before choosing natural quiescence or budget
+  exhaustion. A terminal reason already observed is preserved if this courtesy
+  refresh fails. Cancellation before the first dispatch still reads nothing.
+  The final refresh itself rechecks interruption.
+
 - **The foreground never dispatches a share that requires background
   tracking.** A share a helper accepted needs confirmation polling; an
   ambiguous or in-flight attempt needs duplicate-safe reconciliation and
@@ -607,11 +615,11 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   (`an_unbounded_repoll_waits_instead_of_overflowing`).
 - **A step callback is a boundary too.** `StepFinished` and `StepFailed` run
   host code, so a cancellation or an epoch switch can arrive during the fold. A
-  wave that also produced a terminal or stalled outcome reports `Cancelled`
+  admission group that also produced a terminal or stalled outcome reports `Cancelled`
   rather than that outcome, which is what `RoundDriver::run` promises; the
   diagnostic is not lost, since `chain_outcomes` and `failures` carry it either
   way (`a_cancellation_raised_by_a_step_callback_outranks_the_wave_s_own_stop`).
-  The post-wave refresh blocks on the database, so it is itself the last
+  The final refresh blocks on the database, so it is itself the last
   boundary before that return and is followed by its own check; `finish`
   touches nothing further, so the window closes rather than moving.
 - **A report's fields say what they hold.** `chain_outcomes` is every chain
@@ -711,15 +719,15 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
   (`an_undelivered_share_is_foreground_work`,
   `an_undelivered_share_on_a_skipped_bundle_does_not_hold_the_run_open`).
 - **The dispatch budget is evaluated against a fresh plan.** After the final
-  admitted dispatch or wave, the driver re-plans, refreshes the tally, and
+  admitted dispatch, the driver re-plans, refreshes the tally, and
   prefers natural quiescence when the work completed. If work remains,
   `PassBudgetExhausted::remaining`, `RoundRunReport::plan`, and the tally all
   describe that same read. A zero budget still performs and reports one plan.
 - **Each admitted bundle is judged by its own signer context.** The host source
   is sampled once per dispatch and nothing requires two samples to agree, so no
-  single mode stands for the wave. A bundle whose own context signs during its
+  single mode stands for the admission group. A bundle whose own context signs during its
   step is owed nothing; the stored-material requirement falls only on bundles
-  that read it, plus the ones this wave has not reached. Collapsing the modes
+  that read it, plus the ones this admission group has not reached. Collapsing the modes
   either way is wrong: taking the first context would broadcast a bundle under
   a signer the host had stopped offering, and applying one bundle's stored
   requirement to all would demand a durable row for a bundle that signs itself
@@ -745,9 +753,9 @@ mechanism is in children, one per responsibility — `run_loop`, `selection`,
 - **Missing stored Keystone signatures are a host handoff.** Before admitting
   signer-requiring bundle work, the driver verifies that **every bundle the
   round still owes a delegation for** has a durable signature row — not only
-  the ones the current wave would run. A wave is bounded by the concurrency
+  the ones the current admission group would run. An admission group is bounded by the concurrency
   limit, so checking its members alone would prove and broadcast the signed
-  bundles and report the unsigned ones a wave later: the voter would sign in
+  bundles and report the unsigned ones an admission group later: the voter would sign in
   several device rounds, and delegations would already be on the wire before
   the first of them. Absence yields `NeedsDelegationSignatures` before anything
   is dispatched; malformed stored material remains an executor failure.
@@ -894,7 +902,7 @@ Conformance is demonstrated by behavior. Tests cover:
   `a_missing_stored_keystone_signature_stops_for_the_host`,
   `stored_keystone_handoff_names_only_unsigned_bundles`), and the handoff names
   every unsigned bundle before anything is dispatched, including one outside
-  the first wave
+  the first admission group
   (`every_unsigned_bundle_is_named_before_anything_is_dispatched`,
   `the_handoff_names_every_unsigned_bundle_not_only_one_wave`);
 - a choice recorded before bundle persistence stops for bundle setup, and a
@@ -1042,3 +1050,33 @@ must not replace this reporter with a no-op. The live `after-note-selection`
 and `after-pczt` stages depend on those boundaries. The hermetic
 `proof_preparation_reports_selection_before_a_preparation_failure` test also
 pins the start event when preparation fails before setup.
+
+## Shared proving and tree coordination
+
+ZKP1, ZKP2, direct proving calls, and key warm-up share the SDK proving runtime.
+CPU workers and active heavy jobs are independent limits, both defaulting to
+available parallelism. The existing per-batch proof default remains three.
+Key readiness and admission waits occur outside CPU workers; batch orchestration
+never holds a heavy-job permit while waiting for child proofs. Queued proof
+work observes cancellation, dropped ownership, and captured operation epochs.
+Running proofs retain capacity and executor exclusion through CPU completion;
+subsequent signing, persistence, and network boundaries recheck interruption.
+
+Existing delegation casts synchronize, clean failed syncs, and capture their
+VAN witness under one coordinated operation on the bound tree client. Competing
+sync and reset operations participate in that exclusion, including reset-all.
+Tree coordination ends before proof admission. Fresh combined casts retain
+synthetic witnesses and the ordered VAN-transition planning pass.
+
+Runtime conformance includes
+`independent_callers_share_the_heavy_job_limit_and_worker_pool`,
+`reverse_completion_retains_canonical_action_order_and_local_limit`,
+`bundles_receive_round_robin_admission_with_fifo_actions`,
+`ready_queue_is_bounded_and_backpressured_waiters_can_cancel`,
+`panic_and_error_release_capacity_and_batch_drains`,
+`cancellation_removes_a_queued_job_without_running_it`,
+`dropping_an_owner_interrupts_queued_work_and_epoch_changes_are_observed`, and
+`one_worker_cold_caches_do_not_deadlock`.
+
+`reset_waits_until_the_synced_witness_is_captured` covers both round reset and
+reset-all racing coordinated witness capture.

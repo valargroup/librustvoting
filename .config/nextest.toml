@@ -72,3 +72,8 @@ test-group = 'staging-matrices'
 filter = 'binary(staging_conformance) or binary(stall_conformance) or binary(helper_fleet_conformance)'
 slow-timeout = { period = "10m" }
 test-group = 'staging-matrices'
+
+# Real proof/cache resource conformance and opt-in release benchmarks.
+[[profile.default.overrides]]
+filter = 'test(/real_delegation_proof|zkp2|cold_caches|bundle_pipeline_benchmark/)'
+slow-timeout = { period = "300s", terminate-after = 4 }
