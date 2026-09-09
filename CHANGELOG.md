@@ -8,6 +8,23 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 This release is `zcash_voting` 4.0.0.
 
+### Added
+
+- `stage-bench`, a multi-proposal staging benchmark. One command provisions a
+  round with a configurable ballot — a proposal count and option widths, or a
+  replayed vote-manager round export — drives a complete vote, and reports
+  per-phase and per-proposal timings with the concurrency each phase reached.
+  This automates the capture procedure in `docs/helper_delivery_benchmark.md`,
+  which previously had to be performed by hand. Delivery and confirmation are
+  reported separately, because a wallet waits on the first and spreads the
+  second across the voting window; the confirmation tail is bounded by
+  `--tracking-budget` and reported as incomplete when that expires.
+  `--confirm-concurrency` drives concurrent focused confirmations to measure
+  what the tracker's serial per-share walk costs, and is labelled an experiment
+  wherever its numbers appear. Outside the workspace default
+  members: it provisions real rounds over the network and never runs under
+  `make check` or `make test`.
+
 ### Fixed
 
 - Raise the continuous helper queue to up to 32 process-wide active share deliveries,

@@ -61,6 +61,9 @@ pub const COORDINATOR_ADDRESS: &str = "sv1z4rawnk8ny0pzsewyzm3egdd7296fr8p20fkf8
 /// Returns the chain-derived round id. The id is not chosen: the chain computes
 /// it by hashing the snapshot, ballot, and vote-end together, so a round is
 /// identified by what it is rather than by what it was called.
+///
+/// Uses [`suite_ballot`]; [`provision_round_with_ballot`] is the same sequence
+/// over a ballot the caller chooses.
 pub async fn provision_active_round(
     keyring: &VoteManagerKeyring,
     pir_base_url: &str,
@@ -69,10 +72,43 @@ pub async fn provision_active_round(
     target: &ChainTarget<'_>,
     vote_end_time: i64,
 ) -> anyhow::Result<String> {
+    provision_round_with_ballot(
+        keyring,
+        pir_base_url,
+        lightwalletd_url,
+        network,
+        target,
+        vote_end_time,
+        suite_ballot(),
+    )
+    .await
+}
+
+/// Provisions a fresh round over an arbitrary ballot and waits for its ceremony.
+///
+/// The body [`provision_active_round`] delegates to, with the ballot as an
+/// argument rather than a constant. The conformance matrices always pass
+/// [`suite_ballot`]; a benchmark that needs a wider ballot passes its own,
+/// without a second copy of the create-wait-confirm sequence existing to drift
+/// from this one.
+///
+/// `proposals` must satisfy the chain's own rules — one-based ids, two to eight
+/// options each — and the SDK's `1..=50` proposal-id bound if the round is to be
+/// votable. Neither is checked here; the chain rejects the first and the
+/// executor's binding rejects the second.
+pub async fn provision_round_with_ballot(
+    keyring: &VoteManagerKeyring,
+    pir_base_url: &str,
+    lightwalletd_url: &str,
+    network: zcash_voting::Network,
+    target: &ChainTarget<'_>,
+    vote_end_time: i64,
+    proposals: Vec<RoundProposal>,
+) -> anyhow::Result<String> {
     use anyhow::Context;
 
     let anchor = resolve_anchor(pir_base_url, lightwalletd_url, network).await?;
-    let description = RoundDescription::new(&anchor, vote_end_time, suite_ballot());
+    let description = RoundDescription::new(&anchor, vote_end_time, proposals);
     let path = std::env::temp_dir().join(format!(
         "recovery-conformance-round-{}.json",
         std::process::id()

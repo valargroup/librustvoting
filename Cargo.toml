@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "recovery-conformance",
+    "stage-bench",
     "zcash_voting",
     "vote-commitment-tree",
     "vote-commitment-tree-client",

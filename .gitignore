@@ -11,6 +11,11 @@ zcash-voting-ffi/Sources
 # suite kills processes on top of. Generated per run, never source.
 *.crashlog.jsonl
 
+# stage-bench run directories: sidecar databases, observability snapshots, and
+# derived metrics. Each is one measurement of a staging round, generated per
+# run and never source. Archive one deliberately if it is worth keeping.
+runs/
+
 # Infisical workspace link. Not secret, but it pins this shared repo to one
 # person's project; the suite takes --projectId explicitly instead.
 .infisical.json

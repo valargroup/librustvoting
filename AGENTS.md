@@ -68,6 +68,11 @@ Do not:
 `make pir-smoke` needs a sibling `../vote-nullifier-pir` checkout and is not
 part of the test suite.
 
+`make stage-bench` provisions a real round on the staging vote chain and drives
+it over the network to measure where a vote's time goes; it is not part of the
+test suite either. `make stage-bench-unit` runs its hermetic tests. See
+[`stage-bench/README.md`](stage-bench/README.md).
+
 ## Code standards
 
 These rules apply to all Rust in this workspace. Apply them by default when

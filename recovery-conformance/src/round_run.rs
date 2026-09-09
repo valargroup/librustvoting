@@ -777,7 +777,8 @@ pub fn proposal_ids() -> Vec<u32> {
         .collect()
 }
 
-fn pir_layout() -> zcash_voting::config::PirLayout {
+/// The PIR layout the staging deployment publishes.
+pub fn pir_layout() -> zcash_voting::config::PirLayout {
     zcash_voting::config::PirLayout {
         pir_depth: 19,
         tier0_layers: 12,
