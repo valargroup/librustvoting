@@ -9,12 +9,9 @@ use crate::{
 };
 
 use super::{
-    round_lock::HeldRoundLock,
-    step_ledger::StepLedger,
-    step_scope::StepScope,
-    steps::{persisted_policy, PROVING_STACK_BYTES},
-    RoundExecutor, RoundStepFailure, RoundStepFailureKind, RoundStepOutcome, RoundStepProgress,
-    RoundStepProgressReporter,
+    round_lock::HeldRoundLock, step_ledger::StepLedger, step_scope::StepScope,
+    steps::persisted_policy, RoundExecutor, RoundStepFailure, RoundStepFailureKind,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressReporter,
 };
 
 impl<T: ChainTransport> RoundExecutor<T> {
@@ -36,10 +33,20 @@ impl<T: ChainTransport> RoundExecutor<T> {
         // competing proof for the same bundle meanwhile.
         let held_lock = Arc::clone(lock);
         let observations = scope.observations.clone();
-        std::thread::Builder::new()
-            .name("voting-delegation-step".to_string())
-            .stack_size(PROVING_STACK_BYTES)
-            .spawn(move || {
+        let operation = crate::proving_runtime::Operation::controlled(
+            format!(
+                "{}:{}:{}:{}",
+                self.database.sidecar_id(),
+                scope.wallet_id,
+                scope.round_id,
+                bundle_index
+            ),
+            scope.chain().clone(),
+            scope.entry_epoch(),
+        );
+        let _operation_owner = operation.owner();
+        tokio::task::spawn_blocking(move || {
+            operation.enter(|| {
                 let _held_lock = held_lock;
                 let reporter = DelegationProgressBridge::new(move |progress| {
                     let _ = progress_tx.send(progress);
@@ -64,15 +71,7 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 );
                 let _ = done_tx.send(result);
             })
-            .map_err(|error| {
-                self.step_failure(
-                    RoundStepFailureKind::InvariantViolation,
-                    Some(&scope.step),
-                    None,
-                    &ledger,
-                    format!("failed to spawn delegation thread: {error}"),
-                )
-            })?;
+        });
         tokio::pin!(done_rx);
         let proof_status = loop {
             tokio::select! {
@@ -97,6 +96,9 @@ impl<T: ChainTransport> RoundExecutor<T> {
                 bundle_index,
                 progress: update,
             });
+        }
+        if scope.interrupted() {
+            return self.step_cancelled(scope, ledger);
         }
         proof_status
             .map_err(|error| self.step_voting_failure(error, Some(&scope.step), &ledger))?;

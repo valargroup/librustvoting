@@ -2048,7 +2048,8 @@ pub(crate) fn observe_ensure_proof(
     let observations = &attributed;
     let observation_stage = observations.stage("delegation::ensure_proof");
     let observations = observation_stage.scope();
-    let operation_result: Result<DelegationProofCompletion, VotingError> = (|| {
+    let operation = crate::proving_runtime::Operation::for_bundle(db, round_id, bundle_index);
+    let operation_result: Result<DelegationProofCompletion, VotingError> = operation.enter(|| {
         let identity =
             DelegationProofIdentity::new(db.sidecar_id(), db.wallet_id(), round_id, bundle_index);
         with_live_progress(stages, |progress| {
@@ -2083,7 +2084,7 @@ pub(crate) fn observe_ensure_proof(
                 },
             )
         })
-    })();
+    });
     let outcome = if operation_result
         .as_ref()
         .is_ok_and(|completion| completion.status == DelegationProofStatus::Reused)

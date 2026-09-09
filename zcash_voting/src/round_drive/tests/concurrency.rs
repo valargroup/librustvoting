@@ -12,6 +12,7 @@ struct ConcurrencyProbe {
     active: AtomicUsize,
     maximum: AtomicUsize,
     release: Mutex<bool>,
+    released_bundles: Mutex<std::collections::BTreeSet<u32>>,
     released: Condvar,
     entered: Mutex<Option<tokio::sync::mpsc::UnboundedSender<u32>>>,
 }
@@ -24,10 +25,22 @@ impl ConcurrencyProbe {
             entered.send(bundle_index).unwrap();
         }
         let mut release = self.release.lock().unwrap();
-        while !*release {
+        while !*release
+            && !self
+                .released_bundles
+                .lock()
+                .unwrap()
+                .contains(&bundle_index)
+        {
             release = self.released.wait(release).unwrap();
         }
         self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn release_bundle(&self, bundle: u32) {
+        let _release = self.release.lock().unwrap();
+        self.released_bundles.lock().unwrap().insert(bundle);
+        self.released.notify_all();
     }
 
     fn release(&self) {
@@ -207,4 +220,72 @@ async fn dispatch_budget_is_not_overshot_by_concurrent_launches() {
     let (report, _, entered) = observe_wave(3, 3, 2).await;
     assert_eq!(entered.len(), 2);
     assert!(report.failures.is_empty());
+}
+
+#[tokio::test]
+async fn a_finished_pipeline_refills_while_an_original_bundle_remains_blocked() {
+    let database = database_with_bundles(7);
+    let executor = executor_over_unreachable_chain(Arc::clone(&database));
+    executor
+        .set_ballot_intents(&[BallotIntent {
+            proposal_id: 1,
+            decision: Decision::Choice(0),
+        }])
+        .unwrap();
+    // An open ballot leaves delegation preparation as the only executable work.
+    let (sender, mut entered) = tokio::sync::mpsc::unbounded_channel();
+    let probe = Arc::new(ConcurrencyProbe::default());
+    *probe.entered.lock().unwrap() = Some(sender);
+    let running = probe.clone();
+    let task = tokio::spawn(async move {
+        let events = RecordingReporter::default();
+        let report = RoundDriver::new(&executor)
+            .with_policy(RoundDrivePolicy {
+                max_dispatches: 7,
+                ..Default::default()
+            })
+            .run(
+                &GatedSigningHost {
+                    database,
+                    probe: running,
+                },
+                &ChainSubmissionControl::new(1),
+                &events,
+            )
+            .await;
+        (report, events)
+    });
+    let mut first = Vec::new();
+    for _ in 0..5 {
+        first.push(
+            tokio::time::timeout(Duration::from_secs(5), entered.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    first.sort_unstable();
+    assert_eq!(first, vec![0, 1, 2, 3, 4]);
+    probe.release_bundle(3);
+    let replacement = tokio::time::timeout(Duration::from_secs(5), entered.recv()).await;
+    // Always release workers before asserting, including a scheduler regression.
+    probe.release();
+    assert_eq!(replacement.unwrap().unwrap(), 5);
+    let (report, events) = task.await.unwrap();
+    assert!(report.failures.is_empty());
+    assert_eq!(probe.maximum.load(Ordering::SeqCst), 5);
+    let finished = events
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            RoundDriveEvent::StepFinished { step, .. } => Some(step.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        finished.first(),
+        Some(&NextStep::Delegate { bundle_index: 3 })
+    );
 }

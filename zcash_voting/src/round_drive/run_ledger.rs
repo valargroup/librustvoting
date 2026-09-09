@@ -33,12 +33,43 @@ pub(super) struct Run {
     pub(super) delegations: Vec<SignedDelegationBundle>,
     /// Set when the last dispatch asked to be run again after a wait.
     pub(super) repoll: Vec<(NextStep, std::time::Duration)>,
-    /// Steps whose completed re-poll wait wants them dispatched again.
-    pub(super) awaiting_repoll: Vec<NextStep>,
+    /// Dispatch sequences for failures, skips, chain effects, deliveries, and signatures.
+    order: [Vec<usize>; 5],
 }
 
 impl Run {
-    pub(super) fn finish(self, quiescence: RoundQuiescence) -> RoundRunReport {
+    pub(super) fn effect_lengths(&self) -> [usize; 5] {
+        [
+            self.failures.len(),
+            self.skipped.len(),
+            self.chain_outcomes.len(),
+            self.share_deliveries.len(),
+            self.delegations.len(),
+        ]
+    }
+
+    pub(super) fn record_order(&mut self, sequence: usize, before: [usize; 5]) {
+        for (index, length) in self.effect_lengths().into_iter().enumerate() {
+            self.order[index].resize(before[index], usize::MAX);
+            self.order[index].resize(length, sequence);
+        }
+    }
+
+    pub(super) fn finish(mut self, quiescence: RoundQuiescence) -> RoundRunReport {
+        fn ordered<T>(values: Vec<T>, sequence: &[usize]) -> Vec<T> {
+            let mut tagged: Vec<_> = values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| (sequence.get(index).copied().unwrap_or(usize::MAX), value))
+                .collect();
+            tagged.sort_by_key(|(sequence, _)| *sequence);
+            tagged.into_iter().map(|(_, value)| value).collect()
+        }
+        self.failures = ordered(self.failures, &self.order[0]);
+        self.skipped = ordered(self.skipped, &self.order[1]);
+        self.chain_outcomes = ordered(self.chain_outcomes, &self.order[2]);
+        self.share_deliveries = ordered(self.share_deliveries, &self.order[3]);
+        self.delegations = ordered(self.delegations, &self.order[4]);
         RoundRunReport {
             quiescence,
             plan: self.plan,
@@ -90,10 +121,6 @@ impl Run {
         pending_repoll: std::time::Duration,
         events: &dyn RoundDriveReporter,
     ) -> Option<RoundQuiescence> {
-        events.report(RoundDriveEvent::StepFinished {
-            step: step.clone(),
-            disposition: outcome.disposition,
-        });
         self.share_deliveries.extend(outcome.share_deliveries);
         if let Some(delegation) = outcome.delegation {
             self.delegations.push(delegation);
@@ -101,6 +128,10 @@ impl Run {
         if let Some(chain_outcome) = outcome.chain_outcome.clone() {
             self.chain_outcomes.push((step.clone(), chain_outcome));
         }
+        events.report(RoundDriveEvent::StepFinished {
+            step: step.clone(),
+            disposition: outcome.disposition,
+        });
         match outcome.disposition {
             // More independent work may remain; the next plan says what.
             RoundStepDisposition::Advanced | RoundStepDisposition::NoWork => None,

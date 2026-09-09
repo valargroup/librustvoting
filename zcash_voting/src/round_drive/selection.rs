@@ -14,8 +14,7 @@ pub(super) enum StepLockScope {
 /// Read from [`round_lock::bundle_scope`], the executor's own decision, rather
 /// than restated here. Scheduling and locking must not be two tables that can
 /// drift: a driver that thought a round-locked step was bundle-locked would
-/// admit a wave of steps that then serialize on one lock, each holding a
-/// proving worker open for the wait.
+/// admit steps that then serialize on one lock, wasting available capacity.
 pub(super) fn lock_scope(step: &NextStep) -> StepLockScope {
     match round_lock::bundle_scope(step) {
         Some(_) => StepLockScope::Bundle,
@@ -50,10 +49,10 @@ pub(super) fn needs_delegation_signer(step: &NextStep) -> bool {
     )
 }
 
-/// Selects one round-locked step or a bounded ordered wave of bundle work.
+/// Selects one round-locked step or bounded ordered bundle work.
 ///
-/// Preferred re-polls lead the same ordered candidate stream as the plan.
-/// Bundle waves stop at the first round-locked candidate so concurrency never
+/// Due re-polls and admitted continuations lead new bundles in plan order.
+/// Admissions stop at the first round-locked candidate so concurrency never
 /// jumps over work that plan order says must run first.
 pub(super) fn next_dispatches(
     steps: &[NextStep],

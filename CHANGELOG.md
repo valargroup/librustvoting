@@ -24,6 +24,21 @@ This release is `zcash_voting` 4.0.0.
   wherever its numbers appear. Outside the workspace default
   members: it provisions real rounds over the network and never runs under
   `make check` or `make test`.
+- Add an SDK-owned shared proving pool for ZKP1, ZKP2, and key initialization,
+  with independent `ProvingPolicy` worker/job limits and configure-once setup.
+  Defaults use available parallelism; each worker has a 64 MiB stack.
+- Add `make bench-bundle-pipelines` for repeatable release comparisons over
+  real ZKP2 proofs and controlled peer delays.
+
+### Changed
+
+- Drive up to five bundle obligations concurrently with rolling refill,
+  continuation priority, independent re-poll deadlines, and bundle-scoped
+  executor exclusion. Completion events follow completion order; report
+  collections retain dispatch order. `StopRound` remains strictly serial.
+- Coordinate tree synchronization, failure cleanup, and witness capture before
+  proving. Preserve atomic envelopes and the existing shared initial-delivery
+  queue with its 32-workflow and 128-POST limits.
 
 ### Changed
 
@@ -37,6 +52,8 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Keep expired round re-poll deadlines runnable so expiry between selection and
+  waiting cannot leave the driver asleep until host cancellation.
 - Raise the continuous helper queue to up to 32 process-wide active share deliveries,
   weighting admission by planned helper fan-out so queued shares do not exhaust
   their delivery deadlines behind other queued shares. Retain the independent

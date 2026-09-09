@@ -1,10 +1,7 @@
-//! The run loop: plan, admit a wave, dispatch it, fold the results, repeat.
-//!
-//! One pass of this loop is the driver's whole mechanism. Every decision it
-//! makes is delegated: `selection` says what to admit, `signing` says whether
-//! the host still owes a signature, `dispatch` runs the wave, `run_ledger`
-//! records what happened and whether it ends the run, and `quiescence` says
-//! why a plan with nothing dispatchable stops.
+//! Rolling admission, fresh planning, and draining of bundle obligations.
+
+use futures_util::{stream::FuturesUnordered, StreamExt};
+use std::collections::BTreeSet;
 
 use crate::{
     round_planning::ClassifiedPlan, session::NextStep, ChainSubmissionControl, ChainTransport,
@@ -44,10 +41,10 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
     }
 
     /// Re-reads the plan and tally so a report describes the round after the
-    /// wave's durable effects rather than before them.
+    /// completed operations' durable effects rather than before them.
     ///
-    /// Best effort: a run stops for a reason the wave produced, and a failed
-    /// re-read is not that reason. The pre-wave values stand if it fails.
+    /// Best effort: a run stops for a reason an operation produced, and a failed
+    /// re-read is not that reason. The last known values stand if it fails.
     fn refresh_progress(&self, run: &mut Run) {
         let Ok(classified) = self.plan_off_the_worker() else {
             return;
@@ -58,7 +55,7 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
         run.plan = Some(classified.plan);
     }
 
-    /// Runs the bound round until it is quiescent. See [`RoundDriver::run`].
+    /// Refills available bundle slots after each completion from a fresh plan.
     pub(super) async fn drive(
         &self,
         host: &dyn RoundHostSource,
@@ -68,242 +65,267 @@ impl<T: ChainTransport> RoundDriver<'_, T> {
         let mut run = Run::default();
         let entry_epoch = control.operation_epoch();
         let interrupted = || control.is_cancelled() || control.operation_epoch() != entry_epoch;
+        let limit = if self.policy.failure_isolation == FailureIsolation::StopRound {
+            1
+        } else {
+            self.policy.max_bundle_concurrency.get()
+        };
+        let mut flights = FuturesUnordered::new();
+        let mut active = BTreeSet::new();
+        let mut admitted = BTreeSet::new();
+        let mut deadlines: Vec<(NextStep, Option<tokio::time::Instant>)> = Vec::new();
+        let mut stopping: Option<(usize, RoundQuiescence)> = None;
 
         loop {
             if interrupted() {
-                // A wave that already ran left durable effects the pre-dispatch
-                // plan does not describe, so this return owes the same refresh
-                // a wave-ending one does. A run cancelled before it dispatched
-                // anything has nothing to refresh and reads nothing.
-                if run.dispatches > 0 {
-                    self.refresh_progress(&mut run);
-                }
-                return run.finish(RoundQuiescence::Cancelled);
+                stopping = Some((0, RoundQuiescence::Cancelled));
             }
-
-            // The one read the driver selects from.
-            let classified = match self.plan_off_the_worker() {
-                Ok(classified) => classified,
-                Err(error) => {
-                    // The read spans the same window as a successful one, so
-                    // an abandoned run must not be reported differently just
-                    // because its concurrent database read happened to fail.
-                    //
-                    // Untested: a cancellation observable here is observable
-                    // at the check one statement above unless it lands inside
-                    // the read itself, and nothing in the API can place it
-                    // there deterministically. The guard closes a real race
-                    // rather than a reproducible one.
-                    if interrupted() {
-                        return run.finish(RoundQuiescence::Cancelled);
+            if stopping.is_none() {
+                match self.plan_off_the_worker() {
+                    Err(error) => {
+                        run.record_plan_failure(error);
+                        stopping = Some((run.dispatches, RoundQuiescence::Failures));
                     }
-                    run.record_plan_failure(error);
-                    return run.finish(RoundQuiescence::Failures);
-                }
-            };
-            // Captured from the first plan of the run either way; the policy
-            // only decides what the total counts.
-            let baseline =
-                run.baseline
-                    .get_or_insert_with(|| match self.policy.progress_baseline {
-                        ProgressBaseline::Run => {
-                            VoteProgressBaseline::for_run(&classified.obligations)
-                        }
-                        ProgressBaseline::SelectedChoices => {
-                            VoteProgressBaseline::for_selected_choices(&classified.obligations)
-                        }
-                    });
-            run.tally = baseline.tally(&classified.obligations);
-            run.plan = Some(classified.plan.clone());
-            events.report(RoundDriveEvent::PlanRefreshed {
-                plan: Box::new(classified.plan.clone()),
-                tally: run.tally,
-            });
-
-            // The plan read blocks on the database and the callback above runs
-            // host code, so either can span a cancellation or an epoch switch.
-            // Every early return below reports a state of the round, and a run
-            // the host has abandoned must not describe one: it would answer
-            // `NoWorkLeft` or `NeedsBallot` for a session already left, and no
-            // dispatch follows whose epoch binding could correct it.
-            if interrupted() {
-                return run.finish(RoundQuiescence::Cancelled);
-            }
-
-            if let Some(quiescence) =
-                quiesce_before_dispatch(&classified.plan, &classified.obligations.obligations, &run)
-            {
-                return run.finish(quiescence);
-            }
-            if run.dispatches >= self.policy.max_dispatches {
-                let remaining = classified.plan.next_steps.clone();
-                return run.finish(RoundQuiescence::PassBudgetExhausted { remaining });
-            }
-            // Shares that require polling or recovery stay with the background
-            // tracker, even when other work makes this plan dispatchable. Plan
-            // order can put one ahead of a share no helper reached, and a
-            // pending poll is promoted again, so leaving it in the stream can
-            // starve the delivery the round actually owes.
-            let dispatchable: Vec<NextStep> = classified
-                .plan
-                .next_steps
-                .iter()
-                .filter(|step| {
-                    !requires_background_tracking(step, &classified.obligations.obligations)
-                })
-                .cloned()
-                .collect();
-            run.awaiting_repoll.retain(|step| {
-                dispatchable.contains(step) && !run.skipped.contains(&selection::bundle_index(step))
-            });
-            let remaining_budget = self.policy.max_dispatches - run.dispatches;
-            let steps = selection::next_dispatches(
-                &dispatchable,
-                &run.skipped,
-                &run.awaiting_repoll,
-                self.policy.max_bundle_concurrency.get(),
-                remaining_budget,
-                self.policy.failure_isolation == FailureIsolation::SkipBundle,
-            );
-            if steps.is_empty() {
-                // Every remaining step belongs to a bundle a failure skipped.
-                return run.finish(RoundQuiescence::Failures);
-            }
-            run.awaiting_repoll.retain(|step| !steps.contains(step));
-            let dispatches: Vec<_> = steps
-                .into_iter()
-                .map(|step| (step, host.host_context()))
-                .collect();
-            let signer_handoff = signing::missing_signer_bundles(
-                self.executor,
-                &dispatches,
-                &classified.plan.round_id,
-                &classified.obligations.obligations,
-                &run.skipped,
-            );
-            // Building each host context ran host code and the signature check
-            // read the database, so both can span an interruption too. The two
-            // returns below are the last that describe the round without a
-            // dispatch after them to correct the answer.
-            if interrupted() {
-                return run.finish(RoundQuiescence::Cancelled);
-            }
-            match signer_handoff {
-                Ok(bundles) if !bundles.is_empty() => {
-                    return run.finish(RoundQuiescence::NeedsDelegationSignatures { bundles });
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    run.record_plan_failure(error);
-                    return run.finish(RoundQuiescence::Failures);
-                }
-            }
-
-            for (step, _) in &dispatches {
-                events.report(RoundDriveEvent::StepSelected { step: step.clone() });
-            }
-            run.dispatches += dispatches.len();
-            let dispatched =
-                dispatch::run(self.executor, dispatches, control, entry_epoch, events).await;
-
-            let mut wave_quiescence = None;
-            for (step, dispatched) in dispatched {
-                match dispatched {
-                    Ok(outcome) => {
-                        if let Some(quiescence) =
-                            run.record_outcome(&step, outcome, self.policy.pending_repoll, events)
-                        {
-                            wave_quiescence.get_or_insert(quiescence);
-                        }
-                    }
-                    Err(failure) => {
-                        events.report(RoundDriveEvent::StepFailed {
-                            step: step.clone(),
-                            kind: failure.kind,
-                            message: failure.message.clone(),
-                        });
-                        let bundle_index = selection::bundle_index(&step);
-                        run.record_failure(Some(step.clone()), Some(bundle_index), failure);
-                        match self.policy.failure_isolation {
-                            FailureIsolation::StopRound => {
-                                wave_quiescence.get_or_insert(RoundQuiescence::Failures);
+                    Ok(classified) => {
+                        let baseline = run.baseline.get_or_insert_with(|| {
+                            match self.policy.progress_baseline {
+                                ProgressBaseline::Run => {
+                                    VoteProgressBaseline::for_run(&classified.obligations)
+                                }
+                                ProgressBaseline::SelectedChoices => {
+                                    VoteProgressBaseline::for_selected_choices(
+                                        &classified.obligations,
+                                    )
+                                }
                             }
-                            FailureIsolation::SkipBundle => {
-                                run.skipped.push(bundle_index);
-                                events.report(RoundDriveEvent::BundleSkipped {
-                                    bundle_index,
-                                    after: step,
+                        });
+                        run.tally = baseline.tally(&classified.obligations);
+                        run.plan = Some(classified.plan.clone());
+                        events.report(RoundDriveEvent::PlanRefreshed {
+                            plan: Box::new(classified.plan.clone()),
+                            tally: run.tally,
+                        });
+                        if interrupted() {
+                            stopping = Some((0, RoundQuiescence::Cancelled));
+                        } else if flights.is_empty() {
+                            if let Some(reason) = quiesce_before_dispatch(
+                                &classified.plan,
+                                &classified.obligations.obligations,
+                                &run,
+                            ) {
+                                return run.finish(reason);
+                            }
+                            if run.dispatches >= self.policy.max_dispatches {
+                                return run.finish(RoundQuiescence::PassBudgetExhausted {
+                                    remaining: classified.plan.next_steps,
                                 });
                             }
                         }
+                        let dispatchable: Vec<_> = classified
+                            .plan
+                            .next_steps
+                            .iter()
+                            .filter(|step| {
+                                !requires_background_tracking(
+                                    step,
+                                    &classified.obligations.obligations,
+                                )
+                            })
+                            .cloned()
+                            .collect();
+                        deadlines.retain(|(step, _)| {
+                            dispatchable.contains(step)
+                                && !run.skipped.contains(&selection::bundle_index(step))
+                        });
+                        let now = tokio::time::Instant::now();
+                        let candidates: Vec<_> = dispatchable
+                            .iter()
+                            .filter(|step| {
+                                !active.contains(&selection::bundle_index(step))
+                                    && !deadlines.iter().any(|(waiting, deadline)| {
+                                        waiting == *step
+                                            && deadline.is_none_or(|deadline| deadline > now)
+                                    })
+                            })
+                            .cloned()
+                            .collect();
+                        let preferred: Vec<_> = candidates
+                            .iter()
+                            .filter(|step| deadlines.iter().any(|(waiting, _)| waiting == *step))
+                            .chain(
+                                candidates.iter().filter(|step| {
+                                    admitted.contains(&selection::bundle_index(step))
+                                }),
+                            )
+                            .cloned()
+                            .collect();
+                        if stopping.is_none()
+                            && flights.len() < limit
+                            && run.dispatches < self.policy.max_dispatches
+                        {
+                            let steps = selection::next_dispatches(
+                                &candidates,
+                                &run.skipped,
+                                &preferred,
+                                limit - flights.len(),
+                                self.policy.max_dispatches - run.dispatches,
+                                true,
+                            );
+                            let dispatches: Vec<_> = steps
+                                .into_iter()
+                                .map(|step| (step, host.host_context()))
+                                .collect();
+                            let handoff = signing::missing_signer_bundles(
+                                self.executor,
+                                &dispatches,
+                                &classified.plan.round_id,
+                                &classified.obligations.obligations,
+                                &run.skipped,
+                            );
+                            if interrupted() {
+                                stopping = Some((0, RoundQuiescence::Cancelled));
+                            } else {
+                                match handoff {
+                                    Ok(bundles) if !bundles.is_empty() => {
+                                        stopping = Some((
+                                            run.dispatches,
+                                            RoundQuiescence::NeedsDelegationSignatures { bundles },
+                                        ))
+                                    }
+                                    Err(error) => {
+                                        run.record_plan_failure(error);
+                                        stopping =
+                                            Some((run.dispatches, RoundQuiescence::Failures));
+                                    }
+                                    Ok(_) => {
+                                        for (step, context) in dispatches {
+                                            events.report(RoundDriveEvent::StepSelected {
+                                                step: step.clone(),
+                                            });
+                                            if interrupted() {
+                                                stopping = Some((0, RoundQuiescence::Cancelled));
+                                                break;
+                                            }
+                                            let sequence = run.dispatches;
+                                            run.dispatches += 1;
+                                            active.insert(selection::bundle_index(&step));
+                                            admitted.insert(selection::bundle_index(&step));
+                                            deadlines.retain(|(waiting, _)| waiting != &step);
+                                            flights.push(dispatch::run(
+                                                self.executor,
+                                                sequence,
+                                                step,
+                                                context,
+                                                control,
+                                                entry_epoch,
+                                                events,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-            // `StepFinished` and `StepFailed` run host code, so the fold above
-            // can be where a cancellation or an epoch switch arrives. A wave
-            // that also produced a terminal or stalled outcome would otherwise
-            // report that instead, and `run` promises an interruption ends the
-            // run as `Cancelled` at the next boundary. The diagnostic is not
-            // lost: it is in `chain_outcomes` and `failures` either way.
-            if interrupted() {
-                self.refresh_progress(&mut run);
-                return run.finish(RoundQuiescence::Cancelled);
-            }
-            if let Some(quiescence) = wave_quiescence {
-                // The wave made durable progress before it stopped, so the
-                // pre-dispatch plan and tally no longer describe the round: a
-                // vote that confirmed and then failed on helper delivery would
-                // still be listed as owing reconciliation, and its proposal
-                // counted incomplete. Refresh both from durable state before
-                // reporting, keeping the pre-wave read if the refresh fails —
-                // a failed courtesy read must not replace the reason the run
-                // stopped.
-                self.refresh_progress(&mut run);
-                // That refresh blocks on the database, so it is the last
-                // boundary before this return and owes its own check.
-                // `finish` touches nothing further, so this closes the window
-                // rather than moving it.
-                if interrupted() {
-                    return run.finish(RoundQuiescence::Cancelled);
-                }
-                return run.finish(quiescence);
-            }
-
-            // A re-poll is a wait before another dispatch. With none left in
-            // the budget the wait leads nowhere, and a host-configured
-            // interval would hold the run open for its whole length before the
-            // next pass could report the exhaustion.
-            if run.dispatches >= self.policy.max_dispatches {
-                run.repoll.clear();
-                continue;
-            }
-            if !run.repoll.is_empty() {
-                let repolls = std::mem::take(&mut run.repoll);
-                let delay = repolls
-                    .iter()
-                    .map(|(_, delay)| *delay)
-                    .max()
-                    .unwrap_or_default();
-                for (repoll_step, step_delay) in &repolls {
-                    events.report(RoundDriveEvent::AwaitingRepoll {
-                        step: repoll_step.clone(),
-                        delay: *step_delay,
-                    });
-                }
-                if !sleep_until_interrupted(delay, control, entry_epoch).await {
+            if stopping.is_some() && flights.is_empty() {
+                if run.dispatches > 0 {
                     self.refresh_progress(&mut run);
-                    return run.finish(RoundQuiescence::Cancelled);
                 }
-                // The next pass re-plans, but it dispatches this step again if
-                // the refreshed plan still lists it. Leaving that to plan order
-                // would make the event above a promise the driver does not
-                // keep, and would let a pending step that is not first be
-                // starved by one that is.
-                run.awaiting_repoll
-                    .extend(repolls.into_iter().map(|(step, _)| step));
+                let reason = if interrupted() {
+                    RoundQuiescence::Cancelled
+                } else {
+                    stopping.take().unwrap().1
+                };
+                return run.finish(reason);
+            }
+            let completion = if stopping.is_some() {
+                flights.next().await
+            } else {
+                let delay = repoll_delay(
+                    &deadlines,
+                    &active,
+                    flights.len() < limit && run.dispatches < self.policy.max_dispatches,
+                );
+                tokio::select! {
+                    completion = flights.next(), if !flights.is_empty() => completion,
+                    _ = sleep_until_interrupted(delay, control, entry_epoch) => continue,
+                }
+            };
+            let Some((sequence, step, dispatched)) = completion else {
+                continue;
+            };
+            active.remove(&selection::bundle_index(&step));
+            let before = run.effect_lengths();
+            let terminal = match dispatched {
+                Ok(outcome) => {
+                    run.record_outcome(&step, outcome, self.policy.pending_repoll, events)
+                }
+                Err(failure) => {
+                    let kind = failure.kind;
+                    let message = failure.message.clone();
+                    let bundle_index = selection::bundle_index(&step);
+                    run.record_failure(Some(step.clone()), Some(bundle_index), failure);
+                    events.report(RoundDriveEvent::StepFailed {
+                        step: step.clone(),
+                        kind,
+                        message,
+                    });
+                    match self.policy.failure_isolation {
+                        FailureIsolation::StopRound => Some(RoundQuiescence::Failures),
+                        FailureIsolation::SkipBundle => {
+                            run.skipped.push(bundle_index);
+                            events.report(RoundDriveEvent::BundleSkipped {
+                                bundle_index,
+                                after: step.clone(),
+                            });
+                            None
+                        }
+                    }
+                }
+            };
+            run.record_order(sequence, before);
+            for (step, delay) in std::mem::take(&mut run.repoll) {
+                deadlines.push((step.clone(), tokio::time::Instant::now().checked_add(delay)));
+                if run.dispatches < self.policy.max_dispatches {
+                    events.report(RoundDriveEvent::AwaitingRepoll { step, delay });
+                }
+            }
+            if let Some(reason) = terminal {
+                if stopping
+                    .as_ref()
+                    .is_none_or(|(earlier, _)| sequence < *earlier)
+                {
+                    stopping = Some((sequence, reason));
+                }
+            }
+            // Draining still owes an authoritative snapshot after each completed
+            // operation, even though no subsequent admission can use it.
+            if stopping.is_some() || interrupted() {
+                self.refresh_progress(&mut run);
             }
         }
     }
+}
+
+/// Wakes for the earliest re-poll that can use an admission slot. When capacity
+/// or dispatch budget is exhausted, only completion or interruption can help.
+/// Expiry after selection remains a zero delay so overdue work cannot lose its wake-up.
+pub(super) fn repoll_delay(
+    deadlines: &[(NextStep, Option<tokio::time::Instant>)],
+    active: &BTreeSet<u32>,
+    admission_available: bool,
+) -> std::time::Duration {
+    if !admission_available {
+        return std::time::Duration::MAX;
+    }
+    deadlines
+        .iter()
+        .filter(|(step, _)| !active.contains(&selection::bundle_index(step)))
+        .filter_map(|(_, deadline)| *deadline)
+        .min()
+        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .unwrap_or(std::time::Duration::MAX)
 }
 
 /// Waits `delay`, returning `false` if the host interrupted meanwhile.

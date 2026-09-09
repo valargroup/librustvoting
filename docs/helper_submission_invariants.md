@@ -1026,6 +1026,16 @@ of completion timing. Unprocessed and failed shares remain pending; completed
 shares retain their durable acceptance or ambiguity. Existing public singleton
 submission APIs and report shapes are unchanged.
 
+Concurrent bundle execution uses this existing shared queue, rather than adding
+per-bundle network budgets. The limits below remain process-wide across all
+executors and wallets and are independent of CPU proving admission. Every
+proposal's complete or partial report reaches the step ledger; completion events
+may interleave across bundles while aggregate reports retain dispatch and
+canonical proposal order. Full atomic chain confirmation still precedes every
+fresh delivery. `a_finished_pipeline_refills_while_an_original_bundle_remains_blocked`
+covers rolling bundle admission; the existing delivery queue conformance tests
+continue to own sibling-progress and partial-report behavior.
+
 Up to 32 share tasks across all wallets and committed votes in the process may
 hold a delivery permit at once. Admission uses one process-wide budget of 128
 units, charging each share `max(4, planned target_count)` units atomically. Thus

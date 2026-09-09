@@ -205,3 +205,23 @@ cancelled waits. These diagnostics do not change timing policies or trust rules.
 See [the benchmark and correlation procedure](helper_delivery_benchmark.md) for
 capture limits, stage meanings, occupancy calculations, and the evidence needed
 to join SDK reports to helper processing and chain inclusion.
+
+## Shared proving and rolling bundle progress
+
+The process-wide proving runtime records `proving::queue_backpressure`,
+`proving::ready_queue_wait`, `proving::admission_wait`,
+`proving::cache_ready`, and `proving::heavy_job` through the existing optional
+scope. Admission wait contains backpressure and ready-queue residence; these
+nested times overlap and must not be summed as wall time. Key initialization is
+shared process work; waiting invocations record their own cache-readiness wait.
+Proof records retain bundle/proposal attribution and the invocation collector.
+These stages contain no wallet identifiers, proof inputs, payloads, or secrets.
+
+Round completion events and proposal delivery reports arrive when operations
+finish, so bundle/proposal progress interleaves. Aggregate reports preserve
+internal dispatch sequence and canonical proposal order without delaying new
+admission. Per-invocation capture limits, disabled collection, frozen snapshots,
+and redaction rules remain unchanged.
+
+See [the bundle pipeline benchmark](bundle_pipeline_benchmark.md) for serial and
+five-pipeline release measurements with shared CPU limits and delayed transports.

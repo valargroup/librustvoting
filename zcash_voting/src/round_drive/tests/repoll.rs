@@ -2,7 +2,92 @@
 
 use super::fixtures::*;
 
-use crate::round_drive::run_loop::sleep_until_interrupted;
+use crate::round_drive::run_loop::{repoll_delay, sleep_until_interrupted};
+
+#[tokio::test(start_paused = true)]
+async fn a_deadline_expiring_after_selection_wakes_the_idle_driver() {
+    let selected_at = tokio::time::Instant::now();
+    let deadline = selected_at + Duration::from_secs(2);
+    let deadlines = [(
+        NextStep::AdvanceImportedDelegation { bundle_index: 0 },
+        Some(deadline),
+    )];
+    // Selection excludes this obligation while its deadline is still future.
+    // The task can then be descheduled through the deadline before waiting.
+    assert!(deadline > selected_at);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    let delay = repoll_delay(&deadlines, &Default::default(), true);
+    let control = ChainSubmissionControl::new(1);
+    assert_eq!(
+        delay,
+        Duration::ZERO,
+        "overdue work must wake an idle driver"
+    );
+    assert!(tokio::time::timeout(
+        Duration::from_millis(1),
+        sleep_until_interrupted(delay, &control, 1),
+    )
+    .await
+    .expect("replanning must not need host cancellation"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn repoll_wakes_at_the_earliest_deadline_including_exact_expiry() {
+    let now = tokio::time::Instant::now();
+    let deadlines = [
+        (
+            NextStep::AdvanceImportedDelegation { bundle_index: 0 },
+            Some(now + Duration::from_secs(5)),
+        ),
+        (
+            NextStep::AdvanceImportedDelegation { bundle_index: 1 },
+            Some(now + Duration::from_secs(2)),
+        ),
+    ];
+    assert_eq!(
+        repoll_delay(&deadlines, &Default::default(), true),
+        Duration::from_secs(2)
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        repoll_delay(&deadlines, &Default::default(), true),
+        Duration::ZERO
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn unavailable_repolls_wait_for_completion_or_interruption() {
+    let now = tokio::time::Instant::now();
+    let deadlines = [(
+        NextStep::AdvanceImportedDelegation { bundle_index: 0 },
+        Some(now),
+    )];
+    // Full capacity or an exhausted dispatch budget must not spin on due work.
+    assert_eq!(
+        repoll_delay(&deadlines, &Default::default(), false),
+        Duration::MAX
+    );
+    assert_eq!(repoll_delay(&deadlines, &[0].into(), true), Duration::MAX);
+    assert_eq!(repoll_delay(&[], &Default::default(), true), Duration::MAX);
+    let unbounded = [(
+        NextStep::AdvanceImportedDelegation { bundle_index: 0 },
+        None,
+    )];
+    assert_eq!(
+        repoll_delay(&unbounded, &Default::default(), true),
+        Duration::MAX
+    );
+    let control = ChainSubmissionControl::new(1);
+    control.cancel();
+    assert!(
+        !sleep_until_interrupted(
+            repoll_delay(&deadlines, &Default::default(), false),
+            &control,
+            1
+        )
+        .await
+    );
+}
 
 #[tokio::test(start_paused = true)]
 async fn the_repoll_wait_runs_to_completion_when_nothing_interrupts() {

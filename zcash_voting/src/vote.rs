@@ -8,13 +8,7 @@
 pub(crate) use crate::backend::{orchard, pasta_curves};
 use serde::{Deserialize, Serialize};
 
-use std::{
-    collections::{BTreeSet, HashSet},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex,
-    },
-};
+use std::collections::{BTreeSet, HashSet};
 
 use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
 
@@ -1102,6 +1096,7 @@ pub(crate) fn observe_persist_prepared_vote_work(
         }
         PreparedVoteWork::Singleton(_) => observations.clone(),
     };
+    crate::proving_runtime::check_interruption()?;
     let observation_stage = attributed_observations.stage("vote::persist_prepared_vote_work");
     let observations = observation_stage.scope();
     let operation_result: Result<VoteCommitmentRecovery, VotingError> = (|| match prepared {
@@ -1357,6 +1352,7 @@ pub(crate) fn observe_commit_atomic_vote_batch(
     let attributed_observations = observations.for_bundle(bundle_index);
     let observation_stage = attributed_observations.stage("vote::commit_atomic_vote_batch");
     let observations = observation_stage.scope();
+    crate::proving_runtime::check_interruption()?;
     let operation_result: Result<SignedVoteBatch, VotingError> = (|| {
         let prepared = observe_prepare_atomic_vote_batch(
             db,
@@ -1447,7 +1443,9 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
     let attributed_observations = observations.for_bundle(batch.bundle_index);
     let observation_stage = attributed_observations.stage("vote::prepare_atomic_vote_batch");
     let observations = observation_stage.scope();
-    let operation_result: Result<PreparedAtomicVoteBatch, VotingError> = (|| {
+    let operation =
+        crate::proving_runtime::Operation::for_bundle(db, batch.round_id, batch.bundle_index);
+    let operation_result: Result<PreparedAtomicVoteBatch, VotingError> = operation.enter(|| {
         validate_atomic_vote_batch(batch.drafts)?;
         let bundle_count = db.get_bundle_count(batch.round_id)?;
         crate::round::validate_bundle_index(bundle_count, batch.bundle_index, "voting")?;
@@ -1636,6 +1634,7 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
             observations,
         )?;
 
+        crate::proving_runtime::check_interruption()?;
         let sighash_actions = bundles
             .iter()
             .map(
@@ -1690,6 +1689,7 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
                 proposal_id: plan.draft.proposal_id,
                 bundle_index: batch.bundle_index,
             });
+            crate::proving_runtime::check_interruption()?;
             let signature = crate::vote_commitment::sign_cast_vote_digest(
                 secret,
                 network,
@@ -1751,7 +1751,7 @@ pub(crate) fn observe_prepare_atomic_vote_batch(
             batch_digest,
             batch_json,
         })
-    })();
+    });
     let outcome = if operation_result.is_ok() {
         crate::ObservationOutcome::Succeeded
     } else {
@@ -1821,6 +1821,7 @@ pub(crate) fn observe_persist_prepared_atomic_vote_batch(
     let attributed_observations = observations.for_bundle(prepared.bundle_index);
     let observation_stage =
         attributed_observations.stage("vote::persist_prepared_atomic_vote_batch");
+    crate::proving_runtime::check_interruption()?;
     let operation_result: Result<SignedVoteBatch, VotingError> =
         (|| persist_prepared_atomic_vote_batch_inner(db, prepared, || {}))();
     let outcome = if operation_result.is_ok() {
@@ -2150,32 +2151,19 @@ fn build_batch_proofs(
     plans: &[BatchProofPlan],
     observations: &crate::ObservationScope,
 ) -> Result<Vec<VoteCommitmentBundle>, VotingError> {
-    let next = AtomicUsize::new(0);
-    let results = Mutex::new(
-        (0..plans.len())
-            .map(|_| None)
-            .collect::<Vec<Option<Result<VoteCommitmentBundle, VotingError>>>>(),
-    );
-    let worker_count = max_concurrency.max(1).min(plans.len());
-    std::thread::scope(|scope| -> Result<(), VotingError> {
-        let mut workers = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            workers.push(scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(plan) = plans.get(index) else {
-                        break;
-                    };
-                    stages.on_stage(VoteCommitStage::ProofStarting {
-                        proposal_id: plan.draft.proposal_id,
-                        bundle_index,
-                    });
-                    let progress = VoteProofProgressReporter {
-                        proposal_id: plan.draft.proposal_id,
-                        bundle_index,
-                        stages,
-                    };
-                    let result = crate::zkp2::build_vote_commitment(
+    crate::proving_runtime::ensure_cache(crate::proving_runtime::CacheKind::Vote, observations)?;
+    crate::proving_runtime::execute_many(plans.len(), max_concurrency, observations, |index| {
+        let plan = &plans[index];
+        stages.on_stage(VoteCommitStage::ProofStarting {
+            proposal_id: plan.draft.proposal_id,
+            bundle_index,
+        });
+        let progress = VoteProofProgressReporter {
+            proposal_id: plan.draft.proposal_id,
+            bundle_index,
+            stages,
+        };
+        crate::zkp2::build_admitted_vote_commitment(
                         hotkey_seed,
                         plan.state.network,
                         plan.state.zkp2.address_index,
@@ -2203,33 +2191,8 @@ fn build_batch_proofs(
                             });
                         }
                         Ok(bundle)
-                    });
-                    results.lock().expect("batch proof result mutex poisoned")[index] =
-                        Some(result);
-                }
-            }));
-        }
-        for worker in workers {
-            worker.join().map_err(|_| VotingError::Internal {
-                message: "vote batch proof worker panicked".to_string(),
-            })?;
-        }
-        Ok(())
-    })?;
-
-    results
-        .into_inner()
-        .map_err(|_| VotingError::Internal {
-            message: "batch proof result mutex poisoned".to_string(),
-        })?
-        .into_iter()
-        .enumerate()
-        .map(|(index, result)| {
-            result.ok_or_else(|| VotingError::Internal {
-                message: format!("vote batch proof worker omitted action {index}"),
-            })?
-        })
-        .collect()
+                    })
+    })
 }
 
 fn prepare_recovered_vote_batch(
@@ -2629,7 +2592,8 @@ pub(crate) fn observe_prepare_commit(
     });
     let observation_stage = attributed_observations.stage("vote::prepare_commit");
     let observations = observation_stage.scope();
-    let operation_result: Result<PreparedVoteCommit, VotingError> = (|| {
+    let operation = crate::proving_runtime::Operation::for_bundle(db, round_id, bundle_index);
+    let operation_result: Result<PreparedVoteCommit, VotingError> = operation.enter(|| {
         validate_draft_vote(draft)?;
 
         let (secret, network) = signer_secret_and_network(signer);
@@ -2785,7 +2749,7 @@ pub(crate) fn observe_prepare_commit(
             commit,
             captured_state: CapturedVoteState::Fresh(prepared_proof.state),
         })
-    })();
+    });
     let outcome = if operation_result.is_ok() {
         crate::ObservationOutcome::Succeeded
     } else {
@@ -2868,6 +2832,7 @@ fn persist_prepared_commits(
         .map_err(|e| {
             VotingError::from_sqlite("failed to begin prepared vote persistence transaction", &e)
         })?;
+    crate::proving_runtime::check_interruption()?;
     if let Some(authorization) = &delegation {
         authorization.validate_fresh(&tx)?;
     }
@@ -2970,6 +2935,7 @@ fn persist_prepared_commits(
             .digest;
         authorization.persist(&tx, &digest)?;
     }
+    crate::proving_runtime::check_interruption()?;
     tx.commit().map_err(|e| {
         VotingError::from_sqlite("failed to commit prepared vote persistence transaction", &e)
     })?;

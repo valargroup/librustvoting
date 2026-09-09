@@ -3,7 +3,7 @@
 //! Every step captures its scope once, takes its lock, resolves the
 //! requested step to the obligation a fresh plan lists for it, and runs
 //! that obligation. Proving never runs on the async runtime: delegation and
-//! vote proofs run on dedicated large-stack threads and stream their
+//! vote proofs run on the shared large-stack CPU pool and stream their
 //! progress back through channels.
 //!
 //! Mechanism lives in sibling children, one per responsibility:
@@ -33,7 +33,6 @@ use super::{
 };
 
 // Matches the keygen warm-up threads in voting-circuits.
-pub(super) const PROVING_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 impl<T: ChainTransport> RoundExecutor<T> {
     /// Plans the bound round from durable state.

@@ -18,8 +18,7 @@ use crate::types::{
 };
 
 // Vote proof build runs circuit synthesis + MockProver + proof generation, which can
-// overflow the default simulator thread stack. Run it on a dedicated large-stack thread.
-const VOTE_PROOF_STACK_BYTES: usize = 64 * 1024 * 1024;
+// overflow simulator stacks. Shared pool workers retain 64 MiB stacks.
 
 /// Public VAN values and authority masks for one preplanned vote action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +129,75 @@ pub(crate) fn build_vote_commitment(
     progress: &dyn ProgressReporter,
     observations: &crate::ObservationScope,
 ) -> Result<VoteCommitmentBundle, VotingError> {
+    validate_vote_decision(choice, num_options)?;
+    if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_id)
+        || van_auth_path.len() != VOTE_COMM_TREE_DEPTH
+    {
+        return build_admitted_vote_commitment(
+            hotkey_seed,
+            network,
+            address_index,
+            total_note_value,
+            gov_comm_rand,
+            voting_round_id,
+            ea_pk,
+            proposal_id,
+            choice,
+            num_options,
+            van_auth_path,
+            van_position,
+            anchor_height,
+            proposal_authority,
+            single_share,
+            progress,
+            observations,
+        );
+    }
+    crate::proving_runtime::ensure_cache(crate::proving_runtime::CacheKind::Vote, observations)?;
+    crate::proving_runtime::execute(observations, || {
+        build_admitted_vote_commitment(
+            hotkey_seed,
+            network,
+            address_index,
+            total_note_value,
+            gov_comm_rand,
+            voting_round_id,
+            ea_pk,
+            proposal_id,
+            choice,
+            num_options,
+            van_auth_path,
+            van_position,
+            anchor_height,
+            proposal_authority,
+            single_share,
+            progress,
+            observations,
+        )
+    })
+}
+
+/// Builds one fixed action after the caller has initialized keys and admitted CPU work.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_admitted_vote_commitment(
+    hotkey_seed: &[u8],
+    network: Network,
+    address_index: u32,
+    total_note_value: u64,
+    gov_comm_rand: &[u8],
+    voting_round_id: &[u8],
+    ea_pk: &[u8],
+    proposal_id: u32,
+    choice: u32,
+    num_options: u32,
+    van_auth_path: &[[u8; 32]],
+    van_position: u32,
+    anchor_height: u32,
+    proposal_authority: u64,
+    single_share: bool,
+    progress: &dyn ProgressReporter,
+    observations: &crate::ObservationScope,
+) -> Result<VoteCommitmentBundle, VotingError> {
     let attributed_observations = observations.attributed(crate::ObservationAttribution {
         proposal_id: Some(proposal_id),
         ..Default::default()
@@ -204,38 +272,27 @@ pub(crate) fn build_vote_commitment(
         let alpha_v = pallas::Scalar::random(&mut voting_crypto_deps::rand::rngs::OsRng);
         let sk_for_proof = sk.clone();
         let proof_observations = observations.clone();
-        let vote_bundle = std::thread::Builder::new()
-            .name("vote-proof-build".to_string())
-            .stack_size(VOTE_PROOF_STACK_BYTES)
-            .spawn(move || {
-                proof_observations.measure_result("zkp2.prove", || {
-                    build_vote_proof_from_delegation(
-                        &sk_for_proof,
-                        address_index,
-                        total_note_value,
-                        gcr,
-                        vri,
-                        auth_path,
-                        van_position,
-                        anchor_height,
-                        proposal_id as u64,
-                        choice as u64,
-                        ea_pk_affine,
-                        alpha_v,
-                        proposal_authority,
-                        single_share,
-                    )
-                })
+        let vote_bundle = proof_observations
+            .measure_result("zkp2.prove", || {
+                build_vote_proof_from_delegation(
+                    &sk_for_proof,
+                    address_index,
+                    total_note_value,
+                    gcr,
+                    vri,
+                    auth_path,
+                    van_position,
+                    anchor_height,
+                    proposal_id as u64,
+                    choice as u64,
+                    ea_pk_affine,
+                    alpha_v,
+                    proposal_authority,
+                    single_share,
+                )
             })
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to spawn vote proof builder thread: {e}"),
-            })?
-            .join()
-            .map_err(|_| VotingError::Internal {
-                message: "vote proof builder thread panicked".to_string(),
-            })?
-            .map_err(|e| VotingError::ProofFailed {
-                message: format!("vote proof generation failed: {}", e),
+            .map_err(|error| VotingError::ProofFailed {
+                message: format!("vote proof generation failed: {error}"),
             })?;
         progress.on_progress(1.0);
 

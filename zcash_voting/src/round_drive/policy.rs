@@ -31,9 +31,7 @@ pub struct RoundDrivePolicy {
 
     /// How many bundle-locked obligations run at once.
     ///
-    /// Round-locked obligations are never run concurrently whatever this
-    /// value: they contend for one lock, so a second in flight would only
-    /// queue behind the first while holding a proving thread open.
+    /// All bundle-scoped round work shares this rolling concurrency limit.
     /// [`FailureIsolation::StopRound`] also admits only one step at a time so
     /// no later bundle has started when the first failure stops the run.
     pub max_bundle_concurrency: NonZeroUsize,
@@ -61,7 +59,7 @@ impl Default for RoundDrivePolicy {
     fn default() -> Self {
         Self {
             pending_repoll: Duration::from_secs(2),
-            max_bundle_concurrency: NonZeroUsize::new(3).expect("3 is not zero"),
+            max_bundle_concurrency: NonZeroUsize::new(5).expect("5 is not zero"),
             failure_isolation: FailureIsolation::SkipBundle,
             max_dispatches: 512,
             progress_baseline: ProgressBaseline::Run,

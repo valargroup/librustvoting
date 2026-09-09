@@ -241,7 +241,7 @@ fn the_default_policy_is_the_cadence_hosts_were_driving_by_hand() {
     // Changing one changes every host's pacing, so it is pinned here.
     let policy = RoundDrivePolicy::default();
     assert_eq!(policy.pending_repoll, Duration::from_secs(2));
-    assert_eq!(policy.max_bundle_concurrency.get(), 3);
+    assert_eq!(policy.max_bundle_concurrency.get(), 5);
     assert_eq!(policy.failure_isolation, FailureIsolation::SkipBundle);
 }
 

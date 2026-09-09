@@ -27,7 +27,7 @@
 //! uses them: `run_loop` (plan, admit, dispatch, fold, repeat), `selection`
 //! (which steps a fresh plan admits, and under which lock), `signing` (whether
 //! the host still owes a delegation signature), `dispatch` (running one
-//! admitted wave concurrently), `run_ledger` (what the run has accumulated and
+//! admitted obligations concurrently), `run_ledger` (what the run has accumulated and
 //! whether an outcome ends it), `quiescence` (why a plan with nothing
 //! dispatchable stops), `tally` (selected-vote submission progress), `policy`
 //! (pacing and failure isolation) and `progress` (driver-level events).
@@ -122,7 +122,7 @@ pub struct RoundRunReport {
     /// To learn what actually happened to bundle `n`, read `plan`: its
     /// `delegation_statuses` entry for that bundle carries the durable phase,
     /// the transaction hash, and whether the submission is terminal. That plan
-    /// is re-read after the wave, so it describes the round this run left.
+    /// is re-read after admitted work drains, so it describes the round this run left.
     /// `chain_outcomes` names what each step saw on the chain, keyed by the
     /// step, which names the bundle.
     pub delegations: Vec<SignedDelegationBundle>,
@@ -143,14 +143,14 @@ pub struct RoundRunReport {
 /// This matters because the signature handoff is round-wide by design: with a
 /// Keystone device the voter signs every bundle before any of them is
 /// broadcast, so the driver reports every bundle still owing a stored
-/// signature rather than one wave's worth at a time. It can only know the mode
+/// signature rather than one admission group's worth at a time. It can only know the mode
 /// of bundles it has admitted, and it takes those as speaking for the round.
 /// A source that answered `Keystone(Stored)` for one bundle and a
 /// self-signing mode for another it had not yet been asked about would be told
 /// to store a signature for a bundle that never needed one, and the run would
 /// not progress until it did.
 ///
-/// Within a single wave the driver does not rely on that: a bundle whose own
+/// Within one admission pass the driver does not rely on that: a bundle whose own
 /// admitted context signs during its step is never reported as owing stored
 /// material.
 pub trait RoundHostSource: Send + Sync {
