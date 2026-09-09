@@ -15,6 +15,7 @@ pub(crate) use classification::{
     step_attribution, step_result_outcome, voting_error_kind,
 };
 mod scope;
+pub(crate) use scope::ObservationStage;
 mod types;
 
 // Public only because the defaulted DelegationDriver extension hooks accept it.

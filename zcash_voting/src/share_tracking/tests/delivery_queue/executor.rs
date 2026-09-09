@@ -60,7 +60,7 @@ async fn round_driver_refills_across_confirmed_members_and_retains_every_report(
     assert_eq!(report.chain_outcomes.len(), 1);
     assert_eq!(transport.completed.lock().unwrap().last(), Some(&(1, 0)));
     assert_eq!(transport.count(), SHARE_COUNT * 2);
-    assert!(transport.peak.load(Ordering::SeqCst) <= 16);
+    assert!(transport.peak.load(Ordering::SeqCst) <= 32);
 }
 
 #[tokio::test(start_paused = true)]

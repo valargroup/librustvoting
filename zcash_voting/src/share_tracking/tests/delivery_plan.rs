@@ -9,22 +9,19 @@ use crate::{
 static GLOBAL_BATCH_LIMIT_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// A full commitment offers 160 POSTs, so the transport must queue requests above 128.
+/// Sixteen shares with eight targets exactly fill the 128-unit admission budget.
 #[tokio::test(start_paused = true)]
 async fn full_commitment_reaches_but_never_exceeds_128_posts() {
     let _global_limit_guard = GLOBAL_BATCH_LIMIT_TEST_LOCK.lock().await;
     let db = db_with_unique_recoverable_vote();
     set_recovery_share_count(&db, 16);
-    let configured = helpers(20);
+    let configured = helpers(16);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
     let vote = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let plan = vote
         .prepare_share_delivery(&db, planning_params(&fleet))
         .unwrap();
-    assert!(plan
-        .share_plans
-        .iter()
-        .all(|share| share.target_count == 10));
+    assert!(plan.share_plans.iter().all(|share| share.target_count == 8));
     let transport = Arc::new(MockTransport::default());
     for helper in &configured {
         for _ in 0..16 {
@@ -45,10 +42,10 @@ async fn full_commitment_reaches_but_never_exceeds_128_posts() {
         .await
         .unwrap();
     assert_eq!(transport.peak_posts_in_flight(), 128);
-    assert_eq!(transport.call_count("/shares"), 160);
+    assert_eq!(transport.call_count("/shares"), 128);
     assert_eq!(report.deliveries.len(), 16);
     assert!(report.deliveries.iter().all(|delivery| {
-        delivery.submission.accepted_urls.len() == 10
+        delivery.submission.accepted_urls.len() == 8
             && delivery.submission.ambiguous_urls.is_empty()
     }));
     assert!(share::list(&db, ROUND_ID)
@@ -1344,13 +1341,16 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
 }
 
 #[tokio::test(start_paused = true)]
-async fn share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares() {
+async fn share_task_ceiling_is_thirty_two_and_queued_cancellation_returns_pending_shares() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let _global_limit_guard = GLOBAL_BATCH_LIMIT_TEST_LOCK.lock().await;
     let saturating_db = db_with_unique_recoverable_vote();
     set_recovery_share_count(&saturating_db, 16);
     let saturating = crate::vote::CommittedVote::recover(&saturating_db, ROUND_ID, 0, 1).unwrap();
+    let second_db = db_with_unique_recoverable_vote();
+    set_recovery_share_count(&second_db, 16);
+    let second = crate::vote::CommittedVote::recover(&second_db, ROUND_ID, 0, 1).unwrap();
     let queued_db = db_with_unique_recoverable_vote();
     let queued = crate::vote::CommittedVote::recover(&queued_db, ROUND_ID, 0, 1).unwrap();
     let configured = vec![helper(1)];
@@ -1358,12 +1358,15 @@ async fn share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_s
     saturating
         .prepare_share_delivery(&saturating_db, planning_params(&fleet))
         .unwrap();
+    second
+        .prepare_share_delivery(&second_db, planning_params(&fleet))
+        .unwrap();
     queued
         .prepare_share_delivery(&queued_db, planning_params(&fleet))
         .unwrap();
     let transport = Arc::new(MockTransport::default());
     let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
-    for _ in 0..16 {
+    for _ in 0..32 {
         transport.queue_post_after(&post_url, Duration::from_secs(1), json_status("queued"));
     }
     let client = client_with(transport.clone());
@@ -1400,10 +1403,10 @@ async fn share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_s
     };
     let never_cancel_saturating = never_cancel();
     let observe_ceiling = async {
-        while transport.call_count("/shares") < 16 {
+        while transport.call_count("/shares") < 32 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(transport.call_count("/shares"), 16);
+        assert_eq!(transport.call_count("/shares"), 32);
         while queued_cancel_checks.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
@@ -1415,9 +1418,15 @@ async fn share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_s
             );
     };
 
-    let (saturating_report, queued_report, ()) = tokio::join!(
+    let (saturating_report, second_report, queued_report, ()) = tokio::join!(
         saturating.submit_prepared_shares_unchecked(
             &saturating_db,
+            &client,
+            submission_params(&configured),
+            &never_cancel_saturating,
+        ),
+        second.submit_prepared_shares_unchecked(
+            &second_db,
             &client,
             submission_params(&configured),
             &never_cancel_saturating,
@@ -1425,6 +1434,7 @@ async fn share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_s
         queued_submission,
         observe_ceiling,
     );
+    assert_eq!(second_report.unwrap().deliveries.len(), 16);
     let saturating_report = saturating_report.unwrap();
     let queued_report = queued_report.unwrap();
 
@@ -1432,7 +1442,7 @@ async fn share_task_ceiling_is_sixteen_and_queued_cancellation_returns_pending_s
     assert!(queued_report.cancelled);
     assert!(queued_report.deliveries.is_empty());
     assert_eq!(queued_report.pending_share_indices, vec![0, 1]);
-    assert_eq!(transport.call_count("/shares"), 16);
+    assert_eq!(transport.call_count("/shares"), 32);
     assert_eq!(
         saturating_report
             .deliveries

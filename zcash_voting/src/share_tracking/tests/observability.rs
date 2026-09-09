@@ -375,6 +375,9 @@ async fn atomic_round_delivery_attributes_every_proposal_share_and_retry() {
         .unwrap();
     assert_eq!(step.attribution.proposal_id, Some(1));
     assert_eq!(step.attribution.share_index, None);
+    assert_eq!(failed.endpoint_index, Some(0));
+    assert_eq!(retried.endpoint_index, Some(0));
+    assert_eq!(retry_wait.endpoint_index, Some(0));
     assert_eq!(failed.attribution, retried.attribution);
     assert_eq!(failed.attempt, Some(1));
     assert_eq!(retried.http_status, Some(200));
@@ -483,4 +486,211 @@ pub(super) fn atomic_delivery_executor(
         hotkey_secret: None,
     })
     .unwrap()
+}
+
+#[tokio::test]
+async fn confirmation_diagnostics_distinguish_quorum_persistence_and_reuse() {
+    for failure in ["none", "stale", "storage"] {
+        let configured = helpers(2);
+        let db = Arc::new(db_with_delivery(&configured, &[], 2));
+        if failure == "storage" {
+            db.conn().execute_batch("CREATE TRIGGER fail_confirmation BEFORE UPDATE OF confirmed ON share_delegations BEGIN SELECT RAISE(FAIL, 'confirmation write failed'); END;").unwrap();
+        }
+        let transport = Arc::new(MockTransport::default());
+        let share_id = share_id_of(&db);
+        for endpoint in &configured {
+            transport.queue_get(
+                &format!("{endpoint}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}"),
+                json_status("confirmed"),
+            );
+        }
+        if failure == "stale" {
+            let db = db.clone();
+            transport.observe_gets(move |_| {
+                db.conn()
+                    .execute(
+                        "UPDATE share_delegations SET nullifier = ?1",
+                        [vec![0xF4; 32]],
+                    )
+                    .unwrap();
+            });
+        }
+        let client = client_with(transport.clone());
+        let params = ShareConfirmationParams {
+            round_id: ROUND_ID,
+            share: ShareKey {
+                bundle_index: 0,
+                proposal_id: 1,
+                share_index: 0,
+            },
+            configured_server_urls: &configured,
+            now_seconds: SUBMIT_AT,
+        };
+        let operation = confirm_pending_share_with_report(
+            &db,
+            &params,
+            &client,
+            &never_cancel(),
+            Some(ObservabilityOptions::default()),
+        )
+        .await;
+        let diagnostics = operation.observability.unwrap();
+        let stage = |name: &str| {
+            diagnostics
+                .records
+                .iter()
+                .find(|record| record.stage.as_ref() == name)
+                .unwrap()
+        };
+        assert_eq!(
+            stage("helper::confirmation_quorum").outcome,
+            Outcome::Succeeded
+        );
+        assert_eq!(stage("helper::share_lock_wait").outcome, Outcome::Succeeded);
+        let expected = match failure {
+            "none" => Outcome::Succeeded,
+            "stale" => Outcome::Pending,
+            _ => Outcome::Failed,
+        };
+        assert_eq!(stage("helper::persist_confirmation").outcome, expected);
+        assert_eq!(diagnostics.outcome, expected);
+        if failure == "storage" {
+            assert!(operation.result.is_err());
+        } else {
+            assert_eq!(operation.result.unwrap().confirmed, failure == "none");
+        }
+        assert_eq!(only_share(&db).confirmed, failure == "none");
+        if failure == "none" {
+            let reused = confirm_pending_share_with_report(
+                &db,
+                &params,
+                &client,
+                &never_cancel(),
+                Some(ObservabilityOptions::default()),
+            )
+            .await;
+            assert!(reused.result.unwrap().confirmed);
+            let records = reused.observability.unwrap().records;
+            assert!(records.iter().any(|record| record.stage.as_ref()
+                == "helper::confirmation_reused"
+                && record.outcome == Outcome::Reused));
+            assert!(!records
+                .iter()
+                .any(|record| record.stage.as_ref() == "helper::confirmation_quorum"));
+            assert_eq!(transport.call_count("/share-status/"), 2);
+        }
+    }
+}
+
+#[tokio::test]
+async fn status_endpoint_ordinals_survive_health_order_and_keep_pending_semantics() {
+    let configured = helpers(5);
+    let db = db_with_delivery(&configured, &[], 3);
+    let transport = Arc::new(MockTransport::default());
+    let share_id = share_id_of(&db);
+    for endpoint in &configured {
+        transport.queue_get(
+            &format!("{endpoint}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}"),
+            json_status("pending"),
+        );
+    }
+    let client = client_with(transport.clone());
+    for _ in 0..3 {
+        client.health().record_failure(&configured[0], SUBMIT_AT);
+    }
+    let operation = confirm_pending_share_with_report(
+        &db,
+        &ShareConfirmationParams {
+            round_id: ROUND_ID,
+            share: ShareKey {
+                bundle_index: 0,
+                proposal_id: 1,
+                share_index: 0,
+            },
+            configured_server_urls: &configured,
+            now_seconds: SUBMIT_AT,
+        },
+        &client,
+        &never_cancel(),
+        Some(ObservabilityOptions::default()),
+    )
+    .await;
+    assert!(!operation.result.unwrap().confirmed);
+    let diagnostics = operation.observability.unwrap();
+    let status = diagnostics
+        .records
+        .iter()
+        .filter(|record| record.stage.as_ref() == "helper::share_status")
+        .collect::<Vec<_>>();
+    assert_eq!(status.len(), 5);
+    assert_eq!(status.first().unwrap().endpoint_index, Some(1));
+    assert_eq!(status.last().unwrap().endpoint_index, Some(0));
+    assert!(status
+        .iter()
+        .all(|record| record.outcome == Outcome::Pending));
+    assert_eq!(
+        status
+            .iter()
+            .map(|record| record.endpoint_index.unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        (0..5).collect()
+    );
+    assert!(!diagnostics
+        .records
+        .iter()
+        .any(|record| record.stage.as_ref() == "helper::persist_confirmation"));
+    assert!(diagnostics
+        .records
+        .iter()
+        .filter(|record| record.stage.as_ref() == "helper.http.get")
+        .all(|record| record.endpoint_index.is_some()));
+}
+
+#[tokio::test]
+async fn cancelled_confirmation_reports_lock_wait_without_polling() {
+    let configured = helpers(2);
+    let db = db_with_delivery(&configured, &[], 2);
+    let scope = share::ShareOperationScope::capture(&db);
+    let _guard = lock_share_operation(&scope, ROUND_ID, 0, 1, 0)
+        .await
+        .unwrap();
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let cancel = || cancelled.load(std::sync::atomic::Ordering::SeqCst);
+    let params = ShareConfirmationParams {
+        round_id: ROUND_ID,
+        share: ShareKey {
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+        },
+        configured_server_urls: &configured,
+        now_seconds: SUBMIT_AT,
+    };
+    let interrupt = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+    let (operation, ()) = tokio::join!(
+        confirm_pending_share_with_report(
+            &db,
+            &params,
+            &client,
+            &cancel,
+            Some(ObservabilityOptions::default())
+        ),
+        interrupt,
+    );
+    assert!(operation.result.unwrap().cancelled);
+    let diagnostics = operation.observability.unwrap();
+    let lock = diagnostics
+        .records
+        .iter()
+        .find(|record| record.stage.as_ref() == "helper::share_lock_wait")
+        .unwrap();
+    assert_eq!(lock.outcome, Outcome::Cancelled);
+    assert!(lock.elapsed_us >= 10_000);
+    assert!(transport.calls().is_empty());
+    assert!(!only_share(&db).confirmed);
 }

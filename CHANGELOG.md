@@ -10,6 +10,17 @@ This release is `zcash_voting` 4.0.0.
 
 ### Fixed
 
+- Raise the continuous helper queue to up to 32 process-wide active share deliveries,
+  weighting admission by planned helper fan-out so queued shares do not exhaust
+  their delivery deadlines behind other queued shares. Retain the independent
+  128 initial-POST ceiling and existing placement, timeout, cancellation, and
+  recovery behavior.
+
+- Helper diagnostics distinguish queue residence, active delivery, permit/lock
+  waits, parsed acceptance, durable acceptance, confirmation quorum and persistence,
+  and tracking cadence. Configured endpoint ordinals survive health reordering
+  and retries; the benchmark guide documents client/server correlation limits.
+
 - Preserve combined-vote recovery records when upgrading version-22 preview
   databases, including previews missing the delegation PCZT column. Unknown
   preview schemas fail without changing stored state.

@@ -24,6 +24,8 @@ struct ShareJob<'a> {
     proposal_position: usize,
     payload_position: usize,
     prepared: Arc<PreparedVoteDelivery<'a>>,
+    observations: crate::ObservationScope,
+    queued: crate::observability::ObservationStage,
 }
 
 /// Attribution retained when a share finishes ahead of earlier queue entries.
@@ -35,16 +37,32 @@ struct ShareJobCompletion {
 
 impl ShareJob<'_> {
     async fn deliver(
-        &self,
+        self,
         db: &VotingDb,
         client: &HelperClient,
         scope: &ShareOperationScope,
         params: &ShareDeliverySubmissionParams<'_>,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> ShareResult {
-        let Some(_permit) = capacity::acquire(cancel).await? else {
+        let planned_target = self.prepared.plan.share_plans[self.payload_position].target_count;
+        let admission = capacity::acquire(planned_target, cancel).await;
+        self.queued.finish(
+            match &admission {
+                Ok(Some(_)) => crate::ObservationOutcome::Succeeded,
+                Ok(None) => crate::ObservationOutcome::Cancelled,
+                Err(_) => crate::ObservationOutcome::Failed,
+            },
+            admission
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        let Some(_permit) = admission? else {
             return Ok(None);
         };
+        let active = self.observations.stage("helper::active_delivery");
+        let observed_client = client.observing(active.scope());
+        let client = &observed_client;
         let vote = self.prepared.vote;
         let share_index = vote.commit.share_payloads[self.payload_position]
             .enc_share
@@ -64,11 +82,26 @@ impl ShareJob<'_> {
                 scope,
                 cancel,
             )
-            .await?;
-        Ok(Some(ShareDeliveryOutcome {
-            share_index,
-            submission,
-        }))
+            .await;
+        let outcome = match &submission {
+            Err(_) => crate::ObservationOutcome::Failed,
+            Ok(report) if !report.accepted_urls.is_empty() => crate::ObservationOutcome::Succeeded,
+            Ok(report) if !report.ambiguous_urls.is_empty() => crate::ObservationOutcome::Pending,
+            Ok(_) => crate::ObservationOutcome::Failed,
+        };
+        active.finish(
+            outcome,
+            submission
+                .as_ref()
+                .err()
+                .map(crate::observability::voting_error_kind),
+        );
+        submission.map(|submission| {
+            Some(ShareDeliveryOutcome {
+                share_index,
+                submission,
+            })
+        })
     }
 }
 
@@ -93,10 +126,27 @@ pub(in crate::vote) async fn submit_votes<'a>(
         .enumerate()
         .flat_map(|(proposal_position, proposal)| {
             proposal.prepared.iter().flat_map(move |prepared| {
-                (0..prepared.plan.share_plans.len()).map(move |payload_position| ShareJob {
-                    proposal_position,
-                    payload_position,
-                    prepared: Arc::clone(prepared),
+                (0..prepared.plan.share_plans.len()).map(move |payload_position| {
+                    let observations =
+                        client
+                            .observation_scope()
+                            .attributed(crate::ObservationAttribution {
+                                bundle_index: Some(prepared.vote.bundle_index()),
+                                proposal_id: Some(prepared.vote.proposal_id()),
+                                share_index: Some(
+                                    prepared.vote.commit.share_payloads[payload_position]
+                                        .enc_share
+                                        .share_index,
+                                ),
+                            });
+                    let queued = observations.stage("helper::delivery_queue_wait");
+                    ShareJob {
+                        proposal_position,
+                        payload_position,
+                        prepared: Arc::clone(prepared),
+                        observations,
+                        queued,
+                    }
                 })
             })
         })
@@ -144,10 +194,12 @@ async fn run_job(
     params: &ShareDeliverySubmissionParams<'_>,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> ShareJobCompletion {
+    let proposal_position = job.proposal_position;
+    let payload_position = job.payload_position;
     let delivery = job.deliver(db, client, scope, params, cancel).await;
     ShareJobCompletion {
-        proposal_position: job.proposal_position,
-        payload_position: job.payload_position,
+        proposal_position,
+        payload_position,
         delivery,
     }
 }

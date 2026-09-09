@@ -18,7 +18,19 @@ impl Fixture {
         Self::seed(db, proposals)
     }
 
+    pub fn with_helpers(proposals: u32, helper_count: usize) -> Self {
+        Self::seed_with_helpers(
+            Arc::new(VotingDb::open_in_memory().unwrap()),
+            proposals,
+            helper_count,
+        )
+    }
+
     pub fn seed(db: Arc<VotingDb>, proposals: u32) -> Self {
+        Self::seed_with_helpers(db, proposals, 1)
+    }
+
+    fn seed_with_helpers(db: Arc<VotingDb>, proposals: u32, helper_count: usize) -> Self {
         static WALLET: AtomicUsize = AtomicUsize::new(0);
         db.set_wallet_id(&format!(
             "delivery-queue-{}",
@@ -31,7 +43,7 @@ impl Fixture {
             recovery.vote_commitment = field_bytes(proposal as u8 + 30);
             super::super::observability::store_recovery(&db, &recovery, true);
         }
-        let configured = helpers(1);
+        let configured = helpers(helper_count);
         let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
         let roster = (1..=proposals).collect::<Vec<_>>();
         let votes = roster

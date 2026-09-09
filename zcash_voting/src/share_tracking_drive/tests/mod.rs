@@ -8,6 +8,7 @@
 
 mod admission;
 mod fixtures;
+mod observability;
 mod pacing;
 mod partial_progress;
 mod stopping;

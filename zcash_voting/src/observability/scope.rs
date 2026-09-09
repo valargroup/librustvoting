@@ -23,6 +23,8 @@ pub struct ObservationScope {
     parent_id: Option<u64>,
     attribution: ObservationAttribution,
     attempt: Option<u32>,
+    endpoint_index: Option<u32>,
+    configured_helpers: Option<Arc<[String]>>,
 }
 
 impl std::fmt::Debug for ObservationScope {
@@ -43,6 +45,8 @@ impl ObservationScope {
             parent_id: None,
             attribution: ObservationAttribution::default(),
             attempt: None,
+            endpoint_index: None,
+            configured_helpers: None,
         }
     }
 
@@ -136,6 +140,31 @@ impl ObservationScope {
         }
     }
 
+    /// Retains the validated fleet's original order only while collecting.
+    /// URLs stay private; snapshots carry only zero-based ordinals.
+    pub(crate) fn with_helper_fleet(&self, canonical_urls: &[String]) -> Self {
+        Self {
+            configured_helpers: self.collector.as_ref().map(|_| Arc::from(canonical_urls)),
+            endpoint_index: None,
+            ..self.clone()
+        }
+    }
+
+    /// Binds one helper without inheriting another request's endpoint identity.
+    pub(crate) fn for_helper(&self, server_url: &str) -> Self {
+        let endpoint_index = self.configured_helpers.as_ref().and_then(|configured| {
+            let canonical = crate::helper::url::canonicalize_helper_base_url(server_url).ok()?;
+            configured
+                .iter()
+                .position(|url| url == &canonical)
+                .and_then(|index| u32::try_from(index).ok())
+        });
+        Self {
+            endpoint_index,
+            ..self.clone()
+        }
+    }
+
     /// Starts an SDK-authored stage. Use static labels, never payload contents.
     pub(crate) fn stage(&self, stage: &'static str) -> ObservationStage {
         let Some(collector) = &self.collector else {
@@ -169,7 +198,7 @@ impl ObservationScope {
             outcome: ObservationOutcome::Unfinished,
             error_kind: None,
             http_status: None,
-            endpoint_index: None,
+            endpoint_index: self.endpoint_index,
             attempt: self.attempt,
         };
         collection.active.insert(id, (stage, record, started));
@@ -339,7 +368,7 @@ impl ObservationStage {
             record.outcome = outcome;
             record.error_kind = error_kind.map(|label| collection.label(label));
             record.http_status = status;
-            record.endpoint_index = endpoint_index;
+            record.endpoint_index = endpoint_index.or(record.endpoint_index);
             collection.retain(self.stage, record);
         }
     }

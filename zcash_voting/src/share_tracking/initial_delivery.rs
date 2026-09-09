@@ -196,6 +196,7 @@ async fn dispatch_share_to_canonical_helpers(
         params.proposal_id,
         params.share_index,
         cancel,
+        &client.observation_scope(),
     )
     .await?
     else {
@@ -308,7 +309,23 @@ async fn dispatch_share_to_canonical_helpers(
         let posts = wave.iter().map(|server_url| async move {
             // Waiting consumes the fan-out budget, but an unsent reservation
             // must remain a definite failure on cancellation or expiry.
-            let _permit = match super::post_capacity::acquire(deadline, cancel).await {
+            let observations = client.observation_scope().for_helper(server_url);
+            let wait = observations.stage("helper::post_capacity_wait");
+            let admission = super::post_capacity::acquire(deadline, cancel).await;
+            wait.finish(
+                match &admission {
+                    Ok(_) => crate::ObservationOutcome::Succeeded,
+                    Err(crate::helper::client::HelperError::Cancelled) => {
+                        crate::ObservationOutcome::Cancelled
+                    }
+                    Err(_) => crate::ObservationOutcome::Failed,
+                },
+                admission
+                    .as_ref()
+                    .err()
+                    .map(crate::observability::helper_error_kind),
+            );
+            let _permit = match admission {
                 Ok(permit) => permit,
                 Err(error) => return Ok(Ok(Err(error))),
             };
@@ -375,15 +392,19 @@ async fn dispatch_share_to_canonical_helpers(
                     deadline_elapsed = true;
                 }
                 Ok(Ok(_)) => {
-                    if !share::resolve_delivery_attempt_for_generation(
-                        db,
-                        &attempt,
-                        generation,
-                        share::ShareDeliveryAttemptOutcome::Accepted,
-                        false,
-                    )? {
-                        return Err(stale_delivery_error(params));
-                    }
+                    let observations = client.observation_scope().for_helper(server_url);
+                    observations.measure("helper::persist_acceptance", || {
+                        if !share::resolve_delivery_attempt_for_generation(
+                            db,
+                            &attempt,
+                            generation,
+                            share::ShareDeliveryAttemptOutcome::Accepted,
+                            false,
+                        )? {
+                            return Err(stale_delivery_error(params));
+                        }
+                        Ok(())
+                    })?;
                     delivery_state.mark_accepted(server_url)?;
                 }
                 Ok(Err(error)) if error.is_ambiguous() => {
@@ -515,6 +536,12 @@ pub(crate) async fn submit_committed_share_to_helpers(
     let observed_client = client.observing(&observations);
     let client = &observed_client;
     let configured = ConfiguredHelperFleet::new(request.configured_server_urls)?;
+    let observed_client = client.observing(
+        &client
+            .observation_scope()
+            .with_helper_fleet(configured.urls()),
+    );
+    let client = &observed_client;
     let planning_fleet = ConfiguredHelperFleet::new(request.planning_server_urls)?;
     let planned = canonical_helper_url_list(&request.plan.target_servers)?;
     if planned.len() != request.plan.target_servers.len() {
