@@ -13,7 +13,9 @@ use zcash_voting::share_policy::{
     VOTE_COMMITMENT_SHARE_COUNT,
 };
 
-use recovery_conformance::helper_fleet::{HelperAvailability, HelperFleetPlan, SYNTHETIC_HELPER_URLS};
+use recovery_conformance::helper_fleet::{
+    HelperAvailability, HelperFleetPlan, SYNTHETIC_HELPER_URLS,
+};
 
 /// The fleet size every scenario is written for.
 const FLEET: usize = 10;
@@ -98,7 +100,11 @@ fn every_synthetic_url_is_already_canonical_and_distinct() {
     let count = canonical.len();
     canonical.sort();
     canonical.dedup();
-    assert_eq!(count, canonical.len(), "two synthetic helpers share an identity");
+    assert_eq!(
+        count,
+        canonical.len(),
+        "two synthetic helpers share an identity"
+    );
 }
 
 #[test]
@@ -106,7 +112,10 @@ fn synthetic_helpers_cannot_accidentally_resolve() {
     // `.invalid` is reserved and never resolves, so a bug in the route wrapper
     // fails as a DNS error rather than by quietly reaching some real host.
     for url in SYNTHETIC_HELPER_URLS {
-        assert!(url.ends_with(".invalid"), "{url} is not in a reserved domain");
+        assert!(
+            url.ends_with(".invalid"),
+            "{url} is not in a reserved domain"
+        );
     }
 }
 
@@ -127,9 +136,12 @@ fn a_plan_with_no_backend_routes_nothing() {
     // where it would fail as a DNS error attributed to the SDK.
     let plan = HelperFleetPlan {
         backend: String::new(),
-        availability: [(SYNTHETIC_HELPER_URLS[0].to_string(), HelperAvailability::Answers)]
-            .into_iter()
-            .collect(),
+        availability: [(
+            SYNTHETIC_HELPER_URLS[0].to_string(),
+            HelperAvailability::Answers,
+        )]
+        .into_iter()
+        .collect(),
     };
     assert_eq!(plan.resolve(SYNTHETIC_HELPER_URLS[0]), None);
 }
@@ -166,13 +178,21 @@ fn configured_order_follows_the_fleet_rather_than_the_map() {
 fn availability_is_named_by_url_rather_than_by_index() {
     // So flipping a fleet reads as a statement about which helpers are up, and
     // cannot silently shift by one.
-    let plan = HelperFleetPlan::all_answering(BACKEND, FLEET)
-        .with(&SYNTHETIC_HELPER_URLS[..5], HelperAvailability::NeverAnswers);
+    let plan = HelperFleetPlan::all_answering(BACKEND, FLEET).with(
+        &SYNTHETIC_HELPER_URLS[..5],
+        HelperAvailability::NeverAnswers,
+    );
     for url in &SYNTHETIC_HELPER_URLS[..5] {
-        assert_eq!(plan.resolve(url).map(|(_, a)| a), Some(HelperAvailability::NeverAnswers));
+        assert_eq!(
+            plan.resolve(url).map(|(_, a)| a),
+            Some(HelperAvailability::NeverAnswers)
+        );
     }
     for url in &SYNTHETIC_HELPER_URLS[5..] {
-        assert_eq!(plan.resolve(url).map(|(_, a)| a), Some(HelperAvailability::Answers));
+        assert_eq!(
+            plan.resolve(url).map(|(_, a)| a),
+            Some(HelperAvailability::Answers)
+        );
     }
 }
 
@@ -184,7 +204,10 @@ fn an_answering_helper_keeps_its_path_when_it_is_routed() {
         plan.route_to_backend(&requested),
         Some(format!("{BACKEND}/shielded-vote/v1/shares"))
     );
-    let status = format!("{}/shielded-vote/v1/share-status/ab/cd", SYNTHETIC_HELPER_URLS[9]);
+    let status = format!(
+        "{}/shielded-vote/v1/share-status/ab/cd",
+        SYNTHETIC_HELPER_URLS[9]
+    );
     assert_eq!(
         plan.route_to_backend(&status),
         Some(format!("{BACKEND}/shielded-vote/v1/share-status/ab/cd"))
@@ -195,7 +218,10 @@ fn an_answering_helper_keeps_its_path_when_it_is_routed() {
 fn a_trailing_slash_on_the_backend_does_not_double_up() {
     let plan = HelperFleetPlan::all_answering(format!("{BACKEND}/"), 1);
     assert_eq!(
-        plan.route_to_backend(&format!("{}/shielded-vote/v1/shares", SYNTHETIC_HELPER_URLS[0])),
+        plan.route_to_backend(&format!(
+            "{}/shielded-vote/v1/shares",
+            SYNTHETIC_HELPER_URLS[0]
+        )),
         Some(format!("{BACKEND}/shielded-vote/v1/shares"))
     );
 }
@@ -241,7 +267,10 @@ fn every_scenario_has_a_distinct_name_that_round_trips() {
     assert_eq!(names.len(), count, "two scenarios share a name");
 
     for scenario in FleetScenario::ALL {
-        assert_eq!(scenario.name().parse::<FleetScenario>().ok(), Some(*scenario));
+        assert_eq!(
+            scenario.name().parse::<FleetScenario>().ok(),
+            Some(*scenario)
+        );
     }
 }
 
@@ -281,7 +310,10 @@ fn a_flip_scenario_is_cut_short_after_an_acceptance_not_before_one() {
     // behind. `AfterSharePost` fires before anything is accepted, which was
     // observed live: 730 placements on the second half, zero on the first,
     // making "those acceptances survive the flip" a claim about an empty set.
-    for scenario in [FleetScenario::HalfThenOtherHalf, FleetScenario::SilentHelpers] {
+    for scenario in [
+        FleetScenario::HalfThenOtherHalf,
+        FleetScenario::SilentHelpers,
+    ] {
         assert_eq!(
             scenario.crash_stage(),
             Some(CrashStage::AfterShareAccepted),
@@ -380,9 +412,7 @@ fn a_contracted_fleet_is_smaller_rather_than_unreachable() {
         contracted
             .configured_urls()
             .iter()
-            .all(|url| contracted
-                .resolve(url)
-                .is_some_and(|(_, a)| a.can_accept())),
+            .all(|url| contracted.resolve(url).is_some_and(|(_, a)| a.can_accept())),
         "a contracted fleet's remaining helpers are all reachable"
     );
     assert!(
@@ -403,10 +433,7 @@ fn only_the_silent_scenario_leaves_an_unknown_outcome() {
     // A refusal is definite, so a scenario built only from refusals leaves
     // nothing ambiguous behind.
     let plan = FleetScenario::WholeFleetDown.first_fleet(BACKEND);
-    assert!(plan
-        .configured_urls()
-        .iter()
-        .all(|url| !plan
-            .resolve(url)
-            .is_some_and(|(_, a)| a.leaves_outcome_unknown())));
+    assert!(plan.configured_urls().iter().all(|url| !plan
+        .resolve(url)
+        .is_some_and(|(_, a)| a.leaves_outcome_unknown())));
 }

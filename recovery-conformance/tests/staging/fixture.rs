@@ -14,11 +14,11 @@
 
 use std::path::{Path, PathBuf};
 
+use recovery_conformance::assertions::DurableSnapshot;
+use recovery_conformance::child::run_to_quiescence;
 use recovery_conformance::environment::{
     Environment, LIGHTWALLETD_URLS, STAGING_CHAIN_ID, STAGING_CHAIN_RPC, ZCASH_NETWORK,
 };
-use recovery_conformance::assertions::DurableSnapshot;
-use recovery_conformance::child::run_to_quiescence;
 use recovery_conformance::helper_fleet::HelperFleetPlan;
 use recovery_conformance::provisioning::{provision_active_round, ChainTarget, VoteManagerKeyring};
 use recovery_conformance::round_run::{default_target, endpoints_with_fleet};
@@ -291,7 +291,6 @@ pub async fn fetch_deployment() -> anyhow::Result<StageDeployment> {
     Ok(StageDeployment::from_json(&output.stdout)?)
 }
 
-
 /// The faults one run is configured with.
 ///
 /// Grouped rather than passed as two arguments so a call site reads as "this
@@ -379,7 +378,14 @@ pub async fn build_control(
     let round = provision(fixture).await?;
     let sidecar = fixture.workspace.join("control.db");
     let _ = std::fs::remove_file(&sidecar);
-    let config = config_for(fixture, &sidecar, &round, RunMode::Unarmed, max_dispatches, faults);
+    let config = config_for(
+        fixture,
+        &sidecar,
+        &round,
+        RunMode::Unarmed,
+        max_dispatches,
+        faults,
+    );
     let outcome = run_to_quiescence(&fixture.worker, &config);
     // Before the outcome is judged: a run that failed still fetched whatever
     // PIR proofs it got through, and those are exactly what the next run needs

@@ -1019,7 +1019,10 @@ pub fn assert_every_share_is_confirmed(snapshot: &DurableSnapshot) -> Result<()>
 /// in the fleet's effective redundancy stays visible even though no rule names
 /// it.
 pub fn placement_spread(snapshot: &DurableSnapshot) -> (usize, usize) {
-    let counts = snapshot.deliveries.iter().map(|delivery| delivery.sent.len());
+    let counts = snapshot
+        .deliveries
+        .iter()
+        .map(|delivery| delivery.sent.len());
     let least = counts.clone().min().unwrap_or_default();
     let most = counts.max().unwrap_or_default();
     (least, most)
@@ -1189,14 +1192,23 @@ pub fn assert_the_stall_fired(
         "{target} never stopped answering; the run made no request of that class, so its \
          crash seam has stopped firing rather than the SDK having handled a hang. Recorded \
          instead: {:?}",
-        records.iter().map(|record| &record.target).collect::<Vec<_>>()
+        records
+            .iter()
+            .map(|record| &record.target)
+            .collect::<Vec<_>>()
     );
     let after_dispatch = point == crate::stall::StallPoint::AfterDispatch;
     anyhow::ensure!(
-        matching.iter().all(|record| record.after_dispatch == after_dispatch),
+        matching
+            .iter()
+            .all(|record| record.after_dispatch == after_dispatch),
         "{target} hung at the wrong point: asked for {point:?}, and the dispatch hook \
          {} fired",
-        if after_dispatch { "never" } else { "nonetheless" }
+        if after_dispatch {
+            "never"
+        } else {
+            "nonetheless"
+        }
     );
     Ok(())
 }

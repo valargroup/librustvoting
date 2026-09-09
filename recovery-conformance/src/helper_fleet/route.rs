@@ -60,8 +60,9 @@ impl<R: RouteHttp> RouteHttp for HelperFleetRoute<R> {
                 // failure and try another helper with no ambiguity to carry,
                 // which is exactly what a refused connection means.
                 if delivering {
-                    self.log
-                        .record(&Observation::HelperRefused { url: helper.clone() });
+                    self.log.record(&Observation::HelperRefused {
+                        url: helper.clone(),
+                    });
                 }
                 Box::pin(async move {
                     Err(RouteError::before_dispatch(format!(

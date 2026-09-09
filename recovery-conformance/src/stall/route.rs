@@ -32,7 +32,12 @@ pub struct StallingRoute<R> {
 
 impl<R> StallingRoute<R> {
     /// Wraps `inner`, arming it for whatever `plan` names.
-    pub fn new(inner: R, plan: StallPlan, classifier: RequestClassifier, log: Arc<CrashLog>) -> Self {
+    pub fn new(
+        inner: R,
+        plan: StallPlan,
+        classifier: RequestClassifier,
+        log: Arc<CrashLog>,
+    ) -> Self {
         Self {
             inner,
             plan,

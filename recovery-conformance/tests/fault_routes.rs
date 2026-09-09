@@ -118,7 +118,12 @@ fn still_hanging(future: impl std::future::Future) -> bool {
 fn an_unarmed_stall_route_delegates_everything() {
     // What keeps a control run and a stalled run on one code path.
     let (log, _path) = log("unarmed");
-    let route = StallingRoute::new(RecordingRoute::sharing(&Recorded::default()), StallPlan::none(), classifier(), log);
+    let route = StallingRoute::new(
+        RecordingRoute::sharing(&Recorded::default()),
+        StallPlan::none(),
+        classifier(),
+        log,
+    );
     let url = format!("https://helper.example{SHARES}");
     let response = runtime().block_on(route.execute(request(Method::POST, &url), &|| {}));
     assert_eq!(response.unwrap().status, 200);
@@ -160,7 +165,9 @@ fn the_stall_is_recorded_before_the_hang_begins() {
         log,
     );
     let url = format!("https://helper.example{SHARES}");
-    assert!(still_hanging(route.execute(request(Method::POST, &url), &|| {})));
+    assert!(still_hanging(
+        route.execute(request(Method::POST, &url), &|| {})
+    ));
 
     let records = StallRecord::from_observations(&CrashLog::read(&path).unwrap());
     assert_eq!(records.len(), 1);
@@ -191,7 +198,9 @@ fn a_before_dispatch_stall_leaves_the_hook_unfired() {
     let hook = move || {
         counter.fetch_add(1, Ordering::Relaxed);
     };
-    assert!(still_hanging(route.execute(request(Method::POST, &url), &hook)));
+    assert!(still_hanging(
+        route.execute(request(Method::POST, &url), &hook)
+    ));
     assert_eq!(fired.load(Ordering::Relaxed), 0);
 }
 
@@ -210,7 +219,9 @@ fn an_after_dispatch_stall_fires_the_hook_first() {
     let hook = move || {
         counter.fetch_add(1, Ordering::Relaxed);
     };
-    assert!(still_hanging(route.execute(request(Method::POST, &url), &hook)));
+    assert!(still_hanging(
+        route.execute(request(Method::POST, &url), &hook)
+    ));
     assert_eq!(
         fired.load(Ordering::Relaxed),
         1,
@@ -242,7 +253,11 @@ fn a_lightwalletd_plan_arms_no_route_wrapper() {
 fn an_empty_fleet_plan_touches_nothing() {
     let (log, _path) = log("empty-fleet");
     let inner = Recorded::default();
-    let route = HelperFleetRoute::new(RecordingRoute::sharing(&inner), HelperFleetPlan::none(), log);
+    let route = HelperFleetRoute::new(
+        RecordingRoute::sharing(&inner),
+        HelperFleetPlan::none(),
+        log,
+    );
     let url = format!("{}{SHARES}", SYNTHETIC_HELPER_URLS[0]);
     let _ = runtime().block_on(route.execute(request(Method::POST, &url), &|| {}));
     assert_eq!(inner.urls(), vec![url]);
@@ -279,7 +294,10 @@ fn a_refusing_helper_fails_before_dispatch_and_never_reaches_the_network() {
         .block_on(route.execute(request(Method::POST, &url), &|| {}))
         .expect_err("a refusing helper must not answer");
     assert_eq!(error.phase, RoutePhase::BeforeDispatch);
-    assert!(inner.urls().is_empty(), "a refused request must not be sent");
+    assert!(
+        inner.urls().is_empty(),
+        "a refused request must not be sent"
+    );
 
     let contacts = HelperContacts::from_observations(&CrashLog::read(&path).unwrap());
     assert_eq!(
@@ -293,11 +311,15 @@ fn a_refusing_helper_fails_before_dispatch_and_never_reaches_the_network() {
 fn a_silent_helper_never_answers_and_says_so_in_the_log() {
     let (log, path) = log("silent");
     let inner = Recorded::default();
-    let plan = HelperFleetPlan::all_answering(BACKEND, 10)
-        .with(&SYNTHETIC_HELPER_URLS[..1], HelperAvailability::NeverAnswers);
+    let plan = HelperFleetPlan::all_answering(BACKEND, 10).with(
+        &SYNTHETIC_HELPER_URLS[..1],
+        HelperAvailability::NeverAnswers,
+    );
     let route = HelperFleetRoute::new(RecordingRoute::sharing(&inner), plan, log);
     let url = format!("{}{SHARES}", SYNTHETIC_HELPER_URLS[0]);
-    assert!(still_hanging(route.execute(request(Method::POST, &url), &|| {})));
+    assert!(still_hanging(
+        route.execute(request(Method::POST, &url), &|| {})
+    ));
 
     let contacts = HelperContacts::from_observations(&CrashLog::read(&path).unwrap());
     assert_eq!(
@@ -372,5 +394,7 @@ fn the_two_wrappers_compose_the_way_a_run_stacks_them() {
         log,
     );
     let url = format!("{}{SHARES}", SYNTHETIC_HELPER_URLS[2]);
-    assert!(still_hanging(route.execute(request(Method::POST, &url), &|| {})));
+    assert!(still_hanging(
+        route.execute(request(Method::POST, &url), &|| {})
+    ));
 }

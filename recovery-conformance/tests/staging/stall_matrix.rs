@@ -159,7 +159,9 @@ async fn drive(fixture: Fixture) -> Report {
         let round = match provision(&fixture).await {
             Ok(round) => round,
             Err(error) => {
-                report.skipped.push((target, format!("no round: {error:#}")));
+                report
+                    .skipped
+                    .push((target, format!("no round: {error:#}")));
                 continue;
             }
         };
@@ -200,7 +202,9 @@ async fn exercise(
     round: &fixture::ProvisionedRound,
     control: &DurableSnapshot,
 ) -> Result<(), Outcome> {
-    let sidecar = fixture.workspace.join(format!("stall-{}.db", target.name()));
+    let sidecar = fixture
+        .workspace
+        .join(format!("stall-{}.db", target.name()));
     let _ = std::fs::remove_file(&sidecar);
 
     // After dispatch wherever the class can carry a submission, because that is
@@ -267,8 +271,13 @@ async fn exercise(
         .map_err(|error| Outcome::Failed(format!("unreadable sidecar: {error:#}")))?;
     assert_a_stalled_submission_survived(&after_stall, target, point)
         .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
-    deterministic_plan(&sidecar, &fixture_account(), &round.round_id, &proposal_ids())
-        .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+    deterministic_plan(
+        &sidecar,
+        &fixture_account(),
+        &round.round_id,
+        &proposal_ids(),
+    )
+    .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
 
     // (4) the round converges once the endpoint answers again
     let resumed = config_for(
@@ -310,10 +319,16 @@ async fn exercise(
         after_stall.total_reservations(),
         terminal.total_reservations()
     );
-    assert_matches_control(&terminal, control).map_err(|error| Outcome::Failed(format!("{error:#}")))?;
-
-    let settled = deterministic_plan(&sidecar, &fixture_account(), &round.round_id, &proposal_ids())
+    assert_matches_control(&terminal, control)
         .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
+
+    let settled = deterministic_plan(
+        &sidecar,
+        &fixture_account(),
+        &round.round_id,
+        &proposal_ids(),
+    )
+    .map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     assert_idempotent(&settled).map_err(|error| Outcome::Failed(format!("{error:#}")))?;
     Ok(())
 }

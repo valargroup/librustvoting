@@ -127,9 +127,7 @@ impl FleetScenario {
             // the flip" a claim about an empty set. Observed live — a run cut
             // short at the POST placed 730 shares on the second half and zero
             // on the first.
-            Self::HalfThenOtherHalf | Self::SilentHelpers => {
-                Some(CrashStage::AfterShareAccepted)
-            }
+            Self::HalfThenOtherHalf | Self::SilentHelpers => Some(CrashStage::AfterShareAccepted),
             // Nothing can be delivered at all here, so the outstanding work is
             // guaranteed without killing anything.
             Self::WholeFleetDown => None,
@@ -169,12 +167,19 @@ impl FleetScenario {
         let all = HelperFleetPlan::all_answering(backend, SYNTHETIC_HELPER_URLS.len());
         match self {
             Self::FullFleetThenCrash | Self::FleetContractsThenGrows => all,
-            Self::HalfThenOtherHalf => {
-                all.with(&SYNTHETIC_HELPER_URLS[FIRST_HALF..], HelperAvailability::Refuses)
-            }
+            Self::HalfThenOtherHalf => all.with(
+                &SYNTHETIC_HELPER_URLS[FIRST_HALF..],
+                HelperAvailability::Refuses,
+            ),
             Self::SilentHelpers => all
-                .with(&SYNTHETIC_HELPER_URLS[FIRST_HALF..], HelperAvailability::Refuses)
-                .with(&SYNTHETIC_HELPER_URLS[SILENT], HelperAvailability::NeverAnswers),
+                .with(
+                    &SYNTHETIC_HELPER_URLS[FIRST_HALF..],
+                    HelperAvailability::Refuses,
+                )
+                .with(
+                    &SYNTHETIC_HELPER_URLS[SILENT],
+                    HelperAvailability::NeverAnswers,
+                ),
             Self::WholeFleetDown => all.with(SYNTHETIC_HELPER_URLS, HelperAvailability::Refuses),
         }
     }
@@ -184,9 +189,10 @@ impl FleetScenario {
         let all = HelperFleetPlan::all_answering(backend, SYNTHETIC_HELPER_URLS.len());
         match self {
             Self::FullFleetThenCrash | Self::WholeFleetDown | Self::SilentHelpers => all,
-            Self::HalfThenOtherHalf => {
-                all.with(&SYNTHETIC_HELPER_URLS[..FIRST_HALF], HelperAvailability::Refuses)
-            }
+            Self::HalfThenOtherHalf => all.with(
+                &SYNTHETIC_HELPER_URLS[..FIRST_HALF],
+                HelperAvailability::Refuses,
+            ),
             // A smaller *configured* fleet, not an unreachable one. The helpers
             // it drops are gone from the host's configuration entirely, which
             // is what makes this contraction rather than an outage.

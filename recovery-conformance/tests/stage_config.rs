@@ -138,7 +138,8 @@ fn a_fleet_plan_replaces_the_configured_helpers_entirely() {
     // degenerate case it exists to escape.
     let deployment = StageDeployment::from_json(STAGE_EXCERPT.as_bytes()).unwrap();
     let backend = helper_backend(&deployment);
-    let endpoints = endpoints_with_fleet(&deployment, &HelperFleetPlan::all_answering(&backend, 10));
+    let endpoints =
+        endpoints_with_fleet(&deployment, &HelperFleetPlan::all_answering(&backend, 10));
 
     assert_eq!(endpoints.helper_urls.len(), 10);
     assert_eq!(endpoints.helper_urls, SYNTHETIC_HELPER_URLS.to_vec());

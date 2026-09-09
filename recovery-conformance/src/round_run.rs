@@ -616,7 +616,9 @@ async fn recover_pending_shares(
 }
 
 /// Flattens one `(share, helper)` pair for the parent.
-fn delivery_record(resubmitted: &zcash_voting::share_tracking::ResubmittedShare) -> ShareDeliveryRecord {
+fn delivery_record(
+    resubmitted: &zcash_voting::share_tracking::ResubmittedShare,
+) -> ShareDeliveryRecord {
     ShareDeliveryRecord {
         bundle_index: resubmitted.share.bundle_index,
         proposal_id: resubmitted.share.proposal_id,
