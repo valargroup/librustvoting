@@ -1039,10 +1039,16 @@ impl HelperClient {
             let deadline = tokio::time::Instant::now()
                 .checked_add(timeout)
                 .ok_or(HelperError::Transport(HelperTransportError::Timeout))?;
-            tokio::time::timeout_at(deadline, self.transport.post_json(url, body, timeout))
-                .await
-                .map_err(|_| HelperError::Transport(HelperTransportError::Timeout))?
-                .map_err(HelperError::Transport)
+            tokio::time::timeout_at(
+                deadline,
+                crate::http_transport::observe_helper_http(
+                    stage.scope().clone(),
+                    self.transport.post_json(url, body, timeout),
+                ),
+            )
+            .await
+            .map_err(|_| HelperError::Transport(HelperTransportError::Timeout))?
+            .map_err(HelperError::Transport)
         }
         .await;
         let status = result.as_ref().ok().map(HelperResponse::status);
